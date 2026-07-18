@@ -1,0 +1,1 @@
+<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_User:opensource｜>대한민국의 수도는<｜hy_Assistant:opensource｜><think:opensource></think:opensource>

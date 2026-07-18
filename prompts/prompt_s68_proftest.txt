@@ -1,0 +1,1 @@
+Transformer 모델에서 multi-head attention 이 single-head attention 보다 성능이 좋은 이유를 설명해줘. 단계별로 생각하는 과정을 먼저 보여주고, 마지막에 핵심 결론 한 단락으로 정리해줘. 한국어로 답해.

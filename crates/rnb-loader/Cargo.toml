@@ -1,0 +1,20 @@
+[package]
+name = "rnb-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnb-core = { path = "../rnb-core" }
+rnb-model-ir = { path = "../rnb-model-ir" }
+rnb-model-nemotron = { path = "../rnb-models/nemotron" }
+rnb-memory = { path = "../rnb-memory" }
+rnb-platform = { path = "../rnb-platform" }
+memmap2 = "0.9"
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

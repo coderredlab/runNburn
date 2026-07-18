@@ -1,0 +1,16 @@
+[package]
+name = "rnb-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnb-core = { path = "../../rnb-core" }
+rnb-cpu = { path = "../../rnb-cpu" }
+rnb-loader = { path = "../../rnb-loader" }
+half = "2"
+memmap2 = "0.9"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

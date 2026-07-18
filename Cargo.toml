@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rnb-backend/api",
+    "crates/rnb-backend/cpu",
+    "crates/rnb-backend/cuda",
+    "crates/rnb-backend/metal",
+    "crates/rnb-backend/mediatek",
+    "crates/rnb-backend/opencl",
+    "crates/rnb-backend/vulkan",
+    "crates/rnb-cli",
+    "crates/rnb-core",
+    "crates/rnb-cpu",
+    "crates/rnb-ffi",
+    "crates/rnb-llm",
+    "crates/rnb-loader",
+    "crates/rnb-memory",
+    "crates/rnb-model-ir",
+    "crates/rnb-models/gemma",
+    "crates/rnb-models/nemotron",
+    "crates/rnb-models/qwen",
+    "crates/rnb-mtp",
+    "crates/rnb-platform",
+    "crates/rnb-runtime",
+    "crates/rnb-scheduler",
+    "crates/rnb-tools/convert",
+    "crates/rnb-tools/dev-cli",
+    "crates/rnb-tools/moe-cache-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"

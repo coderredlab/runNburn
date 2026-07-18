@@ -1,0 +1,32 @@
+/target
+.worktrees
+.worktrees/
+.superpowers/
+/models/
+/cache/
+tools/
+.omx/
+.venv/
+
+# Local credentials and developer-only environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+dumps/
+# Local run output stays untracked. Accepted benchmark evidence may be
+# force-added only when a performance journal or session report references it.
+logs/
+.local-lib/
+gemma_debug2_copy.txt
+
+# android_app/ 은 nested git repo (독립 레포)
+android_app/
+
+# Claude Code 로컬 설정 / Python 캐시
+.claude/
+__pycache__/
+
+# Serena MCP local memory (auto-generated)
+.serena/

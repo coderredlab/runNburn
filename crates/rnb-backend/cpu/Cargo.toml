@@ -1,0 +1,10 @@
+[package]
+name = "rnb-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnb-backend-api = { path = "../api" }
+rnb-cpu = { path = "../../rnb-cpu" }
+rnb-platform = { path = "../../rnb-platform" }

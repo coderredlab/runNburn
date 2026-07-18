@@ -1,0 +1,3 @@
+<|turn>user
+대한민국의 수도는 어디야? 한국어로 한 문장만 답해.<turn|>
+<|turn>model

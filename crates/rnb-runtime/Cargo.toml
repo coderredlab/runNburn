@@ -1,0 +1,30 @@
+[package]
+name = "rnb-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = ["dep:rnb-backend-cpu"]
+cuda = ["dep:rnb-backend-cuda"]
+vulkan = ["dep:rnb-backend-vulkan"]
+opencl = ["dep:rnb-backend-opencl"]
+metal = ["dep:rnb-backend-metal"]
+mediatek = ["dep:rnb-backend-mediatek"]
+
+[dependencies]
+rnb-backend-api = { path = "../rnb-backend/api" }
+rnb-core = { path = "../rnb-core" }
+rnb-backend-cpu = { path = "../rnb-backend/cpu", optional = true }
+rnb-backend-cuda = { path = "../rnb-backend/cuda", optional = true }
+rnb-backend-metal = { path = "../rnb-backend/metal", optional = true }
+rnb-backend-mediatek = { path = "../rnb-backend/mediatek", optional = true }
+rnb-backend-opencl = { path = "../rnb-backend/opencl", optional = true }
+rnb-backend-vulkan = { path = "../rnb-backend/vulkan", optional = true }
+rnb-cpu = { path = "../rnb-cpu" }
+rnb-loader = { path = "../rnb-loader" }
+rnb-memory = { path = "../rnb-memory" }
+rnb-model-ir = { path = "../rnb-model-ir" }
+rnb-platform = { path = "../rnb-platform" }
+rnb-scheduler = { path = "../rnb-scheduler" }

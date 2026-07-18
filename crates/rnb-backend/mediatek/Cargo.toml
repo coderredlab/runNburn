@@ -1,0 +1,10 @@
+[package]
+name = "rnb-backend-mediatek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnb-backend-api = { path = "../api" }
+libc = "0.2"
+sha2 = "0.10"

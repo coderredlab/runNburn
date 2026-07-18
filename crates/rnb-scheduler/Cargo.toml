@@ -1,0 +1,10 @@
+[package]
+name = "rnb-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rnb-backend-api = { path = "../rnb-backend/api" }
+rnb-memory = { path = "../rnb-memory" }
+rnb-model-ir = { path = "../rnb-model-ir" }
