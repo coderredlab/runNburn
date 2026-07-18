@@ -298,8 +298,8 @@ The intended ownership boundaries are documented in
 ## Development checks
 
 ```bash
-cargo fmt --all -- --check
-cargo test --workspace
+cargo fmt --all --check
+cargo test -p rnb-cli --no-default-features --features cpu
 scripts/check_build_matrix.sh
 ```
 
