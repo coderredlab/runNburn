@@ -4,27 +4,49 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   linux-x86_64:
-    name: Linux x86_64 release
-    runs-on: ubuntu-latest
+    name: Linux x86_64 ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            features: cpu
+            archive_suffix: ""
+          - backend: vulkan-experimental
+            features: cpu,vulkan
+            archive_suffix: -vulkan-experimental
+          - backend: opencl-experimental
+            features: cpu,opencl
+            archive_suffix: -opencl-experimental
 
     steps:
-      - name: Check out source
+      - name: Check out release tag
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust
         run: |
@@ -32,63 +54,290 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-cpu-
+          key: linux-x86_64-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-${{ matrix.backend }}-
 
       - name: Check formatting
+        if: matrix.backend == 'cpu'
         run: cargo fmt --all --check
 
       - name: Test CPU product path
+        if: matrix.backend == 'cpu'
         run: cargo test --locked -p rnb-cli --no-default-features --features cpu
 
-      - name: Build CPU release binary
-        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu
+      - name: Build release binary
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features "${{ matrix.features }}"
+
+      - name: Smoke test binary
+        run: ./target/release/runNburn --help
 
       - name: Package binary
         id: package
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive="runNburn-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          version="${RELEASE_TAG#v}"
+          archive="runNburn-${version}-x86_64-unknown-linux-gnu${{ matrix.archive_suffix }}.tar.gz"
           mkdir -p dist/package
           install -m 0755 target/release/runNburn dist/package/runNburn
-          tar -C dist/package -czf "dist/${archive}" runNburn
+          install -m 0644 LICENSE NOTICE dist/package/
+          tar -C dist/package -czf "dist/${archive}" runNburn LICENSE NOTICE
           (cd dist && sha256sum "${archive}" > "${archive}.sha256")
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: runNburn-linux-x86_64
+          name: runNburn-release-linux-x86_64-${{ matrix.backend }}
           path: |
             dist/${{ steps.package.outputs.archive }}
             dist/${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
 
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
+  linux-cuda-sm86:
+    name: Linux x86_64 CUDA sm86
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RNB_CUDA_ARCH: sm_86
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install CUDA compiler
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: network
+          sub-packages: '["nvcc"]'
+
+      - name: Verify CUDA compiler
+        run: nvcc --version
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86_64-cuda-sm86-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-cuda-sm86-
+
+      - name: Build release binary
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu,cuda
+
+      - name: Smoke test binary
+        run: ./target/release/runNburn --help
+
+      - name: Package binary
+        id: package
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME"; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "dist/${ARCHIVE}" \
-              "dist/${ARCHIVE}.sha256" \
-              --clobber
+          version="${RELEASE_TAG#v}"
+          archive="runNburn-${version}-x86_64-unknown-linux-gnu-cuda-sm86.tar.gz"
+          mkdir -p dist/package
+          install -m 0755 target/release/runNburn dist/package/runNburn
+          install -m 0644 LICENSE NOTICE dist/package/
+          tar -C dist/package -czf "dist/${archive}" runNburn LICENSE NOTICE
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runNburn-release-linux-x86_64-cuda-sm86
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  macos-metal:
+    name: macOS Apple Silicon Metal
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-aarch64-metal-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-aarch64-metal-
+
+      - name: Build release binary
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu,metal
+
+      - name: Smoke test binary
+        run: ./target/release/runNburn --help
+
+      - name: Package binary
+        id: package
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="runNburn-${version}-aarch64-apple-darwin-metal.tar.gz"
+          mkdir -p dist/package
+          install -m 0755 target/release/runNburn dist/package/runNburn
+          install -m 0644 LICENSE NOTICE dist/package/
+          tar -C dist/package -czf "dist/${archive}" runNburn LICENSE NOTICE
+          (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runNburn-release-macos-aarch64-metal
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  android-aarch64:
+    name: Android aarch64 ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            features: cpu
+          - backend: vulkan-experimental
+            features: cpu,vulkan
+          - backend: opencl-experimental
+            features: cpu,opencl
+          - backend: mediatek-experimental
+            features: cpu,mediatek
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install nightly Rust
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup target add --toolchain nightly aarch64-linux-android
+
+      - name: Configure Android NDK linker
+        shell: bash
+        run: |
+          toolchain="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "${toolchain}/aarch64-linux-android24-clang"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=${toolchain}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=${toolchain}/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: android-aarch64-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: android-aarch64-${{ matrix.backend }}-
+
+      - name: Build Android FFI library
+        run: |
+          rustup run nightly cargo build --locked --release \
+            -p rnb-ffi \
+            --lib \
+            --target aarch64-linux-android \
+            --no-default-features \
+            --features "${{ matrix.features }}"
+
+      - name: Verify Android library architecture
+        shell: bash
+        run: |
+          library="target/aarch64-linux-android/release/librnb_ffi.so"
+          file "${library}" | grep -q "ARM aarch64"
+          readelf -h "${library}"
+
+      - name: Package Android FFI library
+        id: package
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="runNburn-${version}-aarch64-linux-android-${{ matrix.backend }}.tar.gz"
+          mkdir -p dist/package/include dist/package/lib/arm64-v8a
+          install -m 0644 crates/rnb-ffi/include/rnb.h dist/package/include/
+          install -m 0755 target/aarch64-linux-android/release/librnb_ffi.so dist/package/lib/arm64-v8a/
+          install -m 0644 LICENSE NOTICE dist/package/
+          tar -C dist/package -czf "dist/${archive}" include lib LICENSE NOTICE
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runNburn-release-android-aarch64-${{ matrix.backend }}
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs:
+      - linux-x86_64
+      - linux-cuda-sm86
+      - macos-metal
+      - android-aarch64
+
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v8
+        with:
+          pattern: runNburn-release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify all checksums
+        shell: bash
+        run: cd dist && sha256sum -c *.sha256
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG"; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" \
-              "dist/${ARCHIVE}" \
-              "dist/${ARCHIVE}.sha256" \
+            gh release create "$RELEASE_TAG" dist/* \
               --verify-tag \
               --generate-notes \
-              --title "runNburn ${GITHUB_REF_NAME}"
+              --title "runNburn ${RELEASE_TAG}"
           fi
