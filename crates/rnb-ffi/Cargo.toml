@@ -1,0 +1,24 @@
+[package]
+name = "rnb-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+include = ["Cargo.toml", "include/rnb.h", "src/**"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "rnb-ffi-test"
+path = "src/test_ffi.rs"
+
+[features]
+default = ["cpu"]
+cpu = ["rnb-llm/cpu"]
+vulkan = ["rnb-llm/vulkan"]
+opencl = ["rnb-llm/opencl"]
+mediatek = ["rnb-llm/mediatek"]
+
+[dependencies]
+rnb-llm = { path = "../rnb-llm" }
+rand = { version = "0.8", features = ["small_rng"] }

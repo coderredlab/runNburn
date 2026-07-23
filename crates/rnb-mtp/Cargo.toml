@@ -1,0 +1,36 @@
+[package]
+name = "rnb-mtp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# mt1 (2026-05-07) — Multi-Token Prediction (MTP) helper crate.
+#
+# 책임 (rnb-llm 의 generation loop helper):
+# - drafter weight loader (HuggingFace `*-it-assistant` 모델 형식)
+# - parallel verify logic (target.forward 의 N+1 token 검증)
+# - drafter ↔ target KV cache 공유 infrastructure
+# - speculative decoding 일반화 (MTP 외 Medusa / EAGLE / Lookahead 까지 확장 가능)
+#
+# Dependency direction: rnb-llm → rnb-mtp (helper).
+# spec `docs/superpowers/specs/2026-04-28-runtime-crate-boundaries-design.md`
+# 의 forbidden reverse 위반 X.
+
+[features]
+# cu46 (2026-05-22): rnb-runtime/cuda pass-through 로 drafter FFN CUDA port
+# 활성화. mc78 의 backend-agnostic 원칙 위반이지만 production speedup 위해
+# 채택. spec 의 boundary 는 cu46 spec 에서 명시.
+cuda = ["rnb-runtime/cuda"]
+
+[dependencies]
+rnb-core = { path = "../rnb-core" }
+rnb-cpu = { path = "../rnb-cpu" }
+rnb-loader = { path = "../rnb-loader" }
+rnb-runtime = { path = "../rnb-runtime", default-features = false }
+memmap2 = "0.9"
+thiserror = "2"
+half = "2"
+
+[dev-dependencies]
+approx = "0.5"
+rnb-llm = { path = "../rnb-llm" }

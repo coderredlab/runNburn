@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-cpu-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Test CPU product path
+        run: cargo test --locked -p rnb-cli --no-default-features --features cpu
+
+      - name: Build CPU release binary
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu
+
+      - name: Package binary
+        id: package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="runNburn-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p dist/package
+          install -m 0755 target/release/runNburn dist/package/runNburn
+          tar -C dist/package -czf "dist/${archive}" runNburn
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runNburn-linux-x86_64
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME"; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "dist/${ARCHIVE}" \
+              "dist/${ARCHIVE}.sha256" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/${ARCHIVE}" \
+              "dist/${ARCHIVE}.sha256" \
+              --verify-tag \
+              --generate-notes \
+              --title "runNburn ${GITHUB_REF_NAME}"
+          fi

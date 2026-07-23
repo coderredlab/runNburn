@@ -1,0 +1,39 @@
+[package]
+name = "rnb-backend-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+metal = []
+
+[dependencies]
+rnb-backend-api = { path = "../api" }
+rnb-memory = { path = "../../rnb-memory" }
+rnb-platform = { path = "../../rnb-platform" }
+half = "2"
+libc = "0.2"
+
+[dev-dependencies]
+memmap2 = "0.9"
+rnb-cpu = { path = "../../rnb-cpu" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLLibrary",
+    "MTLBuffer",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLArgumentEncoder",
+    "MTLTypes",
+    "MTLCounters",
+    "block2",
+] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }

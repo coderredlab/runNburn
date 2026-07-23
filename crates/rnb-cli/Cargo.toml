@@ -1,0 +1,26 @@
+[package]
+name = "rnb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "runNburn"
+path = "src/main.rs"
+
+[features]
+default = ["cpu"]
+cpu = ["rnb-llm/cpu"]
+vulkan = ["rnb-llm/vulkan"]
+cuda = ["rnb-llm/cuda"]
+opencl = ["rnb-llm/opencl"]
+metal = ["rnb-llm/metal"]
+mediatek = ["rnb-llm/mediatek"]
+
+[dependencies]
+rnb-llm = { path = "../rnb-llm" }
+rnb-runtime = { path = "../rnb-runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+ctrlc = { version = "3.5", features = ["termination"] }

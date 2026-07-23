@@ -1,0 +1,21 @@
+/target/
+
+# Local models, caches, and benchmark output
+/models/
+/cache/
+/logs/
+/dumps/
+/.local-lib/
+
+
+# Credentials and local environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo

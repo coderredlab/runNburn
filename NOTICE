@@ -1,0 +1,91 @@
+runNburn
+Copyright 2026 CoderRed
+
+runNburn is licensed under the Apache License, Version 2.0, except for the
+third-party portions identified below. Those portions remain subject to their
+original license terms.
+
+llama.cpp / ggml
+----------------
+
+Source: https://github.com/ggml-org/llama.cpp
+Copyright (c) 2023-2026 The ggml authors
+License: MIT
+
+runNburn contains specific portions adapted or translated from llama.cpp and
+ggml. Existing source comments identify the relevant ports and compatibility
+references. Principal adapted portions include:
+
+- Reference quantization helpers and GGML-compatible codebooks identified in
+  `crates/rnb-cpu/src/quantize/`.
+- The AVX2 quantized dot-product port in
+  `crates/rnb-cpu/src/gemm/avx2_dot.rs`.
+- CUDA compatibility tables and quantized-kernel portions whose source comments
+  identify llama.cpp or ggml as their reference.
+- The coalesced quantized GEMV kernels and gated-delta-net mapping in
+  `crates/rnb-backend/metal/src/` that explicitly identify llama.cpp as their
+  source or mapping reference.
+
+This attribution applies only to the portions identified as adapted. Native
+runNburn policies, APIs, data layouts, integration code, and independently
+developed kernels are runNburn work. The llama.cpp/ggml-derived portions remain
+under the MIT License below; runNburn modifications and original code are
+provided under the Apache License, Version 2.0, unless a source file states
+otherwise.
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+KVarN
+-----
+
+Method and paper:
+https://arxiv.org/abs/2606.03458
+
+Official implementation:
+https://github.com/huawei-csl/KVarN
+Reference revision:
+7586257f1c632e63187bfacbbe21ccb51540f7b3
+License: Apache License, Version 2.0
+
+runNburn's KVarN support is a runNburn-native Rust, CUDA, and Metal
+implementation informed by the KVarN paper and checked against its official
+Apache-2.0 reference backend. The CPU quantization module records
+the exact reference revision it follows. The packed-record layout, backend API,
+runtime policy, and CUDA/Metal fused decode kernels are runNburn-specific work.
+
+Principal areas include:
+
+- `crates/rnb-cpu/src/quantize/kvarn.rs`.
+- `crates/rnb-llm/src/kv_cache/kvarn.rs`.
+- `crates/rnb-runtime/src/policy/kvarn.rs`.
+- `crates/rnb-backend/cuda/cuda/kernels/kvarn_attention.cuh`.
+- `crates/rnb-backend/metal/src/kvarn_attention.metal`.
+
+This attribution identifies the method and reference implementation; it does
+not characterize the listed files as wholesale copies of upstream code.
+runNburn's KVarN implementation is distributed under the Apache License,
+Version 2.0, included in the repository `LICENSE` file.
+
+KVarN paper authors:
+Lorenz K. Muller, Philippe Bich, Chiara Boretti, Hyun-Min Chang,
+Jiawei Zhuang, and Lukas Cavigelli.

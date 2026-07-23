@@ -1,0 +1,16 @@
+[package]
+name = "rnb-backend-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half = "2"
+libc = "0.2"
+rnb-backend-api = { path = "../api" }
+rnb-core = { path = "../../rnb-core" }
+rnb-memory = { path = "../../rnb-memory" }
+rnb-platform = { path = "../../rnb-platform" }
+
+[dev-dependencies]
+rnb-cpu = { path = "../../rnb-cpu" }
