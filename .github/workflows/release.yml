@@ -61,7 +61,7 @@ jobs:
           mkdir -p dist/package
           install -m 0755 target/release/runNburn dist/package/runNburn
           tar -C dist/package -czf "dist/${archive}" runNburn
-          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
