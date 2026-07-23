@@ -176,10 +176,8 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
 
       - name: Cache Cargo
         uses: actions/cache@v6
@@ -192,7 +190,7 @@ jobs:
           restore-keys: macos-aarch64-metal-
 
       - name: Build release binary
-        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu,metal
+        run: rustup run nightly cargo build --locked --release -p rnb-cli --no-default-features --features cpu,metal
 
       - name: Smoke test binary
         run: ./target/release/runNburn --help
@@ -251,9 +249,9 @@ jobs:
         shell: bash
         run: |
           toolchain="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          test -x "${toolchain}/aarch64-linux-android24-clang"
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=${toolchain}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          test -x "${toolchain}/aarch64-linux-android31-clang"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain}/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=${toolchain}/aarch64-linux-android31-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=${toolchain}/llvm-ar" >> "$GITHUB_ENV"
 
       - name: Cache Cargo

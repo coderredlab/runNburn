@@ -6,6 +6,8 @@ pub use rnb_backend_mediatek::{
 #[cfg(target_os = "android")]
 use std::cell::RefCell;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -368,6 +370,21 @@ pub struct RunCachedGatedGeluFfnF32Weights {
     pub gate_weight: Vec<f32>,
     pub up_weight: Vec<f32>,
     pub down_weight: Vec<f32>,
+}
+
+impl RunCachedGatedGeluFfnF32Weights {
+    fn into_backend(
+        self,
+        shape: rnb_backend_mediatek::MediaTekGatedGeluFfnShape,
+    ) -> Result<rnb_backend_mediatek::MediaTekGatedGeluFfnOwnedWeights, MediaTekRunError> {
+        rnb_backend_mediatek::MediaTekGatedGeluFfnOwnedWeights::new(
+            shape,
+            self.gate_weight,
+            self.up_weight,
+            self.down_weight,
+        )
+        .map_err(|err| invalid_shape(err.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1045,21 +1062,44 @@ fn probe_gated_gelu_ffn_f32_batched_result_from_backend(
     }
 }
 
+fn run_gated_gelu_ffn_f32_result_from_batched_backend(
+    output: rnb_backend_mediatek::MediaTekGatedGeluFfnBatchedOutput,
+    cache_hit: bool,
+    compile_timings: Option<rnb_backend_mediatek::MediaTekGatedGeluFfnTimings>,
+) -> RunGatedGeluFfnF32Result {
+    let chosen = output.chosen_device();
+    let mut timings = RunGatedGeluFfnF32Timings::from_backend(output.timings());
+    if let Some(compile_timings) = compile_timings {
+        timings.model_build_ns = compile_timings.model_build_ns();
+        timings.supported_ops_query_ns = compile_timings.supported_ops_query_ns();
+        timings.compilation_ns = compile_timings.compilation_ns();
+        timings.token_hash_ns = compile_timings.token_hash_ns();
+    }
+    RunGatedGeluFfnF32Result {
+        output: output.output().to_vec(),
+        chosen_device_name: chosen.name().to_string(),
+        chosen_device_type: chosen.device_type(),
+        chosen_device_feature_level: chosen.feature_level(),
+        chosen_device_version: chosen.version().to_string(),
+        supported_ops: output.supported_ops().named().to_vec(),
+        duration_hardware_ns: output.duration_hardware_ns(),
+        duration_driver_ns: output.duration_driver_ns(),
+        timings,
+        cache_hit,
+    }
+}
+
 fn trace_batched_cache_dir_disabled_once(reason: &str) {
-    static WARNED: OnceLock<()> = OnceLock::new();
-    WARNED.get_or_init(|| {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
         eprintln!("[mediatek-ffn-batched] aot_cache_dir=disabled reason={reason}");
-    });
+    }
 }
 
 pub fn default_gated_gelu_ffn_batched_cache_dir() -> Option<String> {
-    let cache_root = match crate::platform::cache_dir::resolve_cache_dir() {
-        Ok(path) => path,
-        Err(err) => {
-            trace_batched_cache_dir_disabled_once(&err);
-            return None;
-        }
-    };
+    let cache_root = std::env::var_os("RNB_CACHE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)?;
     let cache_dir = cache_root.join("mediatek").join("gated_gelu_ffn_batched");
     if let Err(err) = std::fs::create_dir_all(&cache_dir) {
         trace_batched_cache_dir_disabled_once(&format!("create {}: {err}", cache_dir.display()));
