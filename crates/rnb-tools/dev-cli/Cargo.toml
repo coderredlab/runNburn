@@ -29,7 +29,7 @@ rnb-runtime = { path = "../../rnb-runtime", default-features = false, optional =
 half = "2"
 libc = "0.2"
 memmap2 = "0.9"
-rand = { version = "0.8", features = ["small_rng"] }
+rand = { version = "0.9", features = ["small_rng"] }
 sha2 = "0.10"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

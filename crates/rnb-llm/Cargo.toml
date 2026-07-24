@@ -19,7 +19,7 @@ rnb-model-nemotron = { path = "../rnb-models/nemotron" }
 rnb-model-qwen = { path = "../rnb-models/qwen" }
 rnb-mtp = { path = "../rnb-mtp" }
 rnb-runtime = { path = "../rnb-runtime", default-features = false }
-rand = { version = "0.8", features = ["small_rng"] }
+rand = { version = "0.9", features = ["small_rng"] }
 thiserror = "1"
 half = "2"
 rayon = "1"
