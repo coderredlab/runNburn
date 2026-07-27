@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 rnb-backend-api = { path = "../api" }
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.11"
