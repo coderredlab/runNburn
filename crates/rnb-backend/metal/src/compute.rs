@@ -67,6 +67,7 @@ const ATTN_DECODE_SRC: &str = include_str!("attn_decode.metal");
 const KVARN_ATTENTION_SRC: &str = include_str!("kvarn_attention.metal");
 const ATTN_DECODE_I8_SRC: &str = include_str!("attn_decode_i8.metal");
 const ATTN_DECODE_I8_SPLITK_SRC: &str = include_str!("attn_decode_i8_splitk.metal");
+const ATTN_DECODE_I8_GQA_SPLITK_SRC: &str = include_str!("attn_decode_i8_gqa_splitk.metal");
 const ATTN_DECODE_SPLITK_SRC: &str = include_str!("attn_decode_splitk.metal");
 const ATTN_DECODE_GQA_SRC: &str = include_str!("attn_decode_gqa.metal");
 const ROPE_MROPE_SRC: &str = include_str!("rope_mrope.metal");
@@ -581,6 +582,9 @@ pub struct MetalContext {
     /// KV 축 병렬(partial + reduce)로 보완하는 opt-in path.
     pub attn_decode_i8_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_i8_splitk_reduce_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// HD=256/GQA=8 int8 KV split-K part. Query head별 SIMD-group이 shared KV tile을 재사용한다.
+    pub attn_decode_i8_gqa_splitk_part_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm132: split-K f16 KV decode attention.
     pub attn_decode_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2180,6 +2184,11 @@ pub fn build_metal_context_with_opts(
         ATTN_DECODE_I8_SPLITK_SRC,
         "attn_decode_i8_splitk_reduce",
     );
+    let attn_decode_i8_gqa_splitk_part_pipeline = build_pipeline(
+        &device,
+        ATTN_DECODE_I8_GQA_SPLITK_SRC,
+        "attn_decode_i8_gqa_splitk_part",
+    );
     let attn_decode_splitk_part_pipeline =
         build_pipeline(&device, ATTN_DECODE_SPLITK_SRC, "attn_decode_splitk_part");
     let attn_decode_splitk_reduce_pipeline =
@@ -2374,6 +2383,7 @@ pub fn build_metal_context_with_opts(
         attn_decode_i8_pipeline,
         attn_decode_i8_splitk_part_pipeline,
         attn_decode_i8_splitk_reduce_pipeline,
+        attn_decode_i8_gqa_splitk_part_pipeline,
         attn_decode_splitk_part_pipeline,
         attn_decode_splitk_reduce_pipeline,
         attn_decode_gqa_splitk_part_pipeline,
@@ -10518,6 +10528,97 @@ pub(crate) fn encode_attn_decode_i8_splitk(
     enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, tg);
 }
 
+/// HD=256/GQA=8 전용 int8 KV split-K decode attention.
+/// Part는 KV-head당 query-head 8개를 8 SIMD-group으로 병렬 처리하고 quantized KV tile을
+/// threadgroup memory에서 공유한다. Partial ABI와 reduce는 기존 int8 split-K와 동일하다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_i8_gqa_splitk(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_i8: &ProtocolObject<dyn MTLBuffer>,
+    v_i8: &ProtocolObject<dyn MTLBuffer>,
+    k_scale: &ProtocolObject<dyn MTLBuffer>,
+    v_scale: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc: &ProtocolObject<dyn MTLBuffer>,
+    partial_m: &ProtocolObject<dyn MTLBuffer>,
+    partial_s: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    splits_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+) {
+    assert_eq!(head_dim, 256, "int8 GQA split-K requires head_dim=256");
+    assert_eq!(
+        num_heads,
+        num_kv_heads * 8,
+        "int8 GQA split-K requires GQA factor 8"
+    );
+    assert!(
+        num_splits >= 2,
+        "int8 GQA split-K requires at least 2 splits"
+    );
+
+    enc.setComputePipelineState(&ctx.attn_decode_i8_gqa_splitk_part_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_i8), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_i8), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(k_scale), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(v_scale), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 11);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 12);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 13);
+    }
+    let part_grid = MTLSize {
+        width: num_kv_heads,
+        height: num_splits,
+        depth: 1,
+    };
+    let part_tg = MTLSize {
+        width: 8 * SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(part_grid, part_tg);
+    chain_barrier(ctx, enc);
+
+    enc.setComputePipelineState(&ctx.attn_decode_i8_splitk_reduce_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 6);
+    }
+    let reduce_grid = MTLSize {
+        width: num_heads,
+        height: 1,
+        depth: 1,
+    };
+    let reduce_tg = MTLSize {
+        width: SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, reduce_tg);
+}
+
 /// pm132: f16 KV split-K decode attention encode (part + reduce).
 /// buffer layout: q(0) k_f16(1) v_f16(2) partial_acc(3) partial_m(4) partial_s(5)
 ///   nh(6) nkv(7) hd(8) kl(9) scale(10) splits(11)
@@ -10833,6 +10934,7 @@ pub fn attn_decode_i8_splitk_with_ctx(
     kv_len: usize,
     scale: f32,
     num_splits: usize,
+    gqa_grouped: bool,
 ) -> Vec<f32> {
     let kv_dim = num_kv_heads * head_dim;
     assert_eq!(q.len(), num_heads * head_dim, "q length mismatch");
@@ -10913,28 +11015,54 @@ pub fn attn_decode_i8_splitk_with_ctx(
     let enc = cmd
         .computeCommandEncoder()
         .expect("Metal: failed to create compute command encoder");
-    encode_attn_decode_i8_splitk(
-        ctx,
-        &enc,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &ks_buf,
-        &vs_buf,
-        &partial_acc,
-        &partial_m,
-        &partial_s,
-        &o_buf,
-        &nh_buf,
-        &nkv_buf,
-        &hd_buf,
-        &kl_buf,
-        &scale_buf,
-        &splits_buf,
-        num_heads,
-        head_dim,
-        num_splits,
-    );
+    if gqa_grouped {
+        encode_attn_decode_i8_gqa_splitk(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &ks_buf,
+            &vs_buf,
+            &partial_acc,
+            &partial_m,
+            &partial_s,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &hd_buf,
+            &kl_buf,
+            &scale_buf,
+            &splits_buf,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            num_splits,
+        );
+    } else {
+        encode_attn_decode_i8_splitk(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &ks_buf,
+            &vs_buf,
+            &partial_acc,
+            &partial_m,
+            &partial_s,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &hd_buf,
+            &kl_buf,
+            &scale_buf,
+            &splits_buf,
+            num_heads,
+            head_dim,
+            num_splits,
+        );
+    }
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();

@@ -17,19 +17,33 @@ use objc2_metal::{
 
 use crate::compute::{
     self, chain_barrier, chain_compute_encoder, encode_attn_decode, encode_attn_decode_at,
-    encode_attn_decode_gqa_splitk, encode_attn_decode_i8, encode_attn_decode_i8_splitk,
-    encode_attn_decode_splitk, encode_gate_apply, encode_gate_apply_at, encode_gemv_quant_bcol,
-    encode_kv_append, encode_kv_append_at, encode_kv_append_i8, encode_qk_norm, encode_qk_norm_at,
-    encode_rope_partial, encode_rope_partial_at, encode_split_qgate, encode_split_qgate_at,
-    KvResident, MetalContext,
+    encode_attn_decode_gqa_splitk, encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk,
+    encode_attn_decode_i8_splitk, encode_attn_decode_splitk, encode_gate_apply,
+    encode_gate_apply_at, encode_gemv_quant_bcol, encode_kv_append, encode_kv_append_at,
+    encode_kv_append_i8, encode_qk_norm, encode_qk_norm_at, encode_rope_partial,
+    encode_rope_partial_at, encode_split_qgate, encode_split_qgate_at, KvResident, MetalContext,
 };
 use crate::ffn_chain::{
     empty_f32_buf, encode_residual_add, encode_residual_add_at, encode_rms_norm,
     encode_rms_norm_io_offset, encode_silu_mul, f32_buf, readback, u32_buf,
 };
 
+// f16 grouped kernel은 register pressure 회귀 때문에 명시적 opt-in만 허용한다.
 fn gqa_group_requested(value: Option<&str>) -> bool {
     value == Some("1")
+}
+
+// int8 grouped kernel은 KV tile 공유 이득이 검증돼 default-on이고 falsey 값만 opt-out이다.
+fn int8_gqa_group_enabled(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            !value.eq_ignore_ascii_case("0")
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+                && !value.eq_ignore_ascii_case("no")
+        }
+    }
 }
 
 /// Attention layer 의 device-resident 중간 버퍼 + 불변 scalar 버퍼 + KV.
@@ -525,40 +539,82 @@ pub(crate) fn attn_chain_encode_core(
             );
         } else if ctx.kv_int8 {
             if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
-                encode_attn_decode_i8_splitk(
-                    ctx,
-                    enc,
-                    &carrier.q_dev,
-                    carrier.kv.k_i8.as_ref().unwrap(),
-                    carrier.kv.v_i8.as_ref().unwrap(),
-                    carrier.kv.k_scale.as_ref().unwrap(),
-                    carrier.kv.v_scale.as_ref().unwrap(),
-                    carrier
-                        .attn_splitk_acc_dev
-                        .as_ref()
-                        .expect("splitk acc buffer missing"),
-                    carrier
-                        .attn_splitk_m_dev
-                        .as_ref()
-                        .expect("splitk m buffer missing"),
-                    carrier
-                        .attn_splitk_s_dev
-                        .as_ref()
-                        .expect("splitk s buffer missing"),
-                    &carrier.attn_out_dev,
-                    &carrier.nh_buf,
-                    &carrier.nkv_buf,
-                    &carrier.hd_buf,
-                    &kl_buf,
-                    &scale_buf,
-                    carrier
-                        .attn_splitk_splits_buf
-                        .as_ref()
-                        .expect("splitk splits buffer missing"),
-                    num_heads,
-                    head_dim,
-                    ctx.attn_splitk_splits,
-                );
+                let gqa_group = int8_gqa_group_enabled(
+                    std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref(),
+                ) && head_dim == 256
+                    && num_heads == num_kv_heads * 8;
+                if gqa_group {
+                    encode_attn_decode_i8_gqa_splitk(
+                        ctx,
+                        enc,
+                        &carrier.q_dev,
+                        carrier.kv.k_i8.as_ref().unwrap(),
+                        carrier.kv.v_i8.as_ref().unwrap(),
+                        carrier.kv.k_scale.as_ref().unwrap(),
+                        carrier.kv.v_scale.as_ref().unwrap(),
+                        carrier
+                            .attn_splitk_acc_dev
+                            .as_ref()
+                            .expect("splitk acc buffer missing"),
+                        carrier
+                            .attn_splitk_m_dev
+                            .as_ref()
+                            .expect("splitk m buffer missing"),
+                        carrier
+                            .attn_splitk_s_dev
+                            .as_ref()
+                            .expect("splitk s buffer missing"),
+                        &carrier.attn_out_dev,
+                        &carrier.nh_buf,
+                        &carrier.nkv_buf,
+                        &carrier.hd_buf,
+                        &kl_buf,
+                        &scale_buf,
+                        carrier
+                            .attn_splitk_splits_buf
+                            .as_ref()
+                            .expect("splitk splits buffer missing"),
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        ctx.attn_splitk_splits,
+                    );
+                } else {
+                    encode_attn_decode_i8_splitk(
+                        ctx,
+                        enc,
+                        &carrier.q_dev,
+                        carrier.kv.k_i8.as_ref().unwrap(),
+                        carrier.kv.v_i8.as_ref().unwrap(),
+                        carrier.kv.k_scale.as_ref().unwrap(),
+                        carrier.kv.v_scale.as_ref().unwrap(),
+                        carrier
+                            .attn_splitk_acc_dev
+                            .as_ref()
+                            .expect("splitk acc buffer missing"),
+                        carrier
+                            .attn_splitk_m_dev
+                            .as_ref()
+                            .expect("splitk m buffer missing"),
+                        carrier
+                            .attn_splitk_s_dev
+                            .as_ref()
+                            .expect("splitk s buffer missing"),
+                        &carrier.attn_out_dev,
+                        &carrier.nh_buf,
+                        &carrier.nkv_buf,
+                        &carrier.hd_buf,
+                        &kl_buf,
+                        &scale_buf,
+                        carrier
+                            .attn_splitk_splits_buf
+                            .as_ref()
+                            .expect("splitk splits buffer missing"),
+                        num_heads,
+                        head_dim,
+                        ctx.attn_splitk_splits,
+                    );
+                }
             } else {
                 encode_attn_decode_i8(
                     ctx,
@@ -1378,7 +1434,7 @@ pub(crate) fn attn_core_chain_encode_bcol(
 
 #[cfg(test)]
 mod tests {
-    use super::gqa_group_requested;
+    use super::{gqa_group_requested, int8_gqa_group_enabled};
 
     #[test]
     fn gqa_group_requires_explicit_opt_in() {
@@ -1386,5 +1442,15 @@ mod tests {
         assert!(!gqa_group_requested(Some("0")));
         assert!(!gqa_group_requested(Some("false")));
         assert!(gqa_group_requested(Some("1")));
+    }
+
+    #[test]
+    fn int8_gqa_group_is_default_on_with_explicit_opt_out() {
+        assert!(int8_gqa_group_enabled(None));
+        assert!(!int8_gqa_group_enabled(Some("0")));
+        assert!(!int8_gqa_group_enabled(Some("false")));
+        assert!(!int8_gqa_group_enabled(Some("OFF")));
+        assert!(!int8_gqa_group_enabled(Some("no")));
+        assert!(int8_gqa_group_enabled(Some("1")));
     }
 }
