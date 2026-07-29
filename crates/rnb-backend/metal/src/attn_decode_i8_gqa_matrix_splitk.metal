@@ -128,34 +128,38 @@ kernel void attn_decode_i8_gqa_matrix_splitk_part(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint tile_row = 0u; tile_row < tile_len; ++tile_row) {
-            const float x = scores[simdgroup * KV_TILE + tile_row]
-                * scale * k_scale_tile[tile_row];
-            const float value_scale = v_scale_tile[tile_row];
-            const uint tile_offset = tile_row * HEAD_DIM;
-            if (x > m) {
-                const bool rescale = m > -INFINITY;
-                const float alpha = rescale ? exp(m - x) : 1.0f;
-                if (rescale) s *= alpha;
-                for (uint i = 0u; i < HEAD_DIM / SIMD_WIDTH; ++i) {
-                    const uint dim = lane + i * SIMD_WIDTH;
-                    float value = acc[i];
-                    if (rescale) value *= alpha;
-                    const float v = float(v_tile[tile_offset + dim]) * value_scale;
-                    acc[i] = value + v;
-                }
-                s += 1.0f;
-                m = x;
-            } else {
-                const float probability = exp(x - m);
-                for (uint i = 0u; i < HEAD_DIM / SIMD_WIDTH; ++i) {
-                    const uint dim = lane + i * SIMD_WIDTH;
-                    const float v = float(v_tile[tile_offset + dim]) * value_scale;
-                    acc[i] += v * probability;
-                }
-                s += probability;
-            }
+        float lane_x = -INFINITY;
+        if (lane < tile_len) {
+            lane_x =
+                scores[simdgroup * KV_TILE + lane]
+                * scale
+                * k_scale_tile[lane];
         }
+        const float tile_m = simd_max(lane_x);
+        const float new_m = max(m, tile_m);
+        const float old_scale = exp(m - new_m);
+        s *= old_scale;
+        for (uint i = 0; i < 8; ++i) {
+            acc[i] *= old_scale;
+        }
+
+        float tile_s = 0.0f;
+        for (uint tile_row = 0; tile_row < tile_len; ++tile_row) {
+            const float x =
+                scores[simdgroup * KV_TILE + tile_row]
+                * scale
+                * k_scale_tile[tile_row];
+            const float p = exp(x - new_m);
+            const float value_scale = v_scale_tile[tile_row];
+            for (uint i = 0; i < 8; ++i) {
+                const uint d = lane + i * SIMD_WIDTH;
+                const float value = float(v_tile[tile_row * HEAD_DIM + d]) * value_scale;
+                acc[i] += value * p;
+            }
+            tile_s += p;
+        }
+        s += tile_s;
+        m = new_m;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
