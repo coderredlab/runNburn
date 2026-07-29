@@ -28,6 +28,10 @@ use crate::ffn_chain::{
     encode_rms_norm_io_offset, encode_silu_mul, f32_buf, readback, u32_buf,
 };
 
+fn gqa_group_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// Attention layer 의 device-resident 중간 버퍼 + 불변 scalar 버퍼 + KV.
 /// shape 별 1회 alloc 후 재사용. `!Send+!Sync` 라 thread_local.
 pub(crate) struct AttnCarrier {
@@ -575,11 +579,12 @@ pub(crate) fn attn_chain_encode_core(
                 );
             }
         } else {
-            // f16 KV: GQA-grouped split-K (pm132) > split-K > non-split-K
-            let gqa_group = !compute::env_falsey("RNB_METAL_ATTN_GQA_GROUP")
-                && num_heads > num_kv_heads
-                && ctx.attn_splitk_splits > 1
-                && kv_len >= ctx.attn_splitk_min_kv;
+            // f16 KV: 검증된 split-K가 기본. GQA-grouped는 register 압박 때문에 명시적 opt-in.
+            let gqa_group =
+                gqa_group_requested(std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref())
+                    && num_heads > num_kv_heads
+                    && ctx.attn_splitk_splits > 1
+                    && kv_len >= ctx.attn_splitk_min_kv;
             if gqa_group {
                 encode_attn_decode_gqa_splitk(
                     ctx,
@@ -1369,4 +1374,17 @@ pub(crate) fn attn_core_chain_encode_bcol(
     chain_barrier(ctx, enc);
 
     let _ = head_dim;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gqa_group_requested;
+
+    #[test]
+    fn gqa_group_requires_explicit_opt_in() {
+        assert!(!gqa_group_requested(None));
+        assert!(!gqa_group_requested(Some("0")));
+        assert!(!gqa_group_requested(Some("false")));
+        assert!(gqa_group_requested(Some("1")));
+    }
 }
