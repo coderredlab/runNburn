@@ -35,15 +35,16 @@ static inline void produce_qk(
 // M5 HD=256, GQA factor=8 int8 KV decode candidate.
 //
 // All SIMD-groups stage one shared half K/int8 V tile. One SIMD-group computes
-// one 8x16 QK tile with Metal 4 tensor operations. A single buffer keeps
-// threadgroup memory below 17 KiB; all eight query-head accumulators stay in
-// registers.
+// one 8x16 QK tile with Metal 4 tensor operations. The split owning the newest
+// token can quantize and append it while staging that row, so attention does not
+// depend on a preceding KV-append dispatch. All eight query-head accumulators
+// stay in registers.
 kernel void attn_decode_i8_gqa_matrix_splitk_part(
     device const float* q            [[buffer(0)]],
-    device const char*  k_cache      [[buffer(1)]],
-    device const char*  v_cache      [[buffer(2)]],
-    device const float* k_scale      [[buffer(3)]],
-    device const float* v_scale      [[buffer(4)]],
+    device char*        k_cache      [[buffer(1)]],
+    device char*        v_cache      [[buffer(2)]],
+    device float*       k_scale      [[buffer(3)]],
+    device float*       v_scale      [[buffer(4)]],
     device float*       partial_acc  [[buffer(5)]],
     device float*       partial_m    [[buffer(6)]],
     device float*       partial_s    [[buffer(7)]],
@@ -53,6 +54,9 @@ kernel void attn_decode_i8_gqa_matrix_splitk_part(
     constant uint&      kv_len       [[buffer(11)]],
     constant float&     scale        [[buffer(12)]],
     constant uint&      num_splits   [[buffer(13)]],
+    device const float* current_k     [[buffer(14)]],
+    device const float* current_v     [[buffer(15)]],
+    constant uint&      fuse_append   [[buffer(16)]],
     threadgroup uchar*  scratch      [[threadgroup(0)]],
     uint2 gid      [[threadgroup_position_in_grid]],
     uint tid       [[thread_index_in_threadgroup]],
@@ -77,6 +81,7 @@ kernel void attn_decode_i8_gqa_matrix_splitk_part(
         reinterpret_cast<threadgroup float*>(v_tile + tile_elements);
     threadgroup float* k_scale_tile = scores + HEAD_GROUPS * KV_TILE;
     threadgroup float* v_scale_tile = k_scale_tile + KV_TILE;
+    threadgroup float* current_scales = v_scale_tile + KV_TILE;
 
     const uint base_head = kv_h * HEAD_GROUPS;
     for (uint i = tid; i < query_elements; i += SIMD_GROUPS * SIMD_WIDTH) {
@@ -97,16 +102,59 @@ kernel void attn_decode_i8_gqa_matrix_splitk_part(
     const uint start = split * chunk;
     const uint end = min(kv_len, start + chunk);
 
+    const uint current_pos = kv_len - 1u;
+    const bool owns_current =
+        fuse_append != 0u && current_pos >= start && current_pos < end;
+    if (owns_current) {
+        if (simdgroup == 0u) {
+            float kmax = 0.0f;
+            float vmax = 0.0f;
+            const uint current_base = kv_h * HEAD_DIM;
+            for (uint d = lane; d < HEAD_DIM; d += SIMD_WIDTH) {
+                kmax = max(kmax, fabs(current_k[current_base + d]));
+                vmax = max(vmax, fabs(current_v[current_base + d]));
+            }
+            kmax = simd_max(kmax);
+            vmax = simd_max(vmax);
+            if (lane == 0u) {
+                const float ks = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+                const float vs = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+                current_scales[0] = ks;
+                current_scales[1] = vs;
+                const uint scale_index = current_pos * num_kv_heads + kv_h;
+                k_scale[scale_index] = ks;
+                v_scale[scale_index] = vs;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     for (uint tile_start = start; tile_start < end; tile_start += KV_TILE) {
         const uint tile_len = min(KV_TILE, end - tile_start);
         for (uint i = tid; i < tile_elements; i += SIMD_GROUPS * SIMD_WIDTH) {
             const uint tile_row = i / HEAD_DIM;
             const uint dim = i % HEAD_DIM;
             if (tile_row < tile_len) {
-                const uint kv_offset =
-                    (tile_start + tile_row) * kv_dim + kv_h * HEAD_DIM + dim;
-                k_tile[dim * KV_TILE + tile_row] = half(k_cache[kv_offset]);
-                v_tile[i] = v_cache[kv_offset];
+                const uint token = tile_start + tile_row;
+                const uint kv_offset = token * kv_dim + kv_h * HEAD_DIM + dim;
+                if (fuse_append != 0u && token == current_pos) {
+                    const uint current_offset = kv_h * HEAD_DIM + dim;
+                    const float ks = current_scales[0];
+                    const float vs = current_scales[1];
+                    const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
+                    const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
+                    const char kq = char(clamp(
+                        rint(current_k[current_offset] * kinv), -127.0f, 127.0f));
+                    const char vq = char(clamp(
+                        rint(current_v[current_offset] * vinv), -127.0f, 127.0f));
+                    k_cache[kv_offset] = kq;
+                    v_cache[kv_offset] = vq;
+                    k_tile[dim * KV_TILE + tile_row] = half(kq);
+                    v_tile[i] = vq;
+                } else {
+                    k_tile[dim * KV_TILE + tile_row] = half(k_cache[kv_offset]);
+                    v_tile[i] = v_cache[kv_offset];
+                }
             } else {
                 k_tile[dim * KV_TILE + tile_row] = half(0.0f);
                 v_tile[i] = 0;
@@ -114,9 +162,15 @@ kernel void attn_decode_i8_gqa_matrix_splitk_part(
         }
         if (tid < KV_TILE) {
             if (tid < tile_len) {
-                const uint scale_index = (tile_start + tid) * num_kv_heads + kv_h;
-                k_scale_tile[tid] = k_scale[scale_index];
-                v_scale_tile[tid] = v_scale[scale_index];
+                const uint token = tile_start + tid;
+                if (fuse_append != 0u && token == current_pos) {
+                    k_scale_tile[tid] = current_scales[0];
+                    v_scale_tile[tid] = current_scales[1];
+                } else {
+                    const uint scale_index = token * num_kv_heads + kv_h;
+                    k_scale_tile[tid] = k_scale[scale_index];
+                    v_scale_tile[tid] = v_scale[scale_index];
+                }
             } else {
                 k_scale_tile[tid] = 0.0f;
                 v_scale_tile[tid] = 0.0f;

@@ -355,6 +355,17 @@ pub(crate) fn attn_chain_encode_core(
     let scale_buf = f32_buf(ctx, carrier.scale);
 
     let p = ctx.chain_profile;
+    let int8_gqa_group = kvarn.is_none()
+        && ctx.kv_int8
+        && ctx.attn_splitk_splits > 1
+        && kv_len >= ctx.attn_splitk_min_kv
+        && int8_gqa_group_enabled(std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref())
+        && head_dim == 256
+        && num_heads == num_kv_heads * 8;
+    let int8_gqa_matrix = int8_gqa_group
+        && ctx.tensorops_capable
+        && int8_gqa_matrix_requested(std::env::var("RNB_METAL_ATTN_GQA_MATRIX").ok().as_deref());
+    let int8_gqa_fused_append = int8_gqa_matrix;
 
     // ① attn_norm: hidden_dev → normed_dev [small]
     if p.emit_small() {
@@ -483,7 +494,7 @@ pub(crate) fn attn_chain_encode_core(
         );
     }
     chain_barrier(ctx, enc);
-    // ⑧ kv_append: k_dev/v_dev(f32) → KV_dev[pos] (f16) [small]
+    // ⑧ kv_append: k_dev/v_dev(f32) → KV_dev[pos] (fused TensorOps는 ⑨에서 처리) [small]
     if p.emit_small() {
         if let Some(kv) = kvarn {
             kv.resident.encode_tail_append(
@@ -495,20 +506,22 @@ pub(crate) fn attn_chain_encode_core(
                 kv.append_slot,
             );
         } else if ctx.kv_int8 {
-            encode_kv_append_i8(
-                ctx,
-                enc,
-                &carrier.k_dev,
-                &carrier.v_dev,
-                carrier.kv.k_i8.as_ref().unwrap(),
-                carrier.kv.v_i8.as_ref().unwrap(),
-                carrier.kv.k_scale.as_ref().unwrap(),
-                carrier.kv.v_scale.as_ref().unwrap(),
-                &carrier.hd_buf,
-                &carrier.nkv_buf,
-                &pos_buf,
-                num_kv_heads,
-            );
+            if !int8_gqa_fused_append {
+                encode_kv_append_i8(
+                    ctx,
+                    enc,
+                    &carrier.k_dev,
+                    &carrier.v_dev,
+                    carrier.kv.k_i8.as_ref().unwrap(),
+                    carrier.kv.v_i8.as_ref().unwrap(),
+                    carrier.kv.k_scale.as_ref().unwrap(),
+                    carrier.kv.v_scale.as_ref().unwrap(),
+                    &carrier.hd_buf,
+                    &carrier.nkv_buf,
+                    &pos_buf,
+                    num_kv_heads,
+                );
+            }
         } else {
             encode_kv_append(
                 ctx,
@@ -523,7 +536,9 @@ pub(crate) fn attn_chain_encode_core(
             );
         }
     }
-    chain_barrier(ctx, enc);
+    if !int8_gqa_fused_append {
+        chain_barrier(ctx, enc);
+    }
     // ⑨ attn: q_dev + KV_dev[0..kv_len] → attn_out_dev [attn]
     if p.emit_attn() {
         if let Some(kv) = kvarn {
@@ -543,16 +558,7 @@ pub(crate) fn attn_chain_encode_core(
             );
         } else if ctx.kv_int8 {
             if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
-                let gqa_group = int8_gqa_group_enabled(
-                    std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref(),
-                ) && head_dim == 256
-                    && num_heads == num_kv_heads * 8;
-                let gqa_matrix = gqa_group
-                    && ctx.tensorops_capable
-                    && int8_gqa_matrix_requested(
-                        std::env::var("RNB_METAL_ATTN_GQA_MATRIX").ok().as_deref(),
-                    );
-                if gqa_group {
+                if int8_gqa_group {
                     encode_attn_decode_i8_gqa_splitk(
                         ctx,
                         enc,
@@ -587,7 +593,9 @@ pub(crate) fn attn_chain_encode_core(
                         num_kv_heads,
                         head_dim,
                         ctx.attn_splitk_splits,
-                        gqa_matrix,
+                        int8_gqa_matrix,
+                        &carrier.k_dev,
+                        &carrier.v_dev,
                     );
                 } else {
                     encode_attn_decode_i8_splitk(

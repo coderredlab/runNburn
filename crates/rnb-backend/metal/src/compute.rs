@@ -10570,6 +10570,8 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
     head_dim: usize,
     num_splits: usize,
     matrix: bool,
+    current_k: &ProtocolObject<dyn MTLBuffer>,
+    current_v: &ProtocolObject<dyn MTLBuffer>,
 ) {
     assert_eq!(head_dim, 256, "int8 GQA split-K requires head_dim=256");
     assert_eq!(
@@ -10586,7 +10588,8 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
         + 16 * 256 * std::mem::size_of::<u16>()
         + 16 * 256 * std::mem::size_of::<u8>()
         + 8 * 16 * std::mem::size_of::<f32>()
-        + 2 * 16 * std::mem::size_of::<f32>();
+        + 2 * 16 * std::mem::size_of::<f32>()
+        + 2 * std::mem::size_of::<f32>();
 
     if matrix {
         let pipeline = ctx
@@ -10613,8 +10616,15 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
         enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 12);
         enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 13);
         if matrix {
+            enc.setBuffer_offset_atIndex(Some(current_k), 0, 14);
+            enc.setBuffer_offset_atIndex(Some(current_v), 0, 15);
+        }
+        if matrix {
             enc.setThreadgroupMemoryLength_atIndex(MATRIX_SCRATCH_BYTES, 0);
         }
+    }
+    if matrix {
+        set_u32_bytes(enc, 1, 16);
     }
     let part_grid = MTLSize {
         width: num_kv_heads,
@@ -11011,6 +11021,29 @@ pub fn attn_decode_i8_splitk_with_ctx(
     let ks_buf = mk_bytes(k_scale.as_ptr() as *const _, std::mem::size_of_val(k_scale));
     let vs_buf = mk_bytes(v_scale.as_ptr() as *const _, std::mem::size_of_val(v_scale));
 
+    let current_token = kv_len - 1;
+    let mut current_k = vec![0.0f32; kv_dim];
+    let mut current_v = vec![0.0f32; kv_dim];
+    for kv_h in 0..num_kv_heads {
+        let scale_index = current_token * num_kv_heads + kv_h;
+        let cache_base = current_token * kv_dim + kv_h * head_dim;
+        let current_base = kv_h * head_dim;
+        for dim in 0..head_dim {
+            current_k[current_base + dim] =
+                f32::from(k_i8[cache_base + dim]) * k_scale[scale_index];
+            current_v[current_base + dim] =
+                f32::from(v_i8[cache_base + dim]) * v_scale[scale_index];
+        }
+    }
+    let current_k_buf = mk_bytes(
+        current_k.as_ptr() as *const _,
+        std::mem::size_of_val(current_k.as_slice()),
+    );
+    let current_v_buf = mk_bytes(
+        current_v.as_ptr() as *const _,
+        std::mem::size_of_val(current_v.as_slice()),
+    );
+
     let out_len = num_heads * head_dim;
     let o_buf = ctx
         .device
@@ -11073,6 +11106,8 @@ pub fn attn_decode_i8_splitk_with_ctx(
             head_dim,
             num_splits,
             gqa_matrix,
+            &current_k_buf,
+            &current_v_buf,
         );
     } else {
         encode_attn_decode_i8_splitk(
