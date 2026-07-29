@@ -12949,7 +12949,7 @@ mod tests {
         let expected =
             attn_decode_i8_with_ctx(&ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale);
         let actual = attn_decode_i8_splitk_with_ctx(
-            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, 16, false,
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, 16, false, false,
         );
 
         let scale_ref = expected
@@ -13006,10 +13006,10 @@ mod tests {
         }
 
         let expected = attn_decode_i8_splitk_with_ctx(
-            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, false,
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, false, false,
         );
         let actual = attn_decode_i8_splitk_with_ctx(
-            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, true,
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, true, false,
         );
         let mut max_abs = 0.0f32;
         for (a, b) in actual.iter().zip(expected.iter()) {
@@ -13017,6 +13017,25 @@ mod tests {
         }
         eprintln!("attn_decode_i8_gqa_splitk vs split-K max_abs = {max_abs}");
         assert!(max_abs < 1e-6, "GQA shared-tile max_abs {max_abs} >= 1e-6");
+
+        if ctx.tensorops_capable {
+            let matrix = attn_decode_i8_splitk_with_ctx(
+                &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, true, true,
+            );
+            let output_scale = expected
+                .iter()
+                .fold(0.0f32, |value, &x| value.max(x.abs()))
+                .max(1e-4);
+            let mut matrix_max_rel = 0.0f32;
+            for (a, b) in matrix.iter().zip(expected.iter()) {
+                matrix_max_rel = matrix_max_rel.max((a - b).abs() / output_scale);
+            }
+            eprintln!("attn_decode_i8_gqa_qk_matrix vs split-K max_rel = {matrix_max_rel}");
+            assert!(
+                matrix_max_rel < 1e-5,
+                "GQA QK matrix max_rel {matrix_max_rel} >= 1e-5"
+            );
+        }
     }
 
     /// footgun(pm17): in-process 로 engine 을 재사용(반복 측정/multi-turn)하면 직전

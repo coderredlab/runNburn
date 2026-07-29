@@ -68,6 +68,8 @@ const KVARN_ATTENTION_SRC: &str = include_str!("kvarn_attention.metal");
 const ATTN_DECODE_I8_SRC: &str = include_str!("attn_decode_i8.metal");
 const ATTN_DECODE_I8_SPLITK_SRC: &str = include_str!("attn_decode_i8_splitk.metal");
 const ATTN_DECODE_I8_GQA_SPLITK_SRC: &str = include_str!("attn_decode_i8_gqa_splitk.metal");
+const ATTN_DECODE_I8_GQA_MATRIX_SPLITK_SRC: &str =
+    include_str!("attn_decode_i8_gqa_matrix_splitk.metal");
 const ATTN_DECODE_SPLITK_SRC: &str = include_str!("attn_decode_splitk.metal");
 const ATTN_DECODE_GQA_SRC: &str = include_str!("attn_decode_gqa.metal");
 const ROPE_MROPE_SRC: &str = include_str!("rope_mrope.metal");
@@ -586,6 +588,9 @@ pub struct MetalContext {
     /// HD=256/GQA=8 int8 KV split-K part. Query head별 SIMD-group이 shared KV tile을 재사용한다.
     pub attn_decode_i8_gqa_splitk_part_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// QK만 8×8 simdgroup matrix로 계산하고 P*V accumulator는 register에 유지한다.
+    pub attn_decode_i8_gqa_matrix_splitk_part_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// pm132: split-K f16 KV decode attention.
     pub attn_decode_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_reduce_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2189,6 +2194,15 @@ pub fn build_metal_context_with_opts(
         ATTN_DECODE_I8_GQA_SPLITK_SRC,
         "attn_decode_i8_gqa_splitk_part",
     );
+    let attn_decode_i8_gqa_matrix_splitk_part_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            ATTN_DECODE_I8_GQA_MATRIX_SPLITK_SRC,
+            "attn_decode_i8_gqa_matrix_splitk_part",
+        ))
+    } else {
+        None
+    };
     let attn_decode_splitk_part_pipeline =
         build_pipeline(&device, ATTN_DECODE_SPLITK_SRC, "attn_decode_splitk_part");
     let attn_decode_splitk_reduce_pipeline =
@@ -2384,6 +2398,7 @@ pub fn build_metal_context_with_opts(
         attn_decode_i8_splitk_part_pipeline,
         attn_decode_i8_splitk_reduce_pipeline,
         attn_decode_i8_gqa_splitk_part_pipeline,
+        attn_decode_i8_gqa_matrix_splitk_part_pipeline,
         attn_decode_splitk_part_pipeline,
         attn_decode_splitk_reduce_pipeline,
         attn_decode_gqa_splitk_part_pipeline,
@@ -10554,6 +10569,7 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
     num_kv_heads: usize,
     head_dim: usize,
     num_splits: usize,
+    matrix: bool,
 ) {
     assert_eq!(head_dim, 256, "int8 GQA split-K requires head_dim=256");
     assert_eq!(
@@ -10566,7 +10582,21 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
         "int8 GQA split-K requires at least 2 splits"
     );
 
-    enc.setComputePipelineState(&ctx.attn_decode_i8_gqa_splitk_part_pipeline);
+    const MATRIX_SCRATCH_BYTES: usize = 8 * 256 * std::mem::size_of::<u16>()
+        + 16 * 256 * std::mem::size_of::<u16>()
+        + 16 * 256 * std::mem::size_of::<u8>()
+        + 8 * 16 * std::mem::size_of::<f32>()
+        + 2 * 16 * std::mem::size_of::<f32>();
+
+    if matrix {
+        let pipeline = ctx
+            .attn_decode_i8_gqa_matrix_splitk_part_pipeline
+            .as_ref()
+            .expect("int8 GQA QK matrix requires Metal tensor operations");
+        enc.setComputePipelineState(pipeline);
+    } else {
+        enc.setComputePipelineState(&ctx.attn_decode_i8_gqa_splitk_part_pipeline);
+    }
     unsafe {
         enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
         enc.setBuffer_offset_atIndex(Some(k_i8), 0, 1);
@@ -10582,6 +10612,9 @@ pub(crate) fn encode_attn_decode_i8_gqa_splitk(
         enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 11);
         enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 12);
         enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 13);
+        if matrix {
+            enc.setThreadgroupMemoryLength_atIndex(MATRIX_SCRATCH_BYTES, 0);
+        }
     }
     let part_grid = MTLSize {
         width: num_kv_heads,
@@ -10935,6 +10968,7 @@ pub fn attn_decode_i8_splitk_with_ctx(
     scale: f32,
     num_splits: usize,
     gqa_grouped: bool,
+    gqa_matrix: bool,
 ) -> Vec<f32> {
     let kv_dim = num_kv_heads * head_dim;
     assert_eq!(q.len(), num_heads * head_dim, "q length mismatch");
@@ -11038,6 +11072,7 @@ pub fn attn_decode_i8_splitk_with_ctx(
             num_kv_heads,
             head_dim,
             num_splits,
+            gqa_matrix,
         );
     } else {
         encode_attn_decode_i8_splitk(

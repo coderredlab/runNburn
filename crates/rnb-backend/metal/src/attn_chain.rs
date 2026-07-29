@@ -46,6 +46,10 @@ fn int8_gqa_group_enabled(value: Option<&str>) -> bool {
     }
 }
 
+fn int8_gqa_matrix_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// Attention layer 의 device-resident 중간 버퍼 + 불변 scalar 버퍼 + KV.
 /// shape 별 1회 alloc 후 재사용. `!Send+!Sync` 라 thread_local.
 pub(crate) struct AttnCarrier {
@@ -543,6 +547,11 @@ pub(crate) fn attn_chain_encode_core(
                     std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref(),
                 ) && head_dim == 256
                     && num_heads == num_kv_heads * 8;
+                let gqa_matrix = gqa_group
+                    && ctx.tensorops_capable
+                    && int8_gqa_matrix_requested(
+                        std::env::var("RNB_METAL_ATTN_GQA_MATRIX").ok().as_deref(),
+                    );
                 if gqa_group {
                     encode_attn_decode_i8_gqa_splitk(
                         ctx,
@@ -578,6 +587,7 @@ pub(crate) fn attn_chain_encode_core(
                         num_kv_heads,
                         head_dim,
                         ctx.attn_splitk_splits,
+                        gqa_matrix,
                     );
                 } else {
                     encode_attn_decode_i8_splitk(
@@ -1434,7 +1444,7 @@ pub(crate) fn attn_core_chain_encode_bcol(
 
 #[cfg(test)]
 mod tests {
-    use super::{gqa_group_requested, int8_gqa_group_enabled};
+    use super::{gqa_group_requested, int8_gqa_group_enabled, int8_gqa_matrix_requested};
 
     #[test]
     fn gqa_group_requires_explicit_opt_in() {
@@ -1452,5 +1462,13 @@ mod tests {
         assert!(!int8_gqa_group_enabled(Some("OFF")));
         assert!(!int8_gqa_group_enabled(Some("no")));
         assert!(int8_gqa_group_enabled(Some("1")));
+    }
+
+    #[test]
+    fn int8_gqa_matrix_requires_explicit_opt_in() {
+        assert!(!int8_gqa_matrix_requested(None));
+        assert!(!int8_gqa_matrix_requested(Some("0")));
+        assert!(!int8_gqa_matrix_requested(Some("false")));
+        assert!(int8_gqa_matrix_requested(Some("1")));
     }
 }
