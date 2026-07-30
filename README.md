@@ -347,6 +347,45 @@ A useful comparison repeats warm runs, reports the median, and checks generated
 output for semantic quality before accepting a speedup. Keep backend defaults
 unchanged unless the experiment is explicitly testing a documented override.
 
+### Worked example: a 222 GiB model under a 32 GiB host budget
+
+This transcript demonstrates the bounded-memory claim on named hardware. It is
+a reproduction recipe, not a cross-device headline: absolute numbers depend on
+your disk, page cache, and GPU.
+
+Hardware: Ryzen 9 5950X, 64 GB RAM (62.7 GiB usable), RTX 3090 24 GB (CUDA
+device 0), NVMe SSD, Linux. Model: `GLM-5.2` `UD-IQ2_M`, a 6-way split GGUF
+with 222.18 GiB of mapped weights — roughly 2.5 times the machine's RAM and
+VRAM combined.
+
+```bash
+cargo build --release -p rnb-dev-tools --features cuda --bin rnb-llm-bench
+
+RNB_MODEL=/path/to/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf \
+RNB_FORCE_GGUF=1 \
+RNB_PROMPT="대한민국의 수도는" \
+RNB_DECODE_TOKENS=10 \
+RNB_HOST_RAM_BUDGET_BYTES=$((32 * 1024 * 1024 * 1024)) \
+RNB_BENCH_WALL=1 \
+/usr/bin/time -v ./target/release/rnb-llm-bench
+```
+
+Measured on 2026-07-30 (one warmup, then three consecutive runs; the working
+set exceeds RAM, so every run repages from disk and there is no warm/cold
+split):
+
+| Run | Prefill (8 tokens) | Decode (10 tokens) | Peak RSS |
+|---|---:|---:|---:|
+| 1 | 34.92 s | 24.40 s | 28.7 GiB |
+| 2 | 43.41 s | 29.48 s | 28.6 GiB |
+| 3 | 42.44 s | 26.05 s | 28.6 GiB |
+| **median** | **42.44 s** | **26.05 s** (~2.6 s/token) | **< 32 GiB budget** |
+
+All runs produced token-identical output. The same budget applies to the
+product CLI via `--ram-budget 32GiB`. Slower than a model that fits in
+memory? Yes — the point is that it runs at all, with predictable memory,
+instead of being rejected or OOM-killed.
+
 ## Workspace layout
 
 ```text
