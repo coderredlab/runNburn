@@ -96,9 +96,12 @@ pub fn prefill_attention_hd256_if_supported(
     sliding_window: Option<usize>,
     softcap: Option<f32>,
 ) -> Result<Option<Vec<f32>>> {
-    if !backend::tuning::prefill_flash_attention_enabled()
-        || seq_len < backend::tuning::prefill_flash_attention_min_seq(head_dim)
-    {
+    // Terminal CUDA prefill provider: since the strict CUDA cutover removed the
+    // CPU prefill fallback, returning None here is fatal for the caller. The
+    // min-seq tuning threshold only selects between earlier fused CUDA paths;
+    // it must not gate the last supported path. `prefill_flash_attention_enabled`
+    // stays as an explicit diagnostic opt-out.
+    if !backend::tuning::prefill_flash_attention_enabled() {
         return Ok(None);
     }
     let result = if sliding_window.is_some() || softcap.is_some() {
