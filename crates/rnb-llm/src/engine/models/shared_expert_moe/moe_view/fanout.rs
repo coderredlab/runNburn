@@ -248,6 +248,82 @@ struct SparseCpuGeometry {
     down_quant: GGMLType,
     q4k_sparse_cuda_supported: bool,
     high_q2q3_matrix: bool,
+    /// Decode expert placement resolved to host: run gate/up/down on the CPU
+    /// quantized GEMV even in CUDA builds.
+    host_expert_gemv: bool,
+}
+
+/// Host CPU expert compute from explicit weight slices — the decode expert
+/// placement path. The slices may come from the original mmap or from an
+/// O_DIRECT miss-read scratch; math and accumulation order are identical.
+#[allow(clippy::too_many_arguments)]
+fn compute_expert_host_from_slices(
+    gate_slice: &[u8],
+    up_slice: &[u8],
+    down_slice: &[u8],
+    gate_quant: GGMLType,
+    up_quant: GGMLType,
+    down_quant: GGMLType,
+    gate_bpr: usize,
+    up_bpr: usize,
+    down_bpr: usize,
+    n_ff: usize,
+    n_embd: usize,
+    h: &[f32],
+    route_weight: f32,
+    profile_enabled: bool,
+) -> ExpertProfileAcc {
+    let compute_start = Instant::now();
+    let mut gate_up_scratch = vec![0f32; n_ff * 2];
+    let (gate_out, up_out) = gate_up_scratch.split_at_mut(n_ff);
+    let high_gate_up_start = profile_enabled.then(Instant::now);
+    crate::engine::scalar_gemv::gemv_host_quantized(
+        gate_slice, h, gate_out, n_ff, n_embd, gate_bpr, gate_quant,
+    );
+    crate::engine::scalar_gemv::gemv_host_quantized(
+        up_slice, h, up_out, n_ff, n_embd, up_bpr, up_quant,
+    );
+    apply_model_gate_mul_inplace(gate_out, up_out, ModelArchitecture::Qwen35MoE);
+    let high_gate_up_us = high_gate_up_start
+        .map(|start| start.elapsed().as_micros())
+        .unwrap_or(0);
+
+    let high_down_start = profile_enabled.then(Instant::now);
+    let mut expert_out = vec![0f32; n_embd];
+    crate::engine::scalar_gemv::gemv_host_quantized(
+        down_slice,
+        gate_out,
+        &mut expert_out,
+        n_embd,
+        n_ff,
+        down_bpr,
+        down_quant,
+    );
+    let high_down_us = high_down_start
+        .map(|start| start.elapsed().as_micros())
+        .unwrap_or(0);
+
+    for value in &mut expert_out {
+        *value *= route_weight;
+    }
+    let elapsed_us = compute_start.elapsed().as_micros();
+    ExpertProfileAcc {
+        out: expert_out,
+        wall_us: elapsed_us,
+        high_us: elapsed_us,
+        high_gate_up_us,
+        high_down_us,
+        low_us: 0,
+        low_gate_up_us: 0,
+        low_gate_up_row_us: 0,
+        low_gate_up_tile_us: 0,
+        low_gate_up_post_us: 0,
+        low_shadow_down_us: 0,
+        low_base_down_us: 0,
+        high: 1,
+        low: 0,
+        skip: 0,
+    }
 }
 
 fn compute_sparse_expert_cpu(
@@ -276,8 +352,31 @@ fn compute_sparse_expert_cpu(
         down_quant,
         q4k_sparse_cuda_supported,
         high_q2q3_matrix,
+        host_expert_gemv,
     } = geometry;
     let compute_start = Instant::now();
+
+    // Decode expert placement resolved to host: the routed expert's gate/up/
+    // down GEMVs run on the CPU quantized kernels even in CUDA builds, so the
+    // expert weights are never uploaded over PCIe per token.
+    if host_expert_gemv {
+        return compute_expert_host_from_slices(
+            gate_bytes_for(view, expert, per_gate),
+            up_bytes_for(view, expert, per_up),
+            down_bytes_for(view, expert, per_down),
+            view.gate_quant,
+            view.up_quant,
+            down_quant,
+            gate_bpr,
+            up_bpr,
+            down_bpr,
+            n_ff,
+            n_embd,
+            h,
+            route_weight,
+            profile_enabled,
+        );
+    }
 
     if q4k_sparse_cuda_supported {
         let gate_slice = gate_bytes_for(view, expert, per_gate);
@@ -510,6 +609,7 @@ pub(super) fn compute_sparse_fanout(
     gate_scalar: f32,
     profile_enabled: bool,
     prefer_sparse_moe_cuda: bool,
+    decode_expert_host: bool,
 ) -> SparseFanoutResult {
     // pm123: MTP nextn 레이어는 unrouted slot 을 usize::MAX sentinel 로 채운다.
     // 어떤 fanout 경로(IQ gather, batched gate_bytes_for)든 OOB 없이 valid expert 만
@@ -554,22 +654,26 @@ pub(super) fn compute_sparse_fanout(
         && view.gate_quant == GGMLType::Q4_K
         && view.up_quant == GGMLType::Q4_K
         && view.n_embd % 256 == 0;
-    let q4k_sparse_cuda_supported = cfg!(feature = "cuda")
+    let q4k_sparse_cuda_supported = !decode_expert_host
+        && cfg!(feature = "cuda")
         && view.gate_quant == GGMLType::Q4_K
         && view.up_quant == GGMLType::Q4_K
         && matches!(down_quant, GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K);
-    let iq4xs_sparse_cuda_supported = cfg!(feature = "cuda")
+    let iq4xs_sparse_cuda_supported = !decode_expert_host
+        && cfg!(feature = "cuda")
         && view.gate_quant == GGMLType::IQ4_XS
         && view.up_quant == GGMLType::IQ4_XS
         && matches!(
             down_quant,
             GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::IQ4_XS
         );
-    let glm_iq_sparse_cuda_supported = glm_iq_sparse_cuda_supported(view, prefer_sparse_moe_cuda);
+    let glm_iq_sparse_cuda_supported =
+        !decode_expert_host && glm_iq_sparse_cuda_supported(view, prefer_sparse_moe_cuda);
     let high_q2q3_matrix = view.gate_quant == GGMLType::Q2_K
         && view.up_quant == GGMLType::Q2_K
         && down_quant == GGMLType::Q3_K;
-    let q2q3_sparse_cuda_supported = prefer_sparse_moe_cuda && high_q2q3_matrix;
+    let q2q3_sparse_cuda_supported =
+        !decode_expert_host && prefer_sparse_moe_cuda && high_q2q3_matrix;
     let batched_sparse_cuda_supported = q4k_sparse_cuda_supported
         || iq4xs_sparse_cuda_supported
         || q2q3_sparse_cuda_supported
@@ -587,6 +691,7 @@ pub(super) fn compute_sparse_fanout(
         down_quant,
         q4k_sparse_cuda_supported,
         high_q2q3_matrix,
+        host_expert_gemv: decode_expert_host,
     };
 
     #[cfg(target_arch = "aarch64")]
@@ -890,8 +995,128 @@ pub(super) fn compute_sparse_fanout(
             sparse_result.unwrap_or_else(|err| panic!("CUDA sparse MoE execution failed: {err}"));
         batched_sparse_out = Some(gpu_sparse_out);
     }
+    // cu152 hybrid decode: with host expert placement, experts whose weights
+    // are already VRAM-resident run on the CUDA batched kernels while misses
+    // run on the host CPU quantized GEMV in parallel. This token's misses
+    // are enqueued as async admissions inside the backend so later tokens
+    // can hit them; no expert upload sits on this token's critical path.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut hybrid_accs: Option<Vec<ExpertProfileAcc>> = None;
     #[cfg(feature = "cuda")]
-    if batched_sparse_out.is_none() {
+    if batched_sparse_out.is_none()
+        && decode_expert_host
+        && high_q2q3_matrix
+        && idx.len() <= 32
+        && crate::engine::policy::cuda_decode_expert_hybrid_enabled(true)
+    {
+        let hybrid_start = Instant::now();
+        let empty: &[u8] = &[];
+        let mut gate_slices_stack = [empty; 32];
+        let mut up_slices_stack = [empty; 32];
+        let mut down_slices_stack = [empty; 32];
+        let mut expert_ids_stack = [0usize; 32];
+        let mut route_weights_stack = [0.0f32; 32];
+        let mut slot_count = 0usize;
+        for (&e, &w) in idx.iter().zip(exps.iter()) {
+            gate_slices_stack[slot_count] = &view.gate_exps_bytes[e * per_gate..(e + 1) * per_gate];
+            up_slices_stack[slot_count] = &view.up_exps_bytes[e * per_up..(e + 1) * per_up];
+            down_slices_stack[slot_count] = &view.down_exps_bytes[e * per_down..(e + 1) * per_down];
+            expert_ids_stack[slot_count] = e;
+            route_weights_stack[slot_count] = w;
+            slot_count += 1;
+        }
+        let mut gpu_out = vec![0.0f32; n_embd];
+        let mask = match qwen_moe_backend::qwen_moe_decode_sparse_experts_resident_partial(
+            &gate_slices_stack[..slot_count],
+            &up_slices_stack[..slot_count],
+            &down_slices_stack[..slot_count],
+            &route_weights_stack[..slot_count],
+            &expert_ids_stack[..slot_count],
+            down_quant,
+            n_ff,
+            n_embd,
+            h,
+            &mut gpu_out,
+        ) {
+            Some(Ok(mask)) => mask,
+            Some(Err(err)) => panic!("CUDA resident-partial sparse MoE failed: {err}"),
+            None => unreachable!("resident-partial requires the CUDA backend"),
+        };
+        let gpu_us = hybrid_start.elapsed().as_micros();
+        let gpu_slots = u64::from(mask.count_ones());
+        // Misses run on the host CPU quantized GEMV from the mmap slices.
+        // cu153/cu154 note: replacing this read with sync O_DIRECT lost
+        // 58~91% twice. Corrected root cause (cu154): the OS page cache is
+        // the de-facto RAM tier of the expert hierarchy — route reuse
+        // (~5.7x) lets it serve ~80% of miss bytes, and O_DIRECT amputates
+        // that tier so every miss re-reads the disk. Do not bypass the page
+        // cache here until an engine-owned RAM expert cache tier serves
+        // misses first (follow-up axis).
+        let miss_slots: Vec<usize> = (0..slot_count)
+            .filter(|slot| mask & (1u32 << slot) == 0)
+            .collect();
+        let mut accs: Vec<ExpertProfileAcc> = miss_slots
+            .par_iter()
+            .map(|&slot| {
+                compute_expert_host_from_slices(
+                    gate_slices_stack[slot],
+                    up_slices_stack[slot],
+                    down_slices_stack[slot],
+                    view.gate_quant,
+                    view.up_quant,
+                    down_quant,
+                    gate_bpr,
+                    up_bpr,
+                    down_bpr,
+                    n_ff,
+                    n_embd,
+                    h,
+                    exps[slot],
+                    profile_enabled,
+                )
+            })
+            .collect();
+        // Admit this token's misses only after the CPU computed them: their
+        // mmap pages are now warm, so the pageable staging copy on the copy
+        // stream is pure RAM work and overlaps the next layers.
+        if !miss_slots.is_empty() {
+            let mut miss_gate = Vec::with_capacity(miss_slots.len());
+            let mut miss_up = Vec::with_capacity(miss_slots.len());
+            let mut miss_down = Vec::with_capacity(miss_slots.len());
+            for &slot in &miss_slots {
+                miss_gate.push(gate_slices_stack[slot]);
+                miss_up.push(up_slices_stack[slot]);
+                miss_down.push(down_slices_stack[slot]);
+            }
+            if let Err(err) = qwen_moe_backend::qwen_moe_decode_admit_expert_misses(
+                &miss_gate, &miss_up, &miss_down, None,
+            ) {
+                panic!("CUDA expert miss admission failed: {err}");
+            }
+        }
+        if gpu_slots > 0 {
+            accs.push(ExpertProfileAcc {
+                out: gpu_out,
+                wall_us: gpu_us,
+                high_us: gpu_us,
+                high_gate_up_us: 0,
+                high_down_us: 0,
+                low_us: 0,
+                low_gate_up_us: 0,
+                low_gate_up_row_us: 0,
+                low_gate_up_tile_us: 0,
+                low_gate_up_post_us: 0,
+                low_shadow_down_us: 0,
+                low_base_down_us: 0,
+                high: gpu_slots,
+                low: 0,
+                skip: 0,
+            });
+        }
+        hybrid_accs = Some(accs);
+    }
+    #[cfg(feature = "cuda")]
+    if batched_sparse_out.is_none() && hybrid_accs.is_none() {
         let run = |quant, raw: &[u8], rows, cols, input: &[f32], label: &str| {
             crate::engine::cuda_runtime::decode_gemv(quant, raw, rows, cols, input)
                 .unwrap_or_else(|| {
@@ -936,7 +1161,9 @@ pub(super) fn compute_sparse_fanout(
         }
         batched_sparse_out = Some(sparse_out);
     }
-    let per_expert: Vec<ExpertProfileAcc> = if let Some(out) = batched_sparse_out {
+    let per_expert: Vec<ExpertProfileAcc> = if let Some(accs) = hybrid_accs {
+        accs
+    } else if let Some(out) = batched_sparse_out {
         let elapsed_us = fanout_start.elapsed().as_micros();
         vec![ExpertProfileAcc {
             out,
@@ -1189,6 +1416,7 @@ mod aarch64_tests {
             1.0,
             false,
             false,
+            false,
         ));
         unsafe {
             std::env::set_var("RNB_QWEN35_MOE_DECODE_SPARSE_BATCH_DIRECT", "1");
@@ -1201,6 +1429,7 @@ mod aarch64_tests {
             &idx,
             &exps,
             1.0,
+            false,
             false,
             false,
         ));

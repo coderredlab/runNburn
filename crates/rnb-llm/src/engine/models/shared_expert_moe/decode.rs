@@ -93,6 +93,7 @@ pub(in crate::engine) fn decode_shared_expert_moe(
         &mut scratch.ffn_down[..hidden_dim],
         &mut scratch.hidden[..hidden_dim],
         moe_w.prefer_sparse_moe_cuda,
+        moe_w.decode_expert_host,
         moe_w.sparse_page_cache.as_deref(),
     ) {
         emit_mtp_finite_trace(

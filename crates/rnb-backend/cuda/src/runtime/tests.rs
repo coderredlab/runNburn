@@ -19043,6 +19043,123 @@ fn cuda_qwen35_sparse_experts_into_matches_cpu_q2k_q3k_reference() {
 }
 
 #[test]
+fn cuda_qwen35_sparse_experts_resident_partial_skips_misses_then_hits_after_admission() {
+    let _guard = runtime_test_lock();
+    reset_delta_state_cache().expect("reset CUDA runtime cache");
+    let mut state = match CudaState::open() {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("skipping CUDA resident-partial expert test: {err}");
+            return;
+        }
+    };
+    state.qwen35_target_decode_q4k_limit_checked = true;
+    state.resident_q4k_limit = 8 * 1024 * 1024;
+
+    let selected = 2usize;
+    let n_ff = 256usize;
+    let n_embd = 256usize;
+    let gate = (0..selected)
+        .map(|expert| make_test_q2k_weights(n_ff, n_embd / 256, 101 + expert * 17))
+        .collect::<Vec<_>>();
+    let up = (0..selected)
+        .map(|expert| make_test_q2k_weights(n_ff, n_embd / 256, 151 + expert * 19))
+        .collect::<Vec<_>>();
+    let down = (0..selected)
+        .map(|expert| make_test_q3k_weights(n_embd, n_ff / 256, 211 + expert * 23))
+        .collect::<Vec<_>>();
+    let gate_refs = gate.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let up_refs = up.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let down_refs = down.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let route = vec![0.625f32, 0.375f32];
+    let input = (0..n_embd)
+        .map(|i| ((i as f32 % 29.0) - 14.0) * 0.015625)
+        .collect::<Vec<_>>();
+    let expected = cpu_qwen35_sparse_q2k_q3k_reference(
+        &gate_refs, &up_refs, &down_refs, &route, n_ff, n_embd, &input,
+    );
+
+    // 1st token: nothing resident — the hybrid entry must not compute or
+    // upload on the critical path, only enqueue async admissions.
+    let mut first_out = vec![1.0f32; n_embd];
+    let first_mask = state
+        .qwen35_sparse_experts_resident_partial_into(
+            &gate_refs,
+            &up_refs,
+            &down_refs,
+            &route,
+            &[7, 11],
+            11,
+            n_ff,
+            n_embd,
+            &input,
+            &mut first_out,
+        )
+        .expect("resident-partial first call");
+    assert_eq!(first_mask, 0, "cold cache must not report resident slots");
+    assert!(
+        first_out.iter().all(|value| *value == 0.0),
+        "mask 0 must zero the partial output"
+    );
+
+    // The caller admits the misses once their host compute finished; the
+    // copies ride the copy stream and record the readiness fence. The
+    // admission uploads from caller-provided buffers (`data_sources`) while
+    // residency stays keyed on the key slices — the contract an engine-owned
+    // RAM expert tier relies on. The key slices here hold DIFFERENT weights
+    // than the sources, so the final output only matches the source-derived
+    // reference if the upload really came from the buffers.
+    let alt_gate = (0..selected)
+        .map(|expert| make_test_q2k_weights(n_ff, n_embd / 256, 501 + expert * 17))
+        .collect::<Vec<_>>();
+    let alt_up = (0..selected)
+        .map(|expert| make_test_q2k_weights(n_ff, n_embd / 256, 551 + expert * 19))
+        .collect::<Vec<_>>();
+    let alt_down = (0..selected)
+        .map(|expert| make_test_q3k_weights(n_embd, n_ff / 256, 611 + expert * 23))
+        .collect::<Vec<_>>();
+    let alt_gate_refs = alt_gate.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let alt_up_refs = alt_up.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let alt_down_refs = alt_down.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    state
+        .qwen35_admit_expert_misses_async(
+            &alt_gate_refs,
+            &alt_up_refs,
+            &alt_down_refs,
+            Some([&gate_refs, &up_refs, &down_refs]),
+        )
+        .expect("async miss admission from buffers");
+
+    // 2nd token (keyed on the alt slices): the previous admissions are
+    // fenced onto the main stream, both experts are resident hits, and the
+    // GPU partial sum must equal the reference derived from the SOURCE
+    // weights — proving the upload came from `data_sources`.
+    let mut second_out = vec![0.0f32; n_embd];
+    let second_mask = state
+        .qwen35_sparse_experts_resident_partial_into(
+            &alt_gate_refs,
+            &alt_up_refs,
+            &alt_down_refs,
+            &route,
+            &[7, 11],
+            11,
+            n_ff,
+            n_embd,
+            &input,
+            &mut second_out,
+        )
+        .expect("resident-partial second call");
+    assert_eq!(second_mask, 0b11, "admitted experts must be resident hits");
+    assert_close_rows_abs_rel(
+        "resident-partial Q2_K/Q3_K experts",
+        &second_out,
+        &expected,
+        0.05,
+        0.02,
+    );
+}
+
+#[test]
 fn cuda_qwen35_resident_per_slot_q2k_q3k_matches_cpu_layout() {
     let _guard = runtime_test_lock();
     let n_ff = 256usize;

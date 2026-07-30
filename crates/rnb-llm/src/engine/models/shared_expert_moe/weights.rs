@@ -38,6 +38,10 @@ pub(in crate::engine) struct SharedExpertMoELayerWeights {
     pub(in crate::engine) n_expert_used: usize,
     /// Resolved engine-load policy for Q2_K/Q3_K sparse CUDA execution.
     pub(in crate::engine) prefer_sparse_moe_cuda: bool,
+    /// Resolved engine-load decode expert placement: routed sparse experts run
+    /// on the host when their resident bytes exceed free VRAM. Prefill batch
+    /// paths keep `prefer_sparse_moe_cuda`.
+    pub(in crate::engine) decode_expert_host: bool,
     pub(in crate::engine) sparse_page_cache: Option<Arc<SparseExpertPageCache>>,
 }
 

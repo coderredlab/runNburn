@@ -1994,6 +1994,65 @@ pub(in crate::engine) fn qwen_moe_decode_down(
     None
 }
 
+/// cu152 hybrid decode: GPU computes the VRAM-resident expert subset and
+/// returns the computed slot bitmask; `None` when no CUDA backend is built.
+/// The caller computes the remaining slots on the host CPU path.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+pub(in crate::engine) fn qwen_moe_decode_sparse_experts_resident_partial(
+    gate: &[&[u8]],
+    up: &[&[u8]],
+    down: &[&[u8]],
+    route_weights: &[f32],
+    selected_expert_ids: &[usize],
+    down_quant: GGMLType,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    out: &mut [f32],
+) -> Option<std::result::Result<u32, String>> {
+    #[cfg(feature = "cuda")]
+    {
+        Some(
+            cuda_runtime::qwen_moe_decode_sparse_experts_resident_partial_into(
+                gate,
+                up,
+                down,
+                route_weights,
+                selected_expert_ids,
+                down_quant,
+                n_ff,
+                n_embd,
+                input,
+                out,
+            ),
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// cu152 hybrid decode: async recency admission of this token's missed
+/// expert slices. No-op without the CUDA backend.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+pub(in crate::engine) fn qwen_moe_decode_admit_expert_misses(
+    gate: &[&[u8]],
+    up: &[&[u8]],
+    down: &[&[u8]],
+    data_sources: Option<[&[&[u8]]; 3]>,
+) -> std::result::Result<(), String> {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_runtime::qwen_moe_decode_admit_expert_misses_async(gate, up, down, data_sources)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub(in crate::engine) fn qwen_moe_decode_sparse_experts_into(

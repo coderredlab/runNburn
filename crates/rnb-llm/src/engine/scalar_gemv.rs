@@ -10,10 +10,8 @@ use rnb_loader::GGMLType;
 
 #[cfg(not(feature = "cuda"))]
 use super::dequant::dequantize_bytes_to_f32;
-#[cfg(not(feature = "cuda"))]
 use super::gemm_runtime::quant_gemv::{self, QuantGemvType};
 
-#[cfg(not(feature = "cuda"))]
 #[inline]
 fn quant_gemv_type(ggml_type: GGMLType) -> Option<QuantGemvType> {
     match ggml_type {
@@ -34,6 +32,31 @@ fn quant_gemv_type(ggml_type: GGMLType) -> Option<QuantGemvType> {
         GGMLType::IQ4_XS => Some(QuantGemvType::IQ4XS),
         _ => None,
     }
+}
+
+/// True when `gemv_host_quantized` can run this GGML type on the CPU.
+#[inline]
+pub(super) fn host_quant_gemv_supported(ggml_type: GGMLType) -> bool {
+    quant_gemv_type(ggml_type).is_some()
+}
+
+/// Decode expert-placement host path: always executes the CPU quantized GEMV,
+/// regardless of the `cuda` feature. Eligibility is resolved once at engine
+/// load via `host_quant_gemv_supported`; reaching an unsupported quant here is
+/// a policy bug, not a runtime condition to fall back from.
+pub(super) fn gemv_host_quantized(
+    bytes: &[u8],
+    x_data: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    bytes_per_row: usize,
+    ggml_type: GGMLType,
+) {
+    let Some(quant) = quant_gemv_type(ggml_type) else {
+        panic!("host expert GEMV requested for unsupported quant {ggml_type:?}");
+    };
+    quant_gemv::gemv_quantized(bytes, x_data, output, rows, cols, 1, bytes_per_row, quant);
 }
 
 #[cfg(feature = "cuda")]

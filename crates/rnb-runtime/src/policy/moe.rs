@@ -50,6 +50,22 @@ pub fn cuda_q2k_q3k_sparse_moe_enabled(auto_enabled: bool) -> bool {
     env_truthy_override("RNB_CUDA_Q2K_Q3K_SPARSE_MOE").unwrap_or(auto_enabled)
 }
 
+/// Decode expert placement: run routed sparse experts on the host when the
+/// resident expert bytes cannot fit in free VRAM. `auto_enabled` carries the
+/// structural decision (`expert bytes > free VRAM` under a constrained CUDA
+/// plan); `RNB_CUDA_DECODE_EXPERT_HOST` is a diagnostic override only.
+pub fn cuda_decode_expert_host_enabled(auto_enabled: bool) -> bool {
+    env_truthy_override("RNB_CUDA_DECODE_EXPERT_HOST").unwrap_or(auto_enabled)
+}
+
+/// Hybrid decode on top of host expert placement: VRAM-resident experts run
+/// on the GPU while misses stay on the CPU. Auto-on whenever host placement
+/// is active with a CUDA device; `RNB_CUDA_DECODE_EXPERT_HYBRID` is the
+/// diagnostic override for A/B measurement.
+pub fn cuda_decode_expert_hybrid_enabled(auto_enabled: bool) -> bool {
+    env_truthy_override("RNB_CUDA_DECODE_EXPERT_HYBRID").unwrap_or(auto_enabled)
+}
+
 pub fn cuda_cache_trace_enabled() -> bool {
     env_string("RNB_CUDA_CACHE_TRACE").as_deref() == Some("1")
 }

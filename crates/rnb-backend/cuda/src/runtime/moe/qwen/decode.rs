@@ -1738,6 +1738,173 @@ impl CudaState {
         self.stream_synchronize()
     }
 
+    /// cu152 hybrid decode: computes only the selected experts whose gate/up/
+    /// down role slices are already VRAM-resident and returns their slot
+    /// bitmask (`output` holds the route-weighted partial sum for those
+    /// slots, zeroed otherwise). Missing experts are never uploaded on the
+    /// critical path; after the resident subset finishes, this token's
+    /// misses are enqueued as stream-ordered async admissions so following
+    /// tokens can hit them. The caller computes the slots outside the mask
+    /// on the host CPU path.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn qwen35_sparse_experts_resident_partial_into(
+        &mut self,
+        gate_weights: &[&[u8]],
+        up_weights: &[&[u8]],
+        down_weights: &[&[u8]],
+        route_weights: &[f32],
+        selected_expert_ids: &[usize],
+        down_quant: u32,
+        n_ff: usize,
+        n_embd: usize,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<u32, String> {
+        let selected = gate_weights.len();
+        if selected == 0 || selected > 32 {
+            return Err(format!(
+                "Qwen35 resident-partial sparse MoE supports 1..=32 slots, got {selected}"
+            ));
+        }
+        self.set_current()?;
+        self.raise_resident_q4k_limit_for_qwen35_target_decode()?;
+
+        let mut mask: u32 = 0;
+        for slot in 0..selected {
+            if self.q4k_weight_slice_is_resident(gate_weights[slot])
+                && self.q4k_weight_slice_is_resident(up_weights[slot])
+                && self.q4k_weight_slice_is_resident(down_weights[slot])
+            {
+                mask |= 1 << slot;
+            }
+        }
+
+        // Freshly admitted expert weights ride `copy_stream`; make this
+        // token's kernels on `stream` order after the latest admission batch
+        // (device-side wait — free once the copies have drained).
+        if let Some(fence) = self.expert_admission_fence {
+            unsafe {
+                self.api.stream_wait_event(self.stream, fence)?;
+            }
+        }
+
+        if mask == 0 {
+            output.fill(0.0);
+        } else {
+            let mut sub_gate = Vec::with_capacity(selected);
+            let mut sub_up = Vec::with_capacity(selected);
+            let mut sub_down = Vec::with_capacity(selected);
+            let mut sub_route = Vec::with_capacity(selected);
+            let mut sub_ids = Vec::with_capacity(selected);
+            for slot in 0..selected {
+                if mask & (1 << slot) != 0 {
+                    sub_gate.push(gate_weights[slot]);
+                    sub_up.push(up_weights[slot]);
+                    sub_down.push(down_weights[slot]);
+                    sub_route.push(route_weights[slot]);
+                    sub_ids.push(selected_expert_ids[slot]);
+                }
+            }
+            let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
+            let output_bytes = std::mem::size_of_val(output);
+            let output_dev = self.compute_output_ptr(output_bytes)?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input),
+                    self.stream,
+                )?;
+            }
+            // The subset is fully resident, so the weight-pointer resolution
+            // inside `to_dev` takes the resident fast path and never uploads.
+            self.qwen35_sparse_experts_to_dev_with_optional_receipt(
+                &sub_gate, &sub_up, &sub_down, &sub_route, None, &sub_ids, down_quant, n_ff,
+                n_embd, input_dev, output_dev, None,
+            )?;
+            unsafe {
+                self.api.memcpy_dtoh_async(
+                    output.as_mut_ptr().cast::<libc::c_void>(),
+                    output_dev,
+                    output_bytes,
+                    self.stream,
+                )?;
+            }
+            self.stream_synchronize()?;
+        }
+
+        Ok(mask)
+    }
+
+    /// cu152 hybrid decode: enqueues this token's missed expert role slices
+    /// as recency admissions on `copy_stream` and records the readiness
+    /// fence. Called after the host CPU finished computing the misses, so
+    /// the source mmap pages are already faulted in and the pageable staging
+    /// copy never does disk IO on the orchestrator thread. Eviction safety:
+    /// candidates are LRU-oldest while in-flight admissions are LRU-newest,
+    /// so a pending copy is never the eviction victim under any realistic
+    /// cache budget (>= a few layers' misses).
+    pub(in crate::runtime) fn qwen35_admit_expert_misses_async(
+        &mut self,
+        gate_weights: &[&[u8]],
+        up_weights: &[&[u8]],
+        down_weights: &[&[u8]],
+        data_sources: Option<[&[&[u8]]; 3]>,
+    ) -> Result<(), String> {
+        self.set_current()?;
+        let slot_groups = [gate_weights, up_weights, down_weights];
+        let local_ptrs = HashMap::new();
+        let copy_stream = self.copy_stream;
+        let mut source_map = HashMap::new();
+        if let Some(groups) = data_sources {
+            for (keys, sources) in slot_groups.iter().zip(groups.iter()) {
+                if keys.len() != sources.len() {
+                    return Err(format!(
+                        "expert admission source group mismatch: keys={} sources={}",
+                        keys.len(),
+                        sources.len()
+                    ));
+                }
+                for (&key_slice, &source) in keys.iter().zip(sources.iter()) {
+                    if source.len() != key_slice.len() {
+                        return Err(format!(
+                            "expert admission source length mismatch: key bytes {}, source bytes {}",
+                            key_slice.len(),
+                            source.len()
+                        ));
+                    }
+                    source_map.insert(q4k_resident_key(key_slice), source);
+                }
+            }
+        }
+        let uploaded = self
+            .batch_resident_q4k_slot_misses_many_on_stream_with_sources(
+                &slot_groups,
+                &local_ptrs,
+                copy_stream,
+                None,
+                &HashSet::new(),
+                true,
+                None,
+                data_sources.is_some().then_some(&source_map),
+            )?
+            .uploaded;
+        if uploaded {
+            let fence = match self.expert_admission_fence {
+                Some(event) => event,
+                None => {
+                    let event = unsafe { self.api.event_create(0)? };
+                    self.expert_admission_fence = Some(event);
+                    event
+                }
+            };
+            unsafe {
+                self.api.event_record(fence, copy_stream)?;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn qwen35_sparse_experts_add_residual_into(
         &mut self,

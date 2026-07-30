@@ -1884,6 +1884,46 @@ pub fn qwen_moe_decode_sparse_experts_into(
     )
 }
 
+/// cu152 hybrid decode: computes the VRAM-resident expert subset on the GPU
+/// and returns the computed slot bitmask; misses stay on the caller's host
+/// path and are enqueued as async admissions.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen_moe_decode_sparse_experts_resident_partial_into(
+    gate: &[&[u8]],
+    up: &[&[u8]],
+    down: &[&[u8]],
+    route_weights: &[f32],
+    selected_expert_ids: &[usize],
+    down_quant: GGMLType,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    out: &mut [f32],
+) -> std::result::Result<u32, String> {
+    backend::qwen35_sparse_experts_resident_partial_into(
+        gate,
+        up,
+        down,
+        route_weights,
+        selected_expert_ids,
+        down_quant as u32,
+        n_ff,
+        n_embd,
+        input,
+        out,
+    )
+}
+
+/// cu152 hybrid decode: async recency admission of missed expert slices.
+pub fn qwen_moe_decode_admit_expert_misses_async(
+    gate: &[&[u8]],
+    up: &[&[u8]],
+    down: &[&[u8]],
+    data_sources: Option<[&[&[u8]]; 3]>,
+) -> std::result::Result<(), String> {
+    backend::qwen35_admit_expert_misses_async(gate, up, down, data_sources)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn qwen_moe_decode_sparse_experts_iq4xs_into(
     gate: &[&[u8]],

@@ -49,7 +49,49 @@ fn default_kv_cache_format(
 fn apply_host_memory_plan(
     weights: &mut super::layer_weights::ModelWeights,
     sparse_moe_cuda_enabled: bool,
+    cuda_free_vram_bytes: Option<u64>,
 ) {
+    // Decode expert placement: uploading routed experts per token is bounded
+    // by PCIe/disk bandwidth, so the experts run on the host unless their
+    // resident bytes fit in free VRAM. Prefill batch paths keep
+    // `prefer_sparse_moe_cuda` (batched uploads amortize over the sequence).
+    let mut routed_expert_bytes: u64 = 0;
+    let mut any_moe = false;
+    let mut host_quants_supported = true;
+    for layer in &weights.layers {
+        let moe = match layer {
+            LayerType::Attention(weights) => weights.shared_expert_moe.as_ref(),
+            LayerType::GatedDeltaNet(weights) => weights.shared_expert_moe.as_ref(),
+            LayerType::NemotronMamba2(_) | LayerType::NemotronMoE(_) => None,
+        };
+        let Some(moe) = moe else { continue };
+        any_moe = true;
+        for bytes in [
+            moe.gate_exps_bytes(),
+            moe.up_exps_bytes(),
+            moe.down_exps_bytes(),
+        ] {
+            routed_expert_bytes =
+                routed_expert_bytes.saturating_add(bytes.map_or(0, |b| b.len() as u64));
+        }
+        host_quants_supported &= super::scalar_gemv::host_quant_gemv_supported(moe.gate_quant)
+            && super::scalar_gemv::host_quant_gemv_supported(moe.up_quant)
+            && super::scalar_gemv::host_quant_gemv_supported(moe.down_quant);
+    }
+    let auto_decode_host = sparse_moe_cuda_enabled
+        && any_moe
+        && host_quants_supported
+        && cuda_free_vram_bytes.is_none_or(|free| routed_expert_bytes > free);
+    let decode_expert_host =
+        crate::engine::policy::cuda_decode_expert_host_enabled(auto_decode_host);
+    if any_moe && sparse_moe_cuda_enabled {
+        eprintln!(
+            "[INFO] Decode expert placement: {} (routed expert bytes: {:.2} GiB, free VRAM: {:.2} GiB)",
+            if decode_expert_host { "host" } else { "cuda" },
+            routed_expert_bytes as f64 / (1024_u64.pow(3)) as f64,
+            cuda_free_vram_bytes.unwrap_or(0) as f64 / (1024_u64.pow(3)) as f64,
+        );
+    }
     for layer in &mut weights.layers {
         let moe = match layer {
             LayerType::Attention(weights) => weights.shared_expert_moe.as_mut(),
@@ -58,6 +100,7 @@ fn apply_host_memory_plan(
         };
         if let Some(moe) = moe {
             moe.prefer_sparse_moe_cuda = sparse_moe_cuda_enabled;
+            moe.decode_expert_host = decode_expert_host;
         }
     }
 }
@@ -233,7 +276,11 @@ impl Engine {
                 path,
             )
         });
-        apply_host_memory_plan(&mut weights, sparse_moe_cuda_enabled);
+        apply_host_memory_plan(
+            &mut weights,
+            sparse_moe_cuda_enabled,
+            cuda_memory_bytes.map(|(free_bytes, _)| free_bytes),
+        );
         #[cfg(feature = "cuda")]
         register_sparse_stream_regions(&weights);
         let mtp_runtime = load_stage!("load_mtp_weights", {

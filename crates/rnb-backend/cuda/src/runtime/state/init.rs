@@ -143,6 +143,7 @@ impl CudaState {
             ctx,
             stream,
             copy_stream,
+            expert_admission_fence: None,
             api,
             device_residency_plan,
             cublas: None,
@@ -436,6 +437,9 @@ impl Drop for CudaState {
         }
         if let Some(workspace) = self.nemotron_prefill_workspace.take() {
             let _ = unsafe { self.api.mem_free(workspace.ptr) };
+        }
+        if let Some(event) = self.expert_admission_fence.take() {
+            let _ = unsafe { self.api.event_destroy(event) };
         }
         cache_stats()
             .remove_expert_bundle_resident_payload(self.qwen35_q2q3_resident_payload_bytes);

@@ -1168,6 +1168,34 @@ impl CudaState {
         allow_global_oom_offload: bool,
         additional_oom_reload_budget: Option<u64>,
     ) -> Result<ResidentQ4kAdmissionResult, String> {
+        self.batch_resident_q4k_slot_misses_many_on_stream_with_sources(
+            slot_groups,
+            local_ptrs,
+            upload_stream,
+            tracked_expert_bundle_keys,
+            protected_keys,
+            allow_global_oom_offload,
+            additional_oom_reload_budget,
+            None,
+        )
+    }
+
+    /// `data_sources` maps a resident key (mmap slice identity) to the bytes
+    /// actually uploaded — the cu154 direct miss path reads misses once with
+    /// O_DIRECT and feeds the upload from that buffer while lookups keep
+    /// keying on the mmap slice.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn batch_resident_q4k_slot_misses_many_on_stream_with_sources(
+        &mut self,
+        slot_groups: &[&[&[u8]]],
+        local_ptrs: &HashMap<(usize, usize), u64>,
+        upload_stream: usize,
+        tracked_expert_bundle_keys: Option<&HashSet<(usize, usize)>>,
+        protected_keys: &HashSet<(usize, usize)>,
+        allow_global_oom_offload: bool,
+        additional_oom_reload_budget: Option<u64>,
+        data_sources: Option<&HashMap<(usize, usize), &[u8]>>,
+    ) -> Result<ResidentQ4kAdmissionResult, String> {
         let mut missing = Vec::new();
         let mut seen = HashSet::new();
         let mut slab_bytes = 0usize;
@@ -1236,12 +1264,17 @@ impl CudaState {
             tuning::resident_q4k_batch_pinned_staging_enabled(slab_bytes, missing.len());
         if pinned_staging {
             let host_slab = self.host_temp_slab_ptr(slab_bytes)?;
-            for (_, offset, weights) in &missing {
+            for (key, offset, weights) in &missing {
+                let source = data_sources
+                    .and_then(|sources| sources.get(key))
+                    .copied()
+                    .unwrap_or(weights);
+                debug_assert_eq!(source.len(), weights.len());
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        weights.as_ptr(),
+                        source.as_ptr(),
                         host_slab.add(*offset),
-                        weights.len(),
+                        source.len(),
                     );
                 }
             }
@@ -1254,12 +1287,17 @@ impl CudaState {
                 )?;
             }
         } else {
-            for (_, offset, weights) in &missing {
+            for (key, offset, weights) in &missing {
+                let source = data_sources
+                    .and_then(|sources| sources.get(key))
+                    .copied()
+                    .unwrap_or(weights);
+                debug_assert_eq!(source.len(), weights.len());
                 unsafe {
                     self.api.memcpy_htod_async(
                         slab + *offset as u64,
-                        weights.as_ptr().cast::<libc::c_void>(),
-                        weights.len(),
+                        source.as_ptr().cast::<libc::c_void>(),
+                        source.len(),
                         upload_stream,
                     )?;
                 }

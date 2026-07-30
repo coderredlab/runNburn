@@ -922,6 +922,7 @@ pub(in crate::engine) fn forward_shared_expert_moe(
                 &mut moe_out,
                 &mut output[start..start + hidden_dim],
                 true,
+                false,
                 moe_w.sparse_page_cache.as_deref(),
             );
             if !completed {

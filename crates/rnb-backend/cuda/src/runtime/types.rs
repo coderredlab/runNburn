@@ -328,6 +328,10 @@ pub(super) struct CudaState {
     pub(super) ctx: usize,
     pub(super) stream: usize,
     pub(super) copy_stream: usize,
+    /// cu152 hybrid decode: readiness fence for expert admissions enqueued on
+    /// `copy_stream`. Kernels on `stream` that may read freshly admitted
+    /// expert weights wait on this event device-side before launching.
+    pub(super) expert_admission_fence: Option<usize>,
     pub(super) api: CudaApi,
     pub(super) device_residency_plan: rnb_memory::DeviceResidencyPlan,
     pub(super) cublas: Option<CublasState>,

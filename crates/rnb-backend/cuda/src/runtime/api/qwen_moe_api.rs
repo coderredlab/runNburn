@@ -2012,6 +2012,98 @@ pub fn qwen35_sparse_experts_into(
         )
 }
 
+/// cu152 hybrid decode entry: computes the VRAM-resident subset of the
+/// selected experts and returns the computed slot bitmask. Misses are left
+/// for the caller's host path and enqueued as async admissions.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_sparse_experts_resident_partial_into(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    route_weights: &[f32],
+    selected_expert_ids: &[usize],
+    down_quant: u32,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<u32, String> {
+    let selected = gate_weights.len();
+    if selected == 0 {
+        output.fill(0.0);
+        return Ok(0);
+    }
+    if up_weights.len() != selected
+        || down_weights.len() != selected
+        || route_weights.len() != selected
+        || selected_expert_ids.len() != selected
+    {
+        return Err("Qwen35 resident-partial expert batch length mismatch".to_string());
+    }
+    if input.len() != n_embd || output.len() != n_embd {
+        return Err(format!(
+            "Qwen35 resident-partial shape mismatch: input={} output={} expected={n_embd}",
+            input.len(),
+            output.len()
+        ));
+    }
+    if n_embd % 256 != 0 || n_ff % 256 != 0 {
+        return Err(format!(
+            "Qwen35 resident-partial dims must be divisible by 256, got n_ff={n_ff} n_embd={n_embd}"
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .qwen35_sparse_experts_resident_partial_into(
+            gate_weights,
+            up_weights,
+            down_weights,
+            route_weights,
+            selected_expert_ids,
+            down_quant,
+            n_ff,
+            n_embd,
+            input,
+            output,
+        )
+}
+
+/// cu152 hybrid decode: async recency admission of the current token's
+/// missed expert role slices on the copy stream. Call after the host CPU
+/// finished computing the misses so their mmap pages are warm.
+pub fn qwen35_admit_expert_misses_async(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    data_sources: Option<[&[&[u8]]; 3]>,
+) -> Result<(), String> {
+    if gate_weights.is_empty() {
+        return Ok(());
+    }
+    if up_weights.len() != gate_weights.len() || down_weights.len() != gate_weights.len() {
+        return Err("Qwen35 expert admission batch length mismatch".to_string());
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .qwen35_admit_expert_misses_async(gate_weights, up_weights, down_weights, data_sources)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn qwen35_sparse_experts_iq4xs_into(
     gate_weights: &[&[u8]],

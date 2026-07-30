@@ -85,7 +85,7 @@ impl<'a> SharedExpertMoEView<'a> {
     /// Writes the route-weighted sparse-expert sum plus the shared-expert
     /// output into `out`.
     pub fn forward(&self, h: &[f32], out: &mut [f32]) {
-        self.forward_impl(h, out, None, false, None);
+        self.forward_impl(h, out, None, false, false, None);
     }
 
     pub(in crate::engine) fn forward_with_page_cache(
@@ -94,13 +94,13 @@ impl<'a> SharedExpertMoEView<'a> {
         out: &mut [f32],
         page_cache: Option<&SparseExpertPageCache>,
     ) {
-        self.forward_impl(h, out, None, false, page_cache);
+        self.forward_impl(h, out, None, false, false, page_cache);
     }
 
     /// Computes the decode MoE block and adds it directly into `residual` when
     /// the CUDA full sparse+shared path is available.
     pub fn forward_add_residual(&self, h: &[f32], out: &mut [f32], residual: &mut [f32]) -> bool {
-        self.forward_impl(h, out, Some(residual), false, None)
+        self.forward_impl(h, out, Some(residual), false, false, None)
     }
 
     pub(in crate::engine) fn forward_add_residual_with_policy(
@@ -109,9 +109,17 @@ impl<'a> SharedExpertMoEView<'a> {
         out: &mut [f32],
         residual: &mut [f32],
         prefer_sparse_moe_cuda: bool,
+        decode_expert_host: bool,
         page_cache: Option<&SparseExpertPageCache>,
     ) -> bool {
-        self.forward_impl(h, out, Some(residual), prefer_sparse_moe_cuda, page_cache)
+        self.forward_impl(
+            h,
+            out,
+            Some(residual),
+            prefer_sparse_moe_cuda,
+            decode_expert_host,
+            page_cache,
+        )
     }
 
     fn forward_impl(
@@ -120,6 +128,7 @@ impl<'a> SharedExpertMoEView<'a> {
         out: &mut [f32],
         residual: Option<&mut [f32]>,
         _prefer_sparse_moe_cuda: bool,
+        decode_expert_host: bool,
         page_cache: Option<&SparseExpertPageCache>,
     ) -> bool {
         #[cfg(feature = "cuda")]
@@ -315,6 +324,7 @@ impl<'a> SharedExpertMoEView<'a> {
                 gate_scalar,
                 profile_enabled,
                 false,
+                decode_expert_host,
             );
             let shared_out = if matches!(
                 &fanout,
@@ -352,6 +362,7 @@ impl<'a> SharedExpertMoEView<'a> {
                         gate_scalar,
                         profile_enabled,
                         false,
+                        decode_expert_host,
                     )
                 },
                 || compute_shared_expert(self, h, gate_scalar, false, profile_enabled, false),
@@ -369,6 +380,7 @@ impl<'a> SharedExpertMoEView<'a> {
             gate_scalar,
             profile_enabled,
             prefer_sparse_moe_cuda,
+            decode_expert_host,
         );
         if let (Some(page_cache), Some(layer_index)) = (page_cache, self.layer_idx) {
             page_cache.touch(layer_index, idx);

@@ -96,6 +96,7 @@ pub(in crate::engine) fn load_shared_expert_moe_layer(
         n_expert,
         n_expert_used,
         prefer_sparse_moe_cuda: false,
+        decode_expert_host: false,
         sparse_page_cache: None,
     })
 }
