@@ -86,3 +86,20 @@ pub fn glm_moe_prefill_shared_expert_iq(
     )
     .map_err(|err| format!("CUDA GLM batched shared IQ expert failed: {err}"))
 }
+
+/// Registers per-layer sparse expert regions for stream read-ahead.
+pub fn glm_register_stream_region_sequence(sequence: &[[rnb_core::tensor::FileBackedRegion; 3]]) {
+    let sequence = sequence
+        .iter()
+        .map(|regions| {
+            [0usize, 1, 2].map(|index| {
+                (
+                    regions[index].path().to_path_buf(),
+                    regions[index].file_offset(),
+                    regions[index].len(),
+                )
+            })
+        })
+        .collect();
+    backend::glm_register_stream_region_sequence(sequence);
+}

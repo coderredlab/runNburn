@@ -62,6 +62,28 @@ fn apply_host_memory_plan(
     }
 }
 
+/// Registers the per-layer sparse expert file regions with the CUDA backend
+/// so the direct-file prefill stream can prefetch the next layer's expert
+/// bytes while the current layer computes. Layers without fully file-backed
+/// expert tensors truncate the sequence at the first gap to keep indices
+/// aligned with forward order.
+#[cfg(feature = "cuda")]
+fn register_sparse_stream_regions(weights: &super::layer_weights::ModelWeights) {
+    let mut sequence = Vec::new();
+    for layer in &weights.layers {
+        let moe = match layer {
+            LayerType::Attention(weights) => weights.shared_expert_moe.as_ref(),
+            LayerType::GatedDeltaNet(weights) => weights.shared_expert_moe.as_ref(),
+            LayerType::NemotronMamba2(_) | LayerType::NemotronMoE(_) => None,
+        };
+        let Some(regions) = moe.and_then(|moe| moe.sparse_expert_file_regions()) else {
+            continue;
+        };
+        sequence.push(regions);
+    }
+    crate::engine::cuda_runtime::glm_register_stream_region_sequence(&sequence);
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EngineLoadConfig {
     pub host_memory_budget: Option<crate::engine::memory_runtime::MemoryBudget>,
@@ -212,6 +234,8 @@ impl Engine {
             )
         });
         apply_host_memory_plan(&mut weights, sparse_moe_cuda_enabled);
+        #[cfg(feature = "cuda")]
+        register_sparse_stream_regions(&weights);
         let mtp_runtime = load_stage!("load_mtp_weights", {
             mtp.as_ref().and_then(|_| {
                 load_mtp_layer_weights(&model).map(|mtp_weights| {

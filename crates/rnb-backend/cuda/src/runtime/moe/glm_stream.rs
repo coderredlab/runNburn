@@ -23,7 +23,6 @@ pub(super) struct GlmDirectFileStreamRequest<'a> {
     pub(super) n_embd: usize,
     pub(super) input_dev: u64,
     pub(super) output_dev: u64,
-    pub(super) output_bytes: usize,
     pub(super) gate_dev: u64,
     pub(super) up_dev: u64,
 }
@@ -197,6 +196,8 @@ impl CudaState {
         &mut self,
         request: GlmDirectFileStreamRequest<'_>,
     ) -> Result<Vec<f32>, String> {
+        let region_keys = super::glm_prefetch::stream_region_keys(request.file_regions);
+        let mut prefetched = self.glm_stream_prefetch.take_matching(&region_keys);
         let ranges = glm_stream_batch_ranges(
             request.gate_weights,
             request.up_weights,
@@ -230,6 +231,21 @@ impl CudaState {
                 group_meta,
                 weights,
             });
+        }
+
+        // Read ahead the next layer's whole expert regions while this layer's
+        // uploads, kernels, and the following dense/attention work run. The
+        // whole-region read replaces this layer's plan-driven union read, so
+        // it is only spawned when the current union covers at least half of
+        // the region bytes (read amplification bounded at 2x); short prompts
+        // with sparse expert coverage keep the on-demand reads instead.
+        let union_bytes: usize = batches
+            .iter()
+            .map(|batch| batch.weights.logical_bytes)
+            .sum();
+        let region_bytes: usize = request.file_regions.iter().map(|region| region.len()).sum();
+        if union_bytes.saturating_mul(2) >= region_bytes {
+            self.glm_stream_prefetch.spawn_after(&region_keys);
         }
 
         let buffer_stride = batches
@@ -294,13 +310,27 @@ impl CudaState {
                 let host_base = buffer_index * buffer_stride;
                 let device_base = slab_dev + host_base as u64;
                 let read_start = std::time::Instant::now();
-                read_direct_file_plan(
-                    &mut self.direct_file_reader,
-                    &batch.weights,
-                    request.file_regions,
-                    host_slab,
-                    host_base,
-                )?;
+                let mut prefetch_hit = false;
+                if let Some(regions) = prefetched.as_mut() {
+                    prefetch_hit = batch.weights.runs.iter().all(|run| {
+                        let start = host_base + run.staging_offset;
+                        regions.copy_run(
+                            run.region_index,
+                            run.file_offset,
+                            &mut host_slab[start..start + run.staging_len],
+                            run.required_len,
+                        )
+                    });
+                }
+                if !prefetch_hit {
+                    read_direct_file_plan(
+                        &mut self.direct_file_reader,
+                        &batch.weights,
+                        request.file_regions,
+                        host_slab,
+                        host_base,
+                    )?;
+                }
                 let read_ms = read_start.elapsed().as_secs_f64() * 1000.0;
                 unsafe {
                     self.api.memcpy_htod_async(
@@ -389,7 +419,7 @@ impl CudaState {
 
                 if trace {
                     eprintln!(
-                        "[cuda-direct-file-expert-stream] batch={}/{} slots={} groups={} unique={} logical_bytes={} staging_bytes={} read_runs={} read_ms={read_ms:.3}",
+                        "[cuda-direct-file-expert-stream] batch={}/{} slots={} groups={} unique={} logical_bytes={} staging_bytes={} read_runs={} read_ms={read_ms:.3} prefetch_hit={prefetch_hit}",
                         batch_index + 1,
                         batches.len(),
                         slots,
@@ -403,17 +433,12 @@ impl CudaState {
             }
 
             let mut output = vec![0.0f32; request.token_count * request.n_embd];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    output.as_mut_ptr().cast::<libc::c_void>(),
-                    request.output_dev,
-                    request.output_bytes,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
+            self.dtoh_f32_via_pinned(request.output_dev, &mut output)?;
             Ok(output)
         })();
+        if let Some(regions) = prefetched.take() {
+            self.glm_stream_prefetch.recycle(regions);
+        }
 
         if result.is_err() {
             let _ = unsafe { self.api.stream_synchronize(self.stream) };

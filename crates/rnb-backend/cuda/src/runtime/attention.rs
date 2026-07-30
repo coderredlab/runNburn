@@ -1361,15 +1361,7 @@ impl CudaState {
         )?;
 
         let mut output = vec![0.0f32; output_len];
-        unsafe {
-            self.api.memcpy_dtoh_async(
-                output.as_mut_ptr().cast::<libc::c_void>(),
-                output_dev,
-                output_bytes,
-                self.stream,
-            )?;
-        }
-        self.stream_synchronize()?;
+        self.dtoh_f32_via_pinned(output_dev, &mut output)?;
         Ok(output)
     }
 
