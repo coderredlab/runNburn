@@ -41,40 +41,73 @@ kernel void qwen_moe_llama_id_map0(
 
 kernel void qwen_moe_llama_id_build_blocks(
     device const uint *tpe              [[buffer(0)]],
-    device uint       *block_experts    [[buffer(1)]],
-    device uint       *block_local0     [[buffer(2)]],
-    device uint       *indirect_args    [[buffer(3)]],
-    constant uint     &n_expert         [[buffer(4)]],
-    constant uint     &hidden_dim       [[buffer(5)]],
-    constant uint     &ffn_dim          [[buffer(6)]],
+    device uint       *wide_experts     [[buffer(1)]],
+    device uint       *wide_local0      [[buffer(2)]],
+    device uint       *tail_experts     [[buffer(3)]],
+    device uint       *tail_local0      [[buffer(4)]],
+    device uint       *indirect_args    [[buffer(5)]],
+    constant uint     &n_expert         [[buffer(6)]],
+    constant uint     &hidden_dim       [[buffer(7)]],
+    constant uint     &ffn_dim          [[buffer(8)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0u) {
         return;
     }
 
-    uint block_count = 0u;
+    uint wide_count = 0u;
+    uint tail_count = 0u;
     for (uint expert = 0u; expert < n_expert; ++expert) {
         const uint count = tpe[expert];
-        for (uint local0 = 0u; local0 < count; local0 += 64u) {
-            block_experts[block_count] = expert;
-            block_local0[block_count] = local0;
-            ++block_count;
+        const uint full_end = count & ~63u;
+        for (uint local0 = 0u; local0 < full_end; local0 += 64u) {
+            wide_experts[wide_count] = expert;
+            wide_local0[wide_count] = local0;
+            ++wide_count;
+        }
+        const uint remainder = count - full_end;
+        if (remainder == 0u) {
+            continue;
+        }
+        if (remainder <= 32u) {
+            tail_experts[tail_count] = expert;
+            tail_local0[tail_count] = full_end;
+            ++tail_count;
+        } else {
+            wide_experts[wide_count] = expert;
+            wide_local0[wide_count] = full_end;
+            ++wide_count;
         }
     }
 
-    indirect_args[0] = (ffn_dim + 127u) / 128u;
-    indirect_args[1] = block_count;
+    const uint ffn_tiles = (ffn_dim + 127u) / 128u;
+    const uint hidden_tiles = (hidden_dim + 63u) / 64u;
+    const uint hidden_cast_tiles = (hidden_dim + 255u) / 256u;
+    const uint ffn_cast_tiles = (ffn_dim + 255u) / 256u;
+    indirect_args[0] = ffn_tiles;
+    indirect_args[1] = wide_count;
     indirect_args[2] = 1u;
-    indirect_args[4] = (hidden_dim + 63u) / 64u;
-    indirect_args[5] = block_count;
+    indirect_args[4] = ffn_tiles;
+    indirect_args[5] = tail_count;
     indirect_args[6] = 1u;
-    indirect_args[8] = (hidden_dim + 255u) / 256u;
-    indirect_args[9] = block_count;
+    indirect_args[8] = hidden_tiles;
+    indirect_args[9] = wide_count;
     indirect_args[10] = 1u;
-    indirect_args[12] = (ffn_dim + 255u) / 256u;
-    indirect_args[13] = block_count;
+    indirect_args[12] = hidden_tiles;
+    indirect_args[13] = tail_count;
     indirect_args[14] = 1u;
+    indirect_args[16] = hidden_cast_tiles;
+    indirect_args[17] = wide_count;
+    indirect_args[18] = 1u;
+    indirect_args[20] = hidden_cast_tiles;
+    indirect_args[21] = tail_count;
+    indirect_args[22] = 1u;
+    indirect_args[24] = ffn_cast_tiles;
+    indirect_args[25] = wide_count;
+    indirect_args[26] = 1u;
+    indirect_args[28] = ffn_cast_tiles;
+    indirect_args[29] = tail_count;
+    indirect_args[30] = 1u;
 }
 
 kernel void gemm_q4k_tensorops_id(
@@ -806,6 +839,7 @@ static inline void qwen_moe_chain_dequant_q5k_64(
 
 template<
     uint BLOCK_BYTES,
+    uint BM,
     void (*dequantize_group)(device const uchar *, uint, threadgroup half *),
     typename input_t,
     bool INPUT_BY_TOKEN,
@@ -828,7 +862,7 @@ static inline void qwen_moe_chain_large_qk_impl(
     uint3 tgid,
     uint tid)
 {
-    constexpr uint BM = 64u, BN = WIDE_COLS ? 128u : 64u;
+    constexpr uint BN = WIDE_COLS ? 128u : 64u;
     constexpr uint NK = 64u, NUM_THREADS = 128u;
     uint row0 = tgid.x * BN;
     uint block = tgid.y;
@@ -944,7 +978,7 @@ static inline void qwen_moe_chain_large_qk_impl(
 kernel void qwen_moe_chain_large_q4k_f32(QWEN_MOE_CHAIN_LARGE_ARGS(float))
 {
     qwen_moe_chain_large_qk_impl<
-        144u, qwen_moe_chain_dequant_q4k_64, float, true, true, false>(
+        144u, 64u, qwen_moe_chain_dequant_q4k_64, float, true, true, false>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
@@ -952,16 +986,26 @@ kernel void qwen_moe_chain_large_q4k_f32(QWEN_MOE_CHAIN_LARGE_ARGS(float))
 kernel void qwen_moe_chain_large_q4k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 {
     qwen_moe_chain_large_qk_impl<
-        144u, qwen_moe_chain_dequant_q4k_64, half, false, true, true>(
+        144u, 64u, qwen_moe_chain_dequant_q4k_64, half, false, true, true>(
+        weight_bytes, input, tpe, ids, block_experts, block_local0, out,
+        N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
+}
+
+kernel void qwen_moe_chain_tail_q4k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
+{
+    qwen_moe_chain_large_qk_impl<
+        144u, 32u, qwen_moe_chain_dequant_q4k_64, half, false, true, true>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
 
 
+
+
 kernel void qwen_moe_chain_large_q5k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 {
     qwen_moe_chain_large_qk_impl<
-        176u, qwen_moe_chain_dequant_q5k_64, half, false, true, false>(
+        176u, 64u, qwen_moe_chain_dequant_q5k_64, half, false, true, false>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
@@ -969,14 +1013,14 @@ kernel void qwen_moe_chain_large_q5k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 kernel void qwen_moe_chain_large_q4k_f16_dense(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 {
     qwen_moe_chain_large_qk_impl<
-        144u, qwen_moe_chain_dequant_q4k_64, half, false, false, true>(
+        144u, 64u, qwen_moe_chain_dequant_q4k_64, half, false, false, true>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
 
 
 
-template<bool COMPACT_BLOCKS, bool WIDE_ROWS>
+template<uint BM, bool COMPACT_BLOCKS, bool WIDE_ROWS>
 static inline void qwen_moe_chain_large_q6k_impl(
     device const uchar *weight_bytes,
     device const half *input,
@@ -994,7 +1038,7 @@ static inline void qwen_moe_chain_large_q6k_impl(
     uint3 tgid,
     uint tid)
 {
-    constexpr uint BM = 64u, BN = WIDE_ROWS ? 64u : 32u;
+    constexpr uint BN = WIDE_ROWS ? 64u : 32u;
     constexpr uint NK = WIDE_ROWS ? 64u : 128u;
     constexpr uint NUM_THREADS = 128u;
     uint row0 = tgid.x * BN;
@@ -1148,17 +1192,26 @@ static inline void qwen_moe_chain_large_q6k_impl(
 
 kernel void qwen_moe_chain_large_q6k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 {
-    qwen_moe_chain_large_q6k_impl<true, true>(
+    qwen_moe_chain_large_q6k_impl<64u, true, true>(
+        weight_bytes, input, tpe, ids, block_experts, block_local0, out,
+        N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
+}
+
+kernel void qwen_moe_chain_tail_q6k_f16(QWEN_MOE_CHAIN_LARGE_ARGS(half))
+{
+    qwen_moe_chain_large_q6k_impl<32u, true, true>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
 
 kernel void qwen_moe_chain_large_q6k_f16_dense(QWEN_MOE_CHAIN_LARGE_ARGS(half))
 {
-    qwen_moe_chain_large_q6k_impl<false, true>(
+    qwen_moe_chain_large_q6k_impl<64u, false, true>(
         weight_bytes, input, tpe, ids, block_experts, block_local0, out,
         N, K, N_TOKENS, TOP_K, EXPERT_STRIDE_BYTES, shmem, tgid, tid);
 }
+
+
 
 #undef QWEN_MOE_CHAIN_LARGE_ARGS
 
@@ -2743,31 +2796,41 @@ kernel void qwen_moe_llama_expert_order_reduce_shared_f32(
     constant uint &n_tokens [[buffer(6)]],
     constant uint &n_rank [[buffer(7)]],
     constant uint &n_rows [[buffer(8)]],
-    uint gid [[thread_position_in_grid]])
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 tg_size3 [[threads_per_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]])
 {
 #pragma clang fp reassociate(off) contract(off)
-    const uint total = n_tokens * n_rows;
-    if (gid >= total || n_rank == 0u || n_rank > 8u) {
+    const uint tid = tid3.x;
+    const uint tg_size = tg_size3.x;
+    const uint token = tgid.y;
+    if (token >= n_tokens || n_rank == 0u || n_rank > 8u) {
         return;
     }
 
-    const uint token = gid / n_rows;
-    const uint row = gid - token * n_rows;
+    threadgroup uint order[8];
     const uint token_rank_base = token * n_rank;
-    uint order[8];
-    for (uint rank = 0u; rank < n_rank; ++rank) {
-        order[rank] = rank;
-        uint pos = rank;
-        while (pos > 0u &&
-               selected_experts[token_rank_base + order[pos - 1u]] >
-                   selected_experts[token_rank_base + order[pos]]) {
-            const uint previous = order[pos - 1u];
-            order[pos - 1u] = order[pos];
-            order[pos] = previous;
-            --pos;
+    if (tid == 0u) {
+        for (uint rank = 0u; rank < n_rank; ++rank) {
+            order[rank] = rank;
+            uint pos = rank;
+            while (pos > 0u &&
+                   selected_experts[token_rank_base + order[pos - 1u]] >
+                       selected_experts[token_rank_base + order[pos]]) {
+                const uint previous = order[pos - 1u];
+                order[pos - 1u] = order[pos];
+                order[pos] = previous;
+                --pos;
+            }
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    const uint row = tgid.x * tg_size + tid;
+    if (row >= n_rows) {
+        return;
+    }
+    const uint gid = token * n_rows + row;
     float value = 0.0f;
     for (uint sorted_rank = 0u; sorted_rank < n_rank; ++sorted_rank) {
         const uint slot = token_rank_base + order[sorted_rank];

@@ -741,7 +741,7 @@ pub struct MetalContext {
     pub(crate) qwen_moe_chain_small_pipelines:
         [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 3],
     pub(crate) qwen_moe_chain_large_pipelines:
-        [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 6],
+        [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 8],
     pub(crate) qwen_moe_chain_cast_large_slots_pipeline:
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) qwen_moe_chain_cast_compact_slots_pipeline:
@@ -1218,13 +1218,15 @@ impl MetalContext {
         &self,
         variant: usize,
     ) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-        const NAMES: [&str; 6] = [
+        const NAMES: [&str; 8] = [
             "qwen_moe_chain_large_q4k_f32",
             "qwen_moe_chain_large_q4k_f16",
             "qwen_moe_chain_large_q5k_f16",
             "qwen_moe_chain_large_q6k_f16",
             "qwen_moe_chain_large_q4k_f16_dense",
             "qwen_moe_chain_large_q6k_f16_dense",
+            "qwen_moe_chain_tail_q4k_f16",
+            "qwen_moe_chain_tail_q6k_f16",
         ];
         let cell = self.qwen_moe_chain_large_pipelines.get(variant)?;
         self.tensorops_capable
