@@ -665,6 +665,16 @@ impl CudaState {
         {
             return self.q8_0_mmq_batch(weights, rows, blocks_per_row, seq_len, input);
         }
+        if kernel == "rnb_q2k_gemv_batch_warp8"
+            && tuning::q2k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
+        {
+            return self.q2k_mmq_batch(weights, rows, blocks_per_row, seq_len, input);
+        }
+        if kernel == "rnb_q3k_gemv_batch_warp8"
+            && tuning::q3k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
+        {
+            return self.q3k_mmq_batch(weights, rows, blocks_per_row, seq_len, input);
+        }
         if kernel == "rnb_q5_0_gemv_batch"
             && seq_len <= 32
             && std::env::var("RNB_CUDA_Q5_0_BATCH_SEQ32").ok().as_deref() == Some("1")
@@ -680,6 +690,120 @@ impl CudaState {
         }
         self.gemv_batch(kernel, weights, rows, blocks_per_row, seq_len, input)
     }
+    fn q3k_mmq_batch(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let output_len = seq_len
+            .checked_mul(rows)
+            .ok_or_else(|| "Q3K MMQ output length overflow".to_string())?;
+        let output_bytes = output_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "Q3K MMQ output byte size overflow".to_string())?;
+        let input_bytes = std::mem::size_of_val(input);
+        let input_dev = self.compute_input_ptr(input_bytes)?;
+        let output_dev = self.compute_output_ptr(output_bytes)?;
+        let qs_bytes = input.len();
+        let ds_bytes = (input.len() / 32)
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "Q3K MMQ scale byte size overflow".to_string())?;
+        let ds_offset = qs_bytes.next_multiple_of(256);
+        let slab_bytes = (ds_offset + ds_bytes).next_multiple_of(256);
+        let slab = self.compute_temp_slab_ptr(slab_bytes)?;
+        let input_qs_dev = slab;
+        let input_ds_dev = slab + ds_offset as u64;
+        unsafe {
+            self.api.memcpy_htod_async(
+                input_dev,
+                input.as_ptr().cast::<libc::c_void>(),
+                input_bytes,
+                self.stream,
+            )?;
+        }
+        self.launch_quantize_q8_1_by_32(input_dev, input_qs_dev, input_ds_dev, input.len())?;
+        self.launch_q3k_q8_1_matmul_mmq_tile32(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_qs_dev,
+            input_ds_dev,
+            output_dev,
+        )?;
+        let mut output = vec![0.0f32; output_len];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                output.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+        Ok(output)
+    }
+
+    fn q2k_mmq_batch(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let output_len = seq_len
+            .checked_mul(rows)
+            .ok_or_else(|| "Q2K MMQ output length overflow".to_string())?;
+        let output_bytes = output_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "Q2K MMQ output byte size overflow".to_string())?;
+        let input_bytes = std::mem::size_of_val(input);
+        let input_dev = self.compute_input_ptr(input_bytes)?;
+        let output_dev = self.compute_output_ptr(output_bytes)?;
+        let qs_bytes = input.len();
+        let ds_bytes = (input.len() / 32)
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "Q2K MMQ scale byte size overflow".to_string())?;
+        let ds_offset = qs_bytes.next_multiple_of(256);
+        let slab_bytes = (ds_offset + ds_bytes).next_multiple_of(256);
+        let slab = self.compute_temp_slab_ptr(slab_bytes)?;
+        let input_qs_dev = slab;
+        let input_ds_dev = slab + ds_offset as u64;
+        unsafe {
+            self.api.memcpy_htod_async(
+                input_dev,
+                input.as_ptr().cast::<libc::c_void>(),
+                input_bytes,
+                self.stream,
+            )?;
+        }
+        self.launch_quantize_q8_1_by_32(input_dev, input_qs_dev, input_ds_dev, input.len())?;
+        self.launch_q2k_q8_1_matmul_mmq_tile32(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_qs_dev,
+            input_ds_dev,
+            output_dev,
+        )?;
+        let mut output = vec![0.0f32; output_len];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                output.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+        Ok(output)
+    }
+
     fn q8_0_mmq_batch(
         &mut self,
         weights: &[u8],

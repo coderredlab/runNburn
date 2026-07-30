@@ -11839,6 +11839,100 @@ fn cuda_q6k_gemv_batch_matches_cpu_reference() {
 }
 
 #[test]
+fn cuda_q3k_mmq_tile32_matches_cpu_reference_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q3K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 37usize;
+    let weights = make_test_q3k_weights(rows, blocks_per_row, 99);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let mut expected = Vec::with_capacity(seq_len * rows);
+    for token in 0..seq_len {
+        expected.extend(cpu_q3k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            &input[token * cols..(token + 1) * cols],
+        ));
+    }
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..16 {
+        let actual = q3k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q3_K tiled MMQ");
+        // Q8_1 activation quantization leaves a small absolute noise tail on
+        // this fixture's largest-|d| rows (worst observed 0.37 of ~39k rows),
+        // so the gate combines an absolute floor with a relative bound.
+        assert_close_rows_abs_rel(
+            &format!("Q3_K tiled MMQ run {run}"),
+            &actual,
+            &expected,
+            0.5,
+            0.02,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q3_K tiled MMQ run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
+#[test]
+fn cuda_q2k_mmq_tile32_matches_cpu_reference_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q2K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 37usize;
+    let weights = make_test_q2k_weights(rows, blocks_per_row, 99);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let mut expected = Vec::with_capacity(seq_len * rows);
+    for token in 0..seq_len {
+        expected.extend(cpu_q2k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            &input[token * cols..(token + 1) * cols],
+        ));
+    }
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..16 {
+        let actual = q2k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q2_K tiled MMQ");
+        assert_close_rows(
+            &format!("Q2_K tiled MMQ run {run}"),
+            &actual,
+            &expected,
+            0.3,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q2_K tiled MMQ run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
+#[test]
 fn cuda_q6k_mmq_tile32_matches_cpu_reference_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");

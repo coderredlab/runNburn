@@ -131,6 +131,14 @@ pub fn q4k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
 }
 
+pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
+    let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
+    eligible && env_bool("RNB_CUDA_Q2K_MMQ_TILE32", true)
+}
+pub fn q3k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
+    let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
+    eligible && env_bool("RNB_CUDA_Q3K_MMQ_TILE32", true)
+}
 pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
