@@ -13,6 +13,7 @@ struct Entry {
 /// The caller owns cached values and removes the keys returned by [`Self::touch`].
 /// Keeping accounting separate lets memory policy stay in `rnb-memory` while the
 /// owning subsystem retains its value types and synchronization strategy.
+#[derive(Clone)]
 pub struct ByteLruPolicy<K>
 where
     K: Clone + Eq + Hash + Ord,

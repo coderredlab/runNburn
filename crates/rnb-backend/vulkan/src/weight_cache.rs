@@ -46,6 +46,16 @@ pub enum WeightKind {
     GdnSsmDtBias,
     /// GDN per-head-dim RMS norm Raw32 — `[head_v_dim]`.
     GdnSsmNorm,
+    /// F32 `[n_expert, hidden]` MoE router matrix.
+    MoeRouter,
+    /// F32 `[hidden]` shared-expert sigmoid gate vector.
+    MoeSharedInputScale,
+    /// One selected sparse expert gate projection.
+    MoeExpertGate(u16),
+    /// One selected sparse expert up projection.
+    MoeExpertUp(u16),
+    /// One selected sparse expert down projection.
+    MoeExpertDown(u16),
     OutputLogits,
     /// Attention RMS norm weight (pre-attn layernorm)
     AttnNorm,
@@ -202,12 +212,16 @@ pub(crate) fn effective_upload_mode(
 struct CachedWeight {
     buf: GpuBuffer,
     last_used: u64,
+    pinned: bool,
 }
 
 pub struct GpuWeightCache {
-    entries: HashMap<WeightId, CachedWeight>,
+    // Cached weights are boxed so references to pinned base weights stay stable
+    // while sparse expert insertions grow or rehash the map.
+    entries: HashMap<WeightId, Box<CachedWeight>>,
     total_cached: u64,
     budget: u64,
+    external_reserved: u64,
     tick: u64,
     staging_buf: Option<GpuBuffer>,
 }
@@ -219,9 +233,106 @@ impl GpuWeightCache {
             entries: HashMap::new(),
             total_cached: 0,
             budget,
+            external_reserved: 0,
             tick: 0,
             staging_buf: None,
         }
+    }
+
+    unsafe fn evict_to_fit(
+        &mut self,
+        ctx: &VulkanContext,
+        incoming_bytes: u64,
+    ) -> Result<(), String> {
+        while self.total_cached + self.external_reserved + incoming_bytes > self.budget {
+            let lru_id = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.pinned)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| {
+                    format!(
+                        "GPU weight cache pinned set exceeds budget: cached={} external={} incoming={} budget={}",
+                        self.total_cached, self.external_reserved, incoming_bytes, self.budget
+                    )
+                })?;
+            let evicted = self.entries.remove(&lru_id).unwrap();
+            self.total_cached -= evicted.buf.size;
+            ctx.destroy_buffer(evicted.buf);
+        }
+        Ok(())
+    }
+
+    /// Drop every unpinned entry before a backend-owned arena claims the
+    /// remaining cache budget.
+    pub(crate) unsafe fn reclaim_unpinned(&mut self, ctx: &VulkanContext) -> u64 {
+        let ids = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| (!entry.pinned).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(entry) = self.entries.remove(&id) {
+                self.total_cached = self.total_cached.saturating_sub(entry.buf.size);
+                ctx.destroy_buffer(entry.buf);
+            }
+        }
+        self.budget
+            .saturating_sub(self.total_cached)
+            .saturating_sub(self.external_reserved)
+    }
+
+    /// Project the cache budget left after all unpinned entries are reclaimed.
+    pub(crate) fn available_after_reclaim_bytes(&self) -> u64 {
+        let pinned_bytes = self
+            .entries
+            .values()
+            .filter(|entry| entry.pinned)
+            .fold(0_u64, |total, entry| total.saturating_add(entry.buf.size));
+        self.budget
+            .saturating_sub(pinned_bytes)
+            .saturating_sub(self.external_reserved)
+    }
+
+    /// Account for a Vulkan allocation managed outside the entry map.
+    pub(crate) fn reserve_external(&mut self, bytes: u64) -> Result<(), String> {
+        let used = self
+            .total_cached
+            .checked_add(self.external_reserved)
+            .and_then(|value| value.checked_add(bytes))
+            .ok_or("GPU weight cache external reservation overflow")?;
+        if used > self.budget {
+            return Err(format!(
+                "GPU weight cache external reservation exceeds budget: cached={} external={} requested={} budget={}",
+                self.total_cached, self.external_reserved, bytes, self.budget
+            ));
+        }
+        self.external_reserved += bytes;
+        Ok(())
+    }
+
+    pub(crate) fn release_external(&mut self, bytes: u64) -> Result<(), String> {
+        if bytes > self.external_reserved {
+            return Err(format!(
+                "GPU weight cache external release exceeds reservation: reserved={} released={bytes}",
+                self.external_reserved
+            ));
+        }
+        self.external_reserved -= bytes;
+        Ok(())
+    }
+
+    pub(crate) const fn budget_bytes(&self) -> u64 {
+        self.budget
+    }
+
+    pub(crate) const fn cached_bytes(&self) -> u64 {
+        self.total_cached
+    }
+
+    pub(crate) const fn external_reserved_bytes(&self) -> u64 {
+        self.external_reserved
     }
 
     /// Get cached buffer or repack+upload from raw_bytes.
@@ -286,18 +397,7 @@ impl GpuWeightCache {
 
                 let buf_size = (repacked.len() * 4) as u64;
 
-                // Evict LRU entries until budget allows new allocation
-                while self.total_cached + buf_size > self.budget && !self.entries.is_empty() {
-                    let lru_id = self
-                        .entries
-                        .iter()
-                        .min_by_key(|(_, e)| e.last_used)
-                        .map(|(id, _)| *id)
-                        .unwrap();
-                    let evicted = self.entries.remove(&lru_id).unwrap();
-                    self.total_cached -= evicted.buf.size;
-                    ctx.destroy_buffer(evicted.buf);
-                }
+                self.evict_to_fit(ctx, buf_size)?;
 
                 // Ensure staging buffer is large enough
                 let staging_ok = self
@@ -353,9 +453,10 @@ impl GpuWeightCache {
                 let entry = CachedWeight {
                     buf: device_buf,
                     last_used: self.tick,
+                    pinned: false,
                 };
                 self.total_cached += buf_size;
-                self.entries.insert(id, entry);
+                self.entries.insert(id, Box::new(entry));
             }
 
             GpuWeightMode::RowMajor => {
@@ -387,18 +488,7 @@ impl GpuWeightCache {
         // allocation so the final byte load never crosses the descriptor.
         let buf_size = raw_bytes.len().max(1).next_multiple_of(4) as u64;
 
-        // Evict LRU entries until budget allows new allocation
-        while self.total_cached + buf_size > self.budget && !self.entries.is_empty() {
-            let lru_id = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(id, _)| *id)
-                .unwrap();
-            let evicted = self.entries.remove(&lru_id).unwrap();
-            self.total_cached -= evicted.buf.size;
-            ctx.destroy_buffer(evicted.buf);
-        }
+        self.evict_to_fit(ctx, buf_size)?;
 
         // host-visible 버퍼 생성 후 raw_bytes 직접 업로드 (staging 불필요)
         let buf = ctx.create_buffer(
@@ -412,9 +502,10 @@ impl GpuWeightCache {
         let entry = CachedWeight {
             buf,
             last_used: self.tick,
+            pinned: false,
         };
         self.total_cached += buf_size;
-        self.entries.insert(id, entry);
+        self.entries.insert(id, Box::new(entry));
         Ok(())
     }
 
@@ -435,17 +526,7 @@ impl GpuWeightCache {
             std::borrow::Cow::Owned(padded)
         };
 
-        while self.total_cached + buf_size > self.budget && !self.entries.is_empty() {
-            let lru_id = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(entry_id, _)| *entry_id)
-                .unwrap();
-            let evicted = self.entries.remove(&lru_id).unwrap();
-            self.total_cached -= evicted.buf.size;
-            ctx.destroy_buffer(evicted.buf);
-        }
+        self.evict_to_fit(ctx, buf_size)?;
 
         let staging_ok = self
             .staging_buf
@@ -492,10 +573,11 @@ impl GpuWeightCache {
         self.total_cached += buf_size;
         self.entries.insert(
             id,
-            CachedWeight {
+            Box::new(CachedWeight {
                 buf,
                 last_used: self.tick,
-            },
+                pinned: false,
+            }),
         );
         Ok(())
     }
@@ -519,12 +601,25 @@ impl GpuWeightCache {
         self.entries.get(&id).map(|e| &e.buf)
     }
 
+    /// Keep an uploaded weight resident while a full-path graph stores raw
+    /// buffer handles for it. Sparse expert pages remain unpinned and can
+    /// cycle through the remaining cache budget.
+    pub fn pin(&mut self, id: WeightId) -> Result<(), String> {
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| format!("cannot pin missing GPU weight {id:?}"))?;
+        entry.pinned = true;
+        Ok(())
+    }
+
     /// Destroy all GPU resources. Must be called before drop if ctx is available.
     pub unsafe fn destroy(&mut self, ctx: &VulkanContext) {
         for (_, entry) in self.entries.drain() {
             ctx.destroy_buffer(entry.buf);
         }
         self.total_cached = 0;
+        self.external_reserved = 0;
         if let Some(staging) = self.staging_buf.take() {
             ctx.destroy_buffer(staging);
         }
@@ -691,5 +786,40 @@ mod tests {
             .unwrap(),
             "k_shard_0_kvh0"
         );
+    }
+    #[test]
+    fn cached_weight_addresses_survive_hashmap_growth() {
+        let first_id = WeightId {
+            layer: 0,
+            kind: WeightKind::AttnNorm,
+        };
+        let make_entry = |size| {
+            Box::new(CachedWeight {
+                buf: GpuBuffer {
+                    buffer: 0,
+                    memory: 0,
+                    size,
+                },
+                last_used: 0,
+                pinned: true,
+            })
+        };
+        let mut cache = GpuWeightCache::new(u64::MAX);
+        cache.entries.insert(first_id, make_entry(7));
+        let initial = &cache.entries[&first_id].buf as *const GpuBuffer;
+
+        for expert in 0..1024u16 {
+            cache.entries.insert(
+                WeightId {
+                    layer: 1,
+                    kind: WeightKind::MoeExpertGate(expert),
+                },
+                make_entry(u64::from(expert) + 1),
+            );
+        }
+
+        let current = &cache.entries[&first_id].buf as *const GpuBuffer;
+        assert_eq!(initial, current);
+        assert_eq!(cache.entries[&first_id].buf.size, 7);
     }
 }

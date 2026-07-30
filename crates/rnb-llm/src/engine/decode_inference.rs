@@ -98,8 +98,11 @@ impl Engine {
             )
         })?;
 
-        let (layer_raw, layer_kinds) =
-            super::inference::build_fullpath_layer_raw_weights(weights, &self.metadata)?;
+        let (layer_raw, layer_kinds) = super::inference::build_fullpath_layer_raw_weights(
+            weights,
+            &self.metadata,
+            self.architecture,
+        )?;
 
         let embed_quant = super::Engine::fullpath_embed_quant_or_error(
             weights.token_embd.ggml_type,
@@ -129,6 +132,10 @@ impl Engine {
         let max_ctx = self.kv_cache.max_seq_len;
         let kv_cursor = self.kv_cache.current_len();
         let (rope_dim, rope_neox) = self.fullpath_rope_config();
+        let excluded_token = self
+            .scratch
+            .as_ref()
+            .and_then(|scratch| scratch.backend_argmax_excluded_token);
 
         let staging = super::gpu_runtime::StagingPolicy::default();
         let output = gpu
@@ -149,6 +156,7 @@ impl Engine {
                 max_ctx,
                 output_quantized,
                 output_quant,
+                excluded_token,
                 output_norm,
                 token_embd_quantized,
                 embed_quant,

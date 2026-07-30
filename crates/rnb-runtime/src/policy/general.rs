@@ -204,6 +204,7 @@ pub fn mtp_fast_retain_enabled() -> bool {
         })
         .unwrap_or(cfg!(any(
             feature = "cuda",
+            feature = "vulkan",
             all(target_arch = "aarch64", target_os = "android")
         )))
 }
@@ -228,8 +229,12 @@ pub fn mtp_runway_max_extra() -> Option<usize> {
     env_usize("RNB_MTP_RUNWAY_MAX_EXTRA")
 }
 
+pub fn mtp_output_argmax_override() -> Option<bool> {
+    env_truthy_override("RNB_MTP_OUTPUT_ARGMAX")
+}
+
 pub fn mtp_output_argmax_enabled() -> bool {
-    env_truthy_override("RNB_MTP_OUTPUT_ARGMAX").unwrap_or_else(mtp_device_verify_enabled)
+    mtp_output_argmax_override().unwrap_or_else(mtp_device_verify_enabled)
 }
 
 pub fn mtp_decode_block_enabled() -> bool {

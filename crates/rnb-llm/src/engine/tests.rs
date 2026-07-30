@@ -953,7 +953,9 @@ fn fullpath_gdn_extraction_accepts_f32_alpha_beta() {
         ssm_conv_kernel: 4,
         full_attention_interval: 0,
     };
-    let (raw, kinds) = inference::build_fullpath_layer_raw_weights(&weights, &metadata).unwrap();
+    let (raw, kinds) =
+        inference::build_fullpath_layer_raw_weights(&weights, &metadata, ModelArchitecture::LLaMA)
+            .unwrap();
     assert_eq!(kinds, vec![gpu_runtime::ModelLayerKind::Recurrent]);
     match &raw[0] {
         gpu_runtime::LayerRawWeights::Gdn(g) => {
@@ -1562,10 +1564,7 @@ fn make_hybrid_slice1_engine(vocab_size: usize) -> Engine {
         mtp: None,
         mtp_runtime: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
-        packed_model: None,
-        shadow_model: None,
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
-        moe_section_decode_bytes: None,
         #[cfg(feature = "vulkan")]
         fullpath_token_embd_bound: false,
         last_layer_hidden_cached: Vec::new(),
@@ -1994,10 +1993,7 @@ fn make_real_gpu_multi_layer_attention_engine(
         mtp: None,
         mtp_runtime: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
-        packed_model: None,
-        shadow_model: None,
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
-        moe_section_decode_bytes: None,
         #[cfg(feature = "vulkan")]
         fullpath_token_embd_bound: false,
         last_layer_hidden_cached: Vec::new(),
@@ -2197,10 +2193,7 @@ fn make_real_gpu_hybrid_slice1_engine(vocab_size: usize, with_suffix: bool) -> E
         mtp: None,
         mtp_runtime: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
-        packed_model: None,
-        shadow_model: None,
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
-        moe_section_decode_bytes: None,
         #[cfg(feature = "vulkan")]
         fullpath_token_embd_bound: false,
         last_layer_hidden_cached: Vec::new(),
@@ -2398,10 +2391,7 @@ fn make_real_gpu_hybrid_slice1_gqa_engine_with_suffix(vocab_size: usize) -> Engi
         mtp: None,
         mtp_runtime: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
-        packed_model: None,
-        shadow_model: None,
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
-        moe_section_decode_bytes: None,
         #[cfg(feature = "vulkan")]
         fullpath_token_embd_bound: false,
         last_layer_hidden_cached: Vec::new(),

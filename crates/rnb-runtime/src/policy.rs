@@ -209,6 +209,7 @@ mod policy_tests {
         std::env::remove_var("RNB_SPEC_MTP_SEQUENTIAL_MULTI");
 
         assert!(!mtp_output_argmax_enabled());
+        assert_eq!(mtp_output_argmax_override(), None);
         assert!(mtp_decode_block_enabled());
         assert!(!mtp_batch_verify_enabled());
         assert!(!mtp_batch_verify_disabled());
@@ -216,6 +217,7 @@ mod policy_tests {
             mtp_fast_retain_enabled(),
             cfg!(any(
                 feature = "cuda",
+                feature = "vulkan",
                 all(target_arch = "aarch64", target_os = "android")
             ))
         );
@@ -236,6 +238,7 @@ mod policy_tests {
         std::env::set_var("RNB_SPEC_MTP_SEQUENTIAL_MULTI", "1");
 
         assert!(mtp_output_argmax_enabled());
+        assert_eq!(mtp_output_argmax_override(), Some(true));
         assert!(!mtp_decode_block_enabled());
         assert!(mtp_batch_verify_enabled());
         assert!(!mtp_batch_verify_disabled());
@@ -248,6 +251,7 @@ mod policy_tests {
 
         std::env::set_var("RNB_MTP_OUTPUT_ARGMAX", "off");
         assert!(!mtp_output_argmax_enabled());
+        assert_eq!(mtp_output_argmax_override(), Some(false));
         std::env::set_var("RNB_MTP_BATCH_VERIFY", "0");
         assert!(!mtp_batch_verify_enabled());
         assert!(mtp_batch_verify_disabled());

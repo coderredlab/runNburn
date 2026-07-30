@@ -35,6 +35,13 @@ use super::trace::{dump_bin, dump_bin_dir, emit_layer_trace};
 #[cfg(any(feature = "cuda", feature = "vulkan"))]
 use super::types::ModelMetadata;
 
+#[cfg(feature = "vulkan")]
+pub(crate) struct VulkanFullpathVerifyCommit {
+    base_kv_len: usize,
+    verify_input: Vec<u32>,
+    sequence_state: super::gpu_runtime::FullPathSequenceStateSnapshot,
+}
+
 impl Engine {
     pub fn architecture(&self) -> rnb_loader::Architecture {
         self.architecture
@@ -93,7 +100,15 @@ impl Engine {
             .is_ok()
             && Self::fullpath_ffn_inner_dim_or_error(weights, "fullpath_prefill_supported").is_ok()
             && Self::fullpath_vocab_rows_or_error(weights, "fullpath_prefill_supported").is_ok()
-            && fullpath_layer_raw_weights_supported(weights, &self.metadata)
+            && match build_fullpath_layer_raw_weights(weights, &self.metadata, self.architecture) {
+                Ok(_) => true,
+                Err(error) => {
+                    if crate::runtime::scheduler::fullpath_gpu_prefill_requested() {
+                        eprintln!("[vulkan:fullpath] unsupported model: {error}");
+                    }
+                    false
+                }
+            }
     }
     #[cfg(feature = "vulkan")]
     pub(super) fn prepare_vulkan_fullpath_model_for_load(&mut self) -> crate::error::Result<()> {
@@ -117,7 +132,8 @@ impl Engine {
                     "prepare_vulkan_fullpath_model_for_load: engine weights are unavailable".into(),
                 )
             })?;
-            let (layer_raw, _) = build_fullpath_layer_raw_weights(weights, &self.metadata)?;
+            let (layer_raw, _) =
+                build_fullpath_layer_raw_weights(weights, &self.metadata, self.architecture)?;
             let output_quant = Self::fullpath_output_quant_or_error(
                 weights.output.ggml_type,
                 "prepare_vulkan_fullpath_model_for_load",
@@ -1275,19 +1291,28 @@ impl Engine {
         };
         let _norm_eps = self.metadata.norm_eps;
         let kv_cache = std::mem::replace(&mut self.kv_cache, new_empty_kv_cache(&self.metadata));
+        let collect_hidden_rows = self.mtp_spec_requested();
 
         #[cfg(feature = "vulkan")]
-        let result: crate::error::Result<Vec<f32>> = {
+        let result: crate::error::Result<(Vec<f32>, Option<Vec<f32>>, Option<Vec<u32>>)> = {
             let mut scratch = self.scratch.take();
             let mut gpu_runtime = self.backend_runtime.take_gpu_runtime();
-            let outcome = self.fullpath_run_prefill(tokens, scratch.as_mut(), gpu_runtime.as_mut());
+            let outcome = self.fullpath_run_prefill(
+                tokens,
+                0,
+                collect_hidden_rows,
+                false,
+                false,
+                scratch.as_mut(),
+                gpu_runtime.as_mut(),
+            );
             self.scratch = scratch;
             self.backend_runtime.restore_gpu_runtime(gpu_runtime);
             outcome
         };
 
         #[cfg(not(feature = "vulkan"))]
-        let result: crate::error::Result<Vec<f32>> = {
+        let result: crate::error::Result<(Vec<f32>, Option<Vec<f32>>, Option<Vec<u32>>)> = {
             let _ = tokens;
             Err(crate::error::LlmError::Forward(
                 "mv27-task10b-4c: fullpath body wiring pending (vulkan feature disabled)".into(),
@@ -1299,14 +1324,16 @@ impl Engine {
         // 후속 decode 가 올바른 pos_start 를 본다. take/restore 만으로는 cursor 가
         // 0 에 머물러서 다음 decode 가 prefill 처음부터 시작하는 버그가 났었다.
         self.kv_cache = kv_cache;
-        if result.is_ok() {
-            let new_len = self.kv_cache.current_len() + tokens.len();
-            self.kv_cache.set_len(new_len);
-            if let Some(scratch) = self.scratch.as_mut() {
-                scratch.fullpath_resident_kv_active = true;
-            }
+        let (logits, hidden_rows, _) = result?;
+        let new_len = self.kv_cache.current_len() + tokens.len();
+        self.kv_cache.set_len(new_len);
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.fullpath_resident_kv_active = true;
         }
-        result
+        if let Some(hidden_rows) = hidden_rows.as_ref() {
+            self.mtp_observe_prompt_batch(tokens, hidden_rows)?;
+        }
+        Ok(logits)
     }
 
     /// mv27 task 10b-4c-3: 4c-2a 의 `LayerRuntime::run_fullpath_prefill`
@@ -1332,9 +1359,13 @@ impl Engine {
     fn fullpath_run_prefill(
         &mut self,
         tokens: &[u32],
+        pos_start: usize,
+        collect_hidden_rows: bool,
+        collect_all_argmax: bool,
+        skip_output: bool,
         scratch: Option<&mut super::types::ScratchBuffers>,
         gpu_runtime: Option<&mut super::backend_runtime::GpuRuntime>,
-    ) -> crate::error::Result<Vec<f32>> {
+    ) -> crate::error::Result<(Vec<f32>, Option<Vec<f32>>, Option<Vec<u32>>)> {
         let gpu = gpu_runtime.ok_or_else(|| {
             crate::error::LlmError::Forward(
                 "fullpath_run_prefill: gpu_runtime is None — fullpath path requires an active GPU runtime".into(),
@@ -1347,10 +1378,9 @@ impl Engine {
             )
         })?;
 
-        // 1. Build per-layer LayerRawWeights<'_> + ModelLayerKind from
-        //    engine.weights. GDN / MoE layers return Err — those are
-        //    10b-5 / future task scope.
-        let (layer_raw, layer_kinds) = build_fullpath_layer_raw_weights(weights, &self.metadata)?;
+        // 1. Build Attention/GDN raw views, including shared-and-sparse MoE.
+        let (layer_raw, layer_kinds) =
+            build_fullpath_layer_raw_weights(weights, &self.metadata, self.architecture)?;
 
         // 2. Pull token embedding / quantized output bytes for the wrapper.
         let embed_quant = Self::fullpath_embed_quant_or_error(
@@ -1381,9 +1411,13 @@ impl Engine {
         // 4. Call wrapper. Output's last_token_id is the GPU-side argmax;
         //    counters are dropped here (caller observes via runtime_counters()).
         let staging = super::gpu_runtime::StagingPolicy::default();
+        let excluded_token = scratch
+            .as_ref()
+            .and_then(|scratch| scratch.backend_argmax_excluded_token);
         let output = gpu
             .run_fullpath_prefill(
                 tokens,
+                pos_start,
                 metadata.num_layers,
                 metadata.hidden_dim,
                 metadata.num_heads,
@@ -1398,11 +1432,15 @@ impl Engine {
                 max_ctx,
                 output_quantized,
                 output_quant,
+                excluded_token,
                 output_norm,
                 token_embd_quantized,
                 embed_quant,
                 &layer_raw,
                 &layer_kinds,
+                collect_hidden_rows,
+                collect_all_argmax,
+                skip_output,
                 staging,
             )
             .map_err(crate::error::LlmError::Forward)?;
@@ -1421,7 +1459,121 @@ impl Engine {
         // (after the take/restore restore), since `kv_cache` is moved out
         // before this body runs.
         let _ = output.kv_cursor_after; // GPU-side cursor; CPU side advanced in caller.
-        Ok(Vec::new())
+        Ok((Vec::new(), output.hidden_rows, output.argmax_tokens))
+    }
+    pub(crate) fn vulkan_fullpath_verify_ready(&self) -> bool {
+        crate::runtime::scheduler::fullpath_gpu_prefill_requested()
+            && self.backend_runtime.has_active_gpu_prefill_path()
+            && self
+                .scratch
+                .as_ref()
+                .is_some_and(|scratch| scratch.fullpath_resident_kv_active)
+    }
+
+    pub(crate) fn forward_vulkan_fullpath_verify_window(
+        &mut self,
+        tokens: &[u32],
+    ) -> crate::error::Result<(
+        crate::engine::verify_window::VerifyWindowResult,
+        VulkanFullpathVerifyCommit,
+    )> {
+        if tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "Vulkan fullpath MTP verify requires at least one token".to_string(),
+            ));
+        }
+        let base_kv_len = self.kv_cache.current_len();
+        let mut gpu_runtime = self.backend_runtime.take_gpu_runtime();
+        let result = (|| {
+            let sequence_state = gpu_runtime
+                .as_mut()
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Vulkan fullpath MTP verify requires an active GPU runtime".to_string(),
+                    )
+                })?
+                .snapshot_fullpath_sequence_state()
+                .map_err(crate::error::LlmError::Forward)?;
+            let (_, hidden_rows, argmax_tokens) = self.fullpath_run_prefill(
+                tokens,
+                base_kv_len,
+                true,
+                true,
+                false,
+                None,
+                gpu_runtime.as_mut(),
+            )?;
+            let target_tokens = argmax_tokens.ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "Vulkan fullpath MTP verify did not return per-row argmax tokens".to_string(),
+                )
+            })?;
+            let mtp_hidden_rows = hidden_rows.ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "Vulkan fullpath MTP verify did not return target hidden rows".to_string(),
+                )
+            })?;
+            Ok((
+                crate::engine::verify_window::VerifyWindowResult {
+                    target_tokens,
+                    mtp_hidden_rows,
+                    hidden_dim: self.metadata.hidden_dim,
+                    prefix_state: None,
+                    prefix_states: Vec::new(),
+                    #[cfg(any(feature = "cuda", test))]
+                    ssm_final_states: Vec::new(),
+                    #[cfg(any(feature = "cuda", test))]
+                    attention_kv_states: Vec::new(),
+                },
+                VulkanFullpathVerifyCommit {
+                    base_kv_len,
+                    verify_input: tokens.to_vec(),
+                    sequence_state,
+                },
+            ))
+        })();
+        self.backend_runtime.restore_gpu_runtime(gpu_runtime);
+        result
+    }
+
+    pub(crate) fn commit_vulkan_fullpath_verify(
+        &mut self,
+        commit: VulkanFullpathVerifyCommit,
+        committed_tokens: usize,
+    ) -> crate::error::Result<bool> {
+        if committed_tokens == 0 || committed_tokens > commit.verify_input.len() {
+            return Err(crate::error::LlmError::Forward(format!(
+                "Vulkan fullpath MTP commit length {committed_tokens} is outside 1..={}",
+                commit.verify_input.len()
+            )));
+        }
+        let replayed = committed_tokens < commit.verify_input.len();
+        if committed_tokens < commit.verify_input.len() {
+            let mut gpu_runtime = self.backend_runtime.take_gpu_runtime();
+            let result: crate::error::Result<()> = (|| {
+                let gpu = gpu_runtime.as_mut().ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Vulkan fullpath MTP rollback requires an active GPU runtime".to_string(),
+                    )
+                })?;
+                gpu.restore_fullpath_sequence_state(&commit.sequence_state)
+                    .map_err(crate::error::LlmError::Forward)?;
+                let _ = self.fullpath_run_prefill(
+                    &commit.verify_input[..committed_tokens],
+                    commit.base_kv_len,
+                    false,
+                    false,
+                    true,
+                    None,
+                    Some(gpu),
+                )?;
+                Ok(())
+            })();
+            self.backend_runtime.restore_gpu_runtime(gpu_runtime);
+            result?;
+        }
+        self.kv_cache.set_len(commit.base_kv_len + committed_tokens);
+        Ok(replayed)
     }
 
     /// Legacy full-table binding for a quantized GPU fullpath token embedding.
@@ -1516,8 +1668,14 @@ impl Engine {
         let mut max_ffn_inner = 0usize;
         for (idx, layer) in weights.layers.iter().enumerate() {
             let rows = match layer {
-                super::layer_weights::LayerType::Attention(w) => w.ffn_gate_weight.rows,
-                super::layer_weights::LayerType::GatedDeltaNet(w) => w.ffn_gate_weight.rows,
+                super::layer_weights::LayerType::Attention(w) => w
+                    .shared_expert_moe
+                    .as_ref()
+                    .map_or(w.ffn_gate_weight.rows, |moe| moe.n_ff),
+                super::layer_weights::LayerType::GatedDeltaNet(w) => w
+                    .shared_expert_moe
+                    .as_ref()
+                    .map_or(w.ffn_gate_weight.rows, |moe| moe.n_ff),
                 other => {
                     return Err(crate::error::LlmError::Forward(format!(
                         "{caller}: layer {idx} is {}, which is not supported by fullpath ffn_inner sizing",
@@ -1828,6 +1986,12 @@ impl Engine {
         self.scratch
             .as_ref()
             .and_then(|scratch| scratch.backend_argmax_token)
+    }
+
+    pub(crate) fn set_backend_argmax_excluded_token(&mut self, token: Option<u32>) {
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.backend_argmax_excluded_token = token;
+        }
     }
 
     /// Test-only: install a minimal `ScratchBuffers` in a mock engine and seed
@@ -3248,52 +3412,7 @@ pub(super) fn layer_type_name(t: &super::layer_weights::LayerType) -> &'static s
 fn fullpath_attention_semantics_supported(
     attn: &super::layer_weights::AttentionLayerWeights,
 ) -> bool {
-    attn.post_attn_norm.is_none()
-        && attn.out_scale.is_none()
-        && attn.post_ffw_norm.is_none()
-        && attn.moe.is_none()
-        && attn.shared_expert_moe.is_none()
-}
-
-#[cfg(feature = "vulkan")]
-fn fullpath_layer_raw_weights_supported(
-    weights: &super::layer_weights::ModelWeights,
-    metadata: &ModelMetadata,
-) -> bool {
-    if weights.gemma_per_layer.is_some()
-        || weights.glm_dsa_attention.is_some()
-        || weights.rope_freqs.is_some()
-        || metadata.sliding_window > 0
-    {
-        return false;
-    }
-    for (layer_idx, layer) in weights.layers.iter().enumerate() {
-        match layer {
-            super::layer_weights::LayerType::Attention(attn) => {
-                if !fullpath_attention_semantics_supported(attn)
-                    || attn.ffn_gate_up_fused.is_some()
-                    || quant_weight_to_raw_tuple(&attn.q_weight, layer_idx, "q").is_err()
-                    || quant_weight_to_raw_tuple(&attn.k_weight, layer_idx, "k").is_err()
-                    || quant_weight_to_raw_tuple(&attn.v_weight, layer_idx, "v").is_err()
-                    || quant_weight_to_raw_tuple(&attn.o_weight, layer_idx, "o").is_err()
-                    || quant_weight_to_raw_tuple(&attn.ffn_gate_weight, layer_idx, "ffn_gate")
-                        .is_err()
-                    || quant_weight_to_raw_tuple(&attn.ffn_up_weight, layer_idx, "ffn_up").is_err()
-                    || quant_weight_to_raw_tuple(&attn.ffn_down_weight, layer_idx, "ffn_down")
-                        .is_err()
-                {
-                    return false;
-                }
-            }
-            super::layer_weights::LayerType::GatedDeltaNet(gdn) => {
-                if extract_gdn_raw_weights(gdn, metadata, layer_idx).is_err() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
+    attn.out_scale.is_none() && attn.post_ffw_norm.is_none() && attn.moe.is_none()
 }
 
 /// Build per-layer `LayerRawWeights<'_>` + `ModelLayerKind` arrays from
@@ -3303,20 +3422,17 @@ fn fullpath_layer_raw_weights_supported(
 /// Vec alive across the wrapper call (the wrapper consumes it within a single
 /// call, so this is automatic for direct callers).
 ///
-/// **Constraints (post 10b-5c)**:
-/// - Hybrid `Attention` + `GatedDeltaNet` layer mixes are supported (Qwen3.5
-///   0.8B). `NemotronMamba2` and `NemotronMoE` still return Err — those are
-///   future-task scope.
-/// - `ffn_gate_up_fused` (both Attention and GDN) must be `None`. Fused-FFN
-///   models stay unsupported until backend adds a fused-gate-up shader path.
-/// - GDN layers must have `shared_expert_moe` = `None`. Qwen3.5 0.8B is dense; the
-///   Qwen3.5 35B-A3B GDN-MoE path is out of scope for the dense fullpath PoC.
-/// - All quantized weights must map to a backend `QuantType` via
-///   `ggml_to_quant`. Unsupported quants (e.g. Q4_0, Q3_K) return Err.
+/// Supported model contract:
+/// - Hybrid `Attention` + `GatedDeltaNet` layer mixes, including Qwen
+///   shared-and-sparse MoE tails. `NemotronMamba2` and `NemotronMoE` remain
+///   separate layer kinds and are rejected.
+/// - `ffn_gate_up_fused` (both Attention and GDN) must be `None`.
+/// - Every quantized weight must map to a backend `QuantType`.
 #[cfg(feature = "vulkan")]
 pub(super) fn build_fullpath_layer_raw_weights<'a>(
     weights: &'a super::layer_weights::ModelWeights,
     metadata: &ModelMetadata,
+    architecture: rnb_loader::Architecture,
 ) -> crate::error::Result<(
     Vec<super::gpu_runtime::LayerRawWeights<'a>>,
     Vec<super::gpu_runtime::ModelLayerKind>,
@@ -3345,7 +3461,9 @@ pub(super) fn build_fullpath_layer_raw_weights<'a>(
 
                 // f32 norm slices via cpu_runtime kernels helper.
                 let attn_norm = super::cpu_runtime::kernels::tensor_as_f32_slice(&attn.attn_norm);
-                let ffn_norm = super::cpu_runtime::kernels::tensor_as_f32_slice(&attn.ffn_norm);
+                let ffn_norm = super::cpu_runtime::kernels::tensor_as_f32_slice(
+                    super::models::gemma::select_ffn_pre_norm_weight(attn, architecture),
+                );
                 let q_norm = attn
                     .q_norm
                     .as_ref()
@@ -3371,9 +3489,22 @@ pub(super) fn build_fullpath_layer_raw_weights<'a>(
                 let k_combined = quant_weight_to_raw_tuple(&attn.k_weight, idx, "k")?;
                 let v_combined = quant_weight_to_raw_tuple(&attn.v_weight, idx, "v")?;
                 let o_proj = quant_weight_to_raw_tuple(&attn.o_weight, idx, "o")?;
-                let gate_proj = quant_weight_to_raw_tuple(&attn.ffn_gate_weight, idx, "ffn_gate")?;
-                let up_proj = quant_weight_to_raw_tuple(&attn.ffn_up_weight, idx, "ffn_up")?;
-                let down_proj = quant_weight_to_raw_tuple(&attn.ffn_down_weight, idx, "ffn_down")?;
+                let (gate_proj, up_proj, down_proj, shared_expert_moe) =
+                    if let Some(moe) = attn.shared_expert_moe.as_ref() {
+                        (
+                            quant_weight_to_raw_tuple(&moe.shared_gate, idx, "ffn_gate_shexp")?,
+                            quant_weight_to_raw_tuple(&moe.shared_up, idx, "ffn_up_shexp")?,
+                            quant_weight_to_raw_tuple(&moe.shared_down, idx, "ffn_down_shexp")?,
+                            Some(extract_qwen_moe_raw_weights(moe, idx)?),
+                        )
+                    } else {
+                        (
+                            quant_weight_to_raw_tuple(&attn.ffn_gate_weight, idx, "ffn_gate")?,
+                            quant_weight_to_raw_tuple(&attn.ffn_up_weight, idx, "ffn_up")?,
+                            quant_weight_to_raw_tuple(&attn.ffn_down_weight, idx, "ffn_down")?,
+                            None,
+                        )
+                    };
 
                 layer_raw.push(gpu_runtime::LayerRawWeights::Attention(
                     gpu_runtime::AttentionRawWeights {
@@ -3391,6 +3522,7 @@ pub(super) fn build_fullpath_layer_raw_weights<'a>(
                         gate_proj,
                         up_proj,
                         down_proj,
+                        shared_expert_moe,
                     },
                 ));
                 layer_kinds.push(gpu_runtime::ModelLayerKind::Attention);
@@ -3419,12 +3551,8 @@ pub(super) fn build_fullpath_layer_raw_weights<'a>(
 /// f32 fields ride `tensor_as_f32_slice` / Raw32 upload, while projection
 /// fields carry their source format. GDN alpha/beta may be F32 or any Vulkan
 /// fullpath quant (Q4_K / Q5_K / Q6_K / Q8_0).
-///
-/// Rejects:
-/// - `shared_expert_moe.is_some()` — Qwen3.5 35B-A3B GDN-MoE is out of scope for the
-///   dense fullpath PoC.
-/// - `ffn_gate_up_fused.is_some()` — fused gate+up not supported by the
-///   wrapper (no fused-gate-up shader path yet).
+/// Shared-and-sparse MoE weights are extracted with the GDN projections.
+/// Fused gate+up projections remain unsupported.
 #[cfg(feature = "vulkan")]
 fn extract_gdn_raw_weights<'a>(
     g: &'a super::layer_weights::GdnLayerWeights,
@@ -3433,12 +3561,6 @@ fn extract_gdn_raw_weights<'a>(
 ) -> crate::error::Result<super::gpu_runtime::GdnRawWeights<'a>> {
     use super::gpu_runtime;
 
-    if g.shared_expert_moe.is_some() {
-        return Err(crate::error::LlmError::Forward(format!(
-            "build_fullpath_layer_raw_weights: layer {layer_idx} GDN layer has \
-             shared_expert_moe set — only dense GDN layers supported in fullpath wrapper",
-        )));
-    }
     if g.ffn_gate_up_fused.is_some() {
         return Err(crate::error::LlmError::Forward(format!(
             "build_fullpath_layer_raw_weights: layer {layer_idx} GDN layer has fused \
@@ -3465,9 +3587,22 @@ fn extract_gdn_raw_weights<'a>(
     let qkv = quant_weight_to_raw_tuple(&g.qkv_weight, layer_idx, "gdn_qkv")?;
     let gate = quant_weight_to_raw_tuple(&g.gate_weight, layer_idx, "gdn_gate")?;
     let ssm_out = quant_weight_to_raw_tuple(&g.ssm_out, layer_idx, "gdn_ssm_out")?;
-    let ffn_gate = quant_weight_to_raw_tuple(&g.ffn_gate_weight, layer_idx, "gdn_ffn_gate")?;
-    let ffn_up = quant_weight_to_raw_tuple(&g.ffn_up_weight, layer_idx, "gdn_ffn_up")?;
-    let ffn_down = quant_weight_to_raw_tuple(&g.ffn_down_weight, layer_idx, "gdn_ffn_down")?;
+    let (ffn_gate, ffn_up, ffn_down, shared_expert_moe) =
+        if let Some(moe) = g.shared_expert_moe.as_ref() {
+            (
+                quant_weight_to_raw_tuple(&moe.shared_gate, layer_idx, "gdn_ffn_gate_shexp")?,
+                quant_weight_to_raw_tuple(&moe.shared_up, layer_idx, "gdn_ffn_up_shexp")?,
+                quant_weight_to_raw_tuple(&moe.shared_down, layer_idx, "gdn_ffn_down_shexp")?,
+                Some(extract_qwen_moe_raw_weights(moe, layer_idx)?),
+            )
+        } else {
+            (
+                quant_weight_to_raw_tuple(&g.ffn_gate_weight, layer_idx, "gdn_ffn_gate")?,
+                quant_weight_to_raw_tuple(&g.ffn_up_weight, layer_idx, "gdn_ffn_up")?,
+                quant_weight_to_raw_tuple(&g.ffn_down_weight, layer_idx, "gdn_ffn_down")?,
+                None,
+            )
+        };
 
     let ssm_alpha = gdn_alpha_beta_to_raw_tuple(&g.ssm_alpha, layer_idx, "gdn_ssm_alpha")?;
     let ssm_beta = gdn_alpha_beta_to_raw_tuple(&g.ssm_beta, layer_idx, "gdn_ssm_beta")?;
@@ -3516,6 +3651,104 @@ fn extract_gdn_raw_weights<'a>(
         ffn_gate,
         ffn_up,
         ffn_down,
+        shared_expert_moe,
+    })
+}
+
+#[cfg(feature = "vulkan")]
+fn extract_qwen_moe_raw_weights<'a>(
+    moe: &'a super::models::shared_expert_moe::SharedExpertMoELayerWeights,
+    layer_idx: usize,
+) -> crate::error::Result<super::gpu_runtime::QwenMoeRawWeights<'a>> {
+    use super::gpu_runtime;
+
+    if !matches!(moe.expert_gating_func, 0 | 1) {
+        return Err(crate::error::LlmError::Forward(format!(
+            "build_fullpath_layer_raw_weights: layer {layer_idx} Qwen MoE gating function {} is unsupported",
+            moe.expert_gating_func
+        )));
+    }
+    if moe.n_embd == 0
+        || moe.n_ff == 0
+        || moe.n_expert == 0
+        || moe.n_expert_used == 0
+        || moe.n_expert_used > moe.n_expert
+        || moe.n_expert_used > 32
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "build_fullpath_layer_raw_weights: layer {layer_idx} invalid Qwen MoE shape n_embd={} n_ff={} n_expert={} n_expert_used={}",
+            moe.n_embd, moe.n_ff, moe.n_expert, moe.n_expert_used
+        )));
+    }
+    if moe.router_w.dtype() != rnb_core::tensor::DType::F32
+        || moe.shared_input_scale.dtype() != rnb_core::tensor::DType::F32
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "build_fullpath_layer_raw_weights: layer {layer_idx} Qwen MoE router/shared gate must be F32"
+        )));
+    }
+    let router = super::cpu_runtime::kernels::tensor_as_f32_slice(&moe.router_w);
+    let shared_input_scale =
+        super::cpu_runtime::kernels::tensor_as_f32_slice(&moe.shared_input_scale);
+    if router.len() != moe.n_expert * moe.n_embd || shared_input_scale.len() != moe.n_embd {
+        return Err(crate::error::LlmError::Forward(format!(
+            "build_fullpath_layer_raw_weights: layer {layer_idx} Qwen MoE router/shared gate shape mismatch"
+        )));
+    }
+    let sparse_gate = (
+        moe.gate_exps_bytes().ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} gate_exps raw bytes missing"
+            ))
+        })?,
+        gpu_runtime::ggml_to_fullpath_quant(moe.gate_quant).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} unsupported gate_exps quant {:?}",
+                moe.gate_quant
+            ))
+        })?,
+    );
+    let sparse_up = (
+        moe.up_exps_bytes().ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} up_exps raw bytes missing"
+            ))
+        })?,
+        gpu_runtime::ggml_to_fullpath_quant(moe.up_quant).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} unsupported up_exps quant {:?}",
+                moe.up_quant
+            ))
+        })?,
+    );
+    let sparse_down = (
+        moe.down_exps_bytes().ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} down_exps raw bytes missing"
+            ))
+        })?,
+        gpu_runtime::ggml_to_fullpath_quant(moe.down_quant).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "build_fullpath_layer_raw_weights: layer {layer_idx} unsupported down_exps quant {:?}",
+                moe.down_quant
+            ))
+        })?,
+    );
+
+    Ok(gpu_runtime::QwenMoeRawWeights {
+        router,
+        shared_input_scale,
+        shared_expert_gated: moe.shared_expert_gated,
+        sparse_gate,
+        sparse_up,
+        sparse_down,
+        n_embd: moe.n_embd,
+        n_ff: moe.n_ff,
+        n_expert: moe.n_expert,
+        n_expert_used: moe.n_expert_used,
+        expert_gating_func: moe.expert_gating_func,
+        expert_weights_norm: moe.expert_weights_norm,
+        expert_weights_scale: moe.expert_weights_scale,
     })
 }
 

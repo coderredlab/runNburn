@@ -22,6 +22,8 @@ fn full_path_prefill_output_kv_cursor_matches_prompt_len() {
     // Sanity-check the struct field is mutable / addressable.
     let out = FullPathPrefillOutput {
         last_token_id: 42,
+        argmax_tokens: None,
+        hidden_rows: None,
         kv_cursor_after: 393,
         counters: RuntimeCounters::default(),
     };

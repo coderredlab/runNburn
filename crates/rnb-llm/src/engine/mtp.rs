@@ -452,6 +452,13 @@ pub(in crate::engine) fn mtp_device_rope_neox(
         || (matches!(architecture, ModelArchitecture::Gemma4) && gemma_neox_enabled)
 }
 
+fn mtp_vulkan_fullpath_output_quant_supported(output_quant: rnb_loader::GGMLType) -> bool {
+    matches!(
+        output_quant,
+        rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K | rnb_loader::GGMLType::Q8_0
+    )
+}
+
 fn mtp_dense_decode_work_units(metadata: &ModelMetadata) -> usize {
     metadata
         .hidden_dim
@@ -526,6 +533,7 @@ fn mtp_auto_policy_for_model(
     metadata: &ModelMetadata,
     has_mtp_runtime: bool,
     device_verify_supported: bool,
+    vulkan_fullpath_verify_supported: bool,
     resource: Option<MtpAutoResourceHint>,
 ) -> MtpAutoPolicy {
     let dense_spec_k = 1;
@@ -552,6 +560,16 @@ fn mtp_auto_policy_for_model(
             min_free_vram_mib: dense_min_free_vram_mib,
             resource,
             reason: "glm-dsa-metal-batch-verify-auto",
+        };
+    }
+    if architecture == ModelArchitecture::Qwen35MoE && vulkan_fullpath_verify_supported {
+        return MtpAutoPolicy {
+            enabled: true,
+            spec_k: 1,
+            device_verify: false,
+            min_free_vram_mib: dense_min_free_vram_mib,
+            resource,
+            reason: "qwen35moe-k1-vulkan-fullpath-auto",
         };
     }
     if !device_verify_supported {
@@ -711,12 +729,31 @@ impl Engine {
         Ok(())
     }
 
+    fn mtp_vulkan_fullpath_verify_supported(&self) -> bool {
+        #[cfg(feature = "vulkan")]
+        {
+            crate::runtime::scheduler::fullpath_gpu_prefill_requested()
+                && self.backend_runtime.has_active_gpu_prefill_path()
+                && self.weights.as_ref().is_some_and(|weights| {
+                    mtp_vulkan_fullpath_output_quant_supported(weights.output.ggml_type)
+                        && weights.output.cols == self.metadata.hidden_dim
+                        && weights.output.data.as_bytes().is_some()
+                        && weights.output_norm.numel() == self.metadata.hidden_dim
+                })
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    }
+
     pub fn mtp_auto_policy(&self) -> MtpAutoPolicy {
         mtp_auto_policy_for_model(
             self.architecture,
             &self.metadata,
             self.mtp_runtime_ready(),
             self.mtp_device_verify_supported_by_weights(),
+            self.mtp_vulkan_fullpath_verify_supported(),
             current_mtp_auto_resource_hint(),
         )
     }
@@ -991,6 +1028,8 @@ impl Engine {
                 "RNB_MTP=1 but model has no loaded MTP runtime".to_string(),
             ));
         };
+        #[cfg(feature = "vulkan")]
+        let mut gpu_runtime = self.backend_runtime.take_gpu_runtime();
         let result = (|| {
             let Some(inner) = runtime.as_in_model_mut() else {
                 // External drafter (mc78): in-model draft_tokens never called.
@@ -1002,9 +1041,19 @@ impl Engine {
             let weights = self.weights.as_ref().ok_or_else(|| {
                 LlmError::Forward("RNB_MTP=1 requires loaded model weights".to_string())
             })?;
-            draft_tokens(inner, weights, self.architecture, first_token, n_max)
+            draft_tokens(
+                inner,
+                weights,
+                self.architecture,
+                first_token,
+                n_max,
+                #[cfg(feature = "vulkan")]
+                gpu_runtime.as_mut(),
+            )
         })();
         self.mtp_runtime = Some(runtime);
+        #[cfg(feature = "vulkan")]
+        self.backend_runtime.restore_gpu_runtime(gpu_runtime);
         result
     }
 }
@@ -1143,6 +1192,7 @@ fn draft_tokens(
     architecture: ModelArchitecture,
     first_token: u32,
     n_max: usize,
+    #[cfg(feature = "vulkan")] mut gpu_runtime: Option<&mut super::gpu_runtime::LayerRuntime>,
 ) -> Result<Vec<u32>> {
     let mut h = runtime.last_hidden.clone().ok_or_else(|| {
         LlmError::Forward("MTP draft requested before target hidden was observed".to_string())
@@ -1167,7 +1217,14 @@ fn draft_tokens(
                 &[&h],
                 runtime.next_pos,
             )?;
-            let token = mtp_argmax(runtime, weights, architecture, &hidden)?;
+            let token = mtp_argmax(
+                runtime,
+                weights,
+                architecture,
+                &hidden,
+                #[cfg(feature = "vulkan")]
+                gpu_runtime.as_deref_mut(),
+            )?;
             (hidden, token)
         };
         h = hidden;
@@ -1547,6 +1604,7 @@ fn mtp_argmax(
     weights: &ModelWeights,
     architecture: ModelArchitecture,
     hidden: &[f32],
+    #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut super::gpu_runtime::LayerRuntime>,
 ) -> Result<u32> {
     let hidden_dim = runtime.metadata.hidden_dim;
     let mut normed = vec![0.0f32; hidden_dim];
@@ -1558,12 +1616,30 @@ fn mtp_argmax(
         &mut normed,
         architecture,
     );
-
     let head = runtime
         .weights
         .shared_head_head
         .as_ref()
         .unwrap_or(&weights.output);
+    #[cfg(feature = "vulkan")]
+    if super::policy::mtp_output_argmax_override().unwrap_or(true)
+        && runtime.weights.shared_head_head.is_none()
+        && !crate::runtime::mtp_trace_enabled()
+    {
+        if let (Some(gpu), Some(output_quant)) = (
+            gpu_runtime,
+            super::gpu_runtime::ggml_to_fullpath_quant(head.ggml_type),
+        ) {
+            let vocab = u32::try_from(head.rows).map_err(|_| {
+                LlmError::Forward(format!("MTP output rows {} exceed u32", head.rows))
+            })?;
+            return gpu
+                .resident_output_argmax_from_normalized_host(&normed, output_quant, None, vocab)
+                .map_err(|err| {
+                    LlmError::Forward(format!("Vulkan MTP resident output argmax failed: {err}"))
+                });
+        }
+    }
     #[cfg(feature = "cuda")]
     if let Some(token) = mtp_cuda_argmax_token(head, &normed) {
         return Ok(token);
@@ -1671,6 +1747,19 @@ mod tests {
             free_vram_mib,
         }
     }
+
+    #[test]
+    fn vulkan_fullpath_mtp_output_gate_tracks_validated_formats() {
+        assert!(mtp_vulkan_fullpath_output_quant_supported(
+            rnb_loader::GGMLType::Q4_K
+        ));
+        assert!(mtp_vulkan_fullpath_output_quant_supported(
+            rnb_loader::GGMLType::Q6_K
+        ));
+        assert!(mtp_vulkan_fullpath_output_quant_supported(
+            rnb_loader::GGMLType::Q8_0
+        ));
+    }
     #[cfg(feature = "cuda")]
     #[test]
     fn mtp_device_rope_mode_matches_model_attention_semantics() {
@@ -1700,6 +1789,7 @@ mod tests {
             &policy_metadata(4096, 40),
             true,
             true,
+            false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
         );
 
@@ -1716,6 +1806,7 @@ mod tests {
             &policy_metadata(2048, 40),
             true,
             true,
+            false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
         );
 
@@ -1726,12 +1817,30 @@ mod tests {
     }
 
     #[test]
+    fn mtp_auto_policy_enables_qwen35_moe_vulkan_fullpath_without_cuda_resources() {
+        let policy = mtp_auto_policy_for_model(
+            ModelArchitecture::Qwen35MoE,
+            &policy_metadata(2048, 40),
+            true,
+            false,
+            true,
+            None,
+        );
+
+        assert!(policy.enabled);
+        assert_eq!(policy.spec_k, 1);
+        assert!(!policy.device_verify);
+        assert_eq!(policy.reason, "qwen35moe-k1-vulkan-fullpath-auto");
+    }
+
+    #[test]
     fn mtp_auto_policy_keeps_gemma_device_verify_off_until_validated() {
         let policy = mtp_auto_policy_for_model(
             ModelArchitecture::Gemma4,
             &policy_metadata(2560, 42),
             true,
             true,
+            false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
         );
 
@@ -1747,6 +1856,7 @@ mod tests {
             &policy_metadata(1536, 28),
             true,
             true,
+            false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
         );
 
@@ -1762,6 +1872,7 @@ mod tests {
             &policy_metadata(4096, 40),
             false,
             true,
+            false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
         );
 
@@ -1777,6 +1888,7 @@ mod tests {
             &policy_metadata(4096, 40),
             true,
             true,
+            false,
             None,
         );
 
@@ -1792,6 +1904,7 @@ mod tests {
             &policy_metadata(4096, 40),
             true,
             true,
+            false,
             Some(policy_resource(12 * 1024, 512)),
         );
 
@@ -1809,6 +1922,7 @@ mod tests {
             ModelArchitecture::Qwen35,
             &policy_metadata(4096, 40),
             true,
+            false,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
         );

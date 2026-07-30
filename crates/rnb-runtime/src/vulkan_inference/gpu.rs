@@ -32,8 +32,9 @@ pub use decode::{
 };
 pub use gdn_window::{gdn_prefill_ffn_chain_window, gdn_qkv_conv_window_from_resident_state};
 pub use layer_runtime::{
-    AttentionRawWeights, FullPathDecodeStepOutput, FullPathPrefillOutput, GdnRawWeights,
-    KvResidentLayout, LayerRawWeights, LayerRuntime, ModelLayerKind, StagingPolicy,
+    AttentionRawWeights, FullPathDecodeStepOutput, FullPathPrefillOutput,
+    FullPathSequenceStateSnapshot, GdnRawWeights, KvResidentLayout, LayerRawWeights, LayerRuntime,
+    ModelLayerKind, QwenMoeRawWeights, StagingPolicy,
 };
 pub use materialize::{
     materialize_attention_kv, materialize_attention_kv_range_untracked,

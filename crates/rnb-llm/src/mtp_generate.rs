@@ -152,6 +152,19 @@ fn mtp_batch_effective_k(requested_k: usize, tokens_remaining: usize) -> usize {
     requested_k.max(1).min(tokens_remaining)
 }
 
+fn mtp_vulkan_fullpath_effective_k(requested_k: usize, tokens_remaining: usize) -> usize {
+    mtp_batch_effective_k(requested_k, tokens_remaining).min(1)
+}
+
+fn mtp_fast_retain_prefix_tokens(
+    fast_retain: bool,
+    drafted_tokens: usize,
+    committed_tokens: usize,
+) -> Option<usize> {
+    (fast_retain && drafted_tokens > 0 && committed_tokens > 0)
+        .then(|| drafted_tokens.min(committed_tokens))
+}
+
 fn mtp_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> bool {
     // pm116: GLM Metal batch verify 채택 — 기본 ON (`RNB_MTP_BATCH_VERIFY=0` opt-out).
     // verify window 를 Metal prefill 배치 경로로 태워 expert I/O 를 amortize 한다.
@@ -178,6 +191,7 @@ enum MtpVerifyExecution {
     Sequential,
     BatchPrefill,
     DeviceResident,
+    VulkanFullpath,
     /// milestone 5: Qwen35MoE+Metal+f16KV — verify window 을 `decode_chain_run_batched` 로
     /// B lane fused forward(dense weight 1회 read/amortize). verify 는 pure(프로덕션 state
     /// 미접촉), 커밋은 host kv_cache append + GDN ssm_state write 로만(checkpoint/restore 불요).
@@ -212,6 +226,21 @@ fn mtp_batch_decode_chain_allowed(engine: &Engine, architecture: rnb_loader::Arc
             && engine.batched_decode_chain_kv_ready()
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (engine, architecture);
+        false
+    }
+}
+fn mtp_vulkan_fullpath_verify_allowed(
+    engine: &Engine,
+    architecture: rnb_loader::Architecture,
+) -> bool {
+    #[cfg(feature = "vulkan")]
+    {
+        matches!(architecture, rnb_loader::Architecture::Qwen35MoE)
+            && engine.vulkan_fullpath_verify_ready()
+    }
+    #[cfg(not(feature = "vulkan"))]
     {
         let _ = (engine, architecture);
         false
@@ -281,6 +310,9 @@ fn mtp_prefix_restore_base_kv_len(
             )
         }),
         MtpVerifyExecution::DeviceResident => Ok(round_base_kv_len),
+        MtpVerifyExecution::VulkanFullpath => Err(crate::error::LlmError::Forward(
+            "Vulkan fullpath verify owns its rollback and commit path".to_string(),
+        )),
         MtpVerifyExecution::Sequential => Err(crate::error::LlmError::Forward(
             "MTP sequential verify cannot restore a verify-window prefix".to_string(),
         )),
@@ -683,8 +715,11 @@ fn generate_stream_mtp_with_tokens(
         mtp_batch_verify_default_enabled(engine.architecture()),
     );
     let batch_decode_chain = mtp_batch_decode_chain_allowed(engine, engine.architecture());
-    let verify_execution =
-        mtp_verify_execution(mtp_device_verify, batch_verify, batch_decode_chain);
+    let verify_execution = if mtp_vulkan_fullpath_verify_allowed(engine, engine.architecture()) {
+        MtpVerifyExecution::VulkanFullpath
+    } else {
+        mtp_verify_execution(mtp_device_verify, batch_verify, batch_decode_chain)
+    };
     let fast_retain = crate::runtime::mtp_fast_retain_enabled();
     let no_bonus_verify_override = mtp_no_bonus_verify_env_override();
     let verified_runway_enabled = crate::runtime::mtp_shadow_precompute_enabled()
@@ -737,6 +772,9 @@ fn generate_stream_mtp_with_tokens(
             }
             MtpVerifyExecution::BatchPrefill | MtpVerifyExecution::DeviceResident => {
                 mtp_batch_effective_k(params.spec_k, tokens_remaining)
+            }
+            MtpVerifyExecution::VulkanFullpath => {
+                mtp_vulkan_fullpath_effective_k(params.spec_k, tokens_remaining)
             }
             MtpVerifyExecution::Sequential => mtp_effective_k(
                 params.spec_k,
@@ -900,6 +938,138 @@ fn generate_stream_mtp_with_tokens(
             continue;
         }
 
+        #[cfg(feature = "vulkan")]
+        if verify_execution == MtpVerifyExecution::VulkanFullpath {
+            let mut verify_input = Vec::with_capacity(draft_k + 1);
+            verify_input.push(current_token);
+            verify_input.extend_from_slice(&draft_tokens);
+
+            let phase_start = Instant::now();
+            let (mut window, commit) =
+                engine.forward_vulkan_fullpath_verify_window(&verify_input)?;
+            replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+            trace_mtp_sequence_state(engine, "vulkan-fullpath-forward");
+            stats.add_target_verify(window.len(), 1);
+
+            let mut n_accepted = 0usize;
+            let mut stopped = false;
+            let mut next_forced_token = None;
+            let mut target_trace = trace_mtp.then(Vec::new);
+            for i in 0..draft_k {
+                let target_token = *window.target_tokens.get(i).ok_or_else(|| {
+                    crate::error::LlmError::Forward(format!(
+                        "Vulkan fullpath MTP verify missing target token at {i}"
+                    ))
+                })?;
+                if let Some(trace) = target_trace.as_mut() {
+                    let draft_token = draft_tokens[i];
+                    trace.push(format!(
+                        "{}:{}{}{}",
+                        i,
+                        engine.tokenizer.decode_token(target_token),
+                        if target_token == draft_token {
+                            "=draft:"
+                        } else {
+                            "!=draft:"
+                        },
+                        engine.tokenizer.decode_token(draft_token),
+                    ));
+                }
+                if target_token != draft_tokens[i] {
+                    next_forced_token = Some(target_token);
+                    break;
+                }
+                if params.should_stop(draft_tokens[i], eos) {
+                    stopped = true;
+                    break;
+                }
+
+                n_accepted += 1;
+                stats.accepted += 1;
+                if i < k {
+                    generated_tokens.push(draft_tokens[i]);
+                    if !generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback) {
+                        stopped = true;
+                        tokens_remaining -= 1;
+                        break;
+                    }
+                    tokens_remaining -= 1;
+                    if tokens_remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            phase.verify_ms += elapsed_ms(phase_start);
+
+            if let Some(trace) = target_trace {
+                eprintln!(
+                    "[MTP_TRACE] round={} accepted={} targets=[{}]",
+                    stats.rounds,
+                    n_accepted,
+                    trace.join(", ")
+                );
+            }
+
+            let committed_tokens = 1 + n_accepted;
+            let phase_start = Instant::now();
+            let replayed = engine.commit_vulkan_fullpath_verify(commit, committed_tokens)?;
+            if replayed {
+                stats.add_target_replay_invocations(1);
+            }
+            if !stopped && tokens_remaining > 1 {
+                let committed_hidden = window.mtp_hidden_prefix_rows(committed_tokens)?;
+                if let Some(retained_tokens) =
+                    mtp_fast_retain_prefix_tokens(fast_retain, draft_k, committed_tokens)
+                {
+                    let hidden_dim = engine.metadata.hidden_dim;
+                    let retained_hidden_values =
+                        retained_tokens.checked_mul(hidden_dim).ok_or_else(|| {
+                            crate::error::LlmError::Forward(
+                                "Vulkan MTP retained hidden size overflow".to_string(),
+                            )
+                        })?;
+                    engine.mtp_retain_draft_after_spec(
+                        mtp_checkpoint.as_ref(),
+                        &verify_input[..retained_tokens],
+                        retained_tokens,
+                        draft_k,
+                        &committed_hidden[..retained_hidden_values],
+                    )?;
+                    if retained_tokens < committed_tokens {
+                        engine.mtp_observe_target_batch(
+                            &verify_input[retained_tokens..committed_tokens],
+                            &committed_hidden[retained_hidden_values..],
+                        )?;
+                    }
+                } else {
+                    engine.mtp_restore_checkpoint(mtp_checkpoint.as_ref());
+                    engine.mtp_observe_target_batch(
+                        &verify_input[..committed_tokens],
+                        committed_hidden,
+                    )?;
+                }
+            }
+            phase.retain_ms += elapsed_ms(phase_start);
+
+            if stopped || tokens_remaining == 0 {
+                break;
+            }
+            current_token = if n_accepted == draft_k {
+                *window.target_tokens.get(draft_k).ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Vulkan fullpath MTP verify missing bonus token".to_string(),
+                    )
+                })?
+            } else {
+                next_forced_token.ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Vulkan fullpath MTP rejection did not produce a target token".to_string(),
+                    )
+                })?
+            };
+            continue;
+        }
+
         if matches!(
             verify_execution,
             MtpVerifyExecution::BatchPrefill | MtpVerifyExecution::DeviceResident
@@ -938,6 +1108,9 @@ fn generate_stream_mtp_with_tokens(
                 MtpVerifyExecution::Sequential => unreachable!("sequential verify handled below"),
                 MtpVerifyExecution::BatchDecodeChain => {
                     unreachable!("batched decode-chain verify handled above")
+                }
+                MtpVerifyExecution::VulkanFullpath => {
+                    unreachable!("Vulkan fullpath verify handled above")
                 }
             };
             replace_ignored_eos_targets(engine, params, &mut window, eos)?;
@@ -2160,6 +2333,19 @@ mod tests {
         assert_eq!(mtp_batch_effective_k(8, 8), 8);
         assert_eq!(mtp_batch_effective_k(4, 4), 4);
         assert_eq!(mtp_batch_effective_k(4, 1), 1);
+    }
+
+    #[test]
+    fn vulkan_fullpath_mtp_caps_verify_depth_to_one() {
+        assert_eq!(mtp_vulkan_fullpath_effective_k(8, 8), 1);
+        assert_eq!(mtp_vulkan_fullpath_effective_k(1, 1), 1);
+    }
+
+    #[test]
+    fn fast_retain_reuses_drafted_prefix_and_rebuilds_bonus_state() {
+        assert_eq!(mtp_fast_retain_prefix_tokens(true, 4, 4), Some(4));
+        assert_eq!(mtp_fast_retain_prefix_tokens(true, 1, 2), Some(1));
+        assert_eq!(mtp_fast_retain_prefix_tokens(false, 4, 4), None);
     }
 
     #[test]

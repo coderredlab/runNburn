@@ -6,6 +6,7 @@ use rnb_backend_api::{
 pub mod context;
 mod ffi;
 pub use context::GpuBuffer;
+mod expert_arena;
 pub mod full_path;
 mod gemv;
 pub mod kv_resident;

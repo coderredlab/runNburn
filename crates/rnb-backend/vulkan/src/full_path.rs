@@ -73,9 +73,10 @@
 //! tensor roundtrip in the production path is rejected by
 //! `ensure_no_forbidden_fullpath_cpu_escape`.
 //!
-//! ### MoE layers — Err (out of scope for dense PoC)
+//! ### MoE execution
 //!
-//! `ModelLayerKind::MoE` returns `Err` immediately.
+//! Qwen shared-and-sparse MoE tails execute inside Attention/Recurrent layers.
+//! A standalone `ModelLayerKind::MoE` remains unsupported.
 //!
 //! ### run_layer_loop reuse (Task 9)
 //!
@@ -94,19 +95,98 @@
 //! - **Task 11**: ADB smoke test on Lenovo TB373FU.
 
 use crate::context::GpuBuffer;
+use crate::expert_arena::{
+    ExpertArenaBundle, ExpertArenaFormat, ExpertArenaKey, ExpertArenaLayout,
+};
 use crate::ffi::types::*;
 use crate::kv_resident::KvResidentLayout;
+pub use crate::layer_gemv::FullPathSequenceStateSnapshot;
 use crate::layer_gemv::{
     descriptor_window_limit, embed_lookup_row_bytes, logit_argmax_row_bytes,
     AttentionLayerFullpathInput, AttentionLayerSetsConsumed, GdnLayerFullpathInput,
-    RuntimeCounters, VulkanLayerGemv,
+    MoeStagingError, RuntimeCounters, VulkanLayerGemv,
 };
 #[cfg(test)]
 use crate::layer_gemv::{LEGACY_DESCRIPTOR_WINDOW, MAX_BATCH_OUTPUTS};
 use crate::staging::StagingPolicy;
-use crate::weight_cache::QuantType;
+use crate::weight_cache::{GpuWeightMode, QuantType, WeightId, WeightKind};
 use rnb_loader::ModelLayerKind;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// Host-side weight view for one Qwen shared-and-sparse MoE block.
+///
+/// Sparse expert tensors keep their original GGUF quantization and layout.
+/// The streaming fullpath uploads only experts selected by the current token
+/// window; it never expands them into resident f16/f32 projection blobs.
+pub struct QwenMoeRawWeights<'a> {
+    pub router: &'a [f32],
+    pub shared_input_scale: &'a [f32],
+    pub shared_expert_gated: bool,
+    pub sparse_gate: (&'a [u8], QuantType),
+    pub sparse_up: (&'a [u8], QuantType),
+    pub sparse_down: (&'a [u8], QuantType),
+    pub n_embd: usize,
+    pub n_ff: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub expert_gating_func: u32,
+    pub expert_weights_norm: bool,
+    pub expert_weights_scale: f32,
+}
+
+/// Raw host weight view for one attention layer.
+///
+/// `shared_expert_moe = Some(_)` changes the FFN tail from the dense
+/// gate/up/down block to Qwen MoE. In that case `gate_proj`, `up_proj`, and
+/// `down_proj` carry the always-on shared expert projections.
+pub struct AttentionRawWeights<'a> {
+    pub attn_norm: &'a [f32],
+    pub q_proj: (&'a [u8], usize, usize, QuantType),
+    pub q_bias: Option<&'a [f32]>,
+    pub q_norm: Option<&'a [f32]>,
+    pub k_proj_combined: (&'a [u8], usize, usize, QuantType),
+    pub k_bias: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
+    pub v_proj_combined: (&'a [u8], usize, usize, QuantType),
+    pub v_bias: Option<&'a [f32]>,
+    pub o_proj: (&'a [u8], usize, usize, QuantType),
+    pub ffn_norm: &'a [f32],
+    pub gate_proj: (&'a [u8], usize, usize, QuantType),
+    pub up_proj: (&'a [u8], usize, usize, QuantType),
+    pub down_proj: (&'a [u8], usize, usize, QuantType),
+    pub shared_expert_moe: Option<QwenMoeRawWeights<'a>>,
+}
+
+/// Raw host weight view for one GatedDeltaNet layer.
+///
+/// As with [`AttentionRawWeights`], dense FFN projection fields carry the
+/// shared expert when `shared_expert_moe` is present.
+pub struct GdnRawWeights<'a> {
+    pub attn_norm: &'a [f32],
+    pub qkv: (&'a [u8], usize, usize, QuantType),
+    pub gate: (&'a [u8], usize, usize, QuantType),
+    pub ssm_alpha: (&'a [u8], usize, usize, Option<QuantType>),
+    pub ssm_beta: (&'a [u8], usize, usize, Option<QuantType>),
+    pub ssm_a: &'a [f32],
+    pub ssm_conv1d: &'a [f32],
+    pub ssm_dt_bias: &'a [f32],
+    pub ssm_norm: &'a [f32],
+    pub num_k_heads: usize,
+    pub head_k_dim: usize,
+    pub ssm_out: (&'a [u8], usize, usize, QuantType),
+    pub post_attn_norm: &'a [f32],
+    pub ffn_gate: (&'a [u8], usize, usize, QuantType),
+    pub ffn_up: (&'a [u8], usize, usize, QuantType),
+    pub ffn_down: (&'a [u8], usize, usize, QuantType),
+    pub shared_expert_moe: Option<QwenMoeRawWeights<'a>>,
+}
+
+/// Raw host weight view for one streaming fullpath layer.
+pub enum LayerRawWeights<'a> {
+    Attention(AttentionRawWeights<'a>),
+    Gdn(GdnRawWeights<'a>),
+}
 
 // ---------------------------------------------------------------------------
 // Weight-handle stub (Task 10 fills in real GPU-resident buffers)
@@ -170,6 +250,7 @@ pub struct LayerWeightHandles<'a> {
     pub down_weight_buf: &'a GpuBuffer,
     pub down_weight_size: u64,
     pub down_quant: QuantType,
+    pub record_dense_ffn: bool,
     // mv26-task10b-1: per-token intermediate GpuBuffer slices removed.
     // Every per-layer intermediate (norm_attn / q / attn / o_proj_out /
     // norm_ffn / gate / up / down) now lives in a contiguous strided staging
@@ -200,10 +281,7 @@ pub struct LayerWeightHandles<'a> {
 /// 필드 순서: norm → fused QKV → z gate → SSM α/β → SSM raw 묶음 (a /
 /// conv1d / dt_bias / norm) → SSM out → post-attn norm → FFN gate/up/down.
 ///
-/// Out of scope (5a):
-/// - `ffn_gate_up_fused` (Qwen3.5 0.8B 미사용; 필요 모델 등장 시 추가)
-/// - `moe_qwen` (Qwen3.5 35B-A3B 전용; dense PoC 범위 밖)
-#[allow(dead_code)] // constructed by Task 10b-5b's rnb-runtime wrapper
+/// `ffn_gate_up_fused` remains unsupported.
 pub struct GdnLayerWeightHandles<'a> {
     // Attention norm (Raw32)
     pub attn_norm_buf: &'a GpuBuffer,
@@ -274,6 +352,7 @@ pub struct GdnLayerWeightHandles<'a> {
     pub ffn_down_rows: usize,
     pub ffn_down_cols: usize,
     pub ffn_down_quant: QuantType,
+    pub record_dense_ffn: bool,
 }
 
 /// Per-layer fullpath weight handle.
@@ -301,6 +380,8 @@ pub enum LayerHandle<'a> {
 pub struct FullPathPrefillInput<'a> {
     /// Tokenized prompt (input ids).
     pub prompt_token_ids: &'a [u32],
+    /// Absolute model position of the first input token.
+    pub pos_start: usize,
     /// Number of transformer layers in the model.
     pub num_layers: usize,
     /// Hidden dimension (= embedding dim = model dim).
@@ -331,11 +412,21 @@ pub struct FullPathPrefillInput<'a> {
     /// Quantized `output.weight` (lm head). Required for the final argmax.
     pub output_table_q6k: &'a [u8],
     pub output_quant: QuantType,
+    /// Token omitted from GPU argmax, used by greedy generation with ignored EOS.
+    pub excluded_token: Option<u32>,
     /// Final model RMSNorm weight (`output_norm.weight`).
     pub output_norm: &'a [f32],
     /// Quantized `token_embd.weight`. Required for the embedding lookup.
     pub embed_table_q6k: &'a [u8],
     pub embed_quant: QuantType,
+    /// Download all final hidden rows for an explicitly requested MTP observation.
+    /// The normal target-only path leaves this false and keeps tensors GPU-resident.
+    pub collect_hidden_rows: bool,
+    /// Return argmax tokens for every input row instead of only the last row.
+    pub collect_all_argmax: bool,
+    /// Run the transformer state transition without the final output projection.
+    /// Used only to replay a committed recurrent prefix after speculative rejection.
+    pub skip_output: bool,
     /// Per-layer weight handles.  `None` → layer loop is skipped; only
     /// embed_lookup + logit_argmax run (plumbing smoke-test mode).
     /// `Some(handles)` → full 24-layer forward pass; `handles.len()` must
@@ -344,6 +435,9 @@ pub struct FullPathPrefillInput<'a> {
     /// Weight wiring is Task 10's responsibility.  Caller must provide
     /// GPU-resident buffers that remain valid for the duration of this call.
     pub layer_weights: Option<&'a [LayerHandle<'a>]>,
+    /// Original host-side quantized tensors for dynamic sparse-expert paging.
+    /// Present only when at least one layer owns a Qwen shared-expert MoE.
+    pub layer_raw_weights: Option<&'a [LayerRawWeights<'a>]>,
     /// Per-layer kind (Attention / Recurrent / MoE).  Must have length
     /// `num_layers` when `layer_weights.is_some()`; ignored otherwise.
     ///
@@ -355,10 +449,14 @@ pub struct FullPathPrefillInput<'a> {
 }
 
 /// Result of a full prefill pass.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FullPathPrefillOutput {
     /// argmax of logits at the last position — first decoded token id.
     pub last_token_id: u32,
+    /// Per-row argmax tokens, present only when `collect_all_argmax` was requested.
+    pub argmax_tokens: Option<Vec<u32>>,
+    /// Final target hidden rows, present only when `collect_hidden_rows` was requested.
+    pub hidden_rows: Option<Vec<f32>>,
     /// KV cursor after this step (= prompt_len for prefill).
     pub kv_cursor_after: usize,
     /// Aggregated counters for this step.
@@ -412,6 +510,8 @@ pub struct FullPathDecodeStepInput<'a> {
     /// Quantized `output.weight` (lm head). Required for the final argmax.
     pub output_table_q6k: &'a [u8],
     pub output_quant: QuantType,
+    /// Token omitted from GPU argmax, used by greedy generation with ignored EOS.
+    pub excluded_token: Option<u32>,
     /// Final model RMSNorm weight (`output_norm.weight`).
     pub output_norm: &'a [f32],
     /// Quantized `token_embd.weight`. Required for the embedding lookup.
@@ -428,6 +528,9 @@ pub struct FullPathDecodeStepInput<'a> {
     /// Weight wiring is Task 10's responsibility.  Caller must provide
     /// GPU-resident buffers that remain valid for the duration of this call.
     pub layer_weights: Option<&'a [LayerHandle<'a>]>,
+    /// Original host-side quantized tensors for dynamic sparse-expert paging.
+    /// Present only when at least one layer owns a Qwen shared-expert MoE.
+    pub layer_raw_weights: Option<&'a [LayerRawWeights<'a>]>,
 }
 
 /// Result of a single-token decode step.
@@ -495,6 +598,18 @@ struct FullpathProfile {
     submit_wait_us: u128,
     output_us: u128,
     total_us: u128,
+    moe_route_download_us: u128,
+    moe_route_build_us: u128,
+    moe_arena_prepare_us: u128,
+    moe_arena_slot_plan_us: u128,
+    moe_arena_repack_us: u128,
+    moe_arena_staging_us: u128,
+    moe_metadata_upload_us: u128,
+    moe_record_us: u128,
+    moe_arena_hits: u64,
+    moe_arena_misses: u64,
+    moe_arena_upload_bytes: u64,
+    moe_arena_repack_bytes: u64,
 }
 
 impl FullpathProfile {
@@ -556,6 +671,28 @@ impl FullpathProfile {
             gdn_layers
         )
     }
+
+    fn moe_summary_line(&self) -> String {
+        format!(
+            "[fullpath:moe-profile] kind={} route_download_ms={:.3} route_build_ms={:.3} \
+             arena_prepare_ms={:.3} slot_plan_ms={:.3} repack_ms={:.3} staging_ms={:.3} \
+             metadata_upload_ms={:.3} record_ms={:.3} hits={} misses={} arena_upload_mib={:.3} \
+             arena_repack_mib={:.3}",
+            self.kind,
+            us_to_ms(self.moe_route_download_us),
+            us_to_ms(self.moe_route_build_us),
+            us_to_ms(self.moe_arena_prepare_us),
+            us_to_ms(self.moe_arena_slot_plan_us),
+            us_to_ms(self.moe_arena_repack_us),
+            us_to_ms(self.moe_arena_staging_us),
+            us_to_ms(self.moe_metadata_upload_us),
+            us_to_ms(self.moe_record_us),
+            self.moe_arena_hits,
+            self.moe_arena_misses,
+            self.moe_arena_upload_bytes as f64 / (1024.0 * 1024.0),
+            self.moe_arena_repack_bytes as f64 / (1024.0 * 1024.0),
+        )
+    }
 }
 
 fn duration_us(duration: Duration) -> u128 {
@@ -589,7 +726,7 @@ fn emit_fullpath_buffer_stage_trace_at(
     let f32_len = seq_len
         .checked_mul(width)
         .ok_or("emit_fullpath_buffer_stage_trace: seq_len*width overflow")?;
-    let data = gemv.debug_download_buffer_f32_range(
+    let data = gemv.download_buffer_f32_range(
         buf,
         byte_offset,
         (f32_len * std::mem::size_of::<f32>()) as u64,
@@ -659,7 +796,7 @@ fn emit_fullpath_layer_trace_at(
     let f32_len = seq_len
         .checked_mul(hidden)
         .ok_or("emit_fullpath_layer_trace: seq_len*hidden overflow")?;
-    let data = gemv.debug_download_buffer_f32_range(
+    let data = gemv.download_buffer_f32_range(
         buf,
         byte_offset,
         (f32_len * std::mem::size_of::<f32>()) as u64,
@@ -680,12 +817,19 @@ fn emit_fullpath_layer_trace_at(
 fn ensure_no_forbidden_fullpath_cpu_escape(
     caller: &str,
     counters: &RuntimeCounters,
+    allowed_roundtrip_bytes: u64,
+    allowed_materializations: u64,
 ) -> Result<(), String> {
-    if counters.has_forbidden_fullpath_cpu_escape() {
+    if counters.host_tensor_roundtrip_bytes > allowed_roundtrip_bytes
+        || counters.materializations > allowed_materializations
+    {
         return Err(format!(
             "{caller}: production fullpath attempted a forbidden CPU tensor escape \
-             (host_tensor_roundtrip_bytes={} materializations={})",
-            counters.host_tensor_roundtrip_bytes, counters.materializations
+             (host_tensor_roundtrip_bytes={} allowed={} materializations={} allowed_materializations={})",
+            counters.host_tensor_roundtrip_bytes,
+            allowed_roundtrip_bytes,
+            counters.materializations,
+            allowed_materializations,
         ));
     }
     Ok(())
@@ -740,6 +884,15 @@ pub(crate) fn validate_decode_step_input(
             ));
         }
     }
+    if let Some(raw) = input.layer_raw_weights {
+        if raw.len() != input.num_layers {
+            return Err(format!(
+                "full_path::run_decode_step: layer_raw_weights.len() {} != num_layers {}",
+                raw.len(),
+                input.num_layers
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -764,7 +917,8 @@ pub(crate) fn validate_decode_step_input(
 /// **GDN layers**: recorded via `record_gdn_layer_fullpath`; no CPU tensor
 /// roundtrip is allowed in production fullpath.
 ///
-/// **MoE layers**: returns `Err` immediately (out of scope for dense PoC).
+/// **MoE layers**: shared-and-sparse tails run in Attention/Recurrent layers;
+/// standalone `ModelLayerKind::MoE` returns `Err`.
 #[allow(dead_code)] // called by Task 10's engine wiring
 pub fn run_decode_step(
     gemv: &mut VulkanLayerGemv,
@@ -814,6 +968,19 @@ pub fn run_decode_step(
         )?;
         let hidden_cap_bytes = (seq_len * input.hidden * std::mem::size_of::<f32>()) as u64;
         gemv.ensure_hidden_ping_pong(hidden_cap_bytes)?;
+        let mut qwen_moe_grouped =
+            configure_qwen_moe_grouped(gemv, seq_len, input.hidden, input.layer_raw_weights)?;
+        if let Some((n_expert, n_expert_used, n_ff)) = max_qwen_moe_shape(input.layer_raw_weights) {
+            ensure_qwen_moe_staging(
+                gemv,
+                seq_len as u32,
+                input.hidden as u32,
+                n_ff as u32,
+                n_expert as u32,
+                n_expert_used as u32,
+                &mut qwen_moe_grouped,
+            )?;
+        }
         profile.staging_us += FullpathProfile::elapsed_us(stage_timer);
 
         let ping_a_view = {
@@ -859,6 +1026,7 @@ pub fn run_decode_step(
             rope_neox: input.rope_neox,
             layer_kinds: input.layer_kinds,
             hidden: input.hidden,
+            qwen_moe_grouped,
             descriptor_limit: descriptor_window_limit(),
         };
 
@@ -867,6 +1035,7 @@ pub fn run_decode_step(
             gemv,
             &loop_params,
             layer_weights,
+            input.layer_raw_weights,
             &mut counters,
             &mut attention_chunks,
             &mut gdn_layers,
@@ -900,7 +1069,9 @@ pub fn run_decode_step(
             0,
             input.output_norm,
             input.norm_eps,
+            false,
             input.output_quant,
+            input.excluded_token,
             input.vocab as u32,
             input.hidden as u32,
         )?;
@@ -979,9 +1150,10 @@ pub fn run_decode_step(
             "{}",
             profile.summary_line(&counters, attention_chunks, gdn_layers)
         );
+        eprintln!("{}", profile.moe_summary_line());
     }
     if production_fullpath {
-        ensure_no_forbidden_fullpath_cpu_escape("full_path::run_decode_step", &counters)?;
+        ensure_no_forbidden_fullpath_cpu_escape("full_path::run_decode_step", &counters, 0, 0)?;
     }
 
     Ok(FullPathDecodeStepOutput {
@@ -1054,6 +1226,11 @@ impl SetIdxCounters {
             || self.rope + consumed.rope_q + consumed.rope_k > descriptor_limit
     }
 
+    fn moe_router_would_overflow(&self, seq_len: usize, descriptor_limit: usize) -> bool {
+        self.norm.saturating_add(seq_len) > descriptor_limit
+            || self.v.saturating_add(seq_len) > descriptor_limit
+    }
+
     fn advance(&mut self, consumed: &AttentionLayerSetsConsumed) {
         self.norm += consumed.norm;
         self.q += consumed.q;
@@ -1068,6 +1245,22 @@ impl SetIdxCounters {
         self.up += consumed.up;
         self.down += consumed.down;
         self.rope += consumed.rope_q + consumed.rope_k;
+    }
+
+    fn reserve_uniform(&mut self, sets: usize) {
+        self.norm = self.norm.max(sets);
+        self.q = self.q.max(sets);
+        self.k = self.k.max(sets);
+        self.v = self.v.max(sets);
+        self.attn = self.attn.max(sets);
+        self.o = self.o.max(sets);
+        self.silu = self.silu.max(sets);
+        self.add = self.add.max(sets);
+        self.bias = self.bias.max(sets);
+        self.gate = self.gate.max(sets);
+        self.up = self.up.max(sets);
+        self.down = self.down.max(sets);
+        self.rope = self.rope.max(sets);
     }
 
     fn reset(&mut self) {
@@ -1105,6 +1298,9 @@ pub fn run_prefill(
     if input.prompt_token_ids.is_empty() {
         return Err("full_path::run_prefill: prompt_token_ids must not be empty".into());
     }
+    if input.skip_output && input.collect_all_argmax {
+        return Err("full_path::run_prefill: skip_output conflicts with collect_all_argmax".into());
+    }
     embed_lookup_row_bytes(input.hidden as u32, input.embed_quant)
         .map_err(|err| format!("full_path::run_prefill: {err}"))?;
     logit_argmax_row_bytes(input.hidden as u32, input.output_quant)
@@ -1138,14 +1334,35 @@ pub fn run_prefill(
             ));
         }
     }
+    if let Some(raw) = input.layer_raw_weights {
+        if raw.len() != input.num_layers {
+            return Err(format!(
+                "full_path::run_prefill: layer_raw_weights.len() {} != num_layers {}",
+                raw.len(),
+                input.num_layers
+            ));
+        }
+    }
 
     let seq_len = input.prompt_token_ids.len();
+    let pos_end = input
+        .pos_start
+        .checked_add(seq_len)
+        .ok_or_else(|| "full_path::run_prefill: position range overflow".to_string())?;
+    if pos_end > input.kv_layout.max_ctx || pos_end > u32::MAX as usize {
+        return Err(format!(
+            "full_path::run_prefill: position range {}..{} exceeds max_ctx {}",
+            input.pos_start, pos_end, input.kv_layout.max_ctx
+        ));
+    }
     let mut counters = RuntimeCounters::default();
     let production_fullpath = input.layer_weights.is_some();
 
     let mut attention_chunks: usize = 0;
     let mut gdn_layers: usize = 0;
-    let last_token_id = if let Some(layer_weights) = input.layer_weights {
+    let (last_token_id, argmax_tokens, hidden_rows) = if let Some(layer_weights) =
+        input.layer_weights
+    {
         // mv26-task10b-3: 8 strided staging + 2 hidden ping-pong are owned by
         // VulkanLayerGemv. ensure_* is idempotent — the first call allocates,
         // subsequent calls within capacity are no-ops. The previous per-call
@@ -1166,6 +1383,19 @@ pub fn run_prefill(
         )?;
         let hidden_cap_bytes = (seq_len * input.hidden * std::mem::size_of::<f32>()) as u64;
         gemv.ensure_hidden_ping_pong(hidden_cap_bytes)?;
+        let mut qwen_moe_grouped =
+            configure_qwen_moe_grouped(gemv, seq_len, input.hidden, input.layer_raw_weights)?;
+        if let Some((n_expert, n_expert_used, n_ff)) = max_qwen_moe_shape(input.layer_raw_weights) {
+            ensure_qwen_moe_staging(
+                gemv,
+                seq_len as u32,
+                input.hidden as u32,
+                n_ff as u32,
+                n_expert as u32,
+                n_expert_used as u32,
+                &mut qwen_moe_grouped,
+            )?;
+        }
         profile.staging_us += FullpathProfile::elapsed_us(stage_timer);
 
         let ping_a_view = {
@@ -1219,7 +1449,7 @@ pub fn run_prefill(
 
         let mut loop_params = LayerLoopParams {
             seq_len,
-            pos_start: 0,
+            pos_start: input.pos_start as u32,
             hidden_token_start: 0,
             trace_tag: "prefill",
             num_layers: input.num_layers,
@@ -1232,19 +1462,32 @@ pub fn run_prefill(
             rope_neox: input.rope_neox,
             layer_kinds: input.layer_kinds,
             hidden: input.hidden,
+            qwen_moe_grouped,
             descriptor_limit: descriptor_window_limit(),
         };
-        let descriptor_chunk_len = descriptor_safe_prefill_chunk_len(&loop_params, layer_weights)?;
+        let mut descriptor_chunk_len =
+            descriptor_safe_prefill_chunk_len(&loop_params, layer_weights)?;
+        if !qwen_moe_grouped {
+            if let Some((_, n_expert_used, _)) = max_qwen_moe_shape(input.layer_raw_weights) {
+                let moe_descriptor_chunk = loop_params
+                    .descriptor_limit
+                    .checked_div(n_expert_used.saturating_mul(3).max(1))
+                    .unwrap_or(0)
+                    .max(1);
+                descriptor_chunk_len = descriptor_chunk_len.min(moe_descriptor_chunk);
+            }
+        }
         let stage_timer = profile.timer();
         for hidden_token_start in (0..seq_len).step_by(descriptor_chunk_len) {
             loop_params.seq_len = descriptor_chunk_len.min(seq_len - hidden_token_start);
-            loop_params.pos_start = u32::try_from(hidden_token_start)
+            loop_params.pos_start = u32::try_from(input.pos_start + hidden_token_start)
                 .map_err(|_| "run_prefill: token position exceeds u32".to_string())?;
             loop_params.hidden_token_start = hidden_token_start;
             run_layer_loop(
                 gemv,
                 &loop_params,
                 layer_weights,
+                input.layer_raw_weights,
                 &mut counters,
                 &mut attention_chunks,
                 &mut gdn_layers,
@@ -1267,27 +1510,91 @@ pub fn run_prefill(
             }
         };
         let stage_timer = profile.timer();
-        gemv.ensure_output_table_bound(
-            input.output_table_q6k,
-            input.output_quant,
-            input.vocab as u32,
-            input.hidden as u32,
-        )?;
-        let last_hidden_offset = ((seq_len - 1) * input.hidden * std::mem::size_of::<f32>()) as u64;
-        let token = gemv.logit_argmax_bound_from_buffer_with_norm(
-            &final_buf,
-            last_hidden_offset,
-            input.output_norm,
-            input.norm_eps,
-            input.output_quant,
-            input.vocab as u32,
-            input.hidden as u32,
-        )?;
-        counters.submits += 1;
-        counters.upload_bytes += (input.output_norm.len() * std::mem::size_of::<f32>()) as u64;
-        counters.download_bytes += 4;
+        let (token, argmax_tokens) = if input.skip_output {
+            (0, None)
+        } else {
+            gemv.ensure_output_table_bound(
+                input.output_table_q6k,
+                input.output_quant,
+                input.vocab as u32,
+                input.hidden as u32,
+            )?;
+            if input.collect_all_argmax {
+                let tokens = if matches!(input.output_quant, QuantType::Q4K | QuantType::Q6K) {
+                    let hidden_rows = u32::try_from(seq_len)
+                        .map_err(|_| "run_prefill: argmax row count exceeds u32".to_string())?;
+                    let tokens = gemv.logit_argmax_rows_bound_from_buffer_with_norm(
+                        &final_buf,
+                        0,
+                        hidden_rows,
+                        input.output_norm,
+                        input.norm_eps,
+                        input.output_quant,
+                        input.excluded_token,
+                        input.vocab as u32,
+                        input.hidden as u32,
+                    )?;
+                    counters.submits += 1;
+                    counters.upload_bytes +=
+                        (input.output_norm.len() * std::mem::size_of::<f32>()) as u64;
+                    tokens
+                } else {
+                    let mut tokens = Vec::with_capacity(seq_len);
+                    for token_index in 0..seq_len {
+                        let hidden_offset =
+                            (token_index * input.hidden * std::mem::size_of::<f32>()) as u64;
+                        tokens.push(gemv.logit_argmax_bound_from_buffer_with_norm(
+                            &final_buf,
+                            hidden_offset,
+                            input.output_norm,
+                            input.norm_eps,
+                            false,
+                            input.output_quant,
+                            input.excluded_token,
+                            input.vocab as u32,
+                            input.hidden as u32,
+                        )?);
+                    }
+                    counters.submits += seq_len as u64;
+                    counters.upload_bytes +=
+                        (seq_len * input.output_norm.len() * std::mem::size_of::<f32>()) as u64;
+                    tokens
+                };
+                counters.download_bytes += (seq_len * std::mem::size_of::<u32>()) as u64;
+                let token = *tokens
+                    .last()
+                    .ok_or_else(|| "run_prefill: per-row argmax returned no tokens".to_string())?;
+                (token, Some(tokens))
+            } else {
+                let last_hidden_offset =
+                    ((seq_len - 1) * input.hidden * std::mem::size_of::<f32>()) as u64;
+                let token = gemv.logit_argmax_bound_from_buffer_with_norm(
+                    &final_buf,
+                    last_hidden_offset,
+                    input.output_norm,
+                    input.norm_eps,
+                    false,
+                    input.output_quant,
+                    input.excluded_token,
+                    input.vocab as u32,
+                    input.hidden as u32,
+                )?;
+                counters.submits += 1;
+                counters.upload_bytes +=
+                    (input.output_norm.len() * std::mem::size_of::<f32>()) as u64;
+                counters.download_bytes += 4;
+                (token, None)
+            }
+        };
+        let hidden_rows = if input.collect_hidden_rows {
+            let rows = gemv.download_buffer_f32_range(&final_buf, 0, hidden_cap_bytes)?;
+            counters.record_host_tensor_roundtrip(hidden_cap_bytes, 0);
+            Some(rows)
+        } else {
+            None
+        };
         profile.output_us += FullpathProfile::elapsed_us(stage_timer);
-        token
+        (token, argmax_tokens, hidden_rows)
     } else {
         // ----- Smoke-test mode: embed_lookup → host hidden → logit_argmax -----
         let mut hidden_buffer = vec![0.0f32; seq_len * input.hidden];
@@ -1310,25 +1617,45 @@ pub fn run_prefill(
              (smoke-test mode). Weight wiring is Task 10's responsibility; \
              caller must provide resident GPU buffers."
         );
-        let last_offset = (seq_len - 1) * input.hidden;
-        let last_hidden = &hidden_buffer[last_offset..last_offset + input.hidden];
-        let mut normed = vec![0.0f32; input.hidden];
-        rms_norm_slice_into(last_hidden, input.output_norm, input.norm_eps, &mut normed)?;
         let stage_timer = profile.timer();
-        let token = gemv.logit_argmax(
-            &normed,
-            input.output_table_q6k,
-            input.output_quant,
-            input.vocab as u32,
-            input.hidden as u32,
-        )?;
-        counters.submits += 1;
-        let norm_upload_bytes = (normed.len() * std::mem::size_of::<f32>()) as u64;
+        let output_calls = if input.collect_all_argmax { seq_len } else { 1 };
+        let mut normed = vec![0.0f32; input.hidden];
+        let mut tokens = input
+            .collect_all_argmax
+            .then(|| Vec::with_capacity(seq_len));
+        let first_row = if input.collect_all_argmax {
+            0
+        } else {
+            seq_len - 1
+        };
+        let mut token = 0;
+        for token_index in first_row..seq_len {
+            let offset = token_index * input.hidden;
+            rms_norm_slice_into(
+                &hidden_buffer[offset..offset + input.hidden],
+                input.output_norm,
+                input.norm_eps,
+                &mut normed,
+            )?;
+            token = gemv.logit_argmax(
+                &normed,
+                input.output_table_q6k,
+                input.output_quant,
+                input.vocab as u32,
+                input.hidden as u32,
+            )?;
+            if let Some(tokens) = tokens.as_mut() {
+                tokens.push(token);
+            }
+        }
+        counters.submits += output_calls as u64;
+        let norm_upload_bytes = (output_calls * normed.len() * std::mem::size_of::<f32>()) as u64;
         counters.record_host_tensor_roundtrip(hidden_download_bytes, norm_upload_bytes);
-        counters.upload_bytes += input.output_table_q6k.len() as u64;
-        counters.download_bytes += 4;
+        counters.upload_bytes += (output_calls * input.output_table_q6k.len()) as u64;
+        counters.download_bytes += (output_calls * std::mem::size_of::<u32>()) as u64;
         profile.output_us += FullpathProfile::elapsed_us(stage_timer);
-        token
+        let hidden_rows = input.collect_hidden_rows.then_some(hidden_buffer);
+        (token, tokens, hidden_rows)
     };
 
     profile.finish(total_timer);
@@ -1355,14 +1682,27 @@ pub fn run_prefill(
             "{}",
             profile.summary_line(&counters, attention_chunks, gdn_layers)
         );
+        eprintln!("{}", profile.moe_summary_line());
     }
     if production_fullpath {
-        ensure_no_forbidden_fullpath_cpu_escape("full_path::run_prefill", &counters)?;
+        let allowed_roundtrip_bytes = if input.collect_hidden_rows {
+            (seq_len * input.hidden * std::mem::size_of::<f32>()) as u64
+        } else {
+            0
+        };
+        ensure_no_forbidden_fullpath_cpu_escape(
+            "full_path::run_prefill",
+            &counters,
+            allowed_roundtrip_bytes,
+            u64::from(input.collect_hidden_rows),
+        )?;
     }
 
     Ok(FullPathPrefillOutput {
         last_token_id,
-        kv_cursor_after: seq_len,
+        argmax_tokens,
+        hidden_rows,
+        kv_cursor_after: pos_end,
         counters,
     })
 }
@@ -1395,6 +1735,7 @@ struct LayerLoopParams<'a> {
     rope_neox: bool,
     layer_kinds: &'a [ModelLayerKind],
     hidden: usize,
+    qwen_moe_grouped: bool,
     descriptor_limit: usize,
 }
 
@@ -1732,6 +2073,362 @@ fn max_fullpath_staging_inner(
     Ok(inner)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MoeRouteGroup {
+    expert: usize,
+    start: usize,
+    len: usize,
+}
+
+fn qwen_moe_for_layer<'a>(raw: &'a LayerRawWeights<'a>) -> Option<&'a QwenMoeRawWeights<'a>> {
+    match raw {
+        LayerRawWeights::Attention(attention) => attention.shared_expert_moe.as_ref(),
+        LayerRawWeights::Gdn(gdn) => gdn.shared_expert_moe.as_ref(),
+    }
+}
+
+fn max_qwen_moe_shape(
+    layer_raw_weights: Option<&[LayerRawWeights<'_>]>,
+) -> Option<(usize, usize, usize)> {
+    layer_raw_weights.and_then(|layers| {
+        layers
+            .iter()
+            .filter_map(qwen_moe_for_layer)
+            .fold(None, |shape, moe| {
+                let next = (moe.n_expert, moe.n_expert_used, moe.n_ff);
+                Some(
+                    shape.map_or(next, |(experts, used, n_ff): (usize, usize, usize)| {
+                        (experts.max(next.0), used.max(next.1), n_ff.max(next.2))
+                    }),
+                )
+            })
+    })
+}
+
+fn qwen_softmax_topk(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
+    let selected_len = top_k.min(logits.len());
+    let mut best_values = vec![f32::NEG_INFINITY; selected_len];
+    let mut best_ids = vec![usize::MAX; selected_len];
+    for (expert, &value) in logits.iter().enumerate() {
+        for rank in 0..selected_len {
+            if value > best_values[rank] || (value == best_values[rank] && expert < best_ids[rank])
+            {
+                for shift in (rank + 1..selected_len).rev() {
+                    best_values[shift] = best_values[shift - 1];
+                    best_ids[shift] = best_ids[shift - 1];
+                }
+                best_values[rank] = value;
+                best_ids[rank] = expert;
+                break;
+            }
+        }
+    }
+    let Some(&selected_max) = best_values.first() else {
+        return Vec::new();
+    };
+    let mut weights = best_values
+        .iter()
+        .map(|value| (*value - selected_max).exp())
+        .collect::<Vec<_>>();
+    let sum = weights.iter().sum::<f32>();
+    if sum != 0.0 {
+        for weight in &mut weights {
+            *weight /= sum;
+        }
+    }
+    best_ids.into_iter().zip(weights).collect()
+}
+
+fn build_qwen_expert_major_routes(
+    logits: &[f32],
+    seq_len: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Result<(Vec<u32>, Vec<f32>, Vec<MoeRouteGroup>), String> {
+    let expected = seq_len
+        .checked_mul(n_expert)
+        .ok_or("build_qwen_expert_major_routes: logits shape overflow")?;
+    if logits.len() != expected {
+        return Err(format!(
+            "build_qwen_expert_major_routes: logits len {} != {}",
+            logits.len(),
+            expected
+        ));
+    }
+    let mut by_expert = vec![Vec::<(u32, f32)>::new(); n_expert];
+    for token in 0..seq_len {
+        for (expert, weight) in qwen_softmax_topk(
+            &logits[token * n_expert..(token + 1) * n_expert],
+            n_expert_used,
+        ) {
+            by_expert[expert].push((token as u32, weight));
+        }
+    }
+    let route_count = seq_len
+        .checked_mul(n_expert_used.min(n_expert))
+        .ok_or("build_qwen_expert_major_routes: route count overflow")?;
+    let mut token_ids = Vec::with_capacity(route_count + seq_len);
+    let mut route_weights = Vec::with_capacity(route_count + seq_len);
+    let mut groups = Vec::new();
+    for (expert, routes) in by_expert.into_iter().enumerate() {
+        if routes.is_empty() {
+            continue;
+        }
+        let start = token_ids.len();
+        for (token, weight) in routes {
+            token_ids.push(token);
+            route_weights.push(weight);
+        }
+        groups.push(MoeRouteGroup {
+            expert,
+            start,
+            len: token_ids.len() - start,
+        });
+    }
+    for token in 0..seq_len {
+        token_ids.push(token as u32);
+        route_weights.push(1.0);
+    }
+    Ok((token_ids, route_weights, groups))
+}
+#[derive(Debug, PartialEq)]
+struct QwenTokenMajorRoutes {
+    token_ids: Vec<u32>,
+    route_weights: Vec<f32>,
+    expert_ids: Vec<usize>,
+    unique_experts: Vec<usize>,
+}
+
+fn build_qwen_token_major_routes(
+    logits: &[f32],
+    seq_len: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Result<QwenTokenMajorRoutes, String> {
+    let expected = seq_len
+        .checked_mul(n_expert)
+        .ok_or("build_qwen_token_major_routes: logits shape overflow")?;
+    if logits.len() != expected {
+        return Err(format!(
+            "build_qwen_token_major_routes: logits len {} != {}",
+            logits.len(),
+            expected
+        ));
+    }
+    let route_count = seq_len
+        .checked_mul(n_expert_used.min(n_expert))
+        .ok_or("build_qwen_token_major_routes: route count overflow")?;
+    let mut token_ids = Vec::with_capacity(route_count + seq_len);
+    let mut route_weights = Vec::with_capacity(route_count + seq_len);
+    let mut expert_ids = Vec::with_capacity(route_count);
+    for token in 0..seq_len {
+        for (expert, weight) in qwen_softmax_topk(
+            &logits[token * n_expert..(token + 1) * n_expert],
+            n_expert_used,
+        ) {
+            token_ids.push(token as u32);
+            route_weights.push(weight);
+            expert_ids.push(expert);
+        }
+    }
+    let mut unique_experts = expert_ids.clone();
+    unique_experts.sort_unstable();
+    unique_experts.dedup();
+    for token in 0..seq_len {
+        token_ids.push(token as u32);
+        route_weights.push(1.0);
+    }
+    Ok(QwenTokenMajorRoutes {
+        token_ids,
+        route_weights,
+        expert_ids,
+        unique_experts,
+    })
+}
+
+fn qwen_moe_grouped_requested_from(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn qwen_moe_grouped_requested() -> bool {
+    qwen_moe_grouped_requested_from(std::env::var("RNB_VULKAN_QWEN_MOE_GROUPED").ok().as_deref())
+}
+
+fn qwen_moe_grouped_required_slots(
+    seq_len: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Option<usize> {
+    seq_len
+        .checked_mul(n_expert_used.min(n_expert))
+        .map(|routes| routes.min(n_expert))
+        .filter(|slots| *slots != 0)
+}
+
+fn qwen_moe_grouped_layout_for_quant(
+    hidden: u32,
+    n_ff: u32,
+    gate: QuantType,
+    up: QuantType,
+    down: QuantType,
+) -> Option<ExpertArenaLayout> {
+    match (gate, up, down) {
+        (QuantType::Q4K, QuantType::Q4K, QuantType::Q5K | QuantType::Q6K) => {
+            ExpertArenaLayout::qwen(hidden, n_ff).ok()
+        }
+        (QuantType::Q8_0, QuantType::Q8_0, QuantType::Q8_0) => {
+            ExpertArenaLayout::qwen_q8(hidden, n_ff).ok()
+        }
+        _ => None,
+    }
+}
+
+fn configure_qwen_moe_grouped(
+    gemv: &mut VulkanLayerGemv,
+    seq_len: usize,
+    hidden: usize,
+    layer_raw_weights: Option<&[LayerRawWeights<'_>]>,
+) -> Result<bool, String> {
+    if !qwen_moe_grouped_requested() {
+        gemv.disable_expert_arena()?;
+        return Ok(false);
+    }
+    let Some((n_expert, n_expert_used, n_ff)) = max_qwen_moe_shape(layer_raw_weights) else {
+        return Ok(false);
+    };
+    let layout = match (u32::try_from(hidden), u32::try_from(n_ff)) {
+        (Ok(hidden_u32), Ok(n_ff_u32)) if gemv.weight_mode() == GpuWeightMode::RowMajor => {
+            layer_raw_weights.and_then(|layers| {
+                let mut expected = None;
+                for moe in layers.iter().filter_map(qwen_moe_for_layer) {
+                    if moe.n_embd != hidden || moe.n_ff != n_ff {
+                        return None;
+                    }
+                    let candidate = qwen_moe_grouped_layout_for_quant(
+                        hidden_u32,
+                        n_ff_u32,
+                        moe.sparse_gate.1,
+                        moe.sparse_up.1,
+                        moe.sparse_down.1,
+                    )?;
+                    if expected.is_some_and(|layout| layout != candidate) {
+                        return None;
+                    }
+                    expected = Some(candidate);
+                }
+                expected
+            })
+        }
+        _ => None,
+    };
+    let Some(required_slots) = qwen_moe_grouped_required_slots(seq_len, n_expert, n_expert_used)
+    else {
+        gemv.disable_expert_arena()?;
+        return Ok(false);
+    };
+    let Some(layout) = layout else {
+        gemv.disable_expert_arena()?;
+        return Ok(false);
+    };
+    gemv.configure_expert_arena(layout, required_slots)
+}
+
+fn ensure_qwen_moe_staging(
+    gemv: &mut VulkanLayerGemv,
+    seq_len: u32,
+    hidden: u32,
+    n_ff: u32,
+    n_expert: u32,
+    n_expert_used: u32,
+    grouped: &mut bool,
+) -> Result<(), String> {
+    match gemv.ensure_fullpath_moe_staging(seq_len, hidden, n_ff, n_expert, n_expert_used, *grouped)
+    {
+        Ok(()) => Ok(()),
+        Err(MoeStagingError::InsufficientCapacity(error)) if *grouped => {
+            gemv.disable_expert_arena()?;
+            *grouped = false;
+            eprintln!(
+                "[vulkan:moe-arena] grouped=disabled reason=insufficient-vram stage=scratch detail={error}"
+            );
+            gemv.ensure_fullpath_moe_staging(seq_len, hidden, n_ff, n_expert, n_expert_used, false)
+                .map_err(MoeStagingError::into_string)
+        }
+        Err(error) => Err(error.into_string()),
+    }
+}
+
+fn quant_matrix_bytes(rows: usize, cols: usize, quant: QuantType) -> Result<usize, String> {
+    let block = quant.block_elements();
+    if cols == 0 || rows == 0 || !cols.is_multiple_of(block) {
+        return Err(format!(
+            "quant_matrix_bytes: shape [{rows}, {cols}] is incompatible with {quant:?} block {block}"
+        ));
+    }
+    rows.checked_mul(cols / block)
+        .and_then(|blocks| blocks.checked_mul(quant.block_bytes()))
+        .ok_or("quant_matrix_bytes: byte count overflow".into())
+}
+
+fn sparse_expert_slice<'a>(
+    tensor: &'a [u8],
+    expert: usize,
+    rows: usize,
+    cols: usize,
+    quant: QuantType,
+    label: &str,
+) -> Result<&'a [u8], String> {
+    let per_expert = quant_matrix_bytes(rows, cols, quant)?;
+    let start = expert
+        .checked_mul(per_expert)
+        .ok_or_else(|| format!("{label}: expert byte offset overflow"))?;
+    let end = start
+        .checked_add(per_expert)
+        .ok_or_else(|| format!("{label}: expert byte range overflow"))?;
+    tensor.get(start..end).ok_or_else(|| {
+        format!(
+            "{label}: expert {expert} range {start}..{end} exceeds tensor bytes {}",
+            tensor.len()
+        )
+    })
+}
+
+fn moe_weight_id(layer_idx: usize, kind: WeightKind) -> Result<WeightId, String> {
+    Ok(WeightId {
+        layer: u16::try_from(layer_idx)
+            .map_err(|_| format!("MoE layer index {layer_idx} exceeds u16"))?,
+        kind,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_qwen_expert_projection(
+    gemv: &mut VulkanLayerGemv,
+    layer_idx: usize,
+    kind: WeightKind,
+    bytes: &[u8],
+    rows: u32,
+    cols: u32,
+    quant: QuantType,
+    mode: GpuWeightMode,
+) -> Result<GpuBuffer, String> {
+    let id = moe_weight_id(layer_idx, kind)?;
+    gemv.upload_weight(id, bytes, rows, cols, quant, mode)?;
+    let buffer = gemv
+        .weight_buffer(id)
+        .ok_or_else(|| format!("run_qwen_moe_layer: selected expert weight {id:?} was evicted"))?;
+    Ok(GpuBuffer {
+        buffer: buffer.buffer,
+        memory: 0,
+        size: buffer.size,
+    })
+}
+
 impl FullpathBufferRefs {
     fn snapshot(gemv: &VulkanLayerGemv) -> Result<Self, String> {
         let get = |opt: Option<&GpuBuffer>, name: &str| -> Result<*const GpuBuffer, String> {
@@ -1769,10 +2466,765 @@ fn submit_layer_loop_chunk(
 ) -> Result<(), String> {
     let timer = profile.timer();
     gemv.submit_and_wait()?;
+    gemv.commit_expert_arena_batch_if_pending()?;
     profile.submit_wait_us += FullpathProfile::elapsed_us(timer);
     counters.submits += 1;
     *chunks += 1;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct MoeRouterRecord {
+    cmdbuf: VkCommandBuffer,
+    norm_set_idx: usize,
+    f32_set_idx: usize,
+}
+
+fn submit_qwen_moe_stage(
+    gemv: &mut VulkanLayerGemv,
+    counters: &mut RuntimeCounters,
+    profile: &mut FullpathProfile,
+) -> Result<(), String> {
+    let timer = profile.timer();
+    gemv.submit_and_wait()?;
+    profile.submit_wait_us += FullpathProfile::elapsed_us(timer);
+    counters.submits += 1;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qwen_moe_layer(
+    gemv: &mut VulkanLayerGemv,
+    layer_idx: usize,
+    seq_len: usize,
+    hidden: usize,
+    hidden_offset_bytes: u64,
+    hidden_out_buf: &GpuBuffer,
+    norm_ffn_buf: &GpuBuffer,
+    ffn_norm_buf: &GpuBuffer,
+    ffn_norm_size: u64,
+    norm_eps: f32,
+    shared_gate_buf: &GpuBuffer,
+    shared_gate_size: u64,
+    shared_gate_quant: QuantType,
+    shared_up_buf: &GpuBuffer,
+    shared_up_size: u64,
+    shared_up_quant: QuantType,
+    shared_down_buf: &GpuBuffer,
+    shared_down_size: u64,
+    shared_down_quant: QuantType,
+    moe: &QwenMoeRawWeights<'_>,
+    counters: &mut RuntimeCounters,
+    profile: &mut FullpathProfile,
+    grouped_enabled: bool,
+    router_record: Option<MoeRouterRecord>,
+) -> Result<Option<VkCommandBuffer>, String> {
+    if moe.expert_gating_func > 1 {
+        return Err(format!(
+            "run_qwen_moe_layer: layer {layer_idx} unsupported gating function {}",
+            moe.expert_gating_func
+        ));
+    }
+    if moe.n_embd != hidden || moe.n_ff == 0 || moe.n_expert == 0 || moe.n_expert_used == 0 {
+        return Err(format!(
+            "run_qwen_moe_layer: layer {layer_idx} invalid shape hidden={} n_embd={} n_ff={} experts={}/{}",
+            hidden, moe.n_embd, moe.n_ff, moe.n_expert_used, moe.n_expert
+        ));
+    }
+    let seq_u32 = u32::try_from(seq_len).map_err(|_| "run_qwen_moe_layer: seq_len exceeds u32")?;
+    let hidden_u32 = u32::try_from(hidden).map_err(|_| "run_qwen_moe_layer: hidden exceeds u32")?;
+    let n_ff_u32 = u32::try_from(moe.n_ff).map_err(|_| "run_qwen_moe_layer: n_ff exceeds u32")?;
+    let n_expert_u32 =
+        u32::try_from(moe.n_expert).map_err(|_| "run_qwen_moe_layer: n_expert exceeds u32")?;
+    let hidden_bytes = u64::from(hidden_u32) * 4;
+    let norm_bytes = u64::from(seq_u32) * hidden_bytes;
+    let inner_bytes = u64::from(n_ff_u32) * 4;
+    let route_bytes = u64::from(seq_u32) * u64::from(n_expert_u32) * 4;
+
+    let router_id = moe_weight_id(layer_idx, WeightKind::MoeRouter)?;
+    let router_buf = {
+        let buffer = gemv.weight_buffer(router_id).ok_or_else(|| {
+            format!("run_qwen_moe_layer: layer {layer_idx} router is not resident")
+        })?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let shared_scale_buf = if moe.shared_expert_gated {
+        let id = moe_weight_id(layer_idx, WeightKind::MoeSharedInputScale)?;
+        let buffer = gemv.weight_buffer(id).ok_or_else(|| {
+            format!("run_qwen_moe_layer: layer {layer_idx} shared scale is not resident")
+        })?;
+        Some(GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        })
+    } else {
+        None
+    };
+    let route_logits_buf = {
+        let buffer = gemv
+            .fullpath_moe_route_logits
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: route logits buffer missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let token_ids_buf = {
+        let buffer = gemv
+            .fullpath_moe_token_ids
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: token id buffer missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let route_weights_buf = {
+        let buffer = gemv
+            .fullpath_moe_route_weights
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: route weight buffer missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let gate_stage = {
+        let buffer = gemv
+            .fullpath_staging_gate
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: gate staging missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let up_stage = {
+        let buffer = gemv
+            .fullpath_staging_up
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: up staging missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+    let down_stage = {
+        let buffer = gemv
+            .fullpath_staging_down
+            .as_ref()
+            .ok_or("run_qwen_moe_layer: down staging missing")?;
+        GpuBuffer {
+            buffer: buffer.buffer,
+            memory: 0,
+            size: buffer.size,
+        }
+    };
+
+    if router_record.is_some() && !grouped_enabled {
+        return Err("run_qwen_moe_layer: pipelined router requires grouped MoE".into());
+    }
+    let cmdbuf = if let Some(record) = router_record {
+        record.cmdbuf
+    } else {
+        gemv.begin_recording()?
+    };
+    gemv.record_gpu_profile_marker(cmdbuf, "moe.router.begin");
+    gemv.record_rms_norm_window_strided(
+        cmdbuf,
+        router_record.map_or(0, |record| record.norm_set_idx),
+        hidden_out_buf,
+        hidden_offset_bytes,
+        hidden_bytes,
+        ffn_norm_buf,
+        ffn_norm_size,
+        norm_ffn_buf,
+        0,
+        hidden_bytes,
+        seq_u32,
+        hidden_u32,
+        norm_eps,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, norm_ffn_buf, 0, norm_bytes)?;
+    gemv.record_f32_gemv_strided_to_strided(
+        cmdbuf,
+        router_record.map_or(0, |record| record.f32_set_idx),
+        &router_buf,
+        router_buf.size,
+        norm_ffn_buf,
+        0,
+        hidden_bytes,
+        &route_logits_buf,
+        0,
+        u64::from(n_expert_u32) * 4,
+        seq_u32,
+        n_expert_u32,
+        hidden_u32,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, &route_logits_buf, 0, route_bytes)?;
+    gemv.record_gpu_profile_marker(cmdbuf, "moe.router");
+    submit_qwen_moe_stage(gemv, counters, profile)?;
+    if router_record.is_some() {
+        gemv.commit_expert_arena_batch_if_pending()?;
+    }
+
+    let logits_count = seq_len
+        .checked_mul(moe.n_expert)
+        .ok_or("run_qwen_moe_layer: route logits count overflow")?;
+    let route_download_timer = profile.timer();
+    let logits = gemv.download_fullpath_moe_logits(logits_count)?;
+    profile.moe_route_download_us += FullpathProfile::elapsed_us(route_download_timer);
+    counters.download_bytes += route_bytes;
+    let mut grouped_slot_ids = None;
+    let (token_ids, _route_weights, groups, sparse_route_count) = if grouped_enabled {
+        let route_build_timer = profile.timer();
+        let routes =
+            build_qwen_token_major_routes(&logits, seq_len, moe.n_expert, moe.n_expert_used)?;
+        profile.moe_route_build_us += FullpathProfile::elapsed_us(route_build_timer);
+        let sparse_route_count = routes.expert_ids.len();
+        if gemv.weight_mode() != GpuWeightMode::RowMajor {
+            return Err(format!(
+                "run_qwen_moe_layer: grouped MoE requires RowMajor weight mode, got {:?}",
+                gemv.weight_mode()
+            ));
+        }
+        let layout = qwen_moe_grouped_layout_for_quant(
+            hidden_u32,
+            n_ff_u32,
+            moe.sparse_gate.1,
+            moe.sparse_up.1,
+            moe.sparse_down.1,
+        )
+        .ok_or_else(|| {
+            format!(
+                "run_qwen_moe_layer: unsupported grouped quant gate={:?} up={:?} down={:?}",
+                moe.sparse_gate.1, moe.sparse_up.1, moe.sparse_down.1
+            )
+        })?;
+        let layer_u16 = u16::try_from(layer_idx)
+            .map_err(|_| format!("run_qwen_moe_layer: layer {layer_idx} exceeds u16"))?;
+        let mut bundles = Vec::with_capacity(routes.unique_experts.len());
+        for &expert in &routes.unique_experts {
+            let expert_u16 = u16::try_from(expert)
+                .map_err(|_| format!("run_qwen_moe_layer: expert {expert} exceeds u16"))?;
+            bundles.push(ExpertArenaBundle {
+                key: ExpertArenaKey {
+                    layer: layer_u16,
+                    expert: expert_u16,
+                },
+                gate: sparse_expert_slice(
+                    moe.sparse_gate.0,
+                    expert,
+                    moe.n_ff,
+                    hidden,
+                    moe.sparse_gate.1,
+                    "grouped sparse gate",
+                )?,
+                gate_quant: moe.sparse_gate.1,
+                up: sparse_expert_slice(
+                    moe.sparse_up.0,
+                    expert,
+                    moe.n_ff,
+                    hidden,
+                    moe.sparse_up.1,
+                    "grouped sparse up",
+                )?,
+                up_quant: moe.sparse_up.1,
+                down: sparse_expert_slice(
+                    moe.sparse_down.0,
+                    expert,
+                    hidden,
+                    moe.n_ff,
+                    moe.sparse_down.1,
+                    "grouped sparse down",
+                )?,
+                down_quant: moe.sparse_down.1,
+            });
+        }
+        let arena_prepare_timer = profile.timer();
+        let (unique_slots, arena_stats) = gemv.prepare_expert_arena_batch(layout, &bundles)?;
+        profile.moe_arena_prepare_us += FullpathProfile::elapsed_us(arena_prepare_timer);
+        profile.moe_arena_slot_plan_us += arena_stats.slot_plan_us;
+        profile.moe_arena_repack_us += arena_stats.repack_us;
+        profile.moe_arena_staging_us += arena_stats.staging_us;
+        profile.moe_arena_hits += arena_stats.hits;
+        profile.moe_arena_misses += arena_stats.misses;
+        profile.moe_arena_upload_bytes += arena_stats.upload_bytes;
+        profile.moe_arena_repack_bytes += arena_stats.repack_bytes;
+        let slot_by_expert = routes
+            .unique_experts
+            .iter()
+            .copied()
+            .zip(unique_slots)
+            .collect::<HashMap<_, _>>();
+        let route_slots = routes
+            .expert_ids
+            .iter()
+            .map(|expert| {
+                slot_by_expert
+                    .get(expert)
+                    .copied()
+                    .ok_or_else(|| format!("run_qwen_moe_layer: expert {expert} has no arena slot"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let metadata_upload_timer = profile.timer();
+        gemv.upload_fullpath_moe_grouped_metadata(
+            &routes.token_ids,
+            &routes.route_weights,
+            &route_slots,
+        )?;
+        profile.moe_metadata_upload_us += FullpathProfile::elapsed_us(metadata_upload_timer);
+        counters.upload_bytes += (std::mem::size_of_val(routes.token_ids.as_slice())
+            + std::mem::size_of_val(routes.route_weights.as_slice())
+            + std::mem::size_of_val(route_slots.as_slice()))
+            as u64
+            + arena_stats.upload_bytes;
+        if std::env::var_os("RNB_PROFILE").is_some() {
+            let (cached, external, budget) = gemv.weight_cache_usage();
+            eprintln!(
+                "[vulkan:moe-grouped] layer={} routes={} experts={} hits={} misses={} upload_mib={:.3} repack_mib={:.3} arena_slots={} cache_gib={:.3} external_gib={:.3} budget_gib={:.3}",
+                layer_idx,
+                sparse_route_count,
+                routes.unique_experts.len(),
+                arena_stats.hits,
+                arena_stats.misses,
+                arena_stats.upload_bytes as f64 / (1024.0 * 1024.0),
+                arena_stats.repack_bytes as f64 / (1024.0 * 1024.0),
+                gemv.expert_arena_slot_count().unwrap_or(0),
+                cached as f64 / (1024.0 * 1024.0 * 1024.0),
+                external as f64 / (1024.0 * 1024.0 * 1024.0),
+                budget as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        grouped_slot_ids = Some(route_slots);
+        (
+            routes.token_ids,
+            routes.route_weights,
+            Vec::new(),
+            sparse_route_count,
+        )
+    } else {
+        let (token_ids, route_weights, groups) =
+            build_qwen_expert_major_routes(&logits, seq_len, moe.n_expert, moe.n_expert_used)?;
+        let sparse_route_count = groups.iter().map(|group| group.len).sum::<usize>();
+        gemv.upload_fullpath_moe_metadata(&token_ids, &route_weights)?;
+        counters.upload_bytes += (std::mem::size_of_val(token_ids.as_slice())
+            + std::mem::size_of_val(route_weights.as_slice()))
+            as u64;
+        (token_ids, route_weights, groups, sparse_route_count)
+    };
+    let sparse_descriptor_need = if grouped_enabled {
+        0
+    } else {
+        sparse_route_count
+            .checked_mul(3)
+            .ok_or("run_qwen_moe_layer: sparse descriptor count overflow")?
+    };
+    let shared_descriptor_need = seq_len
+        .checked_mul(3)
+        .ok_or("run_qwen_moe_layer: shared descriptor count overflow")?;
+    let descriptor_need = sparse_descriptor_need.max(shared_descriptor_need);
+    if descriptor_need > descriptor_window_limit() {
+        return Err(format!(
+            "run_qwen_moe_layer: descriptor need {descriptor_need} exceeds window {}",
+            descriptor_window_limit()
+        ));
+    }
+
+    let moe_record_timer = profile.timer();
+    if !grouped_enabled {
+        let weight_mode = gemv.weight_mode();
+        for (group_idx, group) in groups.iter().enumerate() {
+            let gate_bytes = sparse_expert_slice(
+                moe.sparse_gate.0,
+                group.expert,
+                moe.n_ff,
+                hidden,
+                moe.sparse_gate.1,
+                "sparse gate",
+            )?;
+            let up_bytes = sparse_expert_slice(
+                moe.sparse_up.0,
+                group.expert,
+                moe.n_ff,
+                hidden,
+                moe.sparse_up.1,
+                "sparse up",
+            )?;
+            let down_bytes = sparse_expert_slice(
+                moe.sparse_down.0,
+                group.expert,
+                hidden,
+                moe.n_ff,
+                moe.sparse_down.1,
+                "sparse down",
+            )?;
+            let expert = u16::try_from(group.expert)
+                .map_err(|_| format!("run_qwen_moe_layer: expert {} exceeds u16", group.expert))?;
+            let group_inner_bytes = group.len as u64 * inner_bytes;
+            let group_hidden_bytes = group.len as u64 * hidden_bytes;
+
+            let gate = upload_qwen_expert_projection(
+                gemv,
+                layer_idx,
+                WeightKind::MoeExpertGate(expert),
+                gate_bytes,
+                n_ff_u32,
+                hidden_u32,
+                moe.sparse_gate.1,
+                weight_mode,
+            )?;
+            counters.upload_bytes += gate_bytes.len() as u64;
+            let cmdbuf = gemv.begin_recording()?;
+            for local_route in 0..group.len {
+                let route_idx = group.start + local_route;
+                let token = token_ids[route_idx] as u64;
+                gemv.record_gemv_strided_to_strided(
+                    cmdbuf,
+                    route_idx,
+                    &gate,
+                    gate.size,
+                    moe.sparse_gate.1,
+                    norm_ffn_buf,
+                    token * hidden_bytes,
+                    hidden_bytes,
+                    &gate_stage,
+                    local_route as u64 * inner_bytes,
+                    inner_bytes,
+                    1,
+                    n_ff_u32,
+                    hidden_u32,
+                )?;
+            }
+            gemv.record_compute_barrier(cmdbuf, &gate_stage, 0, group_inner_bytes)?;
+            submit_qwen_moe_stage(gemv, counters, profile)?;
+
+            let up = upload_qwen_expert_projection(
+                gemv,
+                layer_idx,
+                WeightKind::MoeExpertUp(expert),
+                up_bytes,
+                n_ff_u32,
+                hidden_u32,
+                moe.sparse_up.1,
+                weight_mode,
+            )?;
+            counters.upload_bytes += up_bytes.len() as u64;
+            let cmdbuf = gemv.begin_recording()?;
+            for local_route in 0..group.len {
+                let route_idx = group.start + local_route;
+                let token = token_ids[route_idx] as u64;
+                gemv.record_gemv_strided_to_strided(
+                    cmdbuf,
+                    sparse_route_count + route_idx,
+                    &up,
+                    up.size,
+                    moe.sparse_up.1,
+                    norm_ffn_buf,
+                    token * hidden_bytes,
+                    hidden_bytes,
+                    &up_stage,
+                    local_route as u64 * inner_bytes,
+                    inner_bytes,
+                    1,
+                    n_ff_u32,
+                    hidden_u32,
+                )?;
+            }
+            gemv.record_compute_barrier(cmdbuf, &up_stage, 0, group_inner_bytes)?;
+            let activation_elements = u32::try_from(
+                group
+                    .len
+                    .checked_mul(moe.n_ff)
+                    .ok_or("run_qwen_moe_layer: activation element count overflow")?,
+            )
+            .map_err(|_| "run_qwen_moe_layer: activation element count exceeds u32")?;
+            gemv.record_silu_mul_with_offsets(
+                cmdbuf,
+                group_idx,
+                &gate_stage,
+                0,
+                &up_stage,
+                0,
+                activation_elements,
+            )?;
+            gemv.record_compute_barrier(cmdbuf, &gate_stage, 0, group_inner_bytes)?;
+            submit_qwen_moe_stage(gemv, counters, profile)?;
+
+            let down = upload_qwen_expert_projection(
+                gemv,
+                layer_idx,
+                WeightKind::MoeExpertDown(expert),
+                down_bytes,
+                hidden_u32,
+                n_ff_u32,
+                moe.sparse_down.1,
+                weight_mode,
+            )?;
+            counters.upload_bytes += down_bytes.len() as u64;
+            let cmdbuf = gemv.begin_recording()?;
+            gemv.record_gemv_strided_to_strided(
+                cmdbuf,
+                sparse_route_count * 2 + group.start,
+                &down,
+                down.size,
+                moe.sparse_down.1,
+                &gate_stage,
+                0,
+                inner_bytes,
+                &down_stage,
+                0,
+                hidden_bytes,
+                group.len as u32,
+                hidden_u32,
+                n_ff_u32,
+            )?;
+            gemv.record_compute_barrier(cmdbuf, &down_stage, 0, group_hidden_bytes)?;
+            gemv.record_moe_weighted_scatter_add(
+                cmdbuf,
+                group_idx,
+                hidden_out_buf,
+                hidden_offset_bytes,
+                norm_bytes,
+                &down_stage,
+                0,
+                group_hidden_bytes,
+                &token_ids_buf,
+                group.start as u64 * 4,
+                &route_weights_buf,
+                group.start as u64 * 4,
+                group.len as u32,
+                hidden_u32,
+                false,
+            )?;
+            gemv.record_compute_barrier(cmdbuf, hidden_out_buf, hidden_offset_bytes, norm_bytes)?;
+            submit_qwen_moe_stage(gemv, counters, profile)?;
+        }
+    }
+
+    let grouped_views = if grouped_enabled {
+        let view = |buffer: Option<&GpuBuffer>, label: &str| -> Result<GpuBuffer, String> {
+            let buffer =
+                buffer.ok_or_else(|| format!("run_qwen_moe_layer: grouped {label} missing"))?;
+            Ok(GpuBuffer {
+                buffer: buffer.buffer,
+                memory: 0,
+                size: buffer.size,
+            })
+        };
+        Some((
+            gemv.expert_arena_buffer_view()?,
+            view(gemv.fullpath_moe_slot_ids.as_ref(), "slot ids")?,
+            view(gemv.fullpath_moe_gate.as_ref(), "gate scratch")?,
+            view(gemv.fullpath_moe_activation.as_ref(), "activation scratch")?,
+            view(gemv.fullpath_moe_down.as_ref(), "down scratch")?,
+        ))
+    } else {
+        None
+    };
+
+    let cmdbuf = gemv.begin_recording()?;
+    let all_inner_bytes = u64::from(seq_u32) * inner_bytes;
+    if let Some(((arena, layout), slot_ids, grouped_gate, activation, grouped_down)) =
+        grouped_views.as_ref()
+    {
+        let route_count = u32::try_from(sparse_route_count)
+            .map_err(|_| "run_qwen_moe_layer: grouped route count exceeds u32")?;
+        debug_assert_eq!(
+            grouped_slot_ids.as_ref().map(Vec::len),
+            Some(sparse_route_count)
+        );
+        gemv.record_gpu_profile_marker(cmdbuf, "moe.sparse.begin");
+        gemv.record_expert_arena_uploads(cmdbuf)?;
+        gemv.record_gpu_profile_marker(cmdbuf, "moe.upload");
+        match layout.format {
+            ExpertArenaFormat::Q4KGateUp => {
+                gemv.record_moe_grouped_q4k_gate_up(
+                    cmdbuf,
+                    arena,
+                    slot_ids,
+                    &token_ids_buf,
+                    norm_ffn_buf,
+                    0,
+                    norm_bytes,
+                    grouped_gate,
+                    activation,
+                    route_count,
+                    *layout,
+                )?;
+                gemv.record_moe_grouped_down(
+                    cmdbuf,
+                    arena,
+                    slot_ids,
+                    activation,
+                    grouped_down,
+                    route_count,
+                    moe.sparse_down.1,
+                    *layout,
+                )?;
+            }
+            ExpertArenaFormat::Q8Zero => {
+                gemv.record_moe_grouped_q8_gate_up_down(
+                    cmdbuf,
+                    arena,
+                    slot_ids,
+                    &token_ids_buf,
+                    norm_ffn_buf,
+                    0,
+                    norm_bytes,
+                    grouped_gate,
+                    activation,
+                    grouped_down,
+                    route_count,
+                    *layout,
+                )?;
+            }
+        }
+        gemv.record_moe_grouped_reduce(
+            cmdbuf,
+            hidden_out_buf,
+            hidden_offset_bytes,
+            norm_bytes,
+            grouped_down,
+            &route_weights_buf,
+            route_count,
+            seq_u32,
+            moe.n_expert_used.min(moe.n_expert) as u32,
+            hidden_u32,
+        )?;
+    }
+    let shared_gemv_set_base = 0;
+    let shared_aux_set_idx = 0;
+
+    gemv.record_gemv_strided_to_strided(
+        cmdbuf,
+        shared_gemv_set_base,
+        shared_gate_buf,
+        shared_gate_size,
+        shared_gate_quant,
+        norm_ffn_buf,
+        0,
+        hidden_bytes,
+        &gate_stage,
+        0,
+        inner_bytes,
+        seq_u32,
+        n_ff_u32,
+        hidden_u32,
+    )?;
+    gemv.record_gemv_strided_to_strided(
+        cmdbuf,
+        shared_gemv_set_base + seq_len,
+        shared_up_buf,
+        shared_up_size,
+        shared_up_quant,
+        norm_ffn_buf,
+        0,
+        hidden_bytes,
+        &up_stage,
+        0,
+        inner_bytes,
+        seq_u32,
+        n_ff_u32,
+        hidden_u32,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, &gate_stage, 0, all_inner_bytes)?;
+    gemv.record_compute_barrier(cmdbuf, &up_stage, 0, all_inner_bytes)?;
+    let all_activation_elements = seq_u32
+        .checked_mul(n_ff_u32)
+        .ok_or("run_qwen_moe_layer: shared activation element count overflow")?;
+    gemv.record_silu_mul_with_offsets(
+        cmdbuf,
+        shared_aux_set_idx,
+        &gate_stage,
+        0,
+        &up_stage,
+        0,
+        all_activation_elements,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, &gate_stage, 0, all_inner_bytes)?;
+    gemv.record_gemv_strided_to_strided(
+        cmdbuf,
+        shared_gemv_set_base + seq_len * 2,
+        shared_down_buf,
+        shared_down_size,
+        shared_down_quant,
+        &gate_stage,
+        0,
+        inner_bytes,
+        &down_stage,
+        0,
+        hidden_bytes,
+        seq_u32,
+        hidden_u32,
+        n_ff_u32,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, &down_stage, 0, norm_bytes)?;
+    if let Some(scale) = shared_scale_buf.as_ref() {
+        gemv.record_f32_gemv_strided_to_strided(
+            cmdbuf,
+            0,
+            scale,
+            scale.size,
+            norm_ffn_buf,
+            0,
+            hidden_bytes,
+            &route_logits_buf,
+            0,
+            4,
+            seq_u32,
+            1,
+            hidden_u32,
+        )?;
+        gemv.record_compute_barrier(cmdbuf, &route_logits_buf, 0, u64::from(seq_u32) * 4)?;
+    }
+    let shared_metadata_offset = sparse_route_count as u64 * 4;
+    let (shared_weight_buf, shared_weight_offset) = if moe.shared_expert_gated {
+        (&route_logits_buf, 0)
+    } else {
+        (&route_weights_buf, shared_metadata_offset)
+    };
+    gemv.record_moe_weighted_scatter_add(
+        cmdbuf,
+        shared_aux_set_idx,
+        hidden_out_buf,
+        hidden_offset_bytes,
+        norm_bytes,
+        &down_stage,
+        0,
+        norm_bytes,
+        &token_ids_buf,
+        shared_metadata_offset,
+        shared_weight_buf,
+        shared_weight_offset,
+        seq_u32,
+        hidden_u32,
+        moe.shared_expert_gated,
+    )?;
+    gemv.record_compute_barrier(cmdbuf, hidden_out_buf, hidden_offset_bytes, norm_bytes)?;
+    if grouped_enabled {
+        gemv.record_gpu_profile_marker(cmdbuf, "moe.shared");
+        profile.moe_record_us += FullpathProfile::elapsed_us(moe_record_timer);
+    }
+    if router_record.is_some() {
+        return Ok(Some(cmdbuf));
+    }
+    submit_qwen_moe_stage(gemv, counters, profile)?;
+    if grouped_enabled {
+        gemv.commit_expert_arena_batch()?;
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -1780,6 +3232,7 @@ fn run_layer_loop(
     gemv: &mut VulkanLayerGemv,
     params: &LayerLoopParams<'_>,
     layer_weights: &[LayerHandle<'_>],
+    layer_raw_weights: Option<&[LayerRawWeights<'_>]>,
     counters: &mut RuntimeCounters,
     attention_chunks: &mut usize,
     gdn_layers: &mut usize,
@@ -1836,9 +3289,8 @@ fn run_layer_loop(
                     submit_layer_loop_chunk(gemv, counters, attention_chunks, profile)?;
                 }
                 return Err(format!(
-                    "full_path::run_layer_loop: MoE layer {} encountered — \
-                     MoE is out of scope for the dense PoC (Task 8d). \
-                     Run decode via the CPU or partial-offload path instead.",
+                    "full_path::run_layer_loop: standalone MoE layer {} is unsupported; \
+                     shared-and-sparse MoE must be attached to an Attention or Recurrent layer.",
                     layer_idx
                 ));
             }
@@ -1965,6 +3417,7 @@ fn run_layer_loop(
                     head_v_dim: dims.head_v_dim as u32,
                     conv_kernel: dims.conv_kernel as u32,
                     ffn_inner: params.ffn_inner as u32,
+                    record_dense_ffn: gdn_handle.record_dense_ffn,
                     norm_eps: params.norm_eps,
                     set_idx_norm_base: set_idx.norm,
                     set_idx_q_base: set_idx.q,
@@ -1998,6 +3451,74 @@ fn run_layer_loop(
                     set_idx.reset();
                 }
                 let trace_gdn_stage = gdn_stage_trace_enabled(layer_idx);
+                if !gdn_handle.record_dense_ffn {
+                    let pipelined = params.qwen_moe_grouped
+                        && !layer_profile_flush
+                        && !trace_layers
+                        && !trace_gdn_stage
+                        && !set_idx.moe_router_would_overflow(seq_len, params.descriptor_limit);
+                    if !pipelined && cmd_in_progress {
+                        submit_layer_loop_chunk(gemv, counters, attention_chunks, profile)?;
+                        set_idx.reset();
+                    }
+                    let router_record = pipelined.then_some(MoeRouterRecord {
+                        cmdbuf,
+                        norm_set_idx: set_idx.norm,
+                        f32_set_idx: set_idx.v,
+                    });
+                    let raw = layer_raw_weights
+                        .and_then(|layers| layers.get(layer_idx))
+                        .ok_or_else(|| {
+                            format!("run_layer_loop: layer {layer_idx} GDN MoE raw weights missing")
+                        })?;
+                    let moe = match raw {
+                        LayerRawWeights::Gdn(raw) => raw.shared_expert_moe.as_ref(),
+                        LayerRawWeights::Attention(_) => None,
+                    }
+                    .ok_or_else(|| {
+                        format!("run_layer_loop: layer {layer_idx} GDN MoE contract mismatch")
+                    })?;
+                    let sparse_cmdbuf = run_qwen_moe_layer(
+                        gemv,
+                        layer_idx,
+                        seq_len,
+                        params.hidden,
+                        hidden_offset_bytes,
+                        hidden_out_buf,
+                        norm_ffn_strided_buf,
+                        gdn_handle.post_attn_norm_buf,
+                        gdn_handle.post_attn_norm_size,
+                        params.norm_eps,
+                        gdn_handle.ffn_gate_weight_buf,
+                        gdn_handle.ffn_gate_weight_size,
+                        gdn_handle.ffn_gate_quant,
+                        gdn_handle.ffn_up_weight_buf,
+                        gdn_handle.ffn_up_weight_size,
+                        gdn_handle.ffn_up_quant,
+                        gdn_handle.ffn_down_weight_buf,
+                        gdn_handle.ffn_down_weight_size,
+                        gdn_handle.ffn_down_quant,
+                        moe,
+                        counters,
+                        profile,
+                        params.qwen_moe_grouped,
+                        router_record,
+                    )?;
+                    if let Some(sparse_cmdbuf) = sparse_cmdbuf {
+                        cmdbuf = sparse_cmdbuf;
+                        cmd_in_progress = true;
+                        *attention_chunks += 1;
+                        set_idx.reset();
+                        set_idx.reserve_uniform(
+                            seq_len
+                                .checked_mul(3)
+                                .ok_or("run_layer_loop: grouped MoE descriptor reserve overflow")?,
+                        );
+                    } else {
+                        cmd_in_progress = false;
+                        set_idx.reset();
+                    }
+                }
                 if trace_layers || trace_gdn_stage {
                     let trace_scratch = if trace_gdn_stage {
                         Some(gemv.debug_fullpath_scratch_view()?)
@@ -2070,7 +3591,7 @@ fn run_layer_loop(
                                     )
                                 })
                                 .ok_or("run_layer_loop: trace snapshot byte offset overflow")?;
-                            let snapshot = gemv.debug_download_buffer_f32_range(
+                            let snapshot = gemv.download_buffer_f32_range(
                                 scratch,
                                 trace_snapshot_byte_offset,
                                 (trace_snapshot_f32_len * std::mem::size_of::<f32>()) as u64,
@@ -2333,6 +3854,7 @@ fn run_layer_loop(
                     num_kv_heads: params.num_kv_heads as u32,
                     head_dim: wh.head_dim as u32,
                     ffn_inner: params.ffn_inner as u32,
+                    record_dense_ffn: wh.record_dense_ffn,
                     norm_eps: params.norm_eps,
                     pos_start: params.pos_start,
                     base_freq: params.base_freq,
@@ -2379,6 +3901,76 @@ fn run_layer_loop(
                     set_idx.reset();
                 }
                 let trace_attention_stage = attention_stage_trace_enabled(layer_idx);
+                if !wh.record_dense_ffn {
+                    let pipelined = params.qwen_moe_grouped
+                        && !layer_profile_flush
+                        && !trace_layers
+                        && !trace_attention_stage
+                        && !set_idx.moe_router_would_overflow(seq_len, params.descriptor_limit);
+                    if !pipelined && cmd_in_progress {
+                        submit_layer_loop_chunk(gemv, counters, attention_chunks, profile)?;
+                        set_idx.reset();
+                    }
+                    let router_record = pipelined.then_some(MoeRouterRecord {
+                        cmdbuf,
+                        norm_set_idx: set_idx.norm,
+                        f32_set_idx: set_idx.v,
+                    });
+                    let raw = layer_raw_weights
+                        .and_then(|layers| layers.get(layer_idx))
+                        .ok_or_else(|| {
+                            format!(
+                                "run_layer_loop: layer {layer_idx} attention MoE raw weights missing"
+                            )
+                        })?;
+                    let moe = match raw {
+                        LayerRawWeights::Attention(raw) => raw.shared_expert_moe.as_ref(),
+                        LayerRawWeights::Gdn(_) => None,
+                    }
+                    .ok_or_else(|| {
+                        format!("run_layer_loop: layer {layer_idx} attention MoE contract mismatch")
+                    })?;
+                    let sparse_cmdbuf = run_qwen_moe_layer(
+                        gemv,
+                        layer_idx,
+                        seq_len,
+                        params.hidden,
+                        hidden_offset_bytes,
+                        hidden_out_buf,
+                        norm_ffn_strided_buf,
+                        wh.ffn_norm_buf,
+                        wh.ffn_norm_size,
+                        params.norm_eps,
+                        wh.gate_weight_buf,
+                        wh.gate_weight_size,
+                        wh.gate_quant,
+                        wh.up_weight_buf,
+                        wh.up_weight_size,
+                        wh.up_quant,
+                        wh.down_weight_buf,
+                        wh.down_weight_size,
+                        wh.down_quant,
+                        moe,
+                        counters,
+                        profile,
+                        params.qwen_moe_grouped,
+                        router_record,
+                    )?;
+                    if let Some(sparse_cmdbuf) = sparse_cmdbuf {
+                        cmdbuf = sparse_cmdbuf;
+                        cmd_in_progress = true;
+                        *attention_chunks += 1;
+                        set_idx.reset();
+                        set_idx.reserve_uniform(
+                            seq_len
+                                .checked_mul(3)
+                                .ok_or("run_layer_loop: grouped MoE descriptor reserve overflow")?,
+                        );
+                    } else {
+                        cmd_in_progress = false;
+                        set_idx.reset();
+                    }
+                }
                 if trace_layers || trace_attention_stage {
                     let trace_scratch = if trace_attention_stage {
                         Some(gemv.debug_fullpath_scratch_view()?)
@@ -2576,6 +4168,85 @@ mod tests {
     use crate::layer_gemv::gdn_fullpath_gemv_dispatches;
 
     #[test]
+    fn qwen_topk_uses_stable_expert_id_tie_break_and_selected_softmax() {
+        let selected = qwen_softmax_topk(&[0.0, 1.0, 1.0, -1.0], 2);
+        assert_eq!(selected[0].0, 1);
+        assert_eq!(selected[1].0, 2);
+        assert!((selected[0].1 - 0.5).abs() < 1.0e-6);
+        assert!((selected[1].1 - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn qwen_routes_are_expert_major_and_keep_shared_identity_tail() {
+        let logits = [3.0, 2.0, 0.0, -1.0, 0.0, 1.0, 1.0, -1.0];
+        let (ids, weights, groups) = build_qwen_expert_major_routes(&logits, 2, 4, 2).unwrap();
+        assert_eq!(ids, [0, 0, 1, 1, 0, 1]);
+        assert_eq!(
+            groups,
+            [
+                MoeRouteGroup {
+                    expert: 0,
+                    start: 0,
+                    len: 1,
+                },
+                MoeRouteGroup {
+                    expert: 1,
+                    start: 1,
+                    len: 2,
+                },
+                MoeRouteGroup {
+                    expert: 2,
+                    start: 3,
+                    len: 1,
+                },
+            ]
+        );
+        assert!((weights[0] - 0.731_058_6).abs() < 1.0e-6);
+        assert!((weights[1] - 0.268_941_43).abs() < 1.0e-6);
+        assert!((weights[2] - 0.5).abs() < 1.0e-6);
+        assert!((weights[3] - 0.5).abs() < 1.0e-6);
+        assert_eq!(&weights[4..], &[1.0, 1.0]);
+    }
+    #[test]
+    fn qwen_grouped_routes_are_token_major_and_keep_shared_identity_tail() {
+        let logits = [3.0, 2.0, 0.0, -1.0, 0.0, 1.0, 1.0, -1.0];
+        let routes = build_qwen_token_major_routes(&logits, 2, 4, 2).unwrap();
+        assert_eq!(routes.token_ids, [0, 0, 1, 1, 0, 1]);
+        assert_eq!(routes.expert_ids, [0, 1, 1, 2]);
+        assert_eq!(routes.unique_experts, [0, 1, 2]);
+        assert!((routes.route_weights[0] - 0.731_058_6).abs() < 1.0e-6);
+        assert!((routes.route_weights[1] - 0.268_941_43).abs() < 1.0e-6);
+        assert!((routes.route_weights[2] - 0.5).abs() < 1.0e-6);
+        assert!((routes.route_weights[3] - 0.5).abs() < 1.0e-6);
+        assert_eq!(&routes.route_weights[4..], &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn grouped_moe_is_default_on_with_explicit_false_opt_out() {
+        assert!(qwen_moe_grouped_requested_from(None));
+        assert!(qwen_moe_grouped_requested_from(Some("1")));
+        assert!(!qwen_moe_grouped_requested_from(Some("0")));
+        assert!(!qwen_moe_grouped_requested_from(Some("false")));
+    }
+
+    #[test]
+    fn grouped_moe_slot_requirement_is_bounded_by_expert_count() {
+        assert_eq!(qwen_moe_grouped_required_slots(1, 256, 8), Some(8));
+        assert_eq!(qwen_moe_grouped_required_slots(5, 256, 8), Some(40));
+        assert_eq!(qwen_moe_grouped_required_slots(128, 256, 8), Some(256));
+        assert_eq!(qwen_moe_grouped_required_slots(0, 256, 8), None);
+    }
+
+    #[test]
+    fn sparse_expert_slice_uses_quantized_matrix_extent() {
+        let per_expert = 512 * (2048 / 256) * QuantType::Q4K.block_bytes();
+        let tensor = vec![0u8; per_expert * 3];
+        let expert = sparse_expert_slice(&tensor, 2, 512, 2048, QuantType::Q4K, "gate").unwrap();
+        assert_eq!(expert.len(), per_expert);
+        assert_eq!(expert.as_ptr(), tensor[per_expert * 2..].as_ptr());
+    }
+
+    #[test]
     fn gdn_gemv_budget_includes_quantized_alpha_and_beta() {
         assert_eq!(gdn_fullpath_gemv_dispatches(32, false, false), Some(192));
         assert_eq!(gdn_fullpath_gemv_dispatches(32, true, false), Some(224));
@@ -2652,6 +4323,16 @@ mod tests {
             s.would_overflow(&consumed, MAX_BATCH_OUTPUTS),
             "should detect norm overflow"
         );
+    }
+
+    #[test]
+    fn set_idx_counters_detect_moe_router_pool_overflow() {
+        let mut s = SetIdxCounters::default();
+        s.norm = MAX_BATCH_OUTPUTS - 16;
+        s.v = MAX_BATCH_OUTPUTS - 32;
+
+        assert!(s.moe_router_would_overflow(33, MAX_BATCH_OUTPUTS));
+        assert!(!s.moe_router_would_overflow(16, MAX_BATCH_OUTPUTS));
     }
 
     #[test]
@@ -2748,11 +4429,13 @@ mod tests {
             staging: StagingPolicy::default(),
             output_table_q6k: output,
             output_quant: crate::weight_cache::QuantType::Q6K,
+            excluded_token: None,
             output_norm: &OUTPUT_NORM,
             embed_table_q6k: embed,
             embed_quant: crate::weight_cache::QuantType::Q6K,
             layer_kinds,
             layer_weights: None, // smoke-test mode: skips layer loop
+            layer_raw_weights: None,
         }
     }
 
@@ -2824,11 +4507,13 @@ mod tests {
             staging: StagingPolicy::default(),
             output_table_q6k: &output,
             output_quant: crate::weight_cache::QuantType::Q6K,
+            excluded_token: None,
             output_norm: &output_norm,
             embed_table_q6k: &embed,
             embed_quant: crate::weight_cache::QuantType::Q6K,
             layer_kinds: &[],
             layer_weights: None,
+            layer_raw_weights: None,
         };
 
         let err = validate_decode_step_input(&input);
@@ -2899,6 +4584,7 @@ mod tests {
             down_weight_buf: &dummy_buf,
             down_weight_size: 0,
             down_quant: crate::weight_cache::QuantType::Q4K,
+            record_dense_ffn: true,
         };
         let handles = [LayerHandle::Attention(wh)]; // length 1, but num_layers = 2
         let output_norm = [1.0f32; 256];
@@ -2921,11 +4607,13 @@ mod tests {
             staging: StagingPolicy::default(),
             output_table_q6k: &output,
             output_quant: crate::weight_cache::QuantType::Q6K,
+            excluded_token: None,
             output_norm: &output_norm,
             embed_table_q6k: &embed,
             embed_quant: crate::weight_cache::QuantType::Q6K,
             layer_kinds: &[],
             layer_weights: Some(&handles),
+            layer_raw_weights: None,
         };
 
         let err = validate_decode_step_input(&input);
@@ -3004,6 +4692,7 @@ mod tests {
             ffn_down_rows: 256,
             ffn_down_cols: 1024,
             ffn_down_quant: q,
+            record_dense_ffn: true,
         };
         // Sanity-check that f32-raw and quantized field groups came through.
         // (raw32: norms + ssm_alpha/beta + ssm_a/conv1d/dt_bias/norm)
@@ -3078,6 +4767,7 @@ mod tests {
             down_weight_buf: &dummy_buf,
             down_weight_size: 0,
             down_quant: q,
+            record_dense_ffn: true,
         };
         let gdn = GdnLayerWeightHandles {
             attn_norm_buf: &dummy_buf,
@@ -3134,12 +4824,14 @@ mod tests {
             ffn_down_rows: 256,
             ffn_down_cols: 1024,
             ffn_down_quant: q,
+            record_dense_ffn: true,
         };
         let handles = [LayerHandle::Attention(attention), LayerHandle::Gdn(gdn)];
         let layer_kinds = [ModelLayerKind::Attention, ModelLayerKind::Recurrent];
         let output_norm = [1.0f32; 256];
         let input = FullPathPrefillInput {
             prompt_token_ids: &[1, 2],
+            pos_start: 0,
             num_layers: 2,
             hidden: 256,
             num_heads: 4,
@@ -3155,10 +4847,15 @@ mod tests {
             staging: StagingPolicy::default(),
             output_table_q6k: &[],
             output_quant: crate::weight_cache::QuantType::Q6K,
+            excluded_token: None,
             output_norm: &output_norm,
             embed_table_q6k: &[],
             embed_quant: crate::weight_cache::QuantType::Q6K,
+            collect_hidden_rows: false,
+            collect_all_argmax: false,
+            skip_output: false,
             layer_weights: Some(&handles),
+            layer_raw_weights: None,
             layer_kinds: &layer_kinds,
         };
 
@@ -3197,7 +4894,7 @@ mod tests {
         let mut counters = RuntimeCounters::default();
         counters.record_host_tensor_roundtrip(256, 256);
 
-        let err = ensure_no_forbidden_fullpath_cpu_escape("test_guard", &counters)
+        let err = ensure_no_forbidden_fullpath_cpu_escape("test_guard", &counters, 0, 0)
             .expect_err("host tensor roundtrip must fail production fullpath");
 
         assert!(err.contains("test_guard"));
@@ -3306,6 +5003,7 @@ mod tests {
             ffn_down_rows: 1024,
             ffn_down_cols: 3584,
             ffn_down_quant: q,
+            record_dense_ffn: true,
         }
     }
 

@@ -13,10 +13,11 @@ use rnb_backend_vulkan::{
 
 use super::{
     FullPathDecodeStepInput, FullPathDecodeStepOutput, FullPathPrefillInput, FullPathPrefillOutput,
-    GpuBuffer, GpuWeightMode, KvResidentLayout, LayerRuntime, ModelLayerKind, QuantType,
-    StagingPolicy,
+    FullPathSequenceStateSnapshot, GpuBuffer, GpuWeightMode, KvResidentLayout, LayerRuntime,
+    ModelLayerKind, QuantType, StagingPolicy,
 };
 use crate::vulkan_backend::WeightId;
+use rnb_backend_vulkan::WeightKind;
 
 // ----- mv27-task10b-4c-2a: fullpath wrapper methods -----
 //
@@ -231,6 +232,7 @@ impl LayerRuntime {
     pub fn run_fullpath_prefill(
         &mut self,
         prompt_token_ids: &[u32],
+        pos_start: usize,
         num_layers: usize,
         hidden: usize,
         num_heads: usize,
@@ -245,11 +247,15 @@ impl LayerRuntime {
         max_ctx: usize,
         output_table_q6k: &[u8],
         output_quant: QuantType,
+        excluded_token: Option<u32>,
         output_norm: &[f32],
         embed_table_q6k: &[u8],
         embed_quant: QuantType,
         layer_raw_weights: &[LayerRawWeights<'_>],
         layer_kinds: &[ModelLayerKind],
+        collect_hidden_rows: bool,
+        collect_all_argmax: bool,
+        skip_output: bool,
         staging: StagingPolicy,
     ) -> Result<FullPathPrefillOutput, String> {
         validate_layer_raw_weights_count(layer_raw_weights, num_layers, "run_fullpath_prefill")?;
@@ -287,6 +293,7 @@ impl LayerRuntime {
 
         let input = FullPathPrefillInput {
             prompt_token_ids,
+            pos_start,
             num_layers,
             hidden,
             num_heads,
@@ -302,10 +309,15 @@ impl LayerRuntime {
             staging,
             output_table_q6k,
             output_quant,
+            excluded_token,
             output_norm,
             embed_table_q6k,
             embed_quant,
+            collect_hidden_rows,
+            collect_all_argmax,
+            skip_output,
             layer_weights: Some(&handles),
+            layer_raw_weights: Some(layer_raw_weights),
             layer_kinds,
         };
 
@@ -315,6 +327,18 @@ impl LayerRuntime {
         drop(handles);
         drop(layer_handles_storage);
         result
+    }
+    pub fn snapshot_fullpath_sequence_state(
+        &mut self,
+    ) -> Result<FullPathSequenceStateSnapshot, String> {
+        self.inner.snapshot_fullpath_sequence_state()
+    }
+
+    pub fn restore_fullpath_sequence_state(
+        &mut self,
+        snapshot: &FullPathSequenceStateSnapshot,
+    ) -> Result<(), String> {
+        self.inner.restore_fullpath_sequence_state(snapshot)
     }
 
     /// Drive a single-token full-path decode step on the GPU.
@@ -342,6 +366,7 @@ impl LayerRuntime {
         max_ctx: usize,
         output_table_q6k: &[u8],
         output_quant: QuantType,
+        excluded_token: Option<u32>,
         output_norm: &[f32],
         embed_table_q6k: &[u8],
         embed_quant: QuantType,
@@ -398,11 +423,13 @@ impl LayerRuntime {
             staging,
             output_table_q6k,
             output_quant,
+            excluded_token,
             output_norm,
             embed_table_q6k,
             embed_quant,
             layer_kinds,
             layer_weights: Some(&handles),
+            layer_raw_weights: Some(layer_raw_weights),
         };
 
         let result = rnb_backend_vulkan::full_path::run_decode_step(&mut self.inner, input);
@@ -416,120 +443,9 @@ impl LayerRuntime {
 // Public input types + helpers (mv27-task10b-4c-2a)
 // ---------------------------------------------------------------------------
 
-/// Raw byte slices + metadata for one transformer layer's weights.
-///
-/// Caller (rnb-llm engine, mv27-task10b-4c-2b for Attention; mv28-task10b-5c
-/// for Gdn) constructs an array of these from `engine.weights.*_raw_bytes(...)`
-/// accessors and hands it to [`LayerRuntime::run_fullpath_prefill`] /
-/// `run_fullpath_decode_step`.
-///
-/// **mv28-task10b-5b:** split into an enum so hybrid models (Attention +
-/// GatedDeltaNet) can mix layer kinds. The Gdn arm carries the raw byte
-/// slices for the 14 GDN weights (8 f32-raw + 6 quantized) mirroring
-/// `rnb_backend_vulkan::full_path::GdnLayerWeightHandles<'a>`. Until 5d
-/// activates the Gdn dispatch in the wrapper, presence of any
-/// `LayerRawWeights::Gdn(_)` entry causes `run_fullpath_*` to return Err
-/// (see `run_fullpath_prefill` / `run_fullpath_decode_step`).
-pub enum LayerRawWeights<'a> {
-    Attention(AttentionRawWeights<'a>),
-    /// GDN (GatedDeltaNet / hybrid model) layer raw bytes. Wired through
-    /// `upload_layer_weights` / `build_layer_handles` but dispatch is
-    /// guarded by `Err("...10b-5d wiring pending")` until 5d lands.
-    Gdn(GdnRawWeights<'a>),
-}
-
-/// Raw byte slices + metadata for one **attention** layer's weights.
-///
-/// The wrapper splits combined K/V tensors (`[num_kv_heads*head_dim, hidden]`,
-/// row-major) into per-kv-head shards using the dimensions carried by each
-/// projection. Caller supplies the **combined** tensor bytes — the wrapper
-/// does the sharding.
-///
-/// Quants supported: Q4_K / Q5_K / Q6_K / Q8_0 (those that
-/// `WeightCache::get_or_upload` accepts).
-// Field order mirrors `rnb_backend_vulkan::full_path::LayerWeightHandles`
-// so the upload/build sites read top-to-bottom in the same order as the
-// backend struct they feed.
-pub struct AttentionRawWeights<'a> {
-    /// Attention RMS norm weight (f32, not quantized).
-    pub attn_norm: &'a [f32],
-    /// Q projection: `(raw_bytes, rows, cols, quant)`. `rows = num_heads * head_dim`,
-    /// `cols = hidden`.
-    pub q_proj: (&'a [u8], usize, usize, QuantType),
-    /// Optional Q projection bias. Shape: `[q_rows]`.
-    pub q_bias: Option<&'a [f32]>,
-    /// Optional per-head Q RMS norm weight. Shape: `[head_dim]`.
-    pub q_norm: Option<&'a [f32]>,
-    /// Combined K projection: `(raw_bytes, rows, cols, quant)`, with shape
-    /// `[num_kv_heads * head_dim, hidden]`. Sliced into per-kv-head shards.
-    pub k_proj_combined: (&'a [u8], usize, usize, QuantType),
-    /// Optional combined K projection bias. Shape: `[num_kv_heads * head_dim]`.
-    pub k_bias: Option<&'a [f32]>,
-    /// Optional per-head K RMS norm weight. Shape: `[head_dim]`.
-    pub k_norm: Option<&'a [f32]>,
-    /// Combined V projection, same tuple and shape contract as K.
-    pub v_proj_combined: (&'a [u8], usize, usize, QuantType),
-    /// Optional combined V projection bias. Shape: `[num_kv_heads * head_dim]`.
-    pub v_bias: Option<&'a [f32]>,
-    /// O projection: `(raw_bytes, rows, cols, quant)`. `rows = hidden`,
-    /// `cols = num_heads * head_dim`.
-    pub o_proj: (&'a [u8], usize, usize, QuantType),
-    /// FFN RMS norm weight (f32, not quantized).
-    pub ffn_norm: &'a [f32],
-    /// FFN gate projection: `(raw_bytes, rows, cols, quant)`. `rows = ffn_inner`,
-    /// `cols = hidden`.
-    pub gate_proj: (&'a [u8], usize, usize, QuantType),
-    /// FFN up projection (same shape as `gate_proj`).
-    pub up_proj: (&'a [u8], usize, usize, QuantType),
-    /// FFN down projection: `rows = hidden`, `cols = ffn_inner`.
-    pub down_proj: (&'a [u8], usize, usize, QuantType),
-}
-
-/// Raw byte slices + metadata for one **GDN** (GatedDeltaNet / hybrid model)
-/// layer's weights.
-///
-/// Field order mirrors `rnb_backend_vulkan::full_path::GdnLayerWeightHandles<'a>`:
-/// norm → fused QKV → z gate → SSM α/β → SSM raw 묶음 → SSM out →
-/// post-attn norm → FFN gate/up/down.
-///
-/// Fixed f32 fields (`attn_norm`, `post_attn_norm`, `ssm_a`, `ssm_conv1d`,
-/// `ssm_dt_bias`, `ssm_norm`) ride the `GpuWeightMode::Raw32` upload path.
-/// Projection fields use the standard `Soa` cache path; alpha/beta retain
-/// `None` for F32 Raw32 or `Some(quant)` for quantized GEMV.
-pub struct GdnRawWeights<'a> {
-    /// Pre-attn RMS norm weight (f32, Raw32 path). Shape: `[hidden]`.
-    pub attn_norm: &'a [f32],
-    /// Fused QKV projection — `[conv_channels, hidden]`.
-    pub qkv: (&'a [u8], usize, usize, QuantType),
-    /// z gate (SSM input gating) — `[d_inner, hidden]`.
-    pub gate: (&'a [u8], usize, usize, QuantType),
-    /// SSM α — `[num_heads, hidden]`. `None` quant means F32 Raw32.
-    pub ssm_alpha: (&'a [u8], usize, usize, Option<QuantType>),
-    /// SSM β — `[num_heads, hidden]`. `None` quant means F32 Raw32.
-    pub ssm_beta: (&'a [u8], usize, usize, Option<QuantType>),
-    /// `A_log` per head (f32, Raw32). Shape: `[num_heads]`.
-    pub ssm_a: &'a [f32],
-    /// conv1d kernel (f32, Raw32). Shape: `[conv_kernel, conv_channels]`.
-    pub ssm_conv1d: &'a [f32],
-    /// Δt bias per head (f32, Raw32). Shape: `[num_heads]`.
-    pub ssm_dt_bias: &'a [f32],
-    /// per-head-dim RMS norm (f32, Raw32). Shape: `[head_v_dim]`.
-    pub ssm_norm: &'a [f32],
-    /// GDN key/query group count (`metadata.ssm_n_group`), not attention KV heads.
-    pub num_k_heads: usize,
-    /// GDN key/query state width (`metadata.ssm_d_state`).
-    pub head_k_dim: usize,
-    /// SSM out projection — `[hidden, d_inner]`.
-    pub ssm_out: (&'a [u8], usize, usize, QuantType),
-    /// Post-attn RMS norm weight (f32, Raw32 path). Shape: `[hidden]`.
-    pub post_attn_norm: &'a [f32],
-    /// FFN gate projection — `[ffn_inner, hidden]`.
-    pub ffn_gate: (&'a [u8], usize, usize, QuantType),
-    /// FFN up projection — `[ffn_inner, hidden]`.
-    pub ffn_up: (&'a [u8], usize, usize, QuantType),
-    /// FFN down projection — `[hidden, ffn_inner]`.
-    pub ffn_down: (&'a [u8], usize, usize, QuantType),
-}
+pub use rnb_backend_vulkan::full_path::{
+    AttentionRawWeights, GdnRawWeights, LayerRawWeights, QwenMoeRawWeights,
+};
 
 /// Wrapper-level validation: `layer_raw_weights.len()` must equal `num_layers`.
 ///
@@ -610,11 +526,6 @@ fn attention_layer_head_dim(
             "upload_attention_layer_weights: layer {layer} projection cols q={q_cols} k={k_cols} v={v_cols} != hidden {hidden}"
         ));
     }
-    if q_rows == 0 || q_rows % num_heads != 0 {
-        return Err(format!(
-            "upload_attention_layer_weights: layer {layer} q_rows {q_rows} is not divisible by num_heads {num_heads}"
-        ));
-    }
     if k_rows == 0 || k_rows % num_kv_heads != 0 {
         return Err(format!(
             "upload_attention_layer_weights: layer {layer} k_rows {k_rows} is not divisible by num_kv_heads {num_kv_heads}"
@@ -625,31 +536,54 @@ fn attention_layer_head_dim(
             "upload_attention_layer_weights: layer {layer} v_rows {v_rows} is not divisible by num_kv_heads {num_kv_heads}"
         ));
     }
-    let q_head_dim = q_rows / num_heads;
-    let k_head_dim = k_rows / num_kv_heads;
+    let head_dim = k_rows / num_kv_heads;
     let v_head_dim = v_rows / num_kv_heads;
-    if q_head_dim != k_head_dim || q_head_dim != v_head_dim {
+    if head_dim != v_head_dim {
         return Err(format!(
-            "upload_attention_layer_weights: layer {layer} head dimensions disagree q={q_head_dim} k={k_head_dim} v={v_head_dim}"
+            "upload_attention_layer_weights: layer {layer} K/V head dimensions disagree k={head_dim} v={v_head_dim}"
+        ));
+    }
+    let q_dim = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| format!("upload_attention_layer_weights: layer {layer} q_dim overflow"))?;
+    let gated_q_dim = q_dim.checked_mul(2).ok_or_else(|| {
+        format!("upload_attention_layer_weights: layer {layer} gated q_dim overflow")
+    })?;
+    if q_rows != q_dim && q_rows != gated_q_dim {
+        return Err(format!(
+            "upload_attention_layer_weights: layer {layer} q_rows {q_rows} must equal q_dim {q_dim} or gated q_dim {gated_q_dim}"
         ));
     }
     let (_, o_rows, o_cols, _) = raw.o_proj;
-    if o_rows != hidden || o_cols != q_rows {
+    if o_rows != hidden || o_cols != q_dim {
         return Err(format!(
-            "upload_attention_layer_weights: layer {layer} output projection shape [{o_rows}, {o_cols}] != [{hidden}, {q_rows}]"
+            "upload_attention_layer_weights: layer {layer} output projection shape [{o_rows}, {o_cols}] != [{hidden}, {q_dim}]"
         ));
     }
-    if raw.q_norm.is_some_and(|norm| norm.len() != q_head_dim) {
+    if raw.q_norm.is_some_and(|norm| norm.len() != head_dim) {
         return Err(format!(
-            "upload_attention_layer_weights: layer {layer} q_norm length does not match head_dim {q_head_dim}"
+            "upload_attention_layer_weights: layer {layer} q_norm length does not match head_dim {head_dim}"
         ));
     }
-    if raw.k_norm.is_some_and(|norm| norm.len() != q_head_dim) {
+    if raw.k_norm.is_some_and(|norm| norm.len() != head_dim) {
         return Err(format!(
-            "upload_attention_layer_weights: layer {layer} k_norm length does not match head_dim {q_head_dim}"
+            "upload_attention_layer_weights: layer {layer} k_norm length does not match head_dim {head_dim}"
         ));
     }
-    Ok(q_head_dim)
+    Ok(head_dim)
+}
+fn moe_router_id(layer: usize) -> WeightId {
+    WeightId {
+        layer: layer as u16,
+        kind: WeightKind::MoeRouter,
+    }
+}
+
+fn moe_shared_input_scale_id(layer: usize) -> WeightId {
+    WeightId {
+        layer: layer as u16,
+        kind: WeightKind::MoeSharedInputScale,
+    }
 }
 
 fn upload_attention_layer_weights(
@@ -722,6 +656,44 @@ fn upload_attention_layer_weights(
         mode,
     )?;
 
+    if let Some(moe) = raw.shared_expert_moe.as_ref() {
+        if moe.router.len()
+            != moe
+                .n_expert
+                .checked_mul(moe.n_embd)
+                .ok_or("upload_attention_layer_weights: router shape overflow")?
+        {
+            return Err(format!(
+                "upload_attention_layer_weights: layer {layer} router len {} != {}*{}",
+                moe.router.len(),
+                moe.n_expert,
+                moe.n_embd
+            ));
+        }
+        upload_raw_f32(
+            inner,
+            moe_router_id(layer),
+            moe.router,
+            moe.n_expert as u32,
+            moe.n_embd as u32,
+        )?;
+        if moe.shared_expert_gated {
+            if moe.shared_input_scale.len() != moe.n_embd {
+                return Err(format!(
+                    "upload_attention_layer_weights: layer {layer} shared input scale len {} != hidden {}",
+                    moe.shared_input_scale.len(),
+                    moe.n_embd
+                ));
+            }
+            upload_raw_f32(
+                inner,
+                moe_shared_input_scale_id(layer),
+                moe.shared_input_scale,
+                1,
+                moe.n_embd as u32,
+            )?;
+        }
+    }
     upload_raw_f32(inner, attn_norm_id(layer), raw.attn_norm, 1, hidden as u32)?;
     upload_raw_f32(inner, ffn_norm_id(layer), raw.ffn_norm, 1, hidden as u32)?;
 
@@ -797,6 +769,39 @@ fn upload_attention_layer_weights(
             mode,
         )?;
     }
+    for id in [
+        q_proj_id(layer),
+        o_proj_id(layer),
+        ffn_gate_id(layer),
+        ffn_up_id(layer),
+        ffn_down_id(layer),
+        attn_norm_id(layer),
+        ffn_norm_id(layer),
+    ] {
+        inner.pin_weight(id)?;
+    }
+    for optional_id in [
+        raw.q_bias.map(|_| q_bias_id(layer)),
+        raw.q_norm.map(|_| q_norm_id(layer)),
+        raw.k_norm.map(|_| k_norm_id(layer)),
+        raw.k_bias.map(|_| k_bias_id(layer)),
+        raw.v_bias.map(|_| v_bias_id(layer)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        inner.pin_weight(optional_id)?;
+    }
+    if let Some(moe) = raw.shared_expert_moe.as_ref() {
+        inner.pin_weight(moe_router_id(layer))?;
+        if moe.shared_expert_gated {
+            inner.pin_weight(moe_shared_input_scale_id(layer))?;
+        }
+    }
+    for kvh in 0..num_kv_heads {
+        inner.pin_weight(k_proj_shard_id(layer, kvh as u16))?;
+        inner.pin_weight(v_proj_shard_id(layer, kvh as u16))?;
+    }
     Ok(())
 }
 
@@ -810,10 +815,6 @@ fn upload_attention_layer_weights(
 /// those are already layer-keyed, so a hybrid model keeps disjoint cache
 /// entries by layer index.
 ///
-/// Until 5d activates the dispatch, this is upload-only — the uploaded
-/// buffers are addressable through `build_layer_handles` but the wrapper
-/// returns `Err("...10b-5d wiring pending")` before any actual GPU
-/// dispatch consumes them.
 fn upload_gdn_layer_weights(
     inner: &mut crate::vulkan_backend::PrefillLayerRuntime,
     layer: usize,
@@ -914,9 +915,71 @@ fn upload_gdn_layer_weights(
         1,
         ssm_dt_bias_len,
     )?;
+    if let Some(moe) = raw.shared_expert_moe.as_ref() {
+        if moe.router.len()
+            != moe
+                .n_expert
+                .checked_mul(moe.n_embd)
+                .ok_or("upload_gdn_layer_weights: router shape overflow")?
+        {
+            return Err(format!(
+                "upload_gdn_layer_weights: layer {layer} router len {} != {}*{}",
+                moe.router.len(),
+                moe.n_expert,
+                moe.n_embd
+            ));
+        }
+        upload_raw_f32(
+            inner,
+            moe_router_id(layer),
+            moe.router,
+            moe.n_expert as u32,
+            moe.n_embd as u32,
+        )?;
+        if moe.shared_expert_gated {
+            if moe.shared_input_scale.len() != moe.n_embd {
+                return Err(format!(
+                    "upload_gdn_layer_weights: layer {layer} shared input scale len {} != hidden {}",
+                    moe.shared_input_scale.len(),
+                    moe.n_embd
+                ));
+            }
+            upload_raw_f32(
+                inner,
+                moe_shared_input_scale_id(layer),
+                moe.shared_input_scale,
+                1,
+                moe.n_embd as u32,
+            )?;
+        }
+    }
     let ssm_norm_len = raw.ssm_norm.len() as u32;
     upload_raw_f32(inner, gdn_ssm_norm_id(layer), raw.ssm_norm, 1, ssm_norm_len)?;
 
+    for id in [
+        gdn_qkv_id(layer),
+        gdn_gate_id(layer),
+        gdn_alpha_id(layer),
+        gdn_beta_id(layer),
+        gdn_ssm_out_id(layer),
+        gdn_attn_norm_id(layer),
+        gdn_post_attn_norm_id(layer),
+        gdn_ssm_a_id(layer),
+        gdn_ssm_conv1d_id(layer),
+        gdn_ssm_dt_bias_id(layer),
+        gdn_ssm_norm_id(layer),
+        ffn_gate_id(layer),
+        ffn_up_id(layer),
+        ffn_down_id(layer),
+    ] {
+        inner.pin_weight(id)?;
+    }
+    if let Some(moe) = raw.shared_expert_moe.as_ref() {
+        inner.pin_weight(moe_router_id(layer))?;
+        if moe.shared_expert_gated {
+            inner.pin_weight(moe_shared_input_scale_id(layer))?;
+        }
+    }
     Ok(())
 }
 
@@ -1201,6 +1264,7 @@ fn build_attention_layer_handles(
         down: down_weight_buf as *const GpuBuffer,
         down_size: down_weight_buf.size(),
         down_quant: raw.down_proj.3,
+        record_dense_ffn: raw.shared_expert_moe.is_none(),
         k_ptrs,
         k_weight_size,
         k_quant: raw.k_proj_combined.3,
@@ -1225,11 +1289,8 @@ fn build_attention_layer_handles(
 /// the same model — attention layers and GDN layers occupy disjoint layer
 /// indices in hybrid models).
 ///
-/// The returned storage is read by `as_handles_gdn` to produce a
-/// `GdnLayerWeightHandles<'a>` for the future 5d dispatch path. Until 5d
-/// activates the dispatch, this code path runs to completion but the
-/// wrapper rejects it via `Err("...10b-5d wiring pending")` before any
-/// GPU consumption.
+/// The returned storage is converted to `GdnLayerWeightHandles<'a>` for
+/// fullpath prefill and decode dispatch.
 fn build_gdn_layer_handles(
     inner: &crate::vulkan_backend::PrefillLayerRuntime,
     layer: usize,
@@ -1314,6 +1375,7 @@ fn build_gdn_layer_handles(
         ffn_down_rows: raw.ffn_down.1,
         ffn_down_cols: raw.ffn_down.2,
         ffn_down_quant: raw.ffn_down.3,
+        record_dense_ffn: raw.shared_expert_moe.is_none(),
     }))
 }
 
@@ -1325,10 +1387,6 @@ fn build_gdn_layer_handles(
 /// shared across both variants — see `as_attention_handles` / `as_gdn_handles`.
 enum LayerHandlesStorage {
     Attention(AttentionHandlesStorage),
-    /// Constructed by `build_gdn_layer_handles` but not yet dispatched —
-    /// `extract_attention_handles_or_err` rejects this arm with a
-    /// "10b-5d wiring pending" error until 5d activates the GDN path.
-    #[allow(dead_code)]
     Gdn(GdnHandlesStorage),
 }
 
@@ -1362,6 +1420,7 @@ struct AttentionHandlesStorage {
     down: *const GpuBuffer,
     down_size: u64,
     down_quant: QuantType,
+    record_dense_ffn: bool,
     /// Per-kv-head K shard pointers. Stored as `*const` so the storage
     /// struct itself doesn't carry any lifetime parameter — borrows are
     /// only constructed on-demand by `as_attention_handles()`.
@@ -1393,9 +1452,7 @@ struct AttentionHandlesStorage {
 /// kernel is shared across all heads). All scalar `*const GpuBuffer`, no Vecs.
 ///
 /// Fields are populated by `build_gdn_layer_handles` and consumed by
-/// `as_gdn_handles`; the latter is wired but not yet dispatched until 5d
-/// extends `FullPathPrefillInput` to carry GDN handles.
-#[allow(dead_code)] // 5d activates the as_gdn_handles consumer
+/// `as_gdn_handles` during fullpath dispatch.
 struct GdnHandlesStorage {
     attn_norm: *const GpuBuffer,
     attn_norm_size: u64,
@@ -1451,6 +1508,7 @@ struct GdnHandlesStorage {
     ffn_down_rows: usize,
     ffn_down_cols: usize,
     ffn_down_quant: QuantType,
+    record_dense_ffn: bool,
 }
 
 impl LayerHandlesStorage {
@@ -1574,6 +1632,7 @@ impl AttentionHandlesStorage {
             down_weight_buf,
             down_weight_size: self.down_size,
             down_quant: self.down_quant,
+            record_dense_ffn: self.record_dense_ffn,
         }
     }
 }
@@ -1644,6 +1703,7 @@ impl GdnHandlesStorage {
             ffn_down_rows: self.ffn_down_rows,
             ffn_down_cols: self.ffn_down_cols,
             ffn_down_quant: self.ffn_down_quant,
+            record_dense_ffn: self.record_dense_ffn,
         }
     }
 }
@@ -1702,6 +1762,7 @@ mod tests {
             gate_proj: (&gate_bytes, 1024, 256, QuantType::Q4K),
             up_proj: (&up_bytes, 1024, 256, QuantType::Q4K),
             down_proj: (&down_bytes, 256, 1024, QuantType::Q4K),
+            shared_expert_moe: None,
         };
 
         // Field-shape spot checks — guards against silent struct drift.
@@ -1750,11 +1811,13 @@ mod tests {
             gate_proj: (&gate_bytes, 1024, 256, QuantType::Q4K),
             up_proj: (&up_bytes, 1024, 256, QuantType::Q4K),
             down_proj: (&down_bytes, 256, 1024, QuantType::Q4K),
+            shared_expert_moe: None,
         };
 
         assert_eq!(attn.q_proj.1, 512);
         assert_eq!(attn.q_norm.expect("q_norm must be carried").len(), 64);
         assert_eq!(attn.k_norm.expect("k_norm must be carried").len(), 64);
+        assert_eq!(attention_layer_head_dim(&attn, 0, 4, 2, 256).unwrap(), 64);
     }
 
     #[test]
@@ -1793,6 +1856,7 @@ mod tests {
             ffn_gate: (&ffn_gate_bytes, 1024, 256, QuantType::Q4K),
             ffn_up: (&ffn_up_bytes, 1024, 256, QuantType::Q4K),
             ffn_down: (&ffn_down_bytes, 256, 1024, QuantType::Q4K),
+            shared_expert_moe: None,
         };
 
         let raw = LayerRawWeights::Gdn(gdn);
@@ -1821,6 +1885,7 @@ mod tests {
 
         let input = FullPathPrefillInput {
             prompt_token_ids: &prompt,
+            pos_start: 0,
             num_layers: 2,
             hidden: 256,
             num_heads: 4,
@@ -1836,10 +1901,15 @@ mod tests {
             staging,
             output_table_q6k: &output,
             output_quant: QuantType::Q6K,
+            excluded_token: None,
             output_norm: &output_norm,
             embed_table_q6k: &embed,
             embed_quant: QuantType::Q6K,
+            collect_hidden_rows: false,
+            collect_all_argmax: false,
+            skip_output: false,
             layer_weights: None, // smoke-test mode: layer loop skipped
+            layer_raw_weights: None,
             layer_kinds: &kinds,
         };
 
@@ -1895,6 +1965,7 @@ mod tests {
             gate_proj: (&gate_bytes, 1024, 256, QuantType::Q4K),
             up_proj: (&up_bytes, 1024, 256, QuantType::Q4K),
             down_proj: (&down_bytes, 256, 1024, QuantType::Q4K),
+            shared_expert_moe: None,
         });
         let one_layer = vec![raw];
         validate_layer_raw_weights_count(&one_layer, 1, "test_caller")
@@ -1932,6 +2003,7 @@ mod tests {
 
         let result = runtime.run_fullpath_prefill(
             &prompt,
+            /* pos_start */ 0,
             /* num_layers */ 0,
             /* hidden */ 256,
             /* num_heads */ 4,
@@ -1946,11 +2018,15 @@ mod tests {
             /* max_ctx */ 256,
             /* output_table_q6k */ &[],
             /* output_quant */ QuantType::Q6K,
+            /* excluded_token */ None,
             /* output_norm */ &[1.0f32; 256],
             /* embed_table_q6k */ &[],
             /* embed_quant */ QuantType::Q6K,
             &layer_weights,
             &layer_kinds,
+            /* collect_hidden_rows */ false,
+            /* collect_all_argmax */ false,
+            /* skip_output */ false,
             StagingPolicy::default(),
         );
         // num_layers=0 should hit the "num_layers must be > 0" validation

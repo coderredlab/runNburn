@@ -1,6 +1,7 @@
 use crate::ffi::loader::VulkanLib;
 use crate::ffi::types::*;
 use std::ffi::c_void;
+use std::fmt;
 use std::ptr;
 
 pub(crate) struct VulkanContext {
@@ -10,6 +11,7 @@ pub(crate) struct VulkanContext {
     pub(crate) queue: VkQueue,
     pub(crate) queue_family_index: u32,
     pub(crate) memory_properties: VkPhysicalDeviceMemoryProperties,
+    pub(crate) max_storage_buffer_range: u64,
     pub(crate) shader_float16: bool,
 }
 
@@ -28,6 +30,38 @@ impl GpuBuffer {
     /// the private field.
     pub fn size(&self) -> VkDeviceSize {
         self.size
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum BufferCreateError {
+    Vulkan {
+        operation: &'static str,
+        result: VkResult,
+    },
+    Other(String),
+}
+
+impl BufferCreateError {
+    pub(crate) const fn is_out_of_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Vulkan {
+                result: VK_ERROR_OUT_OF_DEVICE_MEMORY | VK_ERROR_OUT_OF_HOST_MEMORY,
+                ..
+            }
+        )
+    }
+}
+
+impl fmt::Display for BufferCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vulkan { operation, result } => {
+                write!(formatter, "{operation} failed: {result}")
+            }
+            Self::Other(message) => formatter.write_str(message),
+        }
     }
 }
 
@@ -70,6 +104,13 @@ impl VulkanContext {
         let mut devices = vec![ptr::null_mut(); count as usize];
         (vk.enumerate_physical_devices)(instance, &mut count, devices.as_mut_ptr());
         let physical_device = devices[0];
+        let mut physical_properties: VkPhysicalDeviceProperties = std::mem::zeroed();
+        (vk.get_physical_device_properties)(physical_device, &mut physical_properties);
+        let max_storage_buffer_range = u64::from(physical_properties.max_storage_buffer_range);
+        if max_storage_buffer_range == 0 {
+            (vk.destroy_instance)(instance, ptr::null());
+            return Err("Vulkan device reports maxStorageBufferRange=0".into());
+        }
 
         let mut qf_count = 0u32;
         (vk.get_physical_device_queue_family_properties)(
@@ -157,6 +198,7 @@ impl VulkanContext {
             queue,
             queue_family_index,
             memory_properties,
+            max_storage_buffer_range,
             shader_float16,
         })
     }
@@ -196,6 +238,16 @@ impl VulkanContext {
         usage: VkFlags,
         memory_properties: VkFlags,
     ) -> Result<GpuBuffer, String> {
+        self.try_create_buffer(size, usage, memory_properties)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) unsafe fn try_create_buffer(
+        &self,
+        size: VkDeviceSize,
+        usage: VkFlags,
+        memory_properties: VkFlags,
+    ) -> Result<GpuBuffer, BufferCreateError> {
         let buf_info = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             p_next: ptr::null(),
@@ -208,15 +260,25 @@ impl VulkanContext {
         };
 
         let mut buffer: VkBuffer = VK_NULL_HANDLE;
-        let res = (self.vk.create_buffer)(self.device, &buf_info, ptr::null(), &mut buffer);
-        if res != VK_SUCCESS {
-            return Err(format!("vkCreateBuffer failed: {}", res));
+        let result = (self.vk.create_buffer)(self.device, &buf_info, ptr::null(), &mut buffer);
+        if result != VK_SUCCESS {
+            return Err(BufferCreateError::Vulkan {
+                operation: "vkCreateBuffer",
+                result,
+            });
         }
 
         let mut mem_req: VkMemoryRequirements = std::mem::zeroed();
         (self.vk.get_buffer_memory_requirements)(self.device, buffer, &mut mem_req);
 
-        let mem_type_idx = self.find_memory_type(mem_req.memory_type_bits, memory_properties)?;
+        let mem_type_idx = match self.find_memory_type(mem_req.memory_type_bits, memory_properties)
+        {
+            Ok(index) => index,
+            Err(error) => {
+                (self.vk.destroy_buffer)(self.device, buffer, ptr::null());
+                return Err(BufferCreateError::Other(error));
+            }
+        };
 
         let alloc_info = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -226,15 +288,23 @@ impl VulkanContext {
         };
 
         let mut memory: VkDeviceMemory = VK_NULL_HANDLE;
-        let res = (self.vk.allocate_memory)(self.device, &alloc_info, ptr::null(), &mut memory);
-        if res != VK_SUCCESS {
+        let result = (self.vk.allocate_memory)(self.device, &alloc_info, ptr::null(), &mut memory);
+        if result != VK_SUCCESS {
             (self.vk.destroy_buffer)(self.device, buffer, ptr::null());
-            return Err(format!("vkAllocateMemory failed: {}", res));
+            return Err(BufferCreateError::Vulkan {
+                operation: "vkAllocateMemory",
+                result,
+            });
         }
 
-        let res = (self.vk.bind_buffer_memory)(self.device, buffer, memory, 0);
-        if res != VK_SUCCESS {
-            return Err(format!("vkBindBufferMemory failed: {}", res));
+        let result = (self.vk.bind_buffer_memory)(self.device, buffer, memory, 0);
+        if result != VK_SUCCESS {
+            (self.vk.free_memory)(self.device, memory, ptr::null());
+            (self.vk.destroy_buffer)(self.device, buffer, ptr::null());
+            return Err(BufferCreateError::Vulkan {
+                operation: "vkBindBufferMemory",
+                result,
+            });
         }
 
         Ok(GpuBuffer {
@@ -308,6 +378,32 @@ impl VulkanContext {
         dst: &GpuBuffer,
         size: u64,
     ) -> Result<(), String> {
+        self.copy_buffer_region_and_wait(command_pool, src, 0, dst, 0, size)
+    }
+
+    /// Copy one buffer range with a one-shot command buffer, then wait.
+    pub(crate) unsafe fn copy_buffer_region_and_wait(
+        &self,
+        command_pool: VkCommandPool,
+        src: &GpuBuffer,
+        src_offset: u64,
+        dst: &GpuBuffer,
+        dst_offset: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        let src_end = src_offset
+            .checked_add(size)
+            .ok_or("source buffer copy range overflow")?;
+        let dst_end = dst_offset
+            .checked_add(size)
+            .ok_or("destination buffer copy range overflow")?;
+        if src_end > src.size || dst_end > dst.size {
+            return Err(format!(
+                "buffer copy range exceeds allocation: src={src_offset}..{src_end}/{} dst={dst_offset}..{dst_end}/{}",
+                src.size, dst.size
+            ));
+        }
+
         // Allocate a temporary command buffer
         let alloc_info = VkCommandBufferAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -332,15 +428,23 @@ impl VulkanContext {
             flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             p_inheritance_info: ptr::null(),
         };
-        (self.vk.begin_command_buffer)(cmd_buf, &begin_info);
+        let res = (self.vk.begin_command_buffer)(cmd_buf, &begin_info);
+        if res != VK_SUCCESS {
+            (self.vk.free_command_buffers)(self.device, command_pool, 1, &cmd_buf);
+            return Err(format!("vkBeginCommandBuffer (staging) failed: {}", res));
+        }
 
         let region = VkBufferCopy {
-            src_offset: 0,
-            dst_offset: 0,
+            src_offset,
+            dst_offset,
             size,
         };
         (self.vk.cmd_copy_buffer)(cmd_buf, src.buffer, dst.buffer, 1, &region);
-        (self.vk.end_command_buffer)(cmd_buf);
+        let res = (self.vk.end_command_buffer)(cmd_buf);
+        if res != VK_SUCCESS {
+            (self.vk.free_command_buffers)(self.device, command_pool, 1, &cmd_buf);
+            return Err(format!("vkEndCommandBuffer (staging) failed: {}", res));
+        }
 
         // Submit and wait
         let submit_info = VkSubmitInfo {
@@ -356,9 +460,11 @@ impl VulkanContext {
         };
         let res = (self.vk.queue_submit)(self.queue, 1, &submit_info, VK_NULL_HANDLE);
         if res != VK_SUCCESS {
+            (self.vk.free_command_buffers)(self.device, command_pool, 1, &cmd_buf);
             return Err(format!("vkQueueSubmit (staging) failed: {}", res));
         }
         let res = (self.vk.queue_wait_idle)(self.queue);
+        (self.vk.free_command_buffers)(self.device, command_pool, 1, &cmd_buf);
         if res != VK_SUCCESS {
             return Err(format!("vkQueueWaitIdle (staging) failed: {}", res));
         }

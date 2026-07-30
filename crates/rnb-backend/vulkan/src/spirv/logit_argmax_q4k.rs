@@ -4,7 +4,7 @@ use super::builder::{
 
 /// Fused row-major Q4_K output projection and argmax reduction.
 ///
-/// Bindings and push constants match the Q6_K/Q8_0 argmax kernels.
+/// Bindings and push constants match the batched Q6_K/Q8_0 argmax kernels.
 pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     let mut m = SpirvModule::new();
 
@@ -26,7 +26,7 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     let t_struct_in = m.type_struct(&[t_arr_f32_in]);
     let t_struct_table = m.type_struct(&[t_arr_u32_table]);
     let t_struct_out = m.type_struct(&[t_arr_u32_out]);
-    let t_struct_pc = m.type_struct(&[t_u32, t_u32]);
+    let t_struct_pc = m.type_struct(&[t_u32, t_u32, t_u32]);
 
     let c_local_size = m.constant_u32(t_u32, local_size_x);
     let t_shared_arr_f32 = m.type_array(t_f32, c_local_size);
@@ -88,12 +88,14 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     m.decorate(t_struct_pc, decoration::BLOCK, &[]);
     m.member_decorate(t_struct_pc, 0, decoration::OFFSET, &[0]);
     m.member_decorate(t_struct_pc, 1, decoration::OFFSET, &[4]);
+    m.member_decorate(t_struct_pc, 2, decoration::OFFSET, &[8]);
 
     let gvar_in = m.variable(t_ptr_sb_in, storage_class::STORAGE_BUFFER);
     let gvar_table = m.variable(t_ptr_sb_table, storage_class::STORAGE_BUFFER);
     let gvar_out = m.variable(t_ptr_sb_out, storage_class::STORAGE_BUFFER);
     let gvar_pc = m.variable(t_ptr_pc, storage_class::PUSH_CONSTANT);
     let gvar_lid = m.variable(t_ptr_input_v3, storage_class::INPUT);
+    let gvar_wgid = m.variable(t_ptr_input_v3, storage_class::INPUT);
     let gvar_shared_vals = m.variable(t_ptr_wg_arr_f32, storage_class::WORKGROUP);
     let gvar_shared_idxs = m.variable(t_ptr_wg_arr_u32, storage_class::WORKGROUP);
 
@@ -108,9 +110,10 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
         decoration::BUILTIN,
         &[builtin::LOCAL_INVOCATION_ID],
     );
+    m.decorate(gvar_wgid, decoration::BUILTIN, &[builtin::WORKGROUP_ID]);
 
     let func_id = m.alloc_id();
-    m.entry_point(5, func_id, "main", &[gvar_lid]);
+    m.entry_point(5, func_id, "main", &[gvar_lid, gvar_wgid]);
     m.execution_mode_local_size(func_id, local_size_x, 1, 1);
 
     m.function(t_void, func_id, 0, t_fn_void);
@@ -128,11 +131,15 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
 
     let lid_vec = m.load(t_v3u32, gvar_lid);
     let lid = m.composite_extract(t_u32, lid_vec, 0);
+    let wgid_vec = m.load(t_v3u32, gvar_wgid);
+    let hidden_row = m.composite_extract(t_u32, wgid_vec, 1);
 
     let pc_vocab_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_0]);
     let vocab = m.load(t_u32, pc_vocab_ptr);
     let pc_hidden_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_1]);
     let hidden = m.load(t_u32, pc_hidden_ptr);
+    let pc_excluded_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_2]);
+    let excluded_token = m.load(t_u32, pc_excluded_ptr);
     let blocks_per_row = m.udiv(t_u32, hidden, c_u32_256);
 
     m.store(var_best_val, c_f32_neg_inf);
@@ -291,7 +298,9 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     let dmin_min = m.fmul(t_f32, dmin_f32, min_f);
     let weight_val = m.fsub(t_f32, scaled_quant, dmin_min);
 
-    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, cur_h]);
+    let hidden_row_base = m.imul(t_u32, hidden_row, hidden);
+    let hidden_index = m.iadd(t_u32, hidden_row_base, cur_h);
+    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, hidden_index]);
     let hv = m.load(t_f32, hv_ptr);
     let prod = m.fmul(t_f32, weight_val, hv);
     let cur_sum = m.load(t_f32, var_sum);
@@ -311,7 +320,9 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     // Update local best (val, idx) if sum > best_val
     let final_sum = m.load(t_f32, var_sum);
     let cur_best = m.load(t_f32, var_best_val);
-    let beats = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let not_excluded = m.i_not_equal(t_bool, cur_v, excluded_token);
+    let beats_value = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let beats = m.logical_and(t_bool, not_excluded, beats_value);
     let lbl_upd = m.alloc_id();
     let lbl_upd_m = m.alloc_id();
     m.selection_merge(lbl_upd_m, 0);
@@ -419,7 +430,7 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
     m.functions
         .push(SpirvModule::encode_inst(op::LABEL, &[lbl_r_m.0]));
 
-    // ---- Thread 0 writes argmax_out[0] ----
+    // ---- Thread 0 writes argmax_out[hidden_row] ----
     let is_lid_zero = m.u_less_than(t_bool, lid, c_u32_1);
     let lbl_w = m.alloc_id();
     let lbl_w_m = m.alloc_id();
@@ -429,7 +440,7 @@ pub fn emit_logit_argmax_q4k(local_size_x: u32) -> Vec<u32> {
         .push(SpirvModule::encode_inst(op::LABEL, &[lbl_w.0]));
     let win_idx_ptr = m.access_chain(t_ptr_wg_u32, gvar_shared_idxs, &[c_u32_0]);
     let win_idx = m.load(t_u32, win_idx_ptr);
-    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, c_u32_0]);
+    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, hidden_row]);
     m.store(out_ptr, win_idx);
     m.branch(lbl_w_m);
     m.functions

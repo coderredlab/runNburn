@@ -112,6 +112,7 @@ pub const VK_PIPELINE_STAGE_HOST_BIT: VkFlags = 0x00004000;
 pub const VK_ACCESS_SHADER_WRITE_BIT: VkFlags = 0x00000040;
 pub const VK_ACCESS_SHADER_READ_BIT: VkFlags = 0x00000020;
 pub const VK_ACCESS_HOST_READ_BIT: VkFlags = 0x00002000;
+pub const VK_ACCESS_HOST_WRITE_BIT: VkFlags = 0x00004000;
 pub const VK_ACCESS_TRANSFER_READ_BIT: VkFlags = 0x00000800;
 pub const VK_ACCESS_TRANSFER_WRITE_BIT: VkFlags = 0x00001000;
 
@@ -168,6 +169,29 @@ pub struct VkDeviceCreateInfo {
     pub enabled_extension_count: u32,
     pub pp_enabled_extension_names: *const *const u8,
     pub p_enabled_features: *const c_void,
+}
+/// Prefix of `VkPhysicalDeviceProperties` through
+/// `limits.maxStorageBufferRange`, followed by storage large enough for the
+/// remaining core properties. Vulkan writes the complete core structure; the
+/// named prefix follows the fixed ABI from Vulkan 1.0.
+#[repr(C, align(8))]
+pub struct VkPhysicalDeviceProperties {
+    pub api_version: u32,
+    pub driver_version: u32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: u32,
+    pub device_name: [u8; 256],
+    pub pipeline_cache_uuid: [u8; 16],
+    pub max_image_dimension_1d: u32,
+    pub max_image_dimension_2d: u32,
+    pub max_image_dimension_3d: u32,
+    pub max_image_dimension_cube: u32,
+    pub max_image_array_layers: u32,
+    pub max_texel_buffer_elements: u32,
+    pub max_uniform_buffer_range: u32,
+    pub max_storage_buffer_range: u32,
+    pub opaque_tail: [u8; 2048],
 }
 
 #[repr(C)]

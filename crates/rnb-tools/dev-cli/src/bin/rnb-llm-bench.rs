@@ -1521,6 +1521,78 @@ fn run_mtp_abab(
     );
 }
 
+fn run_mtp_onoff_abab(
+    engine: &mut rnb_llm::Engine,
+    prompt: &str,
+    params: &rnb_llm::generate::GenerateParams,
+    repeat: usize,
+) {
+    let _mtp_restore = EnvVarRestore::capture("RNB_MTP");
+    let mut baseline_ms = Vec::with_capacity(repeat.div_ceil(2));
+    let mut mtp_ms = Vec::with_capacity(repeat / 2);
+
+    unsafe {
+        std::env::set_var("RNB_MTP", "0");
+    }
+    let warmup_started = std::time::Instant::now();
+    let warmup = engine
+        .generate_stream(prompt, params, mtp_abab_continue)
+        .unwrap_or_else(|err| panic!("MTP on/off ABAB baseline warmup failed: {err}"));
+    let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
+    let canonical_tokens = warmup.generated_token_ids;
+    eprintln!(
+        "[MTP_ONOFF_ABAB] warmup variant=A/Baseline measured=false mtp=0 wall_ms={warmup_ms:.3} generated_tokens={}",
+        canonical_tokens.len(),
+    );
+
+    for run_index in 0..repeat {
+        let mtp_enabled = run_index % 2 == 1;
+        unsafe {
+            std::env::set_var("RNB_MTP", if mtp_enabled { "1" } else { "0" });
+        }
+        let started = std::time::Instant::now();
+        let result = engine
+            .generate_stream(prompt, params, mtp_abab_continue)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "MTP on/off ABAB run {} ({}) failed: {err}",
+                    run_index + 1,
+                    if mtp_enabled { "B/MTP" } else { "A/Baseline" }
+                )
+            });
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let exact_match = result.generated_token_ids == canonical_tokens;
+        let text_sha256 = generated_text_sha256_hex(&result.text);
+        eprintln!(
+            "[MTP_ONOFF_ABAB] run={} variant={} mtp={} measured=true wall_ms={wall_ms:.3} generated_tokens={} token_ids_equal={} text_sha256={text_sha256}",
+            run_index + 1,
+            if mtp_enabled { "B/MTP" } else { "A/Baseline" },
+            usize::from(mtp_enabled),
+            result.generated_token_ids.len(),
+            exact_match,
+        );
+        assert!(
+            exact_match,
+            "MTP on/off ABAB token mismatch at run {} ({})",
+            run_index + 1,
+            if mtp_enabled { "B/MTP" } else { "A/Baseline" }
+        );
+        if mtp_enabled {
+            mtp_ms.push(wall_ms);
+        } else {
+            baseline_ms.push(wall_ms);
+        }
+    }
+
+    let (baseline_median_ms, mtp_median_ms) = mtp_abab_medians(&baseline_ms, &mtp_ms);
+    let baseline_median_ms = baseline_median_ms.expect("MTP on/off ABAB requires baseline samples");
+    let mtp_median_ms = mtp_median_ms.expect("MTP on/off ABAB requires MTP samples");
+    let improvement_pct = (baseline_median_ms - mtp_median_ms) / baseline_median_ms * 100.0;
+    eprintln!(
+        "[MTP_ONOFF_ABAB] summary warmup=1 measured_runs={repeat} baseline_samples={baseline_ms:?} mtp_samples={mtp_ms:?} baseline_median_ms={baseline_median_ms:.3} mtp_median_ms={mtp_median_ms:.3} improvement_pct={improvement_pct:.3} token_ids_equal=true",
+    );
+}
+
 fn decode_piece_output_enabled(quiet_decode: bool) -> bool {
     !quiet_decode
 }
@@ -1960,7 +2032,14 @@ fn main() {
     let mtp_abab_repeat =
         parse_mtp_abab_repeat(std::env::var("RNB_MTP_ABAB_REPEAT").ok().as_deref())
             .unwrap_or_else(|err| panic!("{err}"));
-    if mtp_abab_repeat.is_some() {
+    let mtp_onoff_abab_repeat =
+        parse_mtp_abab_repeat(std::env::var("RNB_MTP_ONOFF_ABAB_REPEAT").ok().as_deref())
+            .unwrap_or_else(|err| panic!("{err}"));
+    assert!(
+        mtp_abab_repeat.is_none() || mtp_onoff_abab_repeat.is_none(),
+        "RNB_MTP_ABAB_REPEAT and RNB_MTP_ONOFF_ABAB_REPEAT are mutually exclusive"
+    );
+    if mtp_abab_repeat.is_some() || mtp_onoff_abab_repeat.is_some() {
         validate_mtp_abab_timing_env(
             std::env::var_os("RNB_PROFILE").is_some(),
             std::env::var_os("RNB_SPEC_PROFILE").is_some(),
@@ -2152,7 +2231,7 @@ fn main() {
     let mtp_sampling_allowed = mtp_auto_sampling_allowed(mtp_env_request, repetition_penalty);
     let mtp_env_requested =
         mtp_env_requests_generation(mtp_env_request, mtp_policy) && mtp_sampling_allowed;
-    if mtp_abab_repeat.is_some() {
+    if mtp_abab_repeat.is_some() || mtp_onoff_abab_repeat.is_some() {
         let draft_only =
             mtp_abab_draft_only_requested(std::env::var("RNB_MTP_DRAFT_ONLY").ok().as_deref());
         validate_mtp_abab_path(
@@ -2389,6 +2468,11 @@ fn main() {
         };
         if let Some(repeat) = mtp_abab_repeat {
             run_mtp_abab(&mut engine, effective_prompt, &params, repeat);
+            print_profile_reports();
+            return;
+        }
+        if let Some(repeat) = mtp_onoff_abab_repeat {
+            run_mtp_onoff_abab(&mut engine, effective_prompt, &params, repeat);
             print_profile_reports();
             return;
         }

@@ -5,7 +5,7 @@ use super::builder::{
 /// First stage of a hierarchical argmax over `(value, token_id)` pairs.
 ///
 /// Each workgroup scans one contiguous value range, reduces it in shared memory,
-/// and writes one winning pair. Push constants are `[count, values_per_group]`.
+/// and writes one winning pair. Push constants are `[count, values_per_group, excluded_token]`.
 pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
     let mut module = SpirvModule::new();
 
@@ -25,7 +25,7 @@ pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
     let type_struct_indices = module.type_struct(&[type_array_u32]);
     let type_struct_partial_values = module.type_struct(&[type_array_f32]);
     let type_struct_partial_indices = module.type_struct(&[type_array_u32]);
-    let type_struct_push = module.type_struct(&[type_u32, type_u32]);
+    let type_struct_push = module.type_struct(&[type_u32, type_u32, type_u32]);
 
     let constant_local_size = module.constant_u32(type_u32, local_size_x);
     let type_shared_array_f32 = module.type_array(type_f32, constant_local_size);
@@ -56,6 +56,7 @@ pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
 
     let constant_u32_0 = module.constant_u32(type_u32, 0);
     let constant_u32_1 = module.constant_u32(type_u32, 1);
+    let constant_u32_2 = module.constant_u32(type_u32, 2);
     let constant_negative_infinity = module.constant_f32(type_f32, f32::NEG_INFINITY);
 
     for structure in [
@@ -72,6 +73,7 @@ pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
     module.decorate(type_struct_push, decoration::BLOCK, &[]);
     module.member_decorate(type_struct_push, 0, decoration::OFFSET, &[0]);
     module.member_decorate(type_struct_push, 1, decoration::OFFSET, &[4]);
+    module.member_decorate(type_struct_push, 2, decoration::OFFSET, &[8]);
 
     let global_values = module.variable(pointer_storage_values, storage_class::STORAGE_BUFFER);
     let global_indices = module.variable(pointer_storage_indices, storage_class::STORAGE_BUFFER);
@@ -142,6 +144,9 @@ pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
     let values_per_group_pointer =
         module.access_chain(pointer_push_u32, global_push, &[constant_u32_1]);
     let values_per_group = module.load(type_u32, values_per_group_pointer);
+    let excluded_token_pointer =
+        module.access_chain(pointer_push_u32, global_push, &[constant_u32_2]);
+    let excluded_token = module.load(type_u32, excluded_token_pointer);
     let group_start = module.imul(type_u32, workgroup_id, values_per_group);
     let group_end_unclamped = module.iadd(type_u32, group_start, values_per_group);
     let group_end_in_bounds = module.u_less_than(type_bool, group_end_unclamped, count);
@@ -189,11 +194,13 @@ pub fn emit_argmax_pairs_f32_stage1(local_size_x: u32) -> Vec<u32> {
     );
     let token_index = module.load(type_u32, index_pointer);
     let current_best = module.load(type_f32, variable_best_value);
+    let not_excluded = module.i_not_equal(type_bool, token_index, excluded_token);
     let value_beats_best = module.f_ord_greater_than(type_bool, value, current_best);
+    let should_update = module.logical_and(type_bool, not_excluded, value_beats_best);
     let label_update = module.alloc_id();
     let label_update_merge = module.alloc_id();
     module.selection_merge(label_update_merge, 0);
-    module.branch_conditional(value_beats_best, label_update, label_update_merge);
+    module.branch_conditional(should_update, label_update, label_update_merge);
     module
         .functions
         .push(SpirvModule::encode_inst(op::LABEL, &[label_update.0]));

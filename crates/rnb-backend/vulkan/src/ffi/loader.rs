@@ -14,6 +14,8 @@ pub(crate) struct VulkanLib {
     pub destroy_instance: unsafe extern "C" fn(VkInstance, *const c_void),
     pub enumerate_physical_devices:
         unsafe extern "C" fn(VkInstance, *mut u32, *mut VkPhysicalDevice) -> VkResult,
+    pub get_physical_device_properties:
+        unsafe extern "C" fn(VkPhysicalDevice, *mut VkPhysicalDeviceProperties),
     pub get_physical_device_queue_family_properties:
         unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut VkQueueFamilyProperties),
     pub get_physical_device_memory_properties:
@@ -120,6 +122,8 @@ pub(crate) struct VulkanLib {
         *const VkCommandBufferAllocateInfo,
         *mut VkCommandBuffer,
     ) -> VkResult,
+    pub free_command_buffers:
+        unsafe extern "C" fn(VkDevice, VkCommandPool, u32, *const VkCommandBuffer),
     pub begin_command_buffer:
         unsafe extern "C" fn(VkCommandBuffer, *const VkCommandBufferBeginInfo) -> VkResult,
     pub end_command_buffer: unsafe extern "C" fn(VkCommandBuffer) -> VkResult,
@@ -229,6 +233,8 @@ impl VulkanLib {
             create_instance: load_fn!(lib, "vkCreateInstance"),
             destroy_instance: load_fn!(lib, "vkDestroyInstance"),
             enumerate_physical_devices: load_fn!(lib, "vkEnumeratePhysicalDevices"),
+            get_physical_device_properties: load_fn!(lib, "vkGetPhysicalDeviceProperties"),
+
             get_physical_device_queue_family_properties: load_fn!(
                 lib,
                 "vkGetPhysicalDeviceQueueFamilyProperties"
@@ -263,6 +269,7 @@ impl VulkanLib {
             create_command_pool: load_fn!(lib, "vkCreateCommandPool"),
             destroy_command_pool: load_fn!(lib, "vkDestroyCommandPool"),
             allocate_command_buffers: load_fn!(lib, "vkAllocateCommandBuffers"),
+            free_command_buffers: load_fn!(lib, "vkFreeCommandBuffers"),
             begin_command_buffer: load_fn!(lib, "vkBeginCommandBuffer"),
             end_command_buffer: load_fn!(lib, "vkEndCommandBuffer"),
             reset_command_buffer: load_fn!(lib, "vkResetCommandBuffer"),

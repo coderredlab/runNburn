@@ -3,6 +3,10 @@ mod q5k_q8k_self_test;
 mod q8_q8k_self_test;
 
 use crate::context::{GpuBuffer, VulkanContext};
+use crate::expert_arena::{
+    ExpertArena, ExpertArenaBatchStats, ExpertArenaBundle, ExpertArenaCreateError,
+    ExpertArenaFormat, ExpertArenaLayout,
+};
 use crate::ffi::types::*;
 use crate::gemv::{repack_q8_0_transposed, repack_q8_0_transposed_grouped};
 use crate::pipeline::ComputePipeline;
@@ -10,15 +14,19 @@ use crate::spirv::builder::{
     emit_argmax_pairs_f32, emit_attention_decode, emit_depthwise_conv1d_silu, emit_elem_add,
     emit_elem_add_broadcast, emit_elem_add_out, emit_f32_gemv, emit_gdn_delta_precompute,
     emit_gdn_delta_sequence, emit_gdn_delta_step, emit_gdn_gated_norm_silu, emit_logit_argmax_q8_0,
-    emit_logit_argmax_q8_0_chunked, emit_q4k_block_reduce, emit_q4k_gemv, emit_q4k_gemv_batch4,
-    emit_q4k_gemv_block_partial, emit_q4k_gemv_rowmajor, emit_q4k_gemv_rowmajor_batched,
-    emit_q4k_gemv_wg_reduce, emit_q5k_gemv, emit_q5k_gemv_batch2, emit_q5k_gemv_batch4,
-    emit_q6k_gemv, emit_q6k_gemv_batch4, emit_q6k_gemv_batch4_f16, emit_q8_0_gemv, emit_rms_norm,
-    emit_rope_apply, emit_sigmoid_mul, emit_silu_mul, emit_split_gated_q,
+    emit_logit_argmax_q8_0_chunked, emit_moe_weighted_scatter_add, emit_q4k_block_reduce,
+    emit_q4k_gemv, emit_q4k_gemv_batch4, emit_q4k_gemv_block_partial, emit_q4k_gemv_rowmajor,
+    emit_q4k_gemv_rowmajor_batched, emit_q4k_gemv_wg_reduce, emit_q5k_gemv, emit_q5k_gemv_batch2,
+    emit_q5k_gemv_batch4, emit_q6k_gemv, emit_q6k_gemv_batch4, emit_q6k_gemv_batch4_f16,
+    emit_q8_0_gemv, emit_rms_norm, emit_rope_apply, emit_sigmoid_mul, emit_silu_mul,
+    emit_split_gated_q,
 };
 use crate::spirv::{
     emit_argmax_pairs_f32_stage1, emit_gdn_delta_sequence_d128, emit_logit_argmax_q4k,
-    emit_logit_argmax_q5k, emit_q4k_gate_up_batch4,
+    emit_logit_argmax_q5k, emit_moe_grouped_q4k_gate, emit_moe_grouped_q4k_up_silu,
+    emit_moe_grouped_q5k_down, emit_moe_grouped_q6k_down, emit_moe_grouped_q8_down,
+    emit_moe_grouped_q8_gate, emit_moe_grouped_q8_up_silu, emit_moe_grouped_reduce,
+    emit_q4k_gate_up_batch4,
 };
 use crate::weight_cache::{
     effective_upload_mode, GpuWeightCache, GpuWeightMode, QuantType, WeightId, WeightKind,
@@ -278,13 +286,14 @@ const KV_APPEND_PUSH_BYTES: u32 = 5 * 4; // 5 u32: layer_idx, max_ctx, kv_heads,
 const EMBED_LOOKUP_NUM_BINDINGS: u32 = 3;
 const EMBED_LOOKUP_PUSH_BYTES: u32 = 3 * 4; // 3 u32: num_tokens, hidden, vocab
 const LOGIT_ARGMAX_NUM_BINDINGS: u32 = 3;
-const LOGIT_ARGMAX_PUSH_BYTES: u32 = 2 * 4; // 2 u32: vocab, hidden
+const LOGIT_ARGMAX_PUSH_BYTES: u32 = 2 * 4; // vocab, hidden
+const LOGIT_ARGMAX_EXCLUSION_PUSH_BYTES: u32 = 3 * 4; // vocab, hidden, excluded_token
 const LOGIT_ARGMAX_Q8_CHUNKED_NUM_BINDINGS: u32 = 4;
 const LOGIT_ARGMAX_Q8_CHUNKED_PUSH_BYTES: u32 = 3 * 4; // row_base, group_rows, hidden
 const ARGMAX_PAIRS_NUM_BINDINGS: u32 = 3;
 const ARGMAX_PAIRS_PUSH_BYTES: u32 = 4; // count
 const ARGMAX_PAIRS_STAGE1_NUM_BINDINGS: u32 = 4;
-const ARGMAX_PAIRS_STAGE1_PUSH_BYTES: u32 = 2 * 4; // count, values_per_group
+const ARGMAX_PAIRS_STAGE1_PUSH_BYTES: u32 = 3 * 4; // count, values_per_group, excluded_token
 const ARGMAX_PAIRS_STAGE1_VALUES_PER_LANE: u32 = 16;
 const LOGIT_ARGMAX_LOCAL_SIZE: u32 = 256;
 // mv24 Task 8c-impl-8: NEOX RoPE in-place rotation pipeline.
@@ -325,6 +334,16 @@ struct GdnDeltaStateLayer {
     buf: GpuBuffer,
     mapped_ptr: *mut u8,
     capacity: usize,
+}
+
+struct GdnStateCheckpointLayer {
+    buf: GpuBuffer,
+    capacity: usize,
+}
+#[derive(Debug)]
+pub struct FullPathSequenceStateSnapshot {
+    conv_layers: Vec<(usize, usize)>,
+    delta_layers: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -497,6 +516,7 @@ pub(crate) struct AttentionLayerFullpathInput<'a> {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub ffn_inner: u32,
+    pub record_dense_ffn: bool,
     pub norm_eps: f32,
     pub pos_start: u32,
     /// RoPE base frequency (rope_theta from model metadata, e.g. 10000.0 for Qwen3.5).
@@ -593,6 +613,7 @@ pub(crate) struct GdnLayerFullpathInput<'a> {
     pub head_v_dim: u32,
     pub conv_kernel: u32,
     pub ffn_inner: u32,
+    pub record_dense_ffn: bool,
     pub norm_eps: f32,
     pub set_idx_norm_base: usize,
     pub set_idx_q_base: usize,
@@ -771,6 +792,7 @@ pub struct VulkanLayerGemv {
     q8k_input_buf: Option<GpuBuffer>,
     q8k_input_capacity_bytes: u64,
     cache: GpuWeightCache,
+    expert_arena: Option<ExpertArena>,
     input_buf: Option<GpuBuffer>,
     input_mapped_ptr: *mut u8,
     input_capacity: usize,
@@ -786,6 +808,15 @@ pub struct VulkanLayerGemv {
     pipeline_elem_add: Option<ComputePipeline>,
     pipeline_elem_add_broadcast: Option<ComputePipeline>,
     pipeline_elem_add_out: Option<ComputePipeline>,
+    pipeline_moe_weighted_scatter_add: Option<ComputePipeline>,
+    pipeline_moe_grouped_q4k_gate: Option<ComputePipeline>,
+    pipeline_moe_grouped_q4k_up_silu: Option<ComputePipeline>,
+    pipeline_moe_grouped_q5k_down: Option<ComputePipeline>,
+    pipeline_moe_grouped_q6k_down: Option<ComputePipeline>,
+    pipeline_moe_grouped_q8_gate: Option<ComputePipeline>,
+    pipeline_moe_grouped_q8_up_silu: Option<ComputePipeline>,
+    pipeline_moe_grouped_q8_down: Option<ComputePipeline>,
+    pipeline_moe_grouped_reduce: Option<ComputePipeline>,
     pipeline_rms_norm: Option<ComputePipeline>,
     pipeline_attention_decode: Option<ComputePipeline>,
     pipeline_gdn_conv1d_silu: Option<ComputePipeline>,
@@ -816,6 +847,8 @@ pub struct VulkanLayerGemv {
     attention_cache_layers: HashMap<usize, AttentionCacheLayer>,
     gdn_conv_state_layers: HashMap<usize, GdnConvStateLayer>,
     gdn_delta_state_layers: HashMap<usize, GdnDeltaStateLayer>,
+    gdn_conv_state_checkpoint_layers: HashMap<usize, GdnStateCheckpointLayer>,
+    gdn_delta_state_checkpoint_layers: HashMap<usize, GdnStateCheckpointLayer>,
     runtime_counters: RuntimeCounters,
     norm_weight_buf: Option<GpuBuffer>,
     norm_weight_mapped_ptr: *mut u8,
@@ -889,6 +922,13 @@ pub struct VulkanLayerGemv {
     pub(crate) fullpath_staging_up: Option<GpuBuffer>,
     pub(crate) fullpath_staging_down: Option<GpuBuffer>,
     pub(crate) fullpath_staging_capacity: FullpathStagingCapacity,
+    pub(crate) fullpath_moe_route_logits: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_token_ids: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_route_weights: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_slot_ids: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_gate: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_activation: Option<GpuBuffer>,
+    pub(crate) fullpath_moe_down: Option<GpuBuffer>,
 }
 
 /// Recorded capacity of the eight `fullpath_staging_*` buffers — used by
@@ -943,6 +983,20 @@ impl FullpathStagingCapacity {
             num_heads: num_heads.max(self.num_heads),
             head_dim: head_dim.max(self.head_dim),
             ffn_inner: ffn_inner.max(self.ffn_inner),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MoeStagingError {
+    InsufficientCapacity(String),
+    Fatal(String),
+}
+
+impl MoeStagingError {
+    pub(crate) fn into_string(self) -> String {
+        match self {
+            Self::InsufficientCapacity(error) | Self::Fatal(error) => error,
         }
     }
 }
@@ -1015,41 +1069,21 @@ impl VulkanLayerGemv {
             && self.output_table_quant == Some(output_quant)
         {
             if q8_soa_requested {
-                self.ensure_output_table_soa_bound(
-                    bytes,
-                    vocab,
-                    hidden,
-                    q8_chunked_rows_per_group()?,
-                )?;
-                return Ok(());
+                if self.output_table_buffer.is_some() {
+                    self.ensure_output_table_soa_bound(
+                        bytes,
+                        vocab,
+                        hidden,
+                        q8_chunked_rows_per_group()?,
+                    )?;
+                    return Ok(());
+                }
             } else if self.output_table_buffer.is_some() {
                 if q8_chunked_requested {
                     self.ensure_output_indices_bound(vocab)?;
                 }
                 return Ok(());
             }
-        }
-
-        if q8_soa_requested {
-            unsafe {
-                if let Some(old) = self.output_table_buffer.take() {
-                    self.ctx.destroy_buffer(old);
-                }
-                self.ensure_output_table_soa_bound(
-                    bytes,
-                    vocab,
-                    hidden,
-                    q8_chunked_rows_per_group()?,
-                )?;
-                self.output_table_size_bytes = bytes.len();
-                self.output_table_quant = Some(output_quant);
-                eprintln!(
-                    "[vulkan:init] step=output_table_resident_skipped bytes={} quant={:?} reason=soa",
-                    bytes.len(),
-                    output_quant
-                );
-            }
-            return Ok(());
         }
 
         unsafe {
@@ -1603,6 +1637,250 @@ impl VulkanLayerGemv {
             Ok(())
         }
     }
+
+    pub(crate) fn ensure_fullpath_moe_staging(
+        &mut self,
+        max_seq_len: u32,
+        hidden: u32,
+        n_ff: u32,
+        n_expert: u32,
+        n_expert_used: u32,
+        grouped: bool,
+    ) -> Result<(), MoeStagingError> {
+        let sizes = || -> Result<(u64, u64, u64, u64), String> {
+            if max_seq_len == 0 || hidden == 0 || n_ff == 0 || n_expert == 0 || n_expert_used == 0 {
+                return Err("ensure_fullpath_moe_staging: all model dimensions must be > 0".into());
+            }
+            let logits_bytes = u64::from(max_seq_len)
+                .checked_mul(u64::from(n_expert))
+                .and_then(|elements| elements.checked_mul(4))
+                .ok_or("ensure_fullpath_moe_staging: logits size overflow")?;
+            let sparse_routes = u64::from(max_seq_len)
+                .checked_mul(u64::from(n_expert_used))
+                .ok_or("ensure_fullpath_moe_staging: sparse route count overflow")?;
+            let metadata_rows = sparse_routes
+                .checked_add(u64::from(max_seq_len))
+                .ok_or("ensure_fullpath_moe_staging: metadata rows overflow")?;
+            let metadata_bytes = metadata_rows
+                .checked_mul(4)
+                .ok_or("ensure_fullpath_moe_staging: metadata size overflow")?;
+            let gate_bytes = sparse_routes
+                .checked_mul(u64::from(n_ff))
+                .and_then(|elements| elements.checked_mul(4))
+                .ok_or("ensure_fullpath_moe_staging: grouped gate size overflow")?;
+            let down_bytes = sparse_routes
+                .checked_mul(u64::from(hidden))
+                .and_then(|elements| elements.checked_mul(4))
+                .ok_or("ensure_fullpath_moe_staging: grouped down size overflow")?;
+            Ok((logits_bytes, metadata_bytes, gate_bytes, down_bytes))
+        };
+        let (logits_bytes, metadata_bytes, gate_bytes, down_bytes) =
+            sizes().map_err(MoeStagingError::Fatal)?;
+        if !grouped {
+            unsafe {
+                for slot in [
+                    &mut self.fullpath_moe_slot_ids,
+                    &mut self.fullpath_moe_gate,
+                    &mut self.fullpath_moe_activation,
+                    &mut self.fullpath_moe_down,
+                ] {
+                    if let Some(buffer) = slot.take() {
+                        self.ctx.destroy_buffer(buffer);
+                    }
+                }
+            }
+        }
+        let enough = self
+            .fullpath_moe_route_logits
+            .as_ref()
+            .is_some_and(|buffer| buffer.size >= logits_bytes)
+            && self
+                .fullpath_moe_token_ids
+                .as_ref()
+                .is_some_and(|buffer| buffer.size >= metadata_bytes)
+            && self
+                .fullpath_moe_route_weights
+                .as_ref()
+                .is_some_and(|buffer| buffer.size >= metadata_bytes)
+            && (!grouped
+                || (self
+                    .fullpath_moe_slot_ids
+                    .as_ref()
+                    .is_some_and(|buffer| buffer.size >= metadata_bytes)
+                    && self
+                        .fullpath_moe_gate
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.size >= gate_bytes)
+                    && self
+                        .fullpath_moe_activation
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.size >= gate_bytes)
+                    && self
+                        .fullpath_moe_down
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.size >= down_bytes)));
+        if enough {
+            return Ok(());
+        }
+
+        unsafe {
+            for slot in [
+                &mut self.fullpath_moe_route_logits,
+                &mut self.fullpath_moe_token_ids,
+                &mut self.fullpath_moe_route_weights,
+                &mut self.fullpath_moe_slot_ids,
+                &mut self.fullpath_moe_gate,
+                &mut self.fullpath_moe_activation,
+                &mut self.fullpath_moe_down,
+            ] {
+                if let Some(old) = slot.take() {
+                    self.ctx.destroy_buffer(old);
+                }
+            }
+            let usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            let host_visible =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            let device_local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            let mut specs = vec![
+                (logits_bytes, host_visible),
+                (metadata_bytes, host_visible),
+                (metadata_bytes, host_visible),
+            ];
+            if grouped {
+                specs.extend([
+                    (metadata_bytes, host_visible),
+                    (gate_bytes, device_local),
+                    (gate_bytes, device_local),
+                    (down_bytes, device_local),
+                ]);
+            }
+            let mut allocated = Vec::with_capacity(specs.len());
+            for (size, memory) in specs {
+                match self.ctx.try_create_buffer(size, usage, memory) {
+                    Ok(buffer) => allocated.push(buffer),
+                    Err(error) => {
+                        for buffer in allocated {
+                            self.ctx.destroy_buffer(buffer);
+                        }
+                        if grouped && error.is_out_of_memory() {
+                            return Err(MoeStagingError::InsufficientCapacity(error.to_string()));
+                        }
+                        return Err(MoeStagingError::Fatal(error.to_string()));
+                    }
+                }
+            }
+            let mut allocated = allocated.into_iter();
+            self.fullpath_moe_route_logits = allocated.next();
+            self.fullpath_moe_token_ids = allocated.next();
+            self.fullpath_moe_route_weights = allocated.next();
+            if grouped {
+                self.fullpath_moe_slot_ids = allocated.next();
+                self.fullpath_moe_gate = allocated.next();
+                self.fullpath_moe_activation = allocated.next();
+                self.fullpath_moe_down = allocated.next();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn upload_fullpath_moe_metadata(
+        &self,
+        token_ids: &[u32],
+        route_weights: &[f32],
+    ) -> Result<(), String> {
+        if token_ids.len() != route_weights.len() {
+            return Err(format!(
+                "upload_fullpath_moe_metadata: id/weight length mismatch {}/{}",
+                token_ids.len(),
+                route_weights.len()
+            ));
+        }
+        let token_buffer = self
+            .fullpath_moe_token_ids
+            .as_ref()
+            .ok_or("upload_fullpath_moe_metadata: token buffer missing")?;
+        let weight_buffer = self
+            .fullpath_moe_route_weights
+            .as_ref()
+            .ok_or("upload_fullpath_moe_metadata: weight buffer missing")?;
+        let token_bytes = unsafe {
+            std::slice::from_raw_parts(
+                token_ids.as_ptr() as *const u8,
+                std::mem::size_of_val(token_ids),
+            )
+        };
+        let weight_bytes = unsafe {
+            std::slice::from_raw_parts(
+                route_weights.as_ptr() as *const u8,
+                std::mem::size_of_val(route_weights),
+            )
+        };
+        unsafe {
+            self.ctx.upload_to_buffer(token_buffer, token_bytes)?;
+            self.ctx.upload_to_buffer(weight_buffer, weight_bytes)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn upload_fullpath_moe_grouped_metadata(
+        &self,
+        token_ids: &[u32],
+        route_weights: &[f32],
+        slot_ids: &[u32],
+    ) -> Result<(), String> {
+        if slot_ids.len() > token_ids.len() || token_ids.len() != route_weights.len() {
+            return Err(format!(
+                "upload_fullpath_moe_grouped_metadata: token/weight/slot lengths {}/{}/{} are inconsistent",
+                token_ids.len(),
+                route_weights.len(),
+                slot_ids.len()
+            ));
+        }
+        self.upload_fullpath_moe_metadata(token_ids, route_weights)?;
+        let slot_buffer = self
+            .fullpath_moe_slot_ids
+            .as_ref()
+            .ok_or("upload_fullpath_moe_grouped_metadata: slot buffer missing")?;
+        let slot_bytes = unsafe {
+            std::slice::from_raw_parts(
+                slot_ids.as_ptr() as *const u8,
+                std::mem::size_of_val(slot_ids),
+            )
+        };
+        unsafe {
+            self.ctx.upload_to_buffer(slot_buffer, slot_bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn download_fullpath_moe_logits(
+        &self,
+        element_count: usize,
+    ) -> Result<Vec<f32>, String> {
+        let buffer = self
+            .fullpath_moe_route_logits
+            .as_ref()
+            .ok_or("download_fullpath_moe_logits: route buffer missing")?;
+        let mut values = vec![0.0f32; element_count];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(values.as_slice()),
+            )
+        };
+        if bytes.len() as u64 > buffer.size {
+            return Err(format!(
+                "download_fullpath_moe_logits: requested {} bytes from {} byte buffer",
+                bytes.len(),
+                buffer.size
+            ));
+        }
+        unsafe {
+            self.ctx.download_from_buffer(buffer, bytes)?;
+        }
+        Ok(values)
+    }
     /// Allocate the model-shaped buffers and compile lazy kernels that the
     /// first fullpath request would otherwise pay for.
     #[allow(clippy::too_many_arguments)]
@@ -1755,6 +2033,12 @@ impl VulkanLayerGemv {
         Ok(())
     }
 
+    /// Pin a cached weight whose buffer address is retained by the full-path
+    /// graph. Dynamic sparse-expert weights intentionally remain unpinned.
+    pub fn pin_weight(&mut self, id: WeightId) -> Result<(), String> {
+        self.cache.pin(id)
+    }
+
     /// Read-only borrow accessor — returns the cached `&GpuBuffer` for `id`
     /// without mutating the LRU tick. Used by the fullpath wrapper's second
     /// pass to assemble `LayerWeightHandles`.
@@ -1765,6 +2049,156 @@ impl VulkanLayerGemv {
     /// but `Option` is returned for API correctness).
     pub fn weight_buffer(&self, id: WeightId) -> Option<&GpuBuffer> {
         self.cache.get(id)
+    }
+    pub(crate) fn configure_expert_arena(
+        &mut self,
+        layout: ExpertArenaLayout,
+        min_slots: usize,
+    ) -> Result<bool, String> {
+        let min_slots = min_slots.max(1);
+        if let Some(arena) = self.expert_arena.as_ref() {
+            if arena.layout() != layout {
+                return Err(format!(
+                    "expert arena layout changed after initialization: {:?} -> {:?}",
+                    arena.layout(),
+                    layout
+                ));
+            }
+            if arena.batch_slot_count() as usize >= min_slots {
+                return Ok(true);
+            }
+            self.disable_expert_arena()?;
+        }
+
+        let available = self.cache.available_after_reclaim_bytes();
+        if layout.max_slot_count(available, self.ctx.max_storage_buffer_range) < min_slots as u64 {
+            eprintln!(
+                "[vulkan:moe-arena] grouped=disabled reason=insufficient-vram available_mib={:.3} required_mib={:.3} required_slots={}",
+                available as f64 / (1024.0 * 1024.0),
+                layout.required_bytes(min_slots)? as f64 / (1024.0 * 1024.0),
+                min_slots,
+            );
+            return Ok(false);
+        }
+
+        let available = unsafe { self.cache.reclaim_unpinned(&self.ctx) };
+        let arena = match unsafe { ExpertArena::new(&self.ctx, available, min_slots, layout) } {
+            Ok(arena) => arena,
+            Err(ExpertArenaCreateError::InsufficientCapacity(reason)) => {
+                eprintln!(
+                    "[vulkan:moe-arena] grouped=disabled reason=insufficient-vram available_mib={:.3} required_mib={:.3} required_slots={} detail={reason}",
+                    available as f64 / (1024.0 * 1024.0),
+                    layout.required_bytes(min_slots)? as f64 / (1024.0 * 1024.0),
+                    min_slots,
+                );
+                return Ok(false);
+            }
+            Err(ExpertArenaCreateError::Fatal(error)) => return Err(error),
+        };
+        let reserved = arena.allocation_bytes();
+        if let Err(error) = self.cache.reserve_external(reserved) {
+            unsafe {
+                arena.destroy(&self.ctx);
+            }
+            return Err(error);
+        }
+        self.expert_arena = Some(arena);
+        Ok(true)
+    }
+
+    pub(crate) fn disable_expert_arena(&mut self) -> Result<(), String> {
+        let Some(arena) = self.expert_arena.as_ref() else {
+            return Ok(());
+        };
+        if arena.has_pending_batch() {
+            return Err("cannot disable expert arena with a pending batch".into());
+        }
+        let reserved = arena.allocation_bytes();
+        self.cache.release_external(reserved)?;
+        let arena = self
+            .expert_arena
+            .take()
+            .ok_or("expert arena disappeared during disable")?;
+        unsafe {
+            arena.destroy(&self.ctx);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_expert_arena_batch(
+        &mut self,
+        layout: ExpertArenaLayout,
+        bundles: &[ExpertArenaBundle<'_>],
+    ) -> Result<(Vec<u32>, ExpertArenaBatchStats), String> {
+        let arena = self
+            .expert_arena
+            .as_mut()
+            .ok_or("grouped MoE selected without a configured expert arena")?;
+        if arena.layout() != layout {
+            return Err(format!(
+                "expert arena layout changed after initialization: {:?} -> {:?}",
+                arena.layout(),
+                layout
+            ));
+        }
+        unsafe { arena.prepare_batch(bundles) }
+    }
+    pub(crate) fn record_expert_arena_uploads(
+        &self,
+        cmdbuf: VkCommandBuffer,
+    ) -> Result<(), String> {
+        let arena = self
+            .expert_arena
+            .as_ref()
+            .ok_or("expert arena is not initialized")?;
+        unsafe { arena.record_pending_uploads(&self.ctx, cmdbuf) }
+    }
+    pub(crate) fn commit_expert_arena_batch_if_pending(&mut self) -> Result<(), String> {
+        if self
+            .expert_arena
+            .as_ref()
+            .is_some_and(ExpertArena::has_pending_batch)
+        {
+            self.commit_expert_arena_batch()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_expert_arena_batch(&mut self) -> Result<(), String> {
+        self.expert_arena
+            .as_mut()
+            .ok_or("expert arena is not initialized")?
+            .commit_pending_batch()
+    }
+
+    pub(crate) fn expert_arena_buffer_view(
+        &self,
+    ) -> Result<(GpuBuffer, ExpertArenaLayout), String> {
+        let arena = self
+            .expert_arena
+            .as_ref()
+            .ok_or("expert arena is not initialized")?;
+        let buffer = arena.buffer();
+        Ok((
+            GpuBuffer {
+                buffer: buffer.buffer,
+                memory: 0,
+                size: buffer.size,
+            },
+            arena.layout(),
+        ))
+    }
+
+    pub(crate) fn expert_arena_slot_count(&self) -> Option<u32> {
+        self.expert_arena.as_ref().map(ExpertArena::slot_count)
+    }
+
+    pub(crate) fn weight_cache_usage(&self) -> (u64, u64, u64) {
+        (
+            self.cache.cached_bytes(),
+            self.cache.external_reserved_bytes(),
+            self.cache.budget_bytes(),
+        )
     }
 
     // ----- cmd-buffer lifecycle API (Option A from Task 8d design) -----
@@ -1854,6 +2288,14 @@ impl VulkanLayerGemv {
             (self.ctx.vk.cmd_write_timestamp)(cmdbuf, stage, self.gpu_profile_query_pool, query);
         }
         self.gpu_profile_labels.push(label);
+    }
+
+    pub(crate) fn record_gpu_profile_marker(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        label: &'static str,
+    ) {
+        self.gdn_gpu_profile_marker(cmdbuf, label);
     }
 
     fn report_gpu_profile_results(&self) {
@@ -2197,6 +2639,7 @@ impl VulkanLayerGemv {
             let spirv_add = emit_elem_add(LOCAL_SIZE_X);
             let spirv_add_broadcast = emit_elem_add_broadcast(LOCAL_SIZE_X);
             let spirv_add_out = emit_elem_add_out(LOCAL_SIZE_X);
+            let spirv_moe_weighted_scatter_add = emit_moe_weighted_scatter_add(LOCAL_SIZE_X);
             // Parallel reduction keeps normalization on the GPU's full workgroup.
             // Product correctness is judged at response quality; exact CPU-order
             // accumulation is not worth serializing every layer.
@@ -2234,6 +2677,13 @@ impl VulkanLayerGemv {
                 MAX_BATCH_OUTPUTS as u32,
                 3,
                 4,
+            )?;
+            let pipeline_moe_weighted_scatter_add = ComputePipeline::new_nbinding(
+                &ctx,
+                &spirv_moe_weighted_scatter_add,
+                MAX_BATCH_OUTPUTS as u32,
+                4,
+                12,
             )?;
             let pipeline_rms_norm =
                 ComputePipeline::new_nbinding(&ctx, &spirv_norm, MAX_BATCH_OUTPUTS as u32, 3, 8)?; // push: dim(u32)+eps(u32)
@@ -2331,6 +2781,7 @@ impl VulkanLayerGemv {
                 q8k_input_buf: None,
                 q8k_input_capacity_bytes: 0,
                 cache,
+                expert_arena: None,
                 input_buf: Some(input_buf),
                 input_mapped_ptr,
                 input_capacity: max_input_dim,
@@ -2345,6 +2796,15 @@ impl VulkanLayerGemv {
                 pipeline_elem_add: Some(pipeline_elem_add),
                 pipeline_elem_add_broadcast: Some(pipeline_elem_add_broadcast),
                 pipeline_elem_add_out: Some(pipeline_elem_add_out),
+                pipeline_moe_weighted_scatter_add: Some(pipeline_moe_weighted_scatter_add),
+                pipeline_moe_grouped_q4k_gate: None,
+                pipeline_moe_grouped_q4k_up_silu: None,
+                pipeline_moe_grouped_q5k_down: None,
+                pipeline_moe_grouped_q6k_down: None,
+                pipeline_moe_grouped_q8_gate: None,
+                pipeline_moe_grouped_q8_up_silu: None,
+                pipeline_moe_grouped_q8_down: None,
+                pipeline_moe_grouped_reduce: None,
                 pipeline_rms_norm: Some(pipeline_rms_norm),
                 pipeline_attention_decode: Some(pipeline_attention_decode),
                 pipeline_gdn_conv1d_silu: Some(pipeline_gdn_conv1d_silu),
@@ -2375,6 +2835,8 @@ impl VulkanLayerGemv {
                 attention_cache_layers: HashMap::new(),
                 gdn_conv_state_layers: HashMap::new(),
                 gdn_delta_state_layers: HashMap::new(),
+                gdn_conv_state_checkpoint_layers: HashMap::new(),
+                gdn_delta_state_checkpoint_layers: HashMap::new(),
                 runtime_counters: RuntimeCounters::default(),
                 norm_weight_buf: Some(norm_weight_buf),
                 norm_weight_mapped_ptr,
@@ -2427,6 +2889,13 @@ impl VulkanLayerGemv {
                 fullpath_staging_up: None,
                 fullpath_staging_down: None,
                 fullpath_staging_capacity: FullpathStagingCapacity::default(),
+                fullpath_moe_route_logits: None,
+                fullpath_moe_token_ids: None,
+                fullpath_moe_route_weights: None,
+                fullpath_moe_slot_ids: None,
+                fullpath_moe_gate: None,
+                fullpath_moe_activation: None,
+                fullpath_moe_down: None,
             })
         }
     }
@@ -5031,7 +5500,7 @@ impl VulkanLayerGemv {
                         &spirv,
                         MAX_BATCH_OUTPUTS as u32,
                         LOGIT_ARGMAX_NUM_BINDINGS,
-                        LOGIT_ARGMAX_PUSH_BYTES,
+                        LOGIT_ARGMAX_EXCLUSION_PUSH_BYTES,
                     )?;
                     self.pipeline_logit_argmax_q4 = Some(pipe);
                 }
@@ -5057,7 +5526,7 @@ impl VulkanLayerGemv {
                         &spirv,
                         MAX_BATCH_OUTPUTS as u32,
                         LOGIT_ARGMAX_NUM_BINDINGS,
-                        LOGIT_ARGMAX_PUSH_BYTES,
+                        LOGIT_ARGMAX_EXCLUSION_PUSH_BYTES,
                     )?;
                     self.pipeline_logit_argmax = Some(pipe);
                 }
@@ -5070,7 +5539,7 @@ impl VulkanLayerGemv {
                         &spirv,
                         MAX_BATCH_OUTPUTS as u32,
                         LOGIT_ARGMAX_NUM_BINDINGS,
-                        LOGIT_ARGMAX_PUSH_BYTES,
+                        LOGIT_ARGMAX_EXCLUSION_PUSH_BYTES,
                     )?;
                     self.pipeline_logit_argmax_q8 = Some(pipe);
                 }
@@ -5924,6 +6393,7 @@ impl VulkanLayerGemv {
             0,
             argmax_out_size,
             output_quant,
+            None,
             vocab,
             hidden,
         )
@@ -5944,13 +6414,82 @@ impl VulkanLayerGemv {
         argmax_out_offset: u64,
         argmax_out_size: u64,
         output_quant: QuantType,
+        excluded_token: Option<u32>,
+        vocab: u32,
+        hidden: u32,
+    ) -> Result<(), String> {
+        self.record_logit_argmax_rows_with_offsets(
+            cmdbuf,
+            set_idx,
+            buf_hidden_vec,
+            hidden_offset,
+            hidden_size,
+            buf_output_table,
+            table_offset,
+            table_size,
+            buf_argmax_out,
+            argmax_out_offset,
+            argmax_out_size,
+            output_quant,
+            excluded_token,
+            1,
+            vocab,
+            hidden,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_logit_argmax_rows_with_offsets(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        set_idx: usize,
+        buf_hidden_vec: &GpuBuffer,
+        hidden_offset: u64,
+        hidden_size: u64,
+        buf_output_table: &GpuBuffer,
+        table_offset: u64,
+        table_size: u64,
+        buf_argmax_out: &GpuBuffer,
+        argmax_out_offset: u64,
+        argmax_out_size: u64,
+        output_quant: QuantType,
+        excluded_token: Option<u32>,
+        hidden_rows: u32,
         vocab: u32,
         hidden: u32,
     ) -> Result<(), String> {
         logit_argmax_row_bytes(hidden, output_quant)
             .map_err(|e| format!("record_logit_argmax: {e}"))?;
-        if vocab == 0 {
-            return Err("record_logit_argmax: vocab must be > 0".into());
+        if vocab == 0 || hidden_rows == 0 {
+            return Err("record_logit_argmax: vocab and hidden_rows must be > 0".into());
+        }
+        let supports_rows = matches!(output_quant, QuantType::Q4K | QuantType::Q6K);
+        let supports_exclusion = matches!(
+            output_quant,
+            QuantType::Q4K | QuantType::Q6K | QuantType::Q8_0
+        );
+        if hidden_rows > 1 && !supports_rows {
+            return Err(format!(
+                "record_logit_argmax: batched rows unsupported for {output_quant:?}"
+            ));
+        }
+        if excluded_token.is_some() && !supports_exclusion {
+            return Err(format!(
+                "record_logit_argmax: excluded token unsupported for {output_quant:?}"
+            ));
+        }
+        let required_hidden_bytes = (hidden_rows as u64)
+            .checked_mul(hidden as u64)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or("record_logit_argmax: hidden byte size overflow")?;
+        let required_output_bytes = (hidden_rows as u64)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or("record_logit_argmax: output byte size overflow")?;
+        if hidden_size < required_hidden_bytes || argmax_out_size < required_output_bytes {
+            return Err(format!(
+                "record_logit_argmax: buffers too small for {hidden_rows} rows \
+                 (hidden={hidden_size}/{required_hidden_bytes} output={argmax_out_size}/{required_output_bytes})"
+            ));
         }
         if set_idx >= MAX_BATCH_OUTPUTS {
             return Err(format!(
@@ -6005,16 +6544,28 @@ impl VulkanLayerGemv {
                 0,
                 ptr::null(),
             );
-            let pc: [u32; 2] = [vocab, hidden];
-            (self.ctx.vk.cmd_push_constants)(
-                cmdbuf,
-                pipe.pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT,
-                0,
-                (pc.len() * 4) as u32,
-                pc.as_ptr() as *const std::ffi::c_void,
-            );
-            (self.ctx.vk.cmd_dispatch)(cmdbuf, 1, 1, 1);
+            if supports_exclusion {
+                let pc: [u32; 3] = [vocab, hidden, excluded_token.unwrap_or(u32::MAX)];
+                (self.ctx.vk.cmd_push_constants)(
+                    cmdbuf,
+                    pipe.pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    (pc.len() * 4) as u32,
+                    pc.as_ptr() as *const std::ffi::c_void,
+                );
+            } else {
+                let pc: [u32; 2] = [vocab, hidden];
+                (self.ctx.vk.cmd_push_constants)(
+                    cmdbuf,
+                    pipe.pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    (pc.len() * 4) as u32,
+                    pc.as_ptr() as *const std::ffi::c_void,
+                );
+            }
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, 1, hidden_rows, 1);
         }
         Ok(())
     }
@@ -6123,6 +6674,18 @@ impl VulkanLayerGemv {
                 set_idx, MAX_BATCH_OUTPUTS
             ));
         }
+        let required_input_bytes = (count as u64)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or("record_argmax_pairs_f32: input byte overflow")?;
+        if partial_vals_size < required_input_bytes
+            || partial_idxs_size < required_input_bytes
+            || argmax_out_size < std::mem::size_of::<u32>() as u64
+            || partial_vals_size > buf_partial_vals.size
+            || partial_idxs_size > buf_partial_idxs.size
+            || argmax_out_size > buf_argmax_out.size
+        {
+            return Err("record_argmax_pairs_f32: buffer range too small".into());
+        }
 
         unsafe {
             self.ensure_argmax_pairs_f32_pipeline()?;
@@ -6180,6 +6743,7 @@ impl VulkanLayerGemv {
         count: u32,
         workgroup_count: u32,
         values_per_group: u32,
+        excluded_token: Option<u32>,
     ) -> Result<(), String> {
         if count == 0 || workgroup_count == 0 || values_per_group == 0 {
             return Err(
@@ -6194,22 +6758,21 @@ impl VulkanLayerGemv {
             ));
         }
         let input_bytes = (count as u64)
-            .checked_mul(4)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or("record_argmax_pairs_f32_stage1: input byte overflow")?;
         let partial_bytes = (workgroup_count as u64)
-            .checked_mul(4)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or("record_argmax_pairs_f32_stage1: partial byte overflow")?;
-        if values_size < input_bytes || indices_size < input_bytes {
-            return Err(format!(
-                "record_argmax_pairs_f32_stage1: input buffers too small (values={} indices={} required={})",
-                values_size, indices_size, input_bytes
-            ));
-        }
-        if partial_values_size < partial_bytes || partial_indices_size < partial_bytes {
-            return Err(format!(
-                "record_argmax_pairs_f32_stage1: partial buffers too small (values={} indices={} required={})",
-                partial_values_size, partial_indices_size, partial_bytes
-            ));
+        if values_size < input_bytes
+            || indices_size < input_bytes
+            || partial_values_size < partial_bytes
+            || partial_indices_size < partial_bytes
+            || values_size > values.size
+            || indices_size > indices.size
+            || partial_values_size > partial_values.size
+            || partial_indices_size > partial_indices.size
+        {
+            return Err("record_argmax_pairs_f32_stage1: buffer range too small".into());
         }
 
         unsafe {
@@ -6222,10 +6785,10 @@ impl VulkanLayerGemv {
                 &self.ctx,
                 set_idx,
                 &[
-                    (values, 0, input_bytes),
-                    (indices, 0, input_bytes),
-                    (partial_values, 0, partial_bytes),
-                    (partial_indices, 0, partial_bytes),
+                    (values, 0, values_size),
+                    (indices, 0, indices_size),
+                    (partial_values, 0, partial_values_size),
+                    (partial_indices, 0, partial_indices_size),
                 ],
             );
             (self.ctx.vk.cmd_bind_pipeline)(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
@@ -6239,7 +6802,8 @@ impl VulkanLayerGemv {
                 0,
                 ptr::null(),
             );
-            let push_constants: [u32; 2] = [count, values_per_group];
+            let push_constants: [u32; 3] =
+                [count, values_per_group, excluded_token.unwrap_or(u32::MAX)];
             (self.ctx.vk.cmd_push_constants)(
                 cmdbuf,
                 pipe.pipeline_layout,
@@ -9330,6 +9894,751 @@ impl VulkanLayerGemv {
             );
             let num_wg = (elem_count + LOCAL_SIZE_X - 1) / LOCAL_SIZE_X;
             (self.ctx.vk.cmd_dispatch)(cmdbuf, num_wg, 1, 1);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_moe_weighted_scatter_add(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        set_idx: usize,
+        accumulator_buf: &GpuBuffer,
+        accumulator_offset: u64,
+        accumulator_size: u64,
+        values_buf: &GpuBuffer,
+        values_offset: u64,
+        values_size: u64,
+        token_ids_buf: &GpuBuffer,
+        token_ids_offset: u64,
+        weights_buf: &GpuBuffer,
+        weights_offset: u64,
+        group_len: u32,
+        hidden: u32,
+        sigmoid_weights: bool,
+    ) -> Result<(), String> {
+        if set_idx >= MAX_BATCH_OUTPUTS {
+            return Err(format!(
+                "record_moe_weighted_scatter_add: set_idx {} >= MAX_BATCH_OUTPUTS {}",
+                set_idx, MAX_BATCH_OUTPUTS
+            ));
+        }
+        if group_len == 0 || hidden == 0 {
+            return Err("record_moe_weighted_scatter_add: group_len/hidden must be > 0".into());
+        }
+        let values_bytes = u64::from(group_len)
+            .checked_mul(u64::from(hidden))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_weighted_scatter_add: values size overflow")?;
+        let metadata_bytes = u64::from(group_len)
+            .checked_mul(4)
+            .ok_or("record_moe_weighted_scatter_add: metadata size overflow")?;
+        let ranges = [
+            (
+                "accumulator",
+                accumulator_offset,
+                accumulator_size,
+                accumulator_buf.size,
+            ),
+            ("values", values_offset, values_bytes, values_buf.size),
+            (
+                "token ids",
+                token_ids_offset,
+                metadata_bytes,
+                token_ids_buf.size,
+            ),
+            ("weights", weights_offset, metadata_bytes, weights_buf.size),
+        ];
+        for (label, offset, size, buffer_size) in ranges {
+            if offset.checked_add(size).is_none_or(|end| end > buffer_size) {
+                return Err(format!(
+                    "record_moe_weighted_scatter_add: {label} range exceeds buffer"
+                ));
+            }
+        }
+        if values_size < values_bytes {
+            return Err(format!(
+                "record_moe_weighted_scatter_add: values descriptor size {} < need {}",
+                values_size, values_bytes
+            ));
+        }
+        let pipeline = self
+            .pipeline_moe_weighted_scatter_add
+            .as_ref()
+            .ok_or("record_moe_weighted_scatter_add: pipeline not initialized")?;
+        unsafe {
+            pipeline.bind_n_buffers_with_offsets(
+                &self.ctx,
+                set_idx,
+                &[
+                    (accumulator_buf, accumulator_offset, accumulator_size),
+                    (values_buf, values_offset, values_bytes),
+                    (token_ids_buf, token_ids_offset, metadata_bytes),
+                    (weights_buf, weights_offset, metadata_bytes),
+                ],
+            );
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[set_idx],
+                0,
+                ptr::null(),
+            );
+            let push: [u32; 3] = [group_len, hidden, u32::from(sigmoid_weights)];
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                12,
+                push.as_ptr() as *const std::ffi::c_void,
+            );
+            let elements = group_len
+                .checked_mul(hidden)
+                .ok_or("record_moe_weighted_scatter_add: dispatch size overflow")?;
+            let workgroups = elements.div_ceil(LOCAL_SIZE_X);
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, workgroups, 1, 1);
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_moe_grouped_q4k_gate_up(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        arena_buf: &GpuBuffer,
+        slot_ids_buf: &GpuBuffer,
+        token_ids_buf: &GpuBuffer,
+        input_buf: &GpuBuffer,
+        input_offset: u64,
+        input_size: u64,
+        gate_buf: &GpuBuffer,
+        activation_buf: &GpuBuffer,
+        route_count: u32,
+        layout: ExpertArenaLayout,
+    ) -> Result<(), String> {
+        if route_count == 0 || layout.hidden == 0 || layout.n_ff == 0 {
+            return Err(
+                "record_moe_grouped_q4k_gate_up: route_count/hidden/n_ff must be > 0".into(),
+            );
+        }
+        let metadata_bytes = u64::from(route_count)
+            .checked_mul(4)
+            .ok_or("record_moe_grouped_q4k_gate_up: metadata size overflow")?;
+        let scratch_bytes = u64::from(route_count)
+            .checked_mul(u64::from(layout.n_ff))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_q4k_gate_up: scratch size overflow")?;
+        let hidden_bytes = u64::from(layout.hidden) * 4;
+        if input_size < hidden_bytes || !input_size.is_multiple_of(hidden_bytes) {
+            return Err(format!(
+                "record_moe_grouped_q4k_gate_up: input size {input_size} is not whole hidden rows of {hidden_bytes} bytes"
+            ));
+        }
+        for (label, offset, size, allocation) in [
+            ("arena", 0, arena_buf.size, arena_buf.size),
+            ("slots", 0, metadata_bytes, slot_ids_buf.size),
+            ("tokens", 0, metadata_bytes, token_ids_buf.size),
+            ("input", input_offset, input_size, input_buf.size),
+            ("gate", 0, scratch_bytes, gate_buf.size),
+            ("activation", 0, scratch_bytes, activation_buf.size),
+        ] {
+            if size == 0 || offset.checked_add(size).is_none_or(|end| end > allocation) {
+                return Err(format!(
+                    "record_moe_grouped_q4k_gate_up: {label} range exceeds buffer"
+                ));
+            }
+        }
+        unsafe {
+            if self.pipeline_moe_grouped_q4k_gate.is_none() {
+                let spirv = emit_moe_grouped_q4k_gate(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_q4k_gate =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 6, 28)?);
+            }
+            if self.pipeline_moe_grouped_q4k_up_silu.is_none() {
+                let spirv = emit_moe_grouped_q4k_up_silu(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_q4k_up_silu =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 6, 28)?);
+            }
+        }
+        let bindings = [
+            (arena_buf, 0, arena_buf.size),
+            (slot_ids_buf, 0, metadata_bytes),
+            (token_ids_buf, 0, metadata_bytes),
+            (input_buf, input_offset, input_size),
+            (gate_buf, 0, scratch_bytes),
+            (activation_buf, 0, scratch_bytes),
+        ];
+        let dispatch_x = layout.n_ff.div_ceil(2);
+        let gate_push = [
+            layout.n_ff,
+            layout.hidden,
+            route_count,
+            layout.slot_stride_words,
+            layout.gate_offset_words,
+            layout.hidden,
+            layout.n_ff,
+        ];
+        let up_push = [
+            layout.n_ff,
+            layout.hidden,
+            route_count,
+            layout.slot_stride_words,
+            layout.up_offset_words,
+            layout.hidden,
+            layout.n_ff,
+        ];
+        unsafe {
+            let pipeline = self
+                .pipeline_moe_grouped_q4k_gate
+                .as_ref()
+                .ok_or("record_moe_grouped_q4k_gate_up: gate pipeline missing")?;
+            pipeline.bind_n_buffers_with_offsets(&self.ctx, 0, &bindings);
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                28,
+                gate_push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, dispatch_x, route_count, 1);
+        }
+        self.record_compute_barrier(cmdbuf, gate_buf, 0, scratch_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.gate");
+        unsafe {
+            let pipeline = self
+                .pipeline_moe_grouped_q4k_up_silu
+                .as_ref()
+                .ok_or("record_moe_grouped_q4k_gate_up: up pipeline missing")?;
+            pipeline.bind_n_buffers_with_offsets(&self.ctx, 0, &bindings);
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                28,
+                up_push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, dispatch_x, route_count, 1);
+        }
+        self.record_compute_barrier(cmdbuf, activation_buf, 0, scratch_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.up_silu");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_moe_grouped_q8_gate_up_down(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        arena_buf: &GpuBuffer,
+        slot_ids_buf: &GpuBuffer,
+        token_ids_buf: &GpuBuffer,
+        input_buf: &GpuBuffer,
+        input_offset: u64,
+        input_size: u64,
+        gate_buf: &GpuBuffer,
+        activation_buf: &GpuBuffer,
+        down_buf: &GpuBuffer,
+        route_count: u32,
+        layout: ExpertArenaLayout,
+    ) -> Result<(), String> {
+        if layout.format != ExpertArenaFormat::Q8Zero {
+            return Err(format!(
+                "record_moe_grouped_q8_gate_up_down: expected Q8 arena, got {:?}",
+                layout.format
+            ));
+        }
+        if route_count == 0 || layout.hidden == 0 || layout.n_ff == 0 {
+            return Err(
+                "record_moe_grouped_q8_gate_up_down: route_count/hidden/n_ff must be > 0".into(),
+            );
+        }
+        let metadata_bytes = u64::from(route_count)
+            .checked_mul(4)
+            .ok_or("record_moe_grouped_q8_gate_up_down: metadata size overflow")?;
+        let scratch_bytes = u64::from(route_count)
+            .checked_mul(u64::from(layout.n_ff))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_q8_gate_up_down: scratch size overflow")?;
+        let down_bytes = u64::from(route_count)
+            .checked_mul(u64::from(layout.hidden))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_q8_gate_up_down: down size overflow")?;
+        let hidden_bytes = u64::from(layout.hidden) * 4;
+        if input_size < hidden_bytes || !input_size.is_multiple_of(hidden_bytes) {
+            return Err(format!(
+                "record_moe_grouped_q8_gate_up_down: input size {input_size} is not whole hidden rows of {hidden_bytes} bytes"
+            ));
+        }
+        for (label, offset, size, allocation) in [
+            ("arena", 0, arena_buf.size, arena_buf.size),
+            ("slots", 0, metadata_bytes, slot_ids_buf.size),
+            ("tokens", 0, metadata_bytes, token_ids_buf.size),
+            ("input", input_offset, input_size, input_buf.size),
+            ("gate", 0, scratch_bytes, gate_buf.size),
+            ("activation", 0, scratch_bytes, activation_buf.size),
+            ("down", 0, down_bytes, down_buf.size),
+        ] {
+            if size == 0 || offset.checked_add(size).is_none_or(|end| end > allocation) {
+                return Err(format!(
+                    "record_moe_grouped_q8_gate_up_down: {label} range exceeds buffer"
+                ));
+            }
+        }
+        unsafe {
+            if self.pipeline_moe_grouped_q8_gate.is_none() {
+                let spirv = emit_moe_grouped_q8_gate(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_q8_gate =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 6, 28)?);
+            }
+            if self.pipeline_moe_grouped_q8_up_silu.is_none() {
+                let spirv = emit_moe_grouped_q8_up_silu(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_q8_up_silu =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 6, 28)?);
+            }
+            if self.pipeline_moe_grouped_q8_down.is_none() {
+                let spirv = emit_moe_grouped_q8_down(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_q8_down =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 6, 28)?);
+            }
+        }
+        let gate_up_bindings = [
+            (arena_buf, 0, arena_buf.size),
+            (slot_ids_buf, 0, metadata_bytes),
+            (token_ids_buf, 0, metadata_bytes),
+            (input_buf, input_offset, input_size),
+            (gate_buf, 0, scratch_bytes),
+            (activation_buf, 0, scratch_bytes),
+        ];
+        let gate_push = [
+            layout.n_ff,
+            layout.hidden,
+            route_count,
+            layout.slot_stride_words,
+            layout.gate_offset_words,
+            layout.hidden,
+            layout.n_ff,
+        ];
+        let up_push = [
+            layout.n_ff,
+            layout.hidden,
+            route_count,
+            layout.slot_stride_words,
+            layout.up_offset_words,
+            layout.hidden,
+            layout.n_ff,
+        ];
+        let gate_up_dispatch = layout.n_ff.div_ceil(LOCAL_SIZE_X);
+        unsafe {
+            let pipeline = self
+                .pipeline_moe_grouped_q8_gate
+                .as_ref()
+                .ok_or("record_moe_grouped_q8_gate_up_down: gate pipeline missing")?;
+            pipeline.bind_n_buffers_with_offsets(&self.ctx, 0, &gate_up_bindings);
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                28,
+                gate_push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, gate_up_dispatch, route_count, 1);
+        }
+        self.record_compute_barrier(cmdbuf, gate_buf, 0, scratch_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.q8_gate");
+        unsafe {
+            let pipeline = self
+                .pipeline_moe_grouped_q8_up_silu
+                .as_ref()
+                .ok_or("record_moe_grouped_q8_gate_up_down: up pipeline missing")?;
+            pipeline.bind_n_buffers_with_offsets(&self.ctx, 0, &gate_up_bindings);
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                28,
+                up_push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, gate_up_dispatch, route_count, 1);
+        }
+        self.record_compute_barrier(cmdbuf, activation_buf, 0, scratch_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.q8_up_silu");
+
+        let down_bindings = [
+            (arena_buf, 0, arena_buf.size),
+            (slot_ids_buf, 0, metadata_bytes),
+            (token_ids_buf, 0, metadata_bytes),
+            (activation_buf, 0, scratch_bytes),
+            (gate_buf, 0, scratch_bytes),
+            (down_buf, 0, down_bytes),
+        ];
+        let down_push = [
+            layout.hidden,
+            layout.n_ff,
+            route_count,
+            layout.slot_stride_words,
+            layout.down_offset_words,
+            layout.n_ff,
+            layout.hidden,
+        ];
+        unsafe {
+            let pipeline = self
+                .pipeline_moe_grouped_q8_down
+                .as_ref()
+                .ok_or("record_moe_grouped_q8_gate_up_down: down pipeline missing")?;
+            pipeline.bind_n_buffers_with_offsets(&self.ctx, 0, &down_bindings);
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                28,
+                down_push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(
+                cmdbuf,
+                layout.hidden.div_ceil(LOCAL_SIZE_X),
+                route_count,
+                1,
+            );
+        }
+        self.record_compute_barrier(cmdbuf, down_buf, 0, down_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.q8_down");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_moe_grouped_down(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        arena_buf: &GpuBuffer,
+        slot_ids_buf: &GpuBuffer,
+        activation_buf: &GpuBuffer,
+        down_buf: &GpuBuffer,
+        route_count: u32,
+        down_quant: QuantType,
+        layout: ExpertArenaLayout,
+    ) -> Result<(), String> {
+        if route_count == 0 || layout.hidden == 0 || layout.n_ff == 0 {
+            return Err("record_moe_grouped_down: route_count/hidden/n_ff must be > 0".into());
+        }
+        let metadata_bytes = u64::from(route_count)
+            .checked_mul(4)
+            .ok_or("record_moe_grouped_down: metadata size overflow")?;
+        let activation_bytes = u64::from(route_count)
+            .checked_mul(u64::from(layout.n_ff))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_down: activation size overflow")?;
+        let down_bytes = u64::from(route_count)
+            .checked_mul(u64::from(layout.hidden))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_down: output size overflow")?;
+        for (label, size, allocation) in [
+            ("arena", arena_buf.size, arena_buf.size),
+            ("slots", metadata_bytes, slot_ids_buf.size),
+            ("activation", activation_bytes, activation_buf.size),
+            ("down", down_bytes, down_buf.size),
+        ] {
+            if size == 0 || size > allocation {
+                return Err(format!(
+                    "record_moe_grouped_down: {label} range exceeds buffer"
+                ));
+            }
+        }
+        unsafe {
+            let target = match down_quant {
+                QuantType::Q5K => &mut self.pipeline_moe_grouped_q5k_down,
+                QuantType::Q6K => &mut self.pipeline_moe_grouped_q6k_down,
+                other => {
+                    return Err(format!(
+                        "record_moe_grouped_down: unsupported down quant {other:?}"
+                    ))
+                }
+            };
+            if target.is_none() {
+                let spirv = match down_quant {
+                    QuantType::Q5K => emit_moe_grouped_q5k_down(LOCAL_SIZE_X),
+                    QuantType::Q6K => emit_moe_grouped_q6k_down(LOCAL_SIZE_X),
+                    _ => unreachable!(),
+                };
+                *target = Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 4, 20)?);
+            }
+        }
+        let pipeline = match down_quant {
+            QuantType::Q5K => self.pipeline_moe_grouped_q5k_down.as_ref(),
+            QuantType::Q6K => self.pipeline_moe_grouped_q6k_down.as_ref(),
+            _ => None,
+        }
+        .ok_or("record_moe_grouped_down: pipeline missing")?;
+        let push = [
+            layout.hidden,
+            layout.n_ff,
+            route_count,
+            layout.slot_stride_words,
+            layout.down_offset_words,
+        ];
+        unsafe {
+            pipeline.bind_n_buffers_with_offsets(
+                &self.ctx,
+                0,
+                &[
+                    (arena_buf, 0, arena_buf.size),
+                    (slot_ids_buf, 0, metadata_bytes),
+                    (activation_buf, 0, activation_bytes),
+                    (down_buf, 0, down_bytes),
+                ],
+            );
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                20,
+                push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(
+                cmdbuf,
+                layout.hidden.div_ceil(LOCAL_SIZE_X),
+                route_count,
+                1,
+            );
+        }
+        self.record_compute_barrier(cmdbuf, down_buf, 0, down_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.down");
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_moe_grouped_reduce(
+        &mut self,
+        cmdbuf: VkCommandBuffer,
+        hidden_buf: &GpuBuffer,
+        hidden_offset: u64,
+        hidden_size: u64,
+        down_buf: &GpuBuffer,
+        route_weights_buf: &GpuBuffer,
+        route_count: u32,
+        seq_len: u32,
+        top_k: u32,
+        hidden: u32,
+    ) -> Result<(), String> {
+        if seq_len == 0 || top_k == 0 || hidden == 0 {
+            return Err("record_moe_grouped_reduce: seq_len/top_k/hidden must be > 0".into());
+        }
+        let expected_routes = seq_len
+            .checked_mul(top_k)
+            .ok_or("record_moe_grouped_reduce: route count overflow")?;
+        if route_count != expected_routes {
+            return Err(format!(
+                "record_moe_grouped_reduce: route_count {route_count} != seq_len*top_k {expected_routes}"
+            ));
+        }
+        let hidden_bytes = u64::from(seq_len)
+            .checked_mul(u64::from(hidden))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_reduce: hidden size overflow")?;
+        let down_bytes = u64::from(route_count)
+            .checked_mul(u64::from(hidden))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or("record_moe_grouped_reduce: down size overflow")?;
+        let weights_bytes = u64::from(route_count)
+            .checked_mul(4)
+            .ok_or("record_moe_grouped_reduce: weight size overflow")?;
+        if hidden_size < hidden_bytes
+            || hidden_offset
+                .checked_add(hidden_size)
+                .is_none_or(|end| end > hidden_buf.size)
+            || down_bytes > down_buf.size
+            || weights_bytes > route_weights_buf.size
+        {
+            return Err("record_moe_grouped_reduce: buffer range exceeds allocation".into());
+        }
+        unsafe {
+            if self.pipeline_moe_grouped_reduce.is_none() {
+                let spirv = emit_moe_grouped_reduce(LOCAL_SIZE_X);
+                self.pipeline_moe_grouped_reduce =
+                    Some(ComputePipeline::new_nbinding(&self.ctx, &spirv, 1, 3, 12)?);
+            }
+        }
+        let pipeline = self
+            .pipeline_moe_grouped_reduce
+            .as_ref()
+            .ok_or("record_moe_grouped_reduce: pipeline missing")?;
+        let push = [seq_len, top_k, hidden];
+        unsafe {
+            pipeline.bind_n_buffers_with_offsets(
+                &self.ctx,
+                0,
+                &[
+                    (hidden_buf, hidden_offset, hidden_size),
+                    (down_buf, 0, down_bytes),
+                    (route_weights_buf, 0, weights_bytes),
+                ],
+            );
+            (self.ctx.vk.cmd_bind_pipeline)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline,
+            );
+            (self.ctx.vk.cmd_bind_descriptor_sets)(
+                cmdbuf,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.pipeline_layout,
+                0,
+                1,
+                &pipeline.descriptor_sets[0],
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.cmd_push_constants)(
+                cmdbuf,
+                pipeline.pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                12,
+                push.as_ptr() as *const std::ffi::c_void,
+            );
+            (self.ctx.vk.cmd_dispatch)(cmdbuf, hidden.div_ceil(LOCAL_SIZE_X), seq_len, 1);
+        }
+        self.record_compute_barrier(cmdbuf, hidden_buf, hidden_offset, hidden_bytes)?;
+        self.gdn_gpu_profile_marker(cmdbuf, "moe.reduce");
+        Ok(())
+    }
+
+    pub(crate) fn record_compute_barrier(
+        &self,
+        cmdbuf: VkCommandBuffer,
+        buffer: &GpuBuffer,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        if offset.checked_add(size).is_none_or(|end| end > buffer.size) {
+            return Err("record_compute_barrier: buffer range exceeds allocation".into());
+        }
+        let barrier = VkBufferMemoryBarrier {
+            s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            p_next: ptr::null(),
+            src_access_mask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            dst_access_mask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+            buffer: buffer.buffer,
+            offset,
+            size,
+        };
+        unsafe {
+            (self.ctx.vk.cmd_pipeline_barrier)(
+                cmdbuf,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                ptr::null(),
+                1,
+                &barrier,
+                0,
+                ptr::null(),
+            );
         }
         Ok(())
     }
@@ -13457,49 +14766,51 @@ impl VulkanLayerGemv {
 
         self.gdn_gpu_profile_marker(cmdbuf, "attn.residual");
 
-        // ===== Step 6: ffn_chain_strided =====
-        self.record_ffn_chain_strided(
-            cmdbuf,
-            ffn_norm_set_base,
-            gate_set_base,
-            up_set_base,
-            down_set_base,
-            input.set_idx_silu_base,
-            input.set_idx_add_base,
-            input.hidden_out_buf,
-            input.hidden_out_offset,
-            ffn_residual,
-            0,
-            input.ffn_norm_buf,
-            input.ffn_norm_size,
-            input.norm_eps,
-            input.norm_ffn_strided_buf,
-            0,
-            input.gate_weight_buf,
-            input.gate_weight_size,
-            input.gate_quant,
-            input.ffn_inner,
-            input.hidden_dim,
-            input.gate_strided_buf,
-            0,
-            input.up_weight_buf,
-            input.up_weight_size,
-            input.up_quant,
-            input.ffn_inner,
-            input.hidden_dim,
-            input.up_strided_buf,
-            0,
-            input.down_weight_buf,
-            input.down_weight_size,
-            input.down_quant,
-            input.hidden_dim,
-            input.ffn_inner,
-            input.down_strided_buf,
-            0,
-            input.seq_len,
-            input.hidden_dim,
-            input.ffn_inner,
-        )?;
+        // ===== Step 6: dense FFN tail =====
+        if input.record_dense_ffn {
+            self.record_ffn_chain_strided(
+                cmdbuf,
+                ffn_norm_set_base,
+                gate_set_base,
+                up_set_base,
+                down_set_base,
+                input.set_idx_silu_base,
+                input.set_idx_add_base,
+                input.hidden_out_buf,
+                input.hidden_out_offset,
+                ffn_residual,
+                0,
+                input.ffn_norm_buf,
+                input.ffn_norm_size,
+                input.norm_eps,
+                input.norm_ffn_strided_buf,
+                0,
+                input.gate_weight_buf,
+                input.gate_weight_size,
+                input.gate_quant,
+                input.ffn_inner,
+                input.hidden_dim,
+                input.gate_strided_buf,
+                0,
+                input.up_weight_buf,
+                input.up_weight_size,
+                input.up_quant,
+                input.ffn_inner,
+                input.hidden_dim,
+                input.up_strided_buf,
+                0,
+                input.down_weight_buf,
+                input.down_weight_size,
+                input.down_quant,
+                input.hidden_dim,
+                input.ffn_inner,
+                input.down_strided_buf,
+                0,
+                input.seq_len,
+                input.hidden_dim,
+                input.ffn_inner,
+            )?;
+        }
 
         self.gdn_gpu_profile_marker(cmdbuf, "attn.ffn");
 
@@ -14462,48 +15773,50 @@ impl VulkanLayerGemv {
             self.gdn_gpu_profile_marker(cmdbuf, "gdn.residual");
         }
 
-        self.record_ffn_chain_strided(
-            cmdbuf,
-            input.set_idx_norm_base + n,
-            input.set_idx_q_base + 3 * n,
-            input.set_idx_q_base + 4 * n,
-            input.set_idx_q_base + 5 * n,
-            input.set_idx_silu_base,
-            input.set_idx_add_base + n,
-            input.hidden_out_buf,
-            input.hidden_out_offset,
-            None,
-            0,
-            input.ffn_norm_buf,
-            input.ffn_norm_size,
-            input.norm_eps,
-            input.norm_ffn_strided_buf,
-            0,
-            input.ffn_gate_weight_buf,
-            input.ffn_gate_weight_size,
-            input.ffn_gate_quant,
-            input.ffn_inner,
-            input.hidden_dim,
-            input.conv_gated_strided_buf,
-            0,
-            input.ffn_up_weight_buf,
-            input.ffn_up_weight_size,
-            input.ffn_up_quant,
-            input.ffn_inner,
-            input.hidden_dim,
-            input.z_strided_buf,
-            0,
-            input.ffn_down_weight_buf,
-            input.ffn_down_weight_size,
-            input.ffn_down_quant,
-            input.hidden_dim,
-            input.ffn_inner,
-            input.down_strided_buf,
-            0,
-            input.seq_len,
-            input.hidden_dim,
-            input.ffn_inner,
-        )?;
+        if input.record_dense_ffn {
+            self.record_ffn_chain_strided(
+                cmdbuf,
+                input.set_idx_norm_base + n,
+                input.set_idx_q_base + 3 * n,
+                input.set_idx_q_base + 4 * n,
+                input.set_idx_q_base + 5 * n,
+                input.set_idx_silu_base,
+                input.set_idx_add_base + n,
+                input.hidden_out_buf,
+                input.hidden_out_offset,
+                None,
+                0,
+                input.ffn_norm_buf,
+                input.ffn_norm_size,
+                input.norm_eps,
+                input.norm_ffn_strided_buf,
+                0,
+                input.ffn_gate_weight_buf,
+                input.ffn_gate_weight_size,
+                input.ffn_gate_quant,
+                input.ffn_inner,
+                input.hidden_dim,
+                input.conv_gated_strided_buf,
+                0,
+                input.ffn_up_weight_buf,
+                input.ffn_up_weight_size,
+                input.ffn_up_quant,
+                input.ffn_inner,
+                input.hidden_dim,
+                input.z_strided_buf,
+                0,
+                input.ffn_down_weight_buf,
+                input.ffn_down_weight_size,
+                input.ffn_down_quant,
+                input.hidden_dim,
+                input.ffn_inner,
+                input.down_strided_buf,
+                0,
+                input.seq_len,
+                input.hidden_dim,
+                input.ffn_inner,
+            )?;
+        }
         if input.layer_idx == 0 {
             self.gdn_gpu_profile_marker(cmdbuf, "gdn.ffn");
         }
@@ -15467,6 +16780,7 @@ impl VulkanLayerGemv {
                 0,
                 4,
                 output_quant,
+                None,
                 vocab,
                 hidden,
             ) {
@@ -15549,10 +16863,10 @@ impl VulkanLayerGemv {
         src_buf: &GpuBuffer,
         byte_len: u64,
     ) -> Result<Vec<f32>, String> {
-        self.debug_download_buffer_f32_range(src_buf, 0, byte_len)
+        self.download_buffer_f32_range(src_buf, 0, byte_len)
     }
 
-    pub(crate) fn debug_download_buffer_f32_range(
+    pub(crate) fn download_buffer_f32_range(
         &mut self,
         src_buf: &GpuBuffer,
         src_offset: u64,
@@ -15660,6 +16974,63 @@ impl VulkanLayerGemv {
         })
     }
 
+    pub fn resident_output_argmax_from_normalized_host(
+        &mut self,
+        normalized_hidden: &[f32],
+        output_quant: QuantType,
+        excluded_token: Option<u32>,
+        vocab: u32,
+    ) -> Result<u32, String> {
+        if normalized_hidden.is_empty() {
+            return Err(
+                "resident_output_argmax_from_normalized_host: hidden must not be empty".into(),
+            );
+        }
+        if normalized_hidden.len() > self.input_capacity {
+            return Err(format!(
+                "resident_output_argmax_from_normalized_host: hidden length {} exceeds input capacity {}",
+                normalized_hidden.len(),
+                self.input_capacity
+            ));
+        }
+        if self.input_mapped_ptr.is_null() {
+            return Err(
+                "resident_output_argmax_from_normalized_host: input mapping missing".into(),
+            );
+        }
+        let input = self.input_buf.as_ref().ok_or_else(|| {
+            "resident_output_argmax_from_normalized_host: input buffer missing".to_string()
+        })?;
+        let input_view = GpuBuffer {
+            buffer: input.buffer,
+            memory: 0,
+            size: input.size,
+        };
+        let hidden_bytes = normalized_hidden
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or("resident_output_argmax_from_normalized_host: hidden byte size overflow")?;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                normalized_hidden.as_ptr() as *const u8,
+                self.input_mapped_ptr,
+                hidden_bytes,
+            );
+        }
+        self.runtime_counters.upload_bytes += hidden_bytes as u64;
+        self.logit_argmax_bound_from_buffer_with_norm(
+            &input_view,
+            0,
+            &[],
+            0.0,
+            true,
+            output_quant,
+            excluded_token,
+            vocab,
+            normalized_hidden.len() as u32,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn logit_argmax_bound_from_buffer_with_norm(
         &mut self,
@@ -15667,19 +17038,27 @@ impl VulkanLayerGemv {
         hidden_offset: u64,
         output_norm: &[f32],
         norm_eps: f32,
+        input_already_normalized: bool,
         output_quant: QuantType,
+        excluded_token: Option<u32>,
         vocab: u32,
         hidden: u32,
     ) -> Result<u32, String> {
         if vocab == 0 {
             return Err("logit_argmax_bound_from_buffer_with_norm: vocab must be > 0".into());
         }
-        if output_norm.len() != hidden as usize {
+        if !input_already_normalized && output_norm.len() != hidden as usize {
             return Err(format!(
                 "logit_argmax_bound_from_buffer_with_norm: output_norm.len() {} != hidden {}",
                 output_norm.len(),
                 hidden
             ));
+        }
+        if input_already_normalized && hidden_offset != 0 {
+            return Err(
+                "logit_argmax_bound_from_buffer_with_norm: normalized input requires offset 0"
+                    .into(),
+            );
         }
         let hidden_bytes = (hidden as u64) * 4;
         if hidden_buf.size < hidden_offset.saturating_add(hidden_bytes) {
@@ -15735,10 +17114,23 @@ impl VulkanLayerGemv {
             memory: 0,
             size: norm_weight.size,
         };
-        let norm_out_view = GpuBuffer {
+        let norm_scratch_view = GpuBuffer {
             buffer: norm_out.buffer,
             memory: 0,
             size: norm_out.size,
+        };
+        let norm_out_view = if input_already_normalized {
+            GpuBuffer {
+                buffer: hidden_view.buffer,
+                memory: 0,
+                size: hidden_view.size,
+            }
+        } else {
+            GpuBuffer {
+                buffer: norm_scratch_view.buffer,
+                memory: 0,
+                size: norm_scratch_view.size,
+            }
         };
         let host_vis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         let q8_chunked_rows_per_group_opt =
@@ -15758,12 +17150,14 @@ impl VulkanLayerGemv {
         let output_profile_start =
             (self.gpu_profile_query_pool != VK_NULL_HANDLE).then(std::time::Instant::now);
         unsafe {
-            ptr::copy_nonoverlapping(
-                output_norm.as_ptr() as *const u8,
-                self.norm_weight_mapped_ptr,
-                hidden_bytes as usize,
-            );
-            self.runtime_counters.upload_bytes += hidden_bytes;
+            if !input_already_normalized {
+                ptr::copy_nonoverlapping(
+                    output_norm.as_ptr() as *const u8,
+                    self.norm_weight_mapped_ptr,
+                    hidden_bytes as usize,
+                );
+                self.runtime_counters.upload_bytes += hidden_bytes;
+            }
 
             let argmax_buffer = self
                 .output_bufs
@@ -15813,50 +17207,51 @@ impl VulkanLayerGemv {
             }
             self.gdn_gpu_profile_marker(self.command_buffer, "output.begin");
 
-            if let Err(e) = self.record_rms_norm_window_strided(
-                self.command_buffer,
-                0,
-                &hidden_view,
-                hidden_offset,
-                hidden_bytes,
-                &norm_weight_view,
-                hidden_bytes,
-                &norm_out_view,
-                0,
-                hidden_bytes,
-                1,
-                hidden,
-                norm_eps,
-            ) {
-                (self.ctx.vk.end_command_buffer)(self.command_buffer);
-                destroy_partial_buffers!();
-                return Err(e);
+            if !input_already_normalized {
+                if let Err(e) = self.record_rms_norm_window_strided(
+                    self.command_buffer,
+                    0,
+                    &hidden_view,
+                    hidden_offset,
+                    hidden_bytes,
+                    &norm_weight_view,
+                    hidden_bytes,
+                    &norm_scratch_view,
+                    0,
+                    hidden_bytes,
+                    1,
+                    hidden,
+                    norm_eps,
+                ) {
+                    (self.ctx.vk.end_command_buffer)(self.command_buffer);
+                    destroy_partial_buffers!();
+                    return Err(e);
+                }
+                let norm_barrier = VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: norm_scratch_view.buffer,
+                    offset: 0,
+                    size: hidden_bytes,
+                };
+                (self.ctx.vk.cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    1,
+                    &norm_barrier,
+                    0,
+                    ptr::null(),
+                );
+                self.gdn_gpu_profile_marker(self.command_buffer, "output.norm");
             }
-
-            let norm_barrier = VkBufferMemoryBarrier {
-                s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                p_next: ptr::null(),
-                src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
-                dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
-                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
-                buffer: norm_out_view.buffer,
-                offset: 0,
-                size: hidden_bytes,
-            };
-            (self.ctx.vk.cmd_pipeline_barrier)(
-                self.command_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                0,
-                ptr::null(),
-                1,
-                &norm_barrier,
-                0,
-                ptr::null(),
-            );
-            self.gdn_gpu_profile_marker(self.command_buffer, "output.norm");
 
             match output_quant {
                 QuantType::Q8_0 if q8_soa_output => {
@@ -16029,6 +17424,7 @@ impl VulkanLayerGemv {
                         vocab,
                         stage1_workgroups,
                         values_per_group,
+                        excluded_token,
                     ) {
                         (self.ctx.vk.end_command_buffer)(self.command_buffer);
                         destroy_partial_buffers!();
@@ -16273,6 +17669,7 @@ impl VulkanLayerGemv {
                         0,
                         4,
                         output_quant,
+                        excluded_token,
                         vocab,
                         hidden,
                     ) {
@@ -16425,6 +17822,283 @@ impl VulkanLayerGemv {
                 );
             }
             Ok(argmax_word)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn logit_argmax_rows_bound_from_buffer_with_norm(
+        &mut self,
+        hidden_buf: &GpuBuffer,
+        hidden_offset: u64,
+        hidden_rows: u32,
+        output_norm: &[f32],
+        norm_eps: f32,
+        output_quant: QuantType,
+        excluded_token: Option<u32>,
+        vocab: u32,
+        hidden: u32,
+    ) -> Result<Vec<u32>, String> {
+        const CONTEXT: &str = "logit_argmax_rows_bound_from_buffer_with_norm";
+        if !matches!(output_quant, QuantType::Q4K | QuantType::Q6K) {
+            return Err(format!(
+                "{CONTEXT}: batched rows unsupported for {output_quant:?}"
+            ));
+        }
+        if vocab == 0 || hidden_rows == 0 {
+            return Err(format!("{CONTEXT}: vocab and hidden_rows must be > 0"));
+        }
+        if output_norm.len() != hidden as usize {
+            return Err(format!(
+                "{CONTEXT}: output_norm.len() {} != hidden {}",
+                output_norm.len(),
+                hidden
+            ));
+        }
+
+        let hidden_bytes = (hidden as u64)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| format!("{CONTEXT}: hidden byte size overflow"))?;
+        let total_hidden_bytes = (hidden_rows as u64)
+            .checked_mul(hidden_bytes)
+            .ok_or_else(|| format!("{CONTEXT}: total hidden byte size overflow"))?;
+        let hidden_end = hidden_offset
+            .checked_add(total_hidden_bytes)
+            .ok_or_else(|| format!("{CONTEXT}: hidden range overflow"))?;
+        if hidden_buf.size < hidden_end {
+            return Err(format!(
+                "{CONTEXT}: hidden range [{hidden_offset}..{hidden_end}) exceeds buffer size {}",
+                hidden_buf.size
+            ));
+        }
+
+        let row_bytes = logit_argmax_row_bytes(hidden, output_quant)?;
+        let expected_table = (vocab as usize)
+            .checked_mul(row_bytes)
+            .ok_or_else(|| format!("{CONTEXT}: output table byte size overflow"))?;
+        if self.output_table_size_bytes != expected_table
+            || self.output_table_quant != Some(output_quant)
+        {
+            return Err(format!(
+                "{CONTEXT}: resident output table mismatch \
+                 (resident_bytes={} expected={} resident_quant={:?} expected_quant={:?})",
+                self.output_table_size_bytes, expected_table, self.output_table_quant, output_quant
+            ));
+        }
+        if self.norm_weight_mapped_ptr.is_null() {
+            return Err(format!("{CONTEXT}: norm_weight_mapped_ptr missing"));
+        }
+
+        let norm_weight = self
+            .norm_weight_buf
+            .as_ref()
+            .ok_or_else(|| format!("{CONTEXT}: norm_weight_buf missing"))?;
+        if norm_weight.size < hidden_bytes {
+            return Err(format!(
+                "{CONTEXT}: norm weight buffer too small ({} < {hidden_bytes})",
+                norm_weight.size
+            ));
+        }
+        let norm_weight_view = GpuBuffer {
+            buffer: norm_weight.buffer,
+            memory: 0,
+            size: norm_weight.size,
+        };
+
+        let norm_out = self
+            .fullpath_staging_norm_attn
+            .as_ref()
+            .ok_or_else(|| format!("{CONTEXT}: fullpath_staging_norm_attn missing"))?;
+        if norm_out.size < total_hidden_bytes {
+            return Err(format!(
+                "{CONTEXT}: norm output buffer too small ({} < {total_hidden_bytes})",
+                norm_out.size
+            ));
+        }
+        let norm_out_view = GpuBuffer {
+            buffer: norm_out.buffer,
+            memory: 0,
+            size: norm_out.size,
+        };
+        let hidden_view = GpuBuffer {
+            buffer: hidden_buf.buffer,
+            memory: 0,
+            size: hidden_buf.size,
+        };
+
+        let output_table = self
+            .output_table_buffer
+            .as_ref()
+            .ok_or_else(|| format!("{CONTEXT}: output_table_buffer missing"))?;
+        let output_table_view = GpuBuffer {
+            buffer: output_table.buffer,
+            memory: 0,
+            size: output_table.size,
+        };
+
+        let argmax_bytes = (hidden_rows as u64)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or_else(|| format!("{CONTEXT}: argmax byte size overflow"))?;
+        let argmax_buffer = self
+            .output_bufs
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("{CONTEXT}: output buffer missing"))?;
+        if argmax_buffer.size < argmax_bytes {
+            return Err(format!(
+                "{CONTEXT}: output buffer too small ({} < {argmax_bytes})",
+                argmax_buffer.size
+            ));
+        }
+        let argmax_view = GpuBuffer {
+            buffer: argmax_buffer.buffer,
+            memory: 0,
+            size: argmax_buffer.size,
+        };
+        let argmax_mapped_ptr = self
+            .output_mapped_ptrs
+            .first()
+            .copied()
+            .filter(|ptr| !ptr.is_null())
+            .ok_or_else(|| format!("{CONTEXT}: output mapping missing"))?;
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                output_norm.as_ptr() as *const u8,
+                self.norm_weight_mapped_ptr,
+                hidden_bytes as usize,
+            );
+            self.runtime_counters.upload_bytes += hidden_bytes;
+
+            (self.ctx.vk.reset_command_buffer)(self.command_buffer, 0);
+            let begin = VkCommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                p_inheritance_info: ptr::null(),
+            };
+            (self.ctx.vk.begin_command_buffer)(self.command_buffer, &begin);
+
+            if let Err(error) = self.record_rms_norm_window_strided(
+                self.command_buffer,
+                0,
+                &hidden_view,
+                hidden_offset,
+                hidden_bytes,
+                &norm_weight_view,
+                hidden_bytes,
+                &norm_out_view,
+                0,
+                hidden_bytes,
+                hidden_rows,
+                hidden,
+                norm_eps,
+            ) {
+                (self.ctx.vk.end_command_buffer)(self.command_buffer);
+                return Err(error);
+            }
+
+            let norm_barrier = VkBufferMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_SHADER_READ_BIT,
+                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                buffer: norm_out_view.buffer,
+                offset: 0,
+                size: total_hidden_bytes,
+            };
+            (self.ctx.vk.cmd_pipeline_barrier)(
+                self.command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                ptr::null(),
+                1,
+                &norm_barrier,
+                0,
+                ptr::null(),
+            );
+
+            if let Err(error) = self.record_logit_argmax_rows_with_offsets(
+                self.command_buffer,
+                0,
+                &norm_out_view,
+                0,
+                total_hidden_bytes,
+                &output_table_view,
+                0,
+                output_table_view.size,
+                &argmax_view,
+                0,
+                argmax_bytes,
+                output_quant,
+                excluded_token,
+                hidden_rows,
+                vocab,
+                hidden,
+            ) {
+                (self.ctx.vk.end_command_buffer)(self.command_buffer);
+                return Err(error);
+            }
+
+            let host_barrier = VkBufferMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_HOST_READ_BIT,
+                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                buffer: argmax_view.buffer,
+                offset: 0,
+                size: argmax_bytes,
+            };
+            (self.ctx.vk.cmd_pipeline_barrier)(
+                self.command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                0,
+                ptr::null(),
+                1,
+                &host_barrier,
+                0,
+                ptr::null(),
+            );
+            (self.ctx.vk.end_command_buffer)(self.command_buffer);
+
+            (self.ctx.vk.reset_fences)(self.ctx.device, 1, &self.fence);
+            let submit = VkSubmitInfo {
+                s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                p_next: ptr::null(),
+                wait_semaphore_count: 0,
+                p_wait_semaphores: ptr::null(),
+                p_wait_dst_stage_mask: ptr::null(),
+                command_buffer_count: 1,
+                p_command_buffers: &self.command_buffer,
+                signal_semaphore_count: 0,
+                p_signal_semaphores: ptr::null(),
+            };
+            let result = (self.ctx.vk.queue_submit)(self.ctx.queue, 1, &submit, self.fence);
+            if result != VK_SUCCESS {
+                return Err(format!("{CONTEXT}: vkQueueSubmit failed: {result}"));
+            }
+            let result = (self.ctx.vk.wait_for_fences)(
+                self.ctx.device,
+                1,
+                &self.fence,
+                1,
+                10_000_000_000u64,
+            );
+            if result != VK_SUCCESS {
+                return Err(format!("{CONTEXT}: vkWaitForFences failed: {result}"));
+            }
+
+            Ok(
+                std::slice::from_raw_parts(argmax_mapped_ptr as *const u32, hidden_rows as usize)
+                    .to_vec(),
+            )
         }
     }
 
@@ -18183,6 +19857,7 @@ impl VulkanLayerGemv {
                 count as u32,
                 workgroup_count,
                 values_per_group,
+                None,
             )?;
             let partial_barriers = [
                 VkBufferMemoryBarrier {
@@ -20110,6 +21785,407 @@ impl VulkanLayerGemv {
             );
             Ok(state_bytes)
         }
+    }
+
+    fn ensure_gdn_state_checkpoint_layer_buffer(
+        ctx: &VulkanContext,
+        layers: &mut HashMap<usize, GdnStateCheckpointLayer>,
+        layer_idx: usize,
+        state_bytes: usize,
+    ) -> Result<(), String> {
+        let needs_realloc = layers
+            .get(&layer_idx)
+            .is_none_or(|layer| layer.capacity < state_bytes);
+        if !needs_realloc {
+            return Ok(());
+        }
+        unsafe {
+            if let Some(old) = layers.remove(&layer_idx) {
+                ctx.destroy_buffer(old.buf);
+            }
+            let buf = ctx.create_buffer(
+                state_bytes as u64,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            )?;
+            layers.insert(
+                layer_idx,
+                GdnStateCheckpointLayer {
+                    buf,
+                    capacity: state_bytes,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    unsafe fn submit_fullpath_sequence_state_copy(
+        &mut self,
+        context: &'static str,
+    ) -> Result<(), String> {
+        (self.ctx.vk.end_command_buffer)(self.command_buffer);
+        (self.ctx.vk.reset_fences)(self.ctx.device, 1, &self.fence);
+        let submit = VkSubmitInfo {
+            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: ptr::null(),
+            p_wait_dst_stage_mask: ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &self.command_buffer,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: ptr::null(),
+        };
+        let result = (self.ctx.vk.queue_submit)(self.ctx.queue, 1, &submit, self.fence);
+        if result != VK_SUCCESS {
+            return Err(format!("{context}: vkQueueSubmit failed: {result}"));
+        }
+        let result =
+            (self.ctx.vk.wait_for_fences)(self.ctx.device, 1, &self.fence, 1, 10_000_000_000u64);
+        if result != VK_SUCCESS {
+            return Err(format!("{context}: vkWaitForFences failed: {result}"));
+        }
+        self.runtime_counters.submits += 1;
+        Ok(())
+    }
+
+    pub fn snapshot_fullpath_sequence_state(
+        &mut self,
+    ) -> Result<FullPathSequenceStateSnapshot, String> {
+        let mut conv_layers = self
+            .gdn_conv_state_layers
+            .iter()
+            .map(|(&layer_idx, layer)| (layer_idx, layer.capacity))
+            .collect::<Vec<_>>();
+        let mut delta_layers = self
+            .gdn_delta_state_layers
+            .iter()
+            .map(|(&layer_idx, layer)| (layer_idx, layer.capacity))
+            .collect::<Vec<_>>();
+        conv_layers.sort_unstable_by_key(|(layer_idx, _)| *layer_idx);
+        delta_layers.sort_unstable_by_key(|(layer_idx, _)| *layer_idx);
+
+        for &(layer_idx, capacity) in &conv_layers {
+            Self::ensure_gdn_state_checkpoint_layer_buffer(
+                &self.ctx,
+                &mut self.gdn_conv_state_checkpoint_layers,
+                layer_idx,
+                capacity,
+            )?;
+        }
+        for &(layer_idx, capacity) in &delta_layers {
+            Self::ensure_gdn_state_checkpoint_layer_buffer(
+                &self.ctx,
+                &mut self.gdn_delta_state_checkpoint_layers,
+                layer_idx,
+                capacity,
+            )?;
+        }
+
+        unsafe {
+            (self.ctx.vk.reset_command_buffer)(self.command_buffer, 0);
+            let begin = VkCommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                p_inheritance_info: ptr::null(),
+            };
+            (self.ctx.vk.begin_command_buffer)(self.command_buffer, &begin);
+
+            let mut source_barriers = Vec::with_capacity(conv_layers.len() + delta_layers.len());
+            for &(layer_idx, capacity) in &conv_layers {
+                let source = self.gdn_conv_state_layers.get(&layer_idx).ok_or_else(|| {
+                    format!(
+                        "snapshot_fullpath_sequence_state: layer {layer_idx} conv state missing"
+                    )
+                })?;
+                source_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: source.buf.buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+            }
+            for &(layer_idx, capacity) in &delta_layers {
+                let source = self.gdn_delta_state_layers.get(&layer_idx).ok_or_else(|| {
+                    format!(
+                        "snapshot_fullpath_sequence_state: layer {layer_idx} delta state missing"
+                    )
+                })?;
+                source_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: source.buf.buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+            }
+            if !source_barriers.is_empty() {
+                (self.ctx.vk.cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    source_barriers.len() as u32,
+                    source_barriers.as_ptr(),
+                    0,
+                    ptr::null(),
+                );
+            }
+
+            for &(layer_idx, capacity) in &conv_layers {
+                let source = &self.gdn_conv_state_layers[&layer_idx].buf;
+                let checkpoint = &self.gdn_conv_state_checkpoint_layers[&layer_idx].buf;
+                let copy = VkBufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: capacity as u64,
+                };
+                (self.ctx.vk.cmd_copy_buffer)(
+                    self.command_buffer,
+                    source.buffer,
+                    checkpoint.buffer,
+                    1,
+                    &copy,
+                );
+            }
+            for &(layer_idx, capacity) in &delta_layers {
+                let source = &self.gdn_delta_state_layers[&layer_idx].buf;
+                let checkpoint = &self.gdn_delta_state_checkpoint_layers[&layer_idx].buf;
+                let copy = VkBufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: capacity as u64,
+                };
+                (self.ctx.vk.cmd_copy_buffer)(
+                    self.command_buffer,
+                    source.buffer,
+                    checkpoint.buffer,
+                    1,
+                    &copy,
+                );
+            }
+            self.submit_fullpath_sequence_state_copy("snapshot_fullpath_sequence_state")?;
+        }
+
+        Ok(FullPathSequenceStateSnapshot {
+            conv_layers,
+            delta_layers,
+        })
+    }
+
+    pub fn restore_fullpath_sequence_state(
+        &mut self,
+        snapshot: &FullPathSequenceStateSnapshot,
+    ) -> Result<(), String> {
+        if self.gdn_conv_state_layers.len() != snapshot.conv_layers.len()
+            || self.gdn_delta_state_layers.len() != snapshot.delta_layers.len()
+        {
+            return Err("restore_fullpath_sequence_state: GDN layer count changed".to_string());
+        }
+        for &(layer_idx, capacity) in &snapshot.conv_layers {
+            let current = self.gdn_conv_state_layers.get(&layer_idx).ok_or_else(|| {
+                format!("restore_fullpath_sequence_state: layer {layer_idx} conv state missing")
+            })?;
+            let checkpoint = self
+                .gdn_conv_state_checkpoint_layers
+                .get(&layer_idx)
+                .ok_or_else(|| {
+                    format!(
+                        "restore_fullpath_sequence_state: layer {layer_idx} conv checkpoint missing"
+                    )
+                })?;
+            if current.capacity != capacity || checkpoint.capacity < capacity {
+                return Err(format!(
+                    "restore_fullpath_sequence_state: layer {layer_idx} conv state shape changed"
+                ));
+            }
+        }
+        for &(layer_idx, capacity) in &snapshot.delta_layers {
+            let current = self.gdn_delta_state_layers.get(&layer_idx).ok_or_else(|| {
+                format!("restore_fullpath_sequence_state: layer {layer_idx} delta state missing")
+            })?;
+            let checkpoint = self
+                .gdn_delta_state_checkpoint_layers
+                .get(&layer_idx)
+                .ok_or_else(|| {
+                    format!(
+                        "restore_fullpath_sequence_state: layer {layer_idx} delta checkpoint missing"
+                    )
+                })?;
+            if current.capacity != capacity || checkpoint.capacity < capacity {
+                return Err(format!(
+                    "restore_fullpath_sequence_state: layer {layer_idx} delta state shape changed"
+                ));
+            }
+        }
+
+        unsafe {
+            (self.ctx.vk.reset_command_buffer)(self.command_buffer, 0);
+            let begin = VkCommandBufferBeginInfo {
+                s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                p_next: ptr::null(),
+                flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                p_inheritance_info: ptr::null(),
+            };
+            (self.ctx.vk.begin_command_buffer)(self.command_buffer, &begin);
+
+            let mut current_barriers =
+                Vec::with_capacity(snapshot.conv_layers.len() + snapshot.delta_layers.len());
+            let mut checkpoint_barriers =
+                Vec::with_capacity(snapshot.conv_layers.len() + snapshot.delta_layers.len());
+            for &(layer_idx, capacity) in &snapshot.conv_layers {
+                current_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: self.gdn_conv_state_layers[&layer_idx].buf.buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+                checkpoint_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: self.gdn_conv_state_checkpoint_layers[&layer_idx].buf.buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+            }
+            for &(layer_idx, capacity) in &snapshot.delta_layers {
+                current_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_SHADER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: self.gdn_delta_state_layers[&layer_idx].buf.buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+                checkpoint_barriers.push(VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: self.gdn_delta_state_checkpoint_layers[&layer_idx]
+                        .buf
+                        .buffer,
+                    offset: 0,
+                    size: capacity as u64,
+                });
+            }
+            if !current_barriers.is_empty() {
+                (self.ctx.vk.cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    current_barriers.len() as u32,
+                    current_barriers.as_ptr(),
+                    0,
+                    ptr::null(),
+                );
+                (self.ctx.vk.cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    checkpoint_barriers.len() as u32,
+                    checkpoint_barriers.as_ptr(),
+                    0,
+                    ptr::null(),
+                );
+            }
+
+            for &(layer_idx, capacity) in &snapshot.conv_layers {
+                let checkpoint = &self.gdn_conv_state_checkpoint_layers[&layer_idx].buf;
+                let current = &self.gdn_conv_state_layers[&layer_idx].buf;
+                let copy = VkBufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: capacity as u64,
+                };
+                (self.ctx.vk.cmd_copy_buffer)(
+                    self.command_buffer,
+                    checkpoint.buffer,
+                    current.buffer,
+                    1,
+                    &copy,
+                );
+            }
+            for &(layer_idx, capacity) in &snapshot.delta_layers {
+                let checkpoint = &self.gdn_delta_state_checkpoint_layers[&layer_idx].buf;
+                let current = &self.gdn_delta_state_layers[&layer_idx].buf;
+                let copy = VkBufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: capacity as u64,
+                };
+                (self.ctx.vk.cmd_copy_buffer)(
+                    self.command_buffer,
+                    checkpoint.buffer,
+                    current.buffer,
+                    1,
+                    &copy,
+                );
+            }
+
+            let ready_barriers = current_barriers
+                .iter()
+                .map(|barrier| VkBufferMemoryBarrier {
+                    s_type: VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dst_access_mask: VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                    buffer: barrier.buffer,
+                    offset: barrier.offset,
+                    size: barrier.size,
+                })
+                .collect::<Vec<_>>();
+            if !ready_barriers.is_empty() {
+                (self.ctx.vk.cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    ready_barriers.len() as u32,
+                    ready_barriers.as_ptr(),
+                    0,
+                    ptr::null(),
+                );
+            }
+            self.submit_fullpath_sequence_state_copy("restore_fullpath_sequence_state")?;
+        }
+        Ok(())
     }
 
     pub fn clear_sequence_state(&mut self) -> Result<(), String> {
@@ -26312,6 +28388,9 @@ impl Drop for VulkanLayerGemv {
     fn drop(&mut self) {
         unsafe {
             let _ = (self.ctx.vk.queue_wait_idle)(self.ctx.queue);
+            if let Some(arena) = self.expert_arena.take() {
+                arena.destroy(&self.ctx);
+            }
             self.cache.destroy(&self.ctx);
             if let Some(ref buf) = self.input_buf {
                 self.ctx.unmap_buffer(buf);
@@ -26412,6 +28491,33 @@ impl Drop for VulkanLayerGemv {
                 p.destroy(&self.ctx);
             }
             if let Some(p) = self.pipeline_elem_add_out.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_weighted_scatter_add.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q4k_gate.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q4k_up_silu.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q5k_down.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q6k_down.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q8_gate.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q8_up_silu.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_q8_down.take() {
+                p.destroy(&self.ctx);
+            }
+            if let Some(p) = self.pipeline_moe_grouped_reduce.take() {
                 p.destroy(&self.ctx);
             }
             if let Some(p) = self.pipeline_rms_norm.take() {
@@ -26556,6 +28662,12 @@ impl Drop for VulkanLayerGemv {
             if let Some(buf) = self.output_logits_buffer.take() {
                 self.ctx.destroy_buffer(buf);
             }
+            for (_, layer) in self.gdn_conv_state_checkpoint_layers.drain() {
+                self.ctx.destroy_buffer(layer.buf);
+            }
+            for (_, layer) in self.gdn_delta_state_checkpoint_layers.drain() {
+                self.ctx.destroy_buffer(layer.buf);
+            }
             // mv26-task10b-3: hidden ping-pong + 8 fullpath staging cleanup.
             // These follow the same pattern as `token_embd_buffer` above:
             // destroy any live buffers before the context goes away.
@@ -26574,6 +28686,19 @@ impl Drop for VulkanLayerGemv {
                 &mut self.fullpath_staging_gate,
                 &mut self.fullpath_staging_up,
                 &mut self.fullpath_staging_down,
+            ] {
+                if let Some(buf) = slot.take() {
+                    self.ctx.destroy_buffer(buf);
+                }
+            }
+            for slot in [
+                &mut self.fullpath_moe_route_logits,
+                &mut self.fullpath_moe_token_ids,
+                &mut self.fullpath_moe_route_weights,
+                &mut self.fullpath_moe_slot_ids,
+                &mut self.fullpath_moe_gate,
+                &mut self.fullpath_moe_activation,
+                &mut self.fullpath_moe_down,
             ] {
                 if let Some(buf) = slot.take() {
                     self.ctx.destroy_buffer(buf);
@@ -26703,7 +28828,10 @@ mod fullpath_staging_capacity_tests {
 
 #[cfg(test)]
 mod logit_argmax_format_tests {
-    use super::{logit_argmax_row_bytes, output_table_resident_payload, QuantType};
+    use super::{
+        logit_argmax_row_bytes, output_table_resident_payload, GpuBuffer, GpuWeightMode, QuantType,
+        VulkanLayerGemv,
+    };
 
     #[test]
     fn row_bytes_accepts_k_quant_and_q8_0_output_tables() {
@@ -26734,6 +28862,167 @@ mod logit_argmax_format_tests {
 
         let payload = output_table_resident_payload(&raw, QuantType::Q8_0, vocab, hidden).unwrap();
         assert_eq!(payload, raw);
+    }
+
+    #[test]
+    fn q4_batched_rows_match_cpu_with_excluded_token() {
+        let mut gemv = match VulkanLayerGemv::new(1024, 4096, 64, GpuWeightMode::Soa) {
+            Ok(gemv) => gemv,
+            Err(_) => return,
+        };
+        let hidden = 256u32;
+        let vocab = 4u32;
+        let hidden_rows = [
+            vec![1.0f32; hidden as usize],
+            (0..hidden)
+                .map(|index| if index % 2 == 0 { 1.0 } else { -1.0 })
+                .collect::<Vec<_>>(),
+        ];
+        let mut table = Vec::new();
+        for token in 0..vocab {
+            let row = (0..hidden)
+                .map(|index| match token {
+                    0 => 10.0,
+                    1 if index % 2 == 0 => 8.0,
+                    1 => -8.0,
+                    2 => 5.0,
+                    _ => -5.0,
+                })
+                .collect::<Vec<_>>();
+            table.extend_from_slice(&rnb_cpu::quantize::quantize_q4_k_vec(&row));
+        }
+        let expected = hidden_rows
+            .iter()
+            .map(|row| {
+                (0..vocab)
+                    .filter(|&token| token != 0)
+                    .map(|token| {
+                        let offset =
+                            token as usize * std::mem::size_of::<rnb_cpu::quantize::BlockQ4_K>();
+                        let block = unsafe {
+                            std::ptr::read_unaligned(
+                                table.as_ptr().add(offset) as *const rnb_cpu::quantize::BlockQ4_K
+                            )
+                        };
+                        let mut dequantized = [0.0f32; 256];
+                        rnb_cpu::quantize::dequantize_q4_k(&block, &mut dequantized);
+                        let score = row
+                            .iter()
+                            .zip(dequantized)
+                            .map(|(&value, weight)| value * weight)
+                            .sum::<f32>();
+                        (token, score)
+                    })
+                    .max_by(|left, right| left.1.total_cmp(&right.1))
+                    .unwrap()
+                    .0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected, vec![2, 1]);
+
+        gemv.ensure_output_table_bound(&table, QuantType::Q4K, vocab, hidden)
+            .expect("bind q4 output table");
+        gemv.prepare_fullpath_execution(
+            hidden_rows.len() as u32,
+            hidden,
+            1,
+            hidden,
+            hidden,
+            QuantType::Q4K,
+            QuantType::Q4K,
+            &[],
+        )
+        .expect("prepare q4 batched argmax");
+        let flattened = hidden_rows.concat();
+        gemv.upload_prefill_hidden(&flattened)
+            .expect("upload batched hidden rows");
+        let hidden_buf = {
+            let buffer = gemv
+                .prefill_hidden_buf
+                .as_ref()
+                .expect("prefill hidden buffer");
+            GpuBuffer {
+                buffer: buffer.buffer,
+                memory: 0,
+                size: buffer.size,
+            }
+        };
+        let actual = gemv
+            .logit_argmax_rows_bound_from_buffer_with_norm(
+                &hidden_buf,
+                0,
+                hidden_rows.len() as u32,
+                &vec![1.0; hidden as usize],
+                1.0e-6,
+                QuantType::Q4K,
+                Some(0),
+                vocab,
+                hidden,
+            )
+            .expect("q4 batched argmax");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn q8_soa_argmax_excludes_best_token() {
+        let mut gemv = match VulkanLayerGemv::new(1024, 4096, 64, GpuWeightMode::Soa) {
+            Ok(gemv) => gemv,
+            Err(_) => return,
+        };
+        let hidden = 32u32;
+        let vocab = 4u32;
+        let hidden_row = vec![1.0f32; hidden as usize];
+        let mut table = Vec::with_capacity(vocab as usize * 34);
+        for token in 0..vocab {
+            table.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+            table.extend((0..hidden).map(|_| match token {
+                0 => 10i8,
+                1 => -10,
+                2 => 5,
+                _ => -5,
+            } as u8));
+        }
+
+        gemv.ensure_output_table_bound(&table, QuantType::Q8_0, vocab, hidden)
+            .expect("bind q8 output table");
+        gemv.prepare_fullpath_execution(
+            1,
+            hidden,
+            1,
+            hidden,
+            hidden,
+            QuantType::Q8_0,
+            QuantType::Q8_0,
+            &[],
+        )
+        .expect("prepare q8 SoA argmax");
+        gemv.upload_prefill_hidden(&hidden_row)
+            .expect("upload hidden row");
+        let hidden_buf = {
+            let buffer = gemv
+                .prefill_hidden_buf
+                .as_ref()
+                .expect("prefill hidden buffer");
+            GpuBuffer {
+                buffer: buffer.buffer,
+                memory: 0,
+                size: buffer.size,
+            }
+        };
+        let actual = gemv
+            .logit_argmax_bound_from_buffer_with_norm(
+                &hidden_buf,
+                0,
+                &vec![1.0; hidden as usize],
+                1.0e-6,
+                false,
+                QuantType::Q8_0,
+                Some(0),
+                vocab,
+                hidden,
+            )
+            .expect("q8 SoA argmax");
+        assert_eq!(actual, 2);
     }
 
     #[test]

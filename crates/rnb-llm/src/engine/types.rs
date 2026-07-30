@@ -80,6 +80,7 @@ pub(crate) struct ScratchBuffers {
 
     pub(super) logits: Vec<f32>,
     pub(super) backend_argmax_token: Option<u32>,
+    pub(super) backend_argmax_excluded_token: Option<u32>,
     pub(super) backend_argmax_only: bool,
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(super) fullpath_resident_kv_active: bool,
@@ -164,6 +165,7 @@ impl ScratchBuffers {
 
             logits: vec![0.0; vocab_size],
             backend_argmax_token: None,
+            backend_argmax_excluded_token: None,
             backend_argmax_only: false,
             fullpath_resident_kv_active: false,
             #[cfg(feature = "cuda")]

@@ -6651,6 +6651,147 @@ pub fn emit_elem_add(local_size_x: u32) -> Vec<u32> {
     m.encode()
 }
 
+/// Emit SPIR-V for route-weighted expert accumulation.
+///
+/// For each packed expert row `r` and hidden column `c`:
+/// `acc[token_ids[r], c] += values[r, c] * weight[r]`.
+/// When `sigmoid_weights != 0`, `weight[r]` is interpreted as a logit.
+pub fn emit_moe_weighted_scatter_add(local_size_x: u32) -> Vec<u32> {
+    let mut m = SpirvModule::new();
+
+    m.capability(1);
+    m.extension("SPV_KHR_storage_buffer_storage_class");
+    m.memory_model(0, 1);
+
+    let t_void = m.type_void();
+    let t_u32 = m.type_int(32, 0);
+    let t_f32 = m.type_float(32);
+    let t_v3u32 = m.type_vector(t_u32, 3);
+    let t_arr_f32 = m.type_runtime_array(t_f32);
+    let t_arr_u32 = m.type_runtime_array(t_u32);
+    let t_struct_acc = m.type_struct(&[t_arr_f32]);
+    let t_struct_values = m.type_struct(&[t_arr_f32]);
+    let t_struct_ids = m.type_struct(&[t_arr_u32]);
+    let t_struct_weights = m.type_struct(&[t_arr_f32]);
+    let t_struct_pc = m.type_struct(&[t_u32, t_u32, t_u32]);
+
+    let t_ptr_sb_acc = m.type_pointer(storage_class::STORAGE_BUFFER, t_struct_acc);
+    let t_ptr_sb_values = m.type_pointer(storage_class::STORAGE_BUFFER, t_struct_values);
+    let t_ptr_sb_ids = m.type_pointer(storage_class::STORAGE_BUFFER, t_struct_ids);
+    let t_ptr_sb_weights = m.type_pointer(storage_class::STORAGE_BUFFER, t_struct_weights);
+    let t_ptr_sb_f32 = m.type_pointer(storage_class::STORAGE_BUFFER, t_f32);
+    let t_ptr_sb_u32 = m.type_pointer(storage_class::STORAGE_BUFFER, t_u32);
+    let t_ptr_pc = m.type_pointer(storage_class::PUSH_CONSTANT, t_struct_pc);
+    let t_ptr_pc_u32 = m.type_pointer(storage_class::PUSH_CONSTANT, t_u32);
+    let t_ptr_input_v3 = m.type_pointer(storage_class::INPUT, t_v3u32);
+    let t_fn_void = m.type_function(t_void, &[]);
+
+    let c_u32_0 = m.constant_u32(t_u32, 0);
+    let c_u32_1 = m.constant_u32(t_u32, 1);
+    let c_u32_2 = m.constant_u32(t_u32, 2);
+    let c_f32_1 = m.constant_f32(t_f32, 1.0);
+
+    for structure in [
+        t_struct_acc,
+        t_struct_values,
+        t_struct_ids,
+        t_struct_weights,
+    ] {
+        m.decorate(structure, decoration::BLOCK, &[]);
+        m.member_decorate(structure, 0, decoration::OFFSET, &[0]);
+    }
+    m.decorate(t_arr_f32, decoration::ARRAY_STRIDE, &[4]);
+    m.decorate(t_arr_u32, decoration::ARRAY_STRIDE, &[4]);
+    m.decorate(t_struct_pc, decoration::BLOCK, &[]);
+    m.member_decorate(t_struct_pc, 0, decoration::OFFSET, &[0]);
+    m.member_decorate(t_struct_pc, 1, decoration::OFFSET, &[4]);
+    m.member_decorate(t_struct_pc, 2, decoration::OFFSET, &[8]);
+
+    let gvar_acc = m.variable(t_ptr_sb_acc, storage_class::STORAGE_BUFFER);
+    let gvar_values = m.variable(t_ptr_sb_values, storage_class::STORAGE_BUFFER);
+    let gvar_ids = m.variable(t_ptr_sb_ids, storage_class::STORAGE_BUFFER);
+    let gvar_weights = m.variable(t_ptr_sb_weights, storage_class::STORAGE_BUFFER);
+    let gvar_pc = m.variable(t_ptr_pc, storage_class::PUSH_CONSTANT);
+    let gvar_gid = m.variable(t_ptr_input_v3, storage_class::INPUT);
+
+    for (binding, variable) in [
+        (0, gvar_acc),
+        (1, gvar_values),
+        (2, gvar_ids),
+        (3, gvar_weights),
+    ] {
+        m.decorate(variable, decoration::DESCRIPTOR_SET, &[0]);
+        m.decorate(variable, decoration::BINDING, &[binding]);
+    }
+    m.decorate(
+        gvar_gid,
+        decoration::BUILTIN,
+        &[builtin::GLOBAL_INVOCATION_ID],
+    );
+
+    let func_id = m.alloc_id();
+    m.entry_point(5, func_id, "main", &[gvar_gid]);
+    m.execution_mode_local_size(func_id, local_size_x, 1, 1);
+    m.function(t_void, func_id, 0, t_fn_void);
+    let lbl_entry = m.alloc_id();
+    m.functions
+        .push(SpirvModule::encode_inst(op::LABEL, &[lbl_entry.0]));
+
+    let gid_vec = m.load(t_v3u32, gvar_gid);
+    let gid = m.composite_extract(t_u32, gid_vec, 0);
+    let group_len = {
+        let ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_0]);
+        m.load(t_u32, ptr)
+    };
+    let hidden = {
+        let ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_1]);
+        m.load(t_u32, ptr)
+    };
+    let sigmoid_weights = {
+        let ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_2]);
+        m.load(t_u32, ptr)
+    };
+    let total = m.imul(t_u32, group_len, hidden);
+    let t_bool = m.type_bool();
+    let in_bounds = m.u_less_than(t_bool, gid, total);
+    let lbl_body = m.alloc_id();
+    let lbl_end = m.alloc_id();
+    m.selection_merge(lbl_end, 0);
+    m.branch_conditional(in_bounds, lbl_body, lbl_end);
+
+    m.functions
+        .push(SpirvModule::encode_inst(op::LABEL, &[lbl_body.0]));
+    let row = m.udiv(t_u32, gid, hidden);
+    let col = m.umod(t_u32, gid, hidden);
+    let token_ptr = m.access_chain(t_ptr_sb_u32, gvar_ids, &[c_u32_0, row]);
+    let token = m.load(t_u32, token_ptr);
+    let dest_base = m.imul(t_u32, token, hidden);
+    let dest_idx = m.iadd(t_u32, dest_base, col);
+    let acc_ptr = m.access_chain(t_ptr_sb_f32, gvar_acc, &[c_u32_0, dest_idx]);
+    let old = m.load(t_f32, acc_ptr);
+    let value_ptr = m.access_chain(t_ptr_sb_f32, gvar_values, &[c_u32_0, gid]);
+    let value = m.load(t_f32, value_ptr);
+    let weight_ptr = m.access_chain(t_ptr_sb_f32, gvar_weights, &[c_u32_0, row]);
+    let raw_weight = m.load(t_f32, weight_ptr);
+    let neg_weight = m.fnegate(t_f32, raw_weight);
+    let glsl = m.ext_inst_import("GLSL.std.450");
+    let exp_neg = m.ext_inst(t_f32, glsl, 27, &[neg_weight]);
+    let sigmoid_denominator = m.fadd(t_f32, c_f32_1, exp_neg);
+    let sigmoid = m.fdiv(t_f32, c_f32_1, sigmoid_denominator);
+    let use_sigmoid = m.u_less_than(t_bool, c_u32_0, sigmoid_weights);
+    let weight = m.select(t_f32, use_sigmoid, sigmoid, raw_weight);
+    let weighted = m.fmul(t_f32, value, weight);
+    let result = m.fadd(t_f32, old, weighted);
+    m.store(acc_ptr, result);
+
+    m.branch(lbl_end);
+    m.functions
+        .push(SpirvModule::encode_inst(op::LABEL, &[lbl_end.0]));
+    m.ret();
+    m.function_end();
+    m.encode()
+}
+
 /// Emit SPIR-V for row-broadcast elementwise add: `a[i] += bias[i % bias_len]`.
 ///
 /// Layout:
@@ -8852,7 +8993,7 @@ pub fn emit_embed_lookup_q6k(local_size_x: u32) -> Vec<u32> {
 ///   binding 1: output_table_q6k (u32 runtime_array — raw bytes of vocab × hidden Q6_K table)
 ///   binding 2: argmax_out (u32, single element — argmax token id)
 ///
-/// Push constants (2 × u32): vocab, hidden.
+/// Push constants (3 × u32): vocab, hidden, excluded token (`u32::MAX` for none).
 ///
 /// Dispatch shape: (1, 1, 1) — single workgroup of `local_size_x` threads.
 /// Each thread iterates over a stripe of vocab rows; pairs reduce via shared memory.
@@ -8877,7 +9018,7 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
     let t_struct_in = m.type_struct(&[t_arr_f32_in]);
     let t_struct_table = m.type_struct(&[t_arr_u32_table]);
     let t_struct_out = m.type_struct(&[t_arr_u32_out]);
-    let t_struct_pc = m.type_struct(&[t_u32, t_u32]);
+    let t_struct_pc = m.type_struct(&[t_u32, t_u32, t_u32]);
 
     let c_local_size = m.constant_u32(t_u32, local_size_x);
     let t_shared_arr_f32 = m.type_array(t_f32, c_local_size);
@@ -8944,12 +9085,14 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
     m.decorate(t_struct_pc, decoration::BLOCK, &[]);
     m.member_decorate(t_struct_pc, 0, decoration::OFFSET, &[0]);
     m.member_decorate(t_struct_pc, 1, decoration::OFFSET, &[4]);
+    m.member_decorate(t_struct_pc, 2, decoration::OFFSET, &[8]);
 
     let gvar_in = m.variable(t_ptr_sb_in, storage_class::STORAGE_BUFFER);
     let gvar_table = m.variable(t_ptr_sb_table, storage_class::STORAGE_BUFFER);
     let gvar_out = m.variable(t_ptr_sb_out, storage_class::STORAGE_BUFFER);
     let gvar_pc = m.variable(t_ptr_pc, storage_class::PUSH_CONSTANT);
     let gvar_lid = m.variable(t_ptr_input_v3, storage_class::INPUT);
+    let gvar_wgid = m.variable(t_ptr_input_v3, storage_class::INPUT);
     let gvar_shared_vals = m.variable(t_ptr_wg_arr_f32, storage_class::WORKGROUP);
     let gvar_shared_idxs = m.variable(t_ptr_wg_arr_u32, storage_class::WORKGROUP);
 
@@ -8964,9 +9107,10 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
         decoration::BUILTIN,
         &[builtin::LOCAL_INVOCATION_ID],
     );
+    m.decorate(gvar_wgid, decoration::BUILTIN, &[builtin::WORKGROUP_ID]);
 
     let func_id = m.alloc_id();
-    m.entry_point(5, func_id, "main", &[gvar_lid]);
+    m.entry_point(5, func_id, "main", &[gvar_lid, gvar_wgid]);
     m.execution_mode_local_size(func_id, local_size_x, 1, 1);
 
     m.function(t_void, func_id, 0, t_fn_void);
@@ -8984,11 +9128,15 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
 
     let lid_vec = m.load(t_v3u32, gvar_lid);
     let lid = m.composite_extract(t_u32, lid_vec, 0);
+    let wgid_vec = m.load(t_v3u32, gvar_wgid);
+    let hidden_row = m.composite_extract(t_u32, wgid_vec, 1);
 
     let pc_vocab_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_0]);
     let vocab = m.load(t_u32, pc_vocab_ptr);
     let pc_hidden_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_1]);
     let hidden = m.load(t_u32, pc_hidden_ptr);
+    let pc_excluded_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_2]);
+    let excluded_token = m.load(t_u32, pc_excluded_ptr);
     let blocks_per_row = m.udiv(t_u32, hidden, c_u32_256);
 
     m.store(var_best_val, c_f32_neg_inf);
@@ -9140,7 +9288,9 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
     let d_sc = m.fmul(t_f32, d_f32, sc_f);
     let weight_val = m.fmul(t_f32, d_sc, q_f);
 
-    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, cur_h]);
+    let hidden_row_base = m.imul(t_u32, hidden_row, hidden);
+    let hidden_index = m.iadd(t_u32, hidden_row_base, cur_h);
+    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, hidden_index]);
     let hv = m.load(t_f32, hv_ptr);
     let prod = m.fmul(t_f32, weight_val, hv);
     let cur_sum = m.load(t_f32, var_sum);
@@ -9160,7 +9310,9 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
     // Update local best (val, idx) if sum > best_val
     let final_sum = m.load(t_f32, var_sum);
     let cur_best = m.load(t_f32, var_best_val);
-    let beats = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let not_excluded = m.i_not_equal(t_bool, cur_v, excluded_token);
+    let beats_value = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let beats = m.logical_and(t_bool, not_excluded, beats_value);
     let lbl_upd = m.alloc_id();
     let lbl_upd_m = m.alloc_id();
     m.selection_merge(lbl_upd_m, 0);
@@ -9278,7 +9430,7 @@ pub fn emit_logit_argmax_q6k(local_size_x: u32) -> Vec<u32> {
         .push(SpirvModule::encode_inst(op::LABEL, &[lbl_w.0]));
     let win_idx_ptr = m.access_chain(t_ptr_wg_u32, gvar_shared_idxs, &[c_u32_0]);
     let win_idx = m.load(t_u32, win_idx_ptr);
-    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, c_u32_0]);
+    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, hidden_row]);
     m.store(out_ptr, win_idx);
     m.branch(lbl_w_m);
     m.functions
@@ -9315,7 +9467,7 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
     let t_struct_in = m.type_struct(&[t_arr_f32_in]);
     let t_struct_table = m.type_struct(&[t_arr_u32_table]);
     let t_struct_out = m.type_struct(&[t_arr_u32_out]);
-    let t_struct_pc = m.type_struct(&[t_u32, t_u32]);
+    let t_struct_pc = m.type_struct(&[t_u32, t_u32, t_u32]);
 
     let c_local_size = m.constant_u32(t_u32, local_size_x);
     let t_shared_arr_f32 = m.type_array(t_f32, c_local_size);
@@ -9371,12 +9523,14 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
     m.decorate(t_struct_pc, decoration::BLOCK, &[]);
     m.member_decorate(t_struct_pc, 0, decoration::OFFSET, &[0]);
     m.member_decorate(t_struct_pc, 1, decoration::OFFSET, &[4]);
+    m.member_decorate(t_struct_pc, 2, decoration::OFFSET, &[8]);
 
     let gvar_in = m.variable(t_ptr_sb_in, storage_class::STORAGE_BUFFER);
     let gvar_table = m.variable(t_ptr_sb_table, storage_class::STORAGE_BUFFER);
     let gvar_out = m.variable(t_ptr_sb_out, storage_class::STORAGE_BUFFER);
     let gvar_pc = m.variable(t_ptr_pc, storage_class::PUSH_CONSTANT);
     let gvar_lid = m.variable(t_ptr_input_v3, storage_class::INPUT);
+    let gvar_wgid = m.variable(t_ptr_input_v3, storage_class::INPUT);
     let gvar_shared_vals = m.variable(t_ptr_wg_arr_f32, storage_class::WORKGROUP);
     let gvar_shared_idxs = m.variable(t_ptr_wg_arr_u32, storage_class::WORKGROUP);
 
@@ -9391,9 +9545,10 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
         decoration::BUILTIN,
         &[builtin::LOCAL_INVOCATION_ID],
     );
+    m.decorate(gvar_wgid, decoration::BUILTIN, &[builtin::WORKGROUP_ID]);
 
     let func_id = m.alloc_id();
-    m.entry_point(5, func_id, "main", &[gvar_lid]);
+    m.entry_point(5, func_id, "main", &[gvar_lid, gvar_wgid]);
     m.execution_mode_local_size(func_id, local_size_x, 1, 1);
 
     m.function(t_void, func_id, 0, t_fn_void);
@@ -9410,11 +9565,15 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
 
     let lid_vec = m.load(t_v3u32, gvar_lid);
     let lid = m.composite_extract(t_u32, lid_vec, 0);
+    let wgid_vec = m.load(t_v3u32, gvar_wgid);
+    let hidden_row = m.composite_extract(t_u32, wgid_vec, 1);
 
     let pc_vocab_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_0]);
     let vocab = m.load(t_u32, pc_vocab_ptr);
     let pc_hidden_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_1]);
     let hidden = m.load(t_u32, pc_hidden_ptr);
+    let pc_excluded_ptr = m.access_chain(t_ptr_pc_u32, gvar_pc, &[c_u32_2]);
+    let excluded_token = m.load(t_u32, pc_excluded_ptr);
     let blocks_per_row = m.udiv(t_u32, hidden, c_u32_32);
 
     m.store(var_best_val, c_f32_neg_inf);
@@ -9517,7 +9676,9 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
     };
 
     let weight_val = m.fmul(t_f32, d_f32, q_f);
-    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, cur_h]);
+    let hidden_row_base = m.imul(t_u32, hidden_row, hidden);
+    let hidden_index = m.iadd(t_u32, hidden_row_base, cur_h);
+    let hv_ptr = m.access_chain(t_ptr_sb_f32, gvar_in, &[c_u32_0, hidden_index]);
     let hv = m.load(t_f32, hv_ptr);
     let prod = m.fmul(t_f32, weight_val, hv);
     let cur_sum = m.load(t_f32, var_sum);
@@ -9535,7 +9696,9 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
         .push(SpirvModule::encode_inst(op::LABEL, &[lbl_h_m.0]));
     let final_sum = m.load(t_f32, var_sum);
     let cur_best = m.load(t_f32, var_best_val);
-    let beats = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let not_excluded = m.i_not_equal(t_bool, cur_v, excluded_token);
+    let beats_value = m.f_ord_greater_than(t_bool, final_sum, cur_best);
+    let beats = m.logical_and(t_bool, not_excluded, beats_value);
     let lbl_upd = m.alloc_id();
     let lbl_upd_m = m.alloc_id();
     m.selection_merge(lbl_upd_m, 0);
@@ -9648,7 +9811,7 @@ pub fn emit_logit_argmax_q8_0(local_size_x: u32) -> Vec<u32> {
         .push(SpirvModule::encode_inst(op::LABEL, &[lbl_w.0]));
     let win_idx_ptr = m.access_chain(t_ptr_wg_u32, gvar_shared_idxs, &[c_u32_0]);
     let win_idx = m.load(t_u32, win_idx_ptr);
-    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, c_u32_0]);
+    let out_ptr = m.access_chain(t_ptr_sb_u32, gvar_out, &[c_u32_0, hidden_row]);
     m.store(out_ptr, win_idx);
     m.branch(lbl_w_m);
     m.functions

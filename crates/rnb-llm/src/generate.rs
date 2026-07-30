@@ -227,6 +227,11 @@ pub fn generate_stream(
     params: &GenerateParams,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    engine.set_backend_argmax_excluded_token(
+        params
+            .ignore_eos
+            .then_some(engine.tokenizer.vocab.special.eos),
+    );
     if params.constraint.is_some() {
         return generate_stream_impl(engine, prompt, params, callback);
     }
@@ -312,6 +317,11 @@ pub(crate) fn generate_stream_resuming(
     state: &crate::engine::EngineSequenceState,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    engine.set_backend_argmax_excluded_token(
+        params
+            .ignore_eos
+            .then_some(engine.tokenizer.vocab.special.eos),
+    );
     let Some(prompt_tokens) = resumed_prompt_tokens(engine, prompt, state) else {
         return generate_stream(engine, prompt, params, callback);
     };

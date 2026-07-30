@@ -16,6 +16,7 @@ use super::{Quant, RuntimeCounters};
 // re-exports can be added back deliberately.
 pub use rnb_backend_vulkan::full_path::{
     FullPathDecodeStepInput, FullPathDecodeStepOutput, FullPathPrefillInput, FullPathPrefillOutput,
+    FullPathSequenceStateSnapshot,
 };
 pub use rnb_backend_vulkan::kv_resident::KvResidentLayout;
 pub use rnb_backend_vulkan::staging::StagingPolicy;
@@ -24,7 +25,7 @@ pub use rnb_loader::ModelLayerKind;
 
 mod fullpath;
 
-pub use fullpath::{AttentionRawWeights, GdnRawWeights, LayerRawWeights};
+pub use fullpath::{AttentionRawWeights, GdnRawWeights, LayerRawWeights, QwenMoeRawWeights};
 
 pub struct LayerRuntime {
     inner: crate::vulkan_backend::PrefillLayerRuntime,
@@ -57,6 +58,20 @@ impl LayerRuntime {
 
     pub fn reset_runtime_counters(&mut self) {
         self.inner.reset_runtime_counters();
+    }
+    pub fn resident_output_argmax_from_normalized_host(
+        &mut self,
+        normalized_hidden: &[f32],
+        output_quant: Quant,
+        excluded_token: Option<u32>,
+        vocab: u32,
+    ) -> Result<u32, String> {
+        self.inner.resident_output_argmax_from_normalized_host(
+            normalized_hidden,
+            output_quant,
+            excluded_token,
+            vocab,
+        )
     }
 
     pub fn clear_sequence_state(&mut self) -> Result<(), String> {
