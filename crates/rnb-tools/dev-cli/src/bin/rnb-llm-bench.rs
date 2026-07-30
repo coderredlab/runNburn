@@ -181,7 +181,12 @@ fn generated_text_sha256_hex(text: &str) -> String {
 
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 fn dump_generated_text_hash_if_requested(result: &rnb_llm::generate::GenerateResult) {
