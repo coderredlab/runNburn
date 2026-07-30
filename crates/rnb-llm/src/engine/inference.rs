@@ -1291,6 +1291,7 @@ impl Engine {
         };
         let _norm_eps = self.metadata.norm_eps;
         let kv_cache = std::mem::replace(&mut self.kv_cache, new_empty_kv_cache(&self.metadata));
+        #[cfg(feature = "vulkan")]
         let collect_hidden_rows = self.mtp_spec_requested();
 
         #[cfg(feature = "vulkan")]
@@ -1461,6 +1462,7 @@ impl Engine {
         let _ = output.kv_cursor_after; // GPU-side cursor; CPU side advanced in caller.
         Ok((Vec::new(), output.hidden_rows, output.argmax_tokens))
     }
+    #[cfg(feature = "vulkan")]
     pub(crate) fn vulkan_fullpath_verify_ready(&self) -> bool {
         crate::runtime::scheduler::fullpath_gpu_prefill_requested()
             && self.backend_runtime.has_active_gpu_prefill_path()
@@ -1470,6 +1472,7 @@ impl Engine {
                 .is_some_and(|scratch| scratch.fullpath_resident_kv_active)
     }
 
+    #[cfg(feature = "vulkan")]
     pub(crate) fn forward_vulkan_fullpath_verify_window(
         &mut self,
         tokens: &[u32],
@@ -1536,6 +1539,7 @@ impl Engine {
         result
     }
 
+    #[cfg(feature = "vulkan")]
     pub(crate) fn commit_vulkan_fullpath_verify(
         &mut self,
         commit: VulkanFullpathVerifyCommit,
