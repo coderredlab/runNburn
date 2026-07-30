@@ -386,6 +386,47 @@ product CLI via `--ram-budget 32GiB`. Slower than a model that fits in
 memory? Yes — the point is that it runs at all, with predictable memory,
 instead of being rejected or OOM-killed.
 
+#### Core advantage: a 222 GiB model on a 64 GiB Mac
+
+This is the product capability runNburn is built for: executing a model far
+larger than system memory while keeping residency bounded. The same 222.18 GiB
+`GLM-5.2-UD-IQ2_M` split GGUF was measured on an Apple M5 Pro with 64 GiB
+unified memory. Rather than trying to make the whole model resident, runNburn
+streams the required expert weights through a bounded cache. The comparison
+below measures that larger-than-memory capability from process start to
+completion.
+
+- runNburn `67e92b4`: release Metal build, automatic 48 GiB host budget,
+  30.12 GiB sparse-expert page cache, and product-default MTP auto policy.
+- llama.cpp `3018a11`: release Metal build, native six CPU threads,
+  `-c 2048 -ngl 1 -fit off`. This was the stable partial-Metal configuration
+  used for the repeated comparison.
+- Input: `prompts/prompt_capital_qa_ko.txt` (20 prompt tokens), greedy
+  generation, 8 decoded tokens, one warmup per engine, then alternating
+  `runNburn / llama.cpp` runs without cooldown.
+
+| Engine and configuration | External wall samples | Median |
+|---|---:|---:|
+| runNburn Metal, bounded expert streaming | 28.468 / 28.563 / 28.658 s | **28.563 s** |
+| llama.cpp Metal build, one GPU layer | 156.402 / 155.867 / 156.618 s | **156.402 s** |
+
+The measured external-wall ratio was `156.402 / 28.563 = 5.48x`. All three
+runNburn measurements produced the same 8-token SHA-256
+`8136b9f248ff5da30946ca049f8a32435feb4c184a2f8b6665dc5b29f46ca84d`.
+The short generation limit checks repeatability and execution stability; it is
+not a semantic answer-quality comparison.
+
+llama.cpp's default auto-fit and explicit full-Metal attempts both reached a
+Metal command-buffer out-of-memory error. Conservative 16 GiB and 32 GiB fit
+targets failed the same way. `-ngl 8` failed a 65,536 MiB Metal allocation;
+`-ngl 4` completed a one-off screen in 160.87 s, while `-ngl 1` was retained
+for the repeated set above. This is runNburn's intended product advantage:
+stable, bounded execution when the model exceeds available memory and
+full-residency accelerator configurations cannot run. The measured `5.48x`
+is the end-to-end product-wall result for this constrained-memory workload,
+not a claim that runNburn's individual kernels are `5.48x` faster when a model
+fits fully in memory.
+
 ### Availability comparison: 35.2 GiB full-Q8 MTP on a 14 GiB host
 
 This is an availability result, not a throughput ranking. It uses one machine,
