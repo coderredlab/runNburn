@@ -1055,11 +1055,11 @@ const QWEN_MOE_LLAMA_ID_PHYSICAL_BUFFER_ALIGNMENT: usize = 4096;
 const QWEN_MOE_LLAMA_Q8K_BLOCK_BYTES: usize = 292;
 const QWEN_MOE_CHAIN_Q8K_TOKEN_THRESHOLD: usize = 1024;
 const QWEN_MOE_LLAMA_ID_BLOCK_TILE: usize = 64;
-const QWEN_MOE_LLAMA_ID_INDIRECT_ARGS_BYTES: usize = 64;
+const QWEN_MOE_LLAMA_ID_INDIRECT_ARGS_BYTES: usize = 128;
 const QWEN_MOE_LLAMA_ID_FFN_Q4_INDIRECT_OFFSET: usize = 0;
-const QWEN_MOE_LLAMA_ID_HIDDEN_Q6_INDIRECT_OFFSET: usize = 16;
-const QWEN_MOE_LLAMA_ID_HIDDEN_CAST_INDIRECT_OFFSET: usize = 32;
-const QWEN_MOE_LLAMA_ID_FFN_CAST_INDIRECT_OFFSET: usize = 48;
+const QWEN_MOE_LLAMA_ID_HIDDEN_Q6_INDIRECT_OFFSET: usize = 32;
+const QWEN_MOE_LLAMA_ID_HIDDEN_CAST_INDIRECT_OFFSET: usize = 64;
+const QWEN_MOE_LLAMA_ID_FFN_CAST_INDIRECT_OFFSET: usize = 96;
 
 fn qwen_moe_llama_id_compact_blocks_enabled() -> bool {
     std::env::var("RNB_METAL_QWEN35_MOE_COMPACT_ID_BLOCKS")
@@ -1200,7 +1200,14 @@ fn qwen_moe_llama_id_block_meta_layout(
     let block_local_end = block_local_offset
         .checked_add(block_experts_bytes)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
-    let block_indirect_offset = block_local_end
+    let tail_expert_offset = block_local_end;
+    let tail_local_offset = tail_expert_offset
+        .checked_add(block_experts_bytes)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_local_end = tail_local_offset
+        .checked_add(block_experts_bytes)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let block_indirect_offset = tail_local_end
         .checked_add(15)
         .map(|bytes| bytes / 16 * 16)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
@@ -2029,6 +2036,12 @@ fn qwen_moe_llama_id_build_blocks_encode(
     }
     let (block_meta_bytes, block_local_offset, block_indirect_offset) =
         qwen_moe_llama_id_block_meta_layout(n_tokens, n_expert_used)?;
+    let tail_expert_offset = block_local_offset
+        .checked_mul(2)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_local_offset = block_local_offset
+        .checked_mul(3)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
     let tpe_bytes = n_expert
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
@@ -2049,11 +2062,13 @@ fn qwen_moe_llama_id_build_blocks_encode(
         enc.setBuffer_offset_atIndex(Some(tpe), 0, 0);
         enc.setBuffer_offset_atIndex(Some(block_meta), 0, 1);
         enc.setBuffer_offset_atIndex(Some(block_meta), block_local_offset, 2);
-        enc.setBuffer_offset_atIndex(Some(block_meta), block_indirect_offset, 3);
+        enc.setBuffer_offset_atIndex(Some(block_meta), tail_expert_offset, 3);
+        enc.setBuffer_offset_atIndex(Some(block_meta), tail_local_offset, 4);
+        enc.setBuffer_offset_atIndex(Some(block_meta), block_indirect_offset, 5);
     }
-    set_u32_bytes(enc, n_expert, 4);
-    set_u32_bytes(enc, hidden_dim, 5);
-    set_u32_bytes(enc, ffn_dim, 6);
+    set_u32_bytes(enc, n_expert, 6);
+    set_u32_bytes(enc, hidden_dim, 7);
+    set_u32_bytes(enc, ffn_dim, 8);
     enc.dispatchThreads_threadsPerThreadgroup(
         MTLSize {
             width: 1,
@@ -2439,7 +2454,7 @@ fn encode_qwen_moe_chain_hybrid_mul_mm_id(
     weights: &ProtocolObject<dyn MTLBuffer>,
     weight_offset: usize,
     small_input_q8k: &ProtocolObject<dyn MTLBuffer>,
-    large_input_f16: &ProtocolObject<dyn MTLBuffer>,
+    large_input: &ProtocolObject<dyn MTLBuffer>,
     tpe: &ProtocolObject<dyn MTLBuffer>,
     ids: &ProtocolObject<dyn MTLBuffer>,
     block_meta: &ProtocolObject<dyn MTLBuffer>,
@@ -2459,10 +2474,26 @@ fn encode_qwen_moe_chain_hybrid_mul_mm_id(
             return Err(QwenMoeLlamaIdError::InvalidShape);
         }
     };
+    let tail_pipeline = if compact_blocks {
+        let tail_variant = match quant {
+            QwenMoeLlamaIdQuant::Q4K => 6,
+            QwenMoeLlamaIdQuant::Q6K => 7,
+            _ => unreachable!(),
+        };
+        Some(
+            ctx.qwen_moe_chain_large_pipeline(tail_variant)
+                .ok_or(QwenMoeLlamaIdError::CommandBufferFailed)?,
+        )
+    } else {
+        None
+    };
     let large_pipeline = ctx
         .qwen_moe_chain_large_pipeline(large_variant)
         .ok_or(QwenMoeLlamaIdError::CommandBufferFailed)?;
     if large_pipeline.maxTotalThreadsPerThreadgroup() < 128 {
+        return Err(QwenMoeLlamaIdError::DispatchGridOverflow);
+    }
+    if tail_pipeline.is_some_and(|pipeline| pipeline.maxTotalThreadsPerThreadgroup() < 128) {
         return Err(QwenMoeLlamaIdError::DispatchGridOverflow);
     }
     let large_input_bytes = qwen_moe_llama_id_checked_bytes(
@@ -2477,13 +2508,24 @@ fn encode_qwen_moe_chain_hybrid_mul_mm_id(
     let block_local_end = block_local_offset
         .checked_add(block_bytes)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
-    let indirect_args_end = indirect_args_offset
-        .checked_add(3 * std::mem::size_of::<u32>())
+    let tail_expert_offset = block_local_offset
+        .checked_mul(2)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
-    if large_input_f16.length() < large_input_bytes
+    let tail_local_offset = block_local_offset
+        .checked_mul(3)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_local_end = tail_local_offset
+        .checked_add(block_bytes)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let indirect_args_end = indirect_args_offset
+        .checked_add(16 + 3 * std::mem::size_of::<u32>())
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    if large_input.length() < large_input_bytes
         || output.length() < output_bytes
         || block_meta.length() < block_bytes
         || block_meta.length() < block_local_end
+        || block_meta.length() < tail_local_offset
+        || block_meta.length() < tail_local_end
         || block_meta.length() < indirect_args_end
     {
         return Err(QwenMoeLlamaIdError::InvalidShape);
@@ -2518,7 +2560,7 @@ fn encode_qwen_moe_chain_hybrid_mul_mm_id(
     enc.setComputePipelineState(large_pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(weights), weight_offset, 0);
-        enc.setBuffer_offset_atIndex(Some(large_input_f16), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(large_input), 0, 1);
         enc.setBuffer_offset_atIndex(Some(tpe), 0, 2);
         enc.setBuffer_offset_atIndex(Some(ids), 0, 3);
         enc.setBuffer_offset_atIndex(Some(output), 0, 4);
@@ -2536,6 +2578,21 @@ fn encode_qwen_moe_chain_hybrid_mul_mm_id(
             enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                 block_meta,
                 indirect_args_offset,
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        let tail_pipeline = tail_pipeline.ok_or(QwenMoeLlamaIdError::CommandBufferFailed)?;
+        enc.setComputePipelineState(tail_pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(block_meta), tail_expert_offset, 10);
+            enc.setBuffer_offset_atIndex(Some(block_meta), tail_local_offset, 11);
+            enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                block_meta,
+                indirect_args_offset + 16,
                 MTLSize {
                     width: 128,
                     height: 1,
@@ -2605,8 +2662,17 @@ fn encode_qwen_moe_chain_cast_large_slots_f32_f16(
     let block_local_end = block_local_offset
         .checked_add(block_bytes)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_expert_offset = block_local_offset
+        .checked_mul(2)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_local_offset = block_local_offset
+        .checked_mul(3)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let tail_local_end = tail_local_offset
+        .checked_add(block_bytes)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
     let indirect_args_end = indirect_args_offset
-        .checked_add(3 * std::mem::size_of::<u32>())
+        .checked_add(16 + 3 * std::mem::size_of::<u32>())
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
     if input.length() < input_bytes
         || output.length() < output_bytes
@@ -2614,6 +2680,8 @@ fn encode_qwen_moe_chain_cast_large_slots_f32_f16(
         || ids.length() < ids_bytes
         || block_meta.length() < block_bytes
         || block_meta.length() < block_local_end
+        || block_meta.length() < tail_local_offset
+        || block_meta.length() < tail_local_end
         || block_meta.length() < indirect_args_end
     {
         return Err(QwenMoeLlamaIdError::InvalidShape);
@@ -2647,6 +2715,19 @@ fn encode_qwen_moe_chain_cast_large_slots_f32_f16(
             enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                 block_meta,
                 indirect_args_offset,
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(block_meta), tail_expert_offset, 4);
+            enc.setBuffer_offset_atIndex(Some(block_meta), tail_local_offset, 5);
+            enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                block_meta,
+                indirect_args_offset + 16,
                 MTLSize {
                     width: 256,
                     height: 1,
@@ -3063,13 +3144,10 @@ fn qwen_moe_llama_expert_order_reduce_shared_f32_encode(
         u32::try_from(n_rank).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
     let n_rows_u32 =
         u32::try_from(n_rows).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
-    let n_elements = n_tokens
-        .checked_mul(n_rows)
-        .ok_or(QwenMoeLlamaIdError::DispatchGridOverflow)?;
     let pipeline = ctx
         .qwen_moe_llama_expert_order_reduce_shared_f32_pipeline()
         .ok_or(QwenMoeLlamaIdError::CommandBufferFailed)?;
-    let tg_width = pipeline.threadExecutionWidth().max(1);
+    let tg_width = pipeline.maxTotalThreadsPerThreadgroup().max(1).min(n_rows);
 
     enc.setComputePipelineState(pipeline);
     unsafe {
@@ -3083,12 +3161,13 @@ fn qwen_moe_llama_expert_order_reduce_shared_f32_encode(
     set_u32_bytes(enc, n_tokens_u32, 6);
     set_u32_bytes(enc, n_rank_u32, 7);
     set_u32_bytes(enc, n_rows_u32, 8);
+    let threadgroups = MTLSize {
+        width: n_rows.div_ceil(tg_width),
+        height: n_tokens,
+        depth: 1,
+    };
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: n_elements.div_ceil(tg_width),
-            height: 1,
-            depth: 1,
-        },
+        threadgroups,
         MTLSize {
             width: tg_width,
             height: 1,

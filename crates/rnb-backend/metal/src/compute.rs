@@ -67,6 +67,9 @@ const ATTN_DECODE_SRC: &str = include_str!("attn_decode.metal");
 const KVARN_ATTENTION_SRC: &str = include_str!("kvarn_attention.metal");
 const ATTN_DECODE_I8_SRC: &str = include_str!("attn_decode_i8.metal");
 const ATTN_DECODE_I8_SPLITK_SRC: &str = include_str!("attn_decode_i8_splitk.metal");
+const ATTN_DECODE_I8_GQA_SPLITK_SRC: &str = include_str!("attn_decode_i8_gqa_splitk.metal");
+const ATTN_DECODE_I8_GQA_MATRIX_SPLITK_SRC: &str =
+    include_str!("attn_decode_i8_gqa_matrix_splitk.metal");
 const ATTN_DECODE_SPLITK_SRC: &str = include_str!("attn_decode_splitk.metal");
 const ATTN_DECODE_GQA_SRC: &str = include_str!("attn_decode_gqa.metal");
 const ROPE_MROPE_SRC: &str = include_str!("rope_mrope.metal");
@@ -582,6 +585,12 @@ pub struct MetalContext {
     pub attn_decode_i8_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_i8_splitk_reduce_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// HD=256/GQA=8 int8 KV split-K part. Query head별 SIMD-group이 shared KV tile을 재사용한다.
+    pub attn_decode_i8_gqa_splitk_part_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// QK만 8×8 simdgroup matrix로 계산하고 P*V accumulator는 register에 유지한다.
+    pub attn_decode_i8_gqa_matrix_splitk_part_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// pm132: split-K f16 KV decode attention.
     pub attn_decode_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_reduce_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -732,7 +741,7 @@ pub struct MetalContext {
     pub(crate) qwen_moe_chain_small_pipelines:
         [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 3],
     pub(crate) qwen_moe_chain_large_pipelines:
-        [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 6],
+        [OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>; 8],
     pub(crate) qwen_moe_chain_cast_large_slots_pipeline:
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) qwen_moe_chain_cast_compact_slots_pipeline:
@@ -1209,13 +1218,15 @@ impl MetalContext {
         &self,
         variant: usize,
     ) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-        const NAMES: [&str; 6] = [
+        const NAMES: [&str; 8] = [
             "qwen_moe_chain_large_q4k_f32",
             "qwen_moe_chain_large_q4k_f16",
             "qwen_moe_chain_large_q5k_f16",
             "qwen_moe_chain_large_q6k_f16",
             "qwen_moe_chain_large_q4k_f16_dense",
             "qwen_moe_chain_large_q6k_f16_dense",
+            "qwen_moe_chain_tail_q4k_f16",
+            "qwen_moe_chain_tail_q6k_f16",
         ];
         let cell = self.qwen_moe_chain_large_pipelines.get(variant)?;
         self.tensorops_capable
@@ -2180,6 +2191,20 @@ pub fn build_metal_context_with_opts(
         ATTN_DECODE_I8_SPLITK_SRC,
         "attn_decode_i8_splitk_reduce",
     );
+    let attn_decode_i8_gqa_splitk_part_pipeline = build_pipeline(
+        &device,
+        ATTN_DECODE_I8_GQA_SPLITK_SRC,
+        "attn_decode_i8_gqa_splitk_part",
+    );
+    let attn_decode_i8_gqa_matrix_splitk_part_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            ATTN_DECODE_I8_GQA_MATRIX_SPLITK_SRC,
+            "attn_decode_i8_gqa_matrix_splitk_part",
+        ))
+    } else {
+        None
+    };
     let attn_decode_splitk_part_pipeline =
         build_pipeline(&device, ATTN_DECODE_SPLITK_SRC, "attn_decode_splitk_part");
     let attn_decode_splitk_reduce_pipeline =
@@ -2374,6 +2399,8 @@ pub fn build_metal_context_with_opts(
         attn_decode_i8_pipeline,
         attn_decode_i8_splitk_part_pipeline,
         attn_decode_i8_splitk_reduce_pipeline,
+        attn_decode_i8_gqa_splitk_part_pipeline,
+        attn_decode_i8_gqa_matrix_splitk_part_pipeline,
         attn_decode_splitk_part_pipeline,
         attn_decode_splitk_reduce_pipeline,
         attn_decode_gqa_splitk_part_pipeline,
@@ -10518,6 +10545,125 @@ pub(crate) fn encode_attn_decode_i8_splitk(
     enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, tg);
 }
 
+/// HD=256/GQA=8 전용 int8 KV split-K decode attention.
+/// Part는 KV-head당 query-head 8개를 8 SIMD-group으로 병렬 처리하고 quantized KV tile을
+/// threadgroup memory에서 공유한다. Partial ABI와 reduce는 기존 int8 split-K와 동일하다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_i8_gqa_splitk(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_i8: &ProtocolObject<dyn MTLBuffer>,
+    v_i8: &ProtocolObject<dyn MTLBuffer>,
+    k_scale: &ProtocolObject<dyn MTLBuffer>,
+    v_scale: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc: &ProtocolObject<dyn MTLBuffer>,
+    partial_m: &ProtocolObject<dyn MTLBuffer>,
+    partial_s: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    splits_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+    matrix: bool,
+    current_k: &ProtocolObject<dyn MTLBuffer>,
+    current_v: &ProtocolObject<dyn MTLBuffer>,
+) {
+    assert_eq!(head_dim, 256, "int8 GQA split-K requires head_dim=256");
+    assert_eq!(
+        num_heads,
+        num_kv_heads * 8,
+        "int8 GQA split-K requires GQA factor 8"
+    );
+    assert!(
+        num_splits >= 2,
+        "int8 GQA split-K requires at least 2 splits"
+    );
+
+    const MATRIX_SCRATCH_BYTES: usize = 8 * 256 * std::mem::size_of::<u16>()
+        + 16 * 256 * std::mem::size_of::<u16>()
+        + 16 * 256 * std::mem::size_of::<u8>()
+        + 8 * 16 * std::mem::size_of::<f32>()
+        + 2 * 16 * std::mem::size_of::<f32>()
+        + 2 * std::mem::size_of::<f32>();
+
+    if matrix {
+        let pipeline = ctx
+            .attn_decode_i8_gqa_matrix_splitk_part_pipeline
+            .as_ref()
+            .expect("int8 GQA QK matrix requires Metal tensor operations");
+        enc.setComputePipelineState(pipeline);
+    } else {
+        enc.setComputePipelineState(&ctx.attn_decode_i8_gqa_splitk_part_pipeline);
+    }
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_i8), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_i8), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(k_scale), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(v_scale), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 11);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 12);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 13);
+        if matrix {
+            enc.setBuffer_offset_atIndex(Some(current_k), 0, 14);
+            enc.setBuffer_offset_atIndex(Some(current_v), 0, 15);
+        }
+        if matrix {
+            enc.setThreadgroupMemoryLength_atIndex(MATRIX_SCRATCH_BYTES, 0);
+        }
+    }
+    if matrix {
+        set_u32_bytes(enc, 1, 16);
+    }
+    let part_grid = MTLSize {
+        width: num_kv_heads,
+        height: num_splits,
+        depth: 1,
+    };
+    let part_tg = MTLSize {
+        width: 8 * SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(part_grid, part_tg);
+    chain_barrier(ctx, enc);
+
+    enc.setComputePipelineState(&ctx.attn_decode_i8_splitk_reduce_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 6);
+    }
+    let reduce_grid = MTLSize {
+        width: num_heads,
+        height: 1,
+        depth: 1,
+    };
+    let reduce_tg = MTLSize {
+        width: SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, reduce_tg);
+}
+
 /// pm132: f16 KV split-K decode attention encode (part + reduce).
 /// buffer layout: q(0) k_f16(1) v_f16(2) partial_acc(3) partial_m(4) partial_s(5)
 ///   nh(6) nkv(7) hd(8) kl(9) scale(10) splits(11)
@@ -10833,6 +10979,8 @@ pub fn attn_decode_i8_splitk_with_ctx(
     kv_len: usize,
     scale: f32,
     num_splits: usize,
+    gqa_grouped: bool,
+    gqa_matrix: bool,
 ) -> Vec<f32> {
     let kv_dim = num_kv_heads * head_dim;
     assert_eq!(q.len(), num_heads * head_dim, "q length mismatch");
@@ -10875,6 +11023,29 @@ pub fn attn_decode_i8_splitk_with_ctx(
     let ks_buf = mk_bytes(k_scale.as_ptr() as *const _, std::mem::size_of_val(k_scale));
     let vs_buf = mk_bytes(v_scale.as_ptr() as *const _, std::mem::size_of_val(v_scale));
 
+    let current_token = kv_len - 1;
+    let mut current_k = vec![0.0f32; kv_dim];
+    let mut current_v = vec![0.0f32; kv_dim];
+    for kv_h in 0..num_kv_heads {
+        let scale_index = current_token * num_kv_heads + kv_h;
+        let cache_base = current_token * kv_dim + kv_h * head_dim;
+        let current_base = kv_h * head_dim;
+        for dim in 0..head_dim {
+            current_k[current_base + dim] =
+                f32::from(k_i8[cache_base + dim]) * k_scale[scale_index];
+            current_v[current_base + dim] =
+                f32::from(v_i8[cache_base + dim]) * v_scale[scale_index];
+        }
+    }
+    let current_k_buf = mk_bytes(
+        current_k.as_ptr() as *const _,
+        std::mem::size_of_val(current_k.as_slice()),
+    );
+    let current_v_buf = mk_bytes(
+        current_v.as_ptr() as *const _,
+        std::mem::size_of_val(current_v.as_slice()),
+    );
+
     let out_len = num_heads * head_dim;
     let o_buf = ctx
         .device
@@ -10913,28 +11084,57 @@ pub fn attn_decode_i8_splitk_with_ctx(
     let enc = cmd
         .computeCommandEncoder()
         .expect("Metal: failed to create compute command encoder");
-    encode_attn_decode_i8_splitk(
-        ctx,
-        &enc,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &ks_buf,
-        &vs_buf,
-        &partial_acc,
-        &partial_m,
-        &partial_s,
-        &o_buf,
-        &nh_buf,
-        &nkv_buf,
-        &hd_buf,
-        &kl_buf,
-        &scale_buf,
-        &splits_buf,
-        num_heads,
-        head_dim,
-        num_splits,
-    );
+    if gqa_grouped {
+        encode_attn_decode_i8_gqa_splitk(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &ks_buf,
+            &vs_buf,
+            &partial_acc,
+            &partial_m,
+            &partial_s,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &hd_buf,
+            &kl_buf,
+            &scale_buf,
+            &splits_buf,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            num_splits,
+            gqa_matrix,
+            &current_k_buf,
+            &current_v_buf,
+        );
+    } else {
+        encode_attn_decode_i8_splitk(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &ks_buf,
+            &vs_buf,
+            &partial_acc,
+            &partial_m,
+            &partial_s,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &hd_buf,
+            &kl_buf,
+            &scale_buf,
+            &splits_buf,
+            num_heads,
+            head_dim,
+            num_splits,
+        );
+    }
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();

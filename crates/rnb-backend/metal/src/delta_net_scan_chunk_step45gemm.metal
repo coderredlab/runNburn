@@ -1,6 +1,6 @@
-// pm47 ② STEP4+STEP5 GEMM: delta_net_scan_chunk 의 STEP4(inter+intra concat) + STEP5(outer)
-// 둘 다 matmul2d f16 으로. step5gemm 복사 + STEP4 를 concat GEMM 으로 교체.
-// STEP1/PRECOMPUTE/STEP2 는 scalar(delta_net_scan_chunk.metal 과 1:1 동일).
+// pm149: pm47 STEP4+STEP5 GEMM에 STEP2 initial-state prediction을 추가한다.
+// 각 row가 반복하던 γ_r·(S_init·k_r)를 chunk당 state×K TensorOps GEMM으로 계산하고,
+// PRECOMPUTE와 triangular correction은 기존 f32 순서를 유지한다.
 //
 // STEP4: o[c×hv] = [q_scaled | W](c×KPAD) · [state^T ; u_corr](KPAD×hv)   (M=CPAD48, N=hv128, K=KPAD176)
 //   A_cat[r, 0:hk]   = exp(g_cum[r])·q[r,:]                      (inter, q_scaled)
@@ -10,9 +10,9 @@
 //   → step4_temp(device f32) → out copy(r<c). M=c 가변이라 CPAD=48 패딩(r≥c 행 0, out copy 제외).
 // STEP5: state = γ_C·state + scaled_u^T·k   (step5gemm 와 동일).
 //
-// threadgroup 32KiB 한계(u_corr+kk_sh+qk_sh) + state 32KB → STEP4/5 staging 전부 device workspace
-// + threadgroup_barrier(mem_device). matmul2d descriptor 컴파일타임 상수 → hv=hk=128, cs≤48 고정.
-// f32 oracle(delta_net_scan_chunkwise) 와 chunk drift 대조. accumulate fp32(dest float).
+// threadgroup 32KiB 한계(u_corr+kk_sh+qk_sh) + state 32KB → STEP2/4/5 staging 전부
+// 기존 device workspace를 재사용한다. matmul2d descriptor가 compile-time 상수라
+// hv=hk=128, cs≤48 고정이며 f32 oracle과 chunk drift를 계속 대조한다.
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -84,14 +84,49 @@ kernel void delta_net_scan_chunk_step45gemm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        uint pred_a_base = h * S4_KPAD * S5_HV;
+        uint pred_b_base = h * S4_CPAD * S4_KPAD;
+        uint pred_c_base = h * S4_CPAD * S5_HV;
+        // STEP2의 γ_r·(S_init·k_r)를 128개 row별 scalar dot 대신 한 번의
+        // 128×128 · 128×48 TensorOps GEMM으로 계산한다. FLA의 current
+        // chunk path와 같은 state×K chunk projection이며, 뒤의 triangular
+        // correction은 기존 f32 순서를 유지한다. STEP4가 나중에 같은
+        // workspaces를 덮어쓰므로 추가 device allocation은 없다.
+        for (uint p = vi; p < S5_HV * S5_HK; p += tg_size) {
+            b_cat_half[pred_a_base + p] = (half)state[s_base + p];
+        }
+        for (uint p = vi; p < S5_HK * S4_CPAD; p += tg_size) {
+            uint ki = p / S4_CPAD;
+            uint r = p % S4_CPAD;
+            half value = (half)0;
+            if (r < c) {
+                uint kr_base = (base + r * num_heads) * hk;
+                value = (half)k[kr_base + ki];
+            }
+            a_cat_half[pred_b_base + p] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        {
+            auto A = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
+                b_cat_half + pred_a_base, dextents<int32_t, 2>(S5_HK, S5_HV));
+            auto B = tensor<device half, dextents<int32_t, 2>, tensor_inline>(
+                a_cat_half + pred_b_base, dextents<int32_t, 2>(S4_CPAD, S5_HK));
+            auto C = tensor<device float, dextents<int32_t, 2>, tensor_inline>(
+                step4_temp + pred_c_base, dextents<int32_t, 2>(S4_CPAD, S5_HV));
+            constexpr auto desc = matmul2d_descriptor(
+                S5_HV, S4_CPAD, S5_HK, false, false, false,
+                matmul2d_descriptor::mode::multiply);
+            matmul2d<desc, execution_simdgroups<4>> op;
+            op.run(A, B, C);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
         // STEP 2 (동일)
         for (uint r = 0; r < c; r++) {
             if (vi < hv) {
                 float gr = exp(g_cum[r]);
                 float br = beta[(t0 + r) * num_heads + h];
-                uint kr_base = (base + r * num_heads) * hk;
-                float pred = 0.0f;
-                for (uint ki = 0; ki < hk; ki++) pred += state[s_base + vi * hk + ki] * k[kr_base + ki];
+                float pred = step4_temp[pred_c_base + vi * S4_CPAD + r];
                 float a = v[(base + r * num_heads) * hv + vi] - gr * pred;
                 for (uint i = 0; i < r; i++) {
                     float s_kk = kk_sh[i * c + r] * exp(g_cum[r] - g_cum[i]);
@@ -207,3 +242,4 @@ kernel void delta_net_scan_chunk_step45gemm(
         t0 += c;
     }
 }
+

@@ -12906,8 +12906,7 @@ mod tests {
     }
 
     /// pm54: split-K int8 KV decode attention 은 기존 int8 커널과 같은 의미여야 한다.
-    /// 긴 kv_len 에서 KV 축 병렬도를 늘리기 위한 opt-in fast path 이므로, 먼저 기존
-    /// int8 attention 을 reference 로 삼아 scale-normalized 오차를 고정한다.
+    /// 긴 kv_len 에서 KV 축 병렬도를 늘리기 위한 fast path의 오차를 고정한다.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires Metal device"]
@@ -12950,7 +12949,7 @@ mod tests {
         let expected =
             attn_decode_i8_with_ctx(&ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale);
         let actual = attn_decode_i8_splitk_with_ctx(
-            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, 16,
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, 16, false, false,
         );
 
         let scale_ref = expected
@@ -12966,6 +12965,77 @@ mod tests {
             max_rel < 2e-2,
             "max_rel {max_rel} >= 2e-2 (split-K reduction drift)"
         );
+    }
+
+    /// HD=256/GQA=8 shared-tile part는 기존 query-head split-K와 query별 연산 순서 및
+    /// partial ABI가 같아야 한다. KV tile과 split tail이 모두 남는 길이로 직접 대조한다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn attn_decode_i8_gqa_splitk_matches_splitk() {
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(true) else {
+            panic!("no Metal device — run on macOS host")
+        };
+        use crate::compute::{attn_decode_i8_splitk_with_ctx, quantize_slot_i8_ref};
+        let (nh, nkv, hd, kl, splits) = (16usize, 2usize, 256usize, 2051usize, 16usize);
+        let kv_dim = nkv * hd;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let q: Vec<f32> = (0..nh * hd)
+            .map(|i| (((i * 17 + 3) as f32) * 0.007).sin())
+            .collect();
+        let kf: Vec<f32> = (0..kl * kv_dim)
+            .map(|i| (((i * 13 + 11) as f32) * 0.005).sin())
+            .collect();
+        let vf: Vec<f32> = (0..kl * kv_dim)
+            .map(|i| (((i * 19 + 5) as f32) * 0.006).cos())
+            .collect();
+        let mut ki = vec![0i8; kl * kv_dim];
+        let mut vi = vec![0i8; kl * kv_dim];
+        let mut ks = vec![0f32; kl * nkv];
+        let mut vs = vec![0f32; kl * nkv];
+        for j in 0..kl {
+            for h in 0..nkv {
+                let off = j * kv_dim + h * hd;
+                let (kq, ksc) = quantize_slot_i8_ref(&kf[off..off + hd]);
+                let (vq, vsc) = quantize_slot_i8_ref(&vf[off..off + hd]);
+                ks[j * nkv + h] = ksc;
+                vs[j * nkv + h] = vsc;
+                ki[off..off + hd].copy_from_slice(&kq);
+                vi[off..off + hd].copy_from_slice(&vq);
+            }
+        }
+
+        let expected = attn_decode_i8_splitk_with_ctx(
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, false, false,
+        );
+        let actual = attn_decode_i8_splitk_with_ctx(
+            &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, true, false,
+        );
+        let mut max_abs = 0.0f32;
+        for (a, b) in actual.iter().zip(expected.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        eprintln!("attn_decode_i8_gqa_splitk vs split-K max_abs = {max_abs}");
+        assert!(max_abs < 1e-6, "GQA shared-tile max_abs {max_abs} >= 1e-6");
+
+        if ctx.tensorops_capable {
+            let matrix = attn_decode_i8_splitk_with_ctx(
+                &ctx, &q, &ki, &vi, &ks, &vs, nh, nkv, hd, kl, scale, splits, true, true,
+            );
+            let output_scale = expected
+                .iter()
+                .fold(0.0f32, |value, &x| value.max(x.abs()))
+                .max(1e-4);
+            let mut matrix_max_rel = 0.0f32;
+            for (a, b) in matrix.iter().zip(expected.iter()) {
+                matrix_max_rel = matrix_max_rel.max((a - b).abs() / output_scale);
+            }
+            eprintln!("attn_decode_i8_gqa_qk_matrix vs split-K max_rel = {matrix_max_rel}");
+            assert!(
+                matrix_max_rel < 1e-5,
+                "GQA QK matrix max_rel {matrix_max_rel} >= 1e-5"
+            );
+        }
     }
 
     /// footgun(pm17): in-process 로 engine 을 재사용(반복 측정/multi-turn)하면 직전
