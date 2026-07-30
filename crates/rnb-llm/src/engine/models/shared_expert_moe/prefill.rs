@@ -2029,6 +2029,12 @@ mod tests {
 
     #[test]
     fn hy3_q2q3_expert_major_matches_token_major_reference() {
+        // view.forward는 moe profile이 켜져 있으면 전역 profile 맵에 기록한다.
+        // profile 창을 여는 테스트(moe_profile, qwen35 profile)와 서열화해
+        // 동시 실행 오염을 막는다.
+        let _profile_guard = crate::engine::moe_profile::test_lock()
+            .lock()
+            .expect("moe profile test lock poisoned");
         let _guard = ENV_LOCK.lock();
         let batch_key = "RNB_CPU_Q2Q3_BATCH_X4";
         let previous_batch = crate::engine::policy::env_string(batch_key);

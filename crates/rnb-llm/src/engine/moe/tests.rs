@@ -86,8 +86,8 @@ fn qwen35_moe_profile_records_high_path_summary() {
         .lock()
         .expect("moe profile test lock poisoned");
     let _guard = env_lock().lock().expect("env lock poisoned");
+    crate::engine::moe_profile::set_moe_profile_enabled_for_tests(Some(true));
     unsafe {
-        std::env::set_var("RNB_MOE_PROFILE", "1");
         std::env::remove_var("RNB_HOBBIT");
     }
     reset_moe_profile();
@@ -143,16 +143,20 @@ fn qwen35_moe_profile_records_high_path_summary() {
     view.forward(&h, &mut out);
 
     let report = moe_profile_report().expect("report should exist");
-    assert!(report.contains("qwen35moe:decode:router"));
-    assert!(report.contains("qwen35moe:decode:routing"));
-    assert!(report.contains("qwen35moe:decode:high_compute"));
-    assert!(report.contains("qwen35moe:decode:shared_expert"));
-    assert!(report.contains("qwen35moe:decode counts high=2 low=0 skip=0"));
+    assert!(report.contains("qwen35moe:decode:router"), "{report}");
+    assert!(report.contains("qwen35moe:decode:routing"), "{report}");
+    assert!(report.contains("qwen35moe:decode:high_compute"), "{report}");
+    assert!(
+        report.contains("qwen35moe:decode:shared_expert"),
+        "{report}"
+    );
+    assert!(
+        report.contains("qwen35moe:decode counts high=2 low=0 skip=0"),
+        "{report}"
+    );
 
-    unsafe {
-        std::env::remove_var("RNB_MOE_PROFILE");
-    }
     reset_moe_profile();
+    crate::engine::moe_profile::set_moe_profile_enabled_for_tests(None);
 }
 
 #[test]
