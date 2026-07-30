@@ -5299,7 +5299,7 @@ impl CudaState {
                 (&mut adaptive_top_p_arg as *mut f32).cast::<libc::c_void>(),
             ],
             (seq_len as u32, 1, 1),
-            (1, 1, 1),
+            (256, 1, 1),
         )
     }
 

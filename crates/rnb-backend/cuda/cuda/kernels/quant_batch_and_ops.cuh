@@ -3242,40 +3242,75 @@ extern "C" __global__ void rnb_moe_route_topk_f32(
     float scale,
     float adaptive_top_p) {
     const unsigned token = blockIdx.x;
-    if (token >= seq_len || threadIdx.x != 0u) {
+    if (token >= seq_len) {
         return;
     }
-    unsigned selected_ids[256];
+    // One 256-thread block per token. Every thread scores one expert, then
+    // top-k ranks are found with a block-wide argmax reduction whose
+    // tie-break (equal score -> lower expert index) matches the original
+    // ascending serial scan exactly. Post-selection normalization stays on
+    // thread 0 in rank order, so all outputs are bit-exact with the old
+    // single-thread kernel.
+    __shared__ float expert_scores[256];
+    __shared__ float expert_values[256];
+    __shared__ unsigned char expert_taken[256];
+    __shared__ float red_score[256];
+    __shared__ unsigned red_idx[256];
+    __shared__ unsigned selected_ids[256];
     float selected_values[256];
     const unsigned selected_len = top_k < n_expert ? top_k : n_expert;
     const float* token_logits = logits + (unsigned long long)token * n_expert;
+    const unsigned tid = threadIdx.x;
+    if (tid < n_expert) {
+        const float base = sigmoid_mode != 0u
+            ? 1.0f / (1.0f + expf(-token_logits[tid]))
+            : token_logits[tid];
+        expert_values[tid] = base;
+        expert_scores[tid] = base
+            + ((sigmoid_mode != 0u && selection_bias != nullptr)
+                ? selection_bias[tid]
+                : 0.0f);
+        expert_taken[tid] = 0u;
+    }
+    __syncthreads();
     for (unsigned rank = 0u; rank < selected_len; ++rank) {
-        float best_score = -3.402823466e+38F;
-        unsigned best_expert = 0xffffffffu;
-        for (unsigned expert = 0u; expert < n_expert; ++expert) {
-            bool already_selected = false;
-            for (unsigned prior = 0u; prior < rank; ++prior) {
-                already_selected |= selected_ids[prior] == expert;
+        if (tid < n_expert && expert_taken[tid] == 0u) {
+            red_score[tid] = expert_scores[tid];
+            red_idx[tid] = tid;
+        } else {
+            red_score[tid] = -3.402823466e+38F;
+            red_idx[tid] = 0xffffffffu;
+        }
+        __syncthreads();
+        for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                const float other_score = red_score[tid + stride];
+                const unsigned other_idx = red_idx[tid + stride];
+                if (other_score > red_score[tid]
+                    || (other_score == red_score[tid] && other_idx < red_idx[tid])) {
+                    red_score[tid] = other_score;
+                    red_idx[tid] = other_idx;
+                }
             }
-            if (already_selected) {
-                continue;
-            }
-            const float base = sigmoid_mode != 0u
-                ? 1.0f / (1.0f + expf(-token_logits[expert]))
-                : token_logits[expert];
-            const float score = base
-                + ((sigmoid_mode != 0u && selection_bias != nullptr)
-                    ? selection_bias[expert]
-                    : 0.0f);
-            if (score > best_score || (score == best_score && expert < best_expert)) {
-                best_score = score;
-                best_expert = expert;
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            const unsigned best_expert = red_idx[0];
+            selected_ids[rank] = best_expert;
+            if (best_expert < n_expert) {
+                expert_taken[best_expert] = 1u;
             }
         }
-        selected_ids[rank] = best_expert;
-        selected_values[rank] = sigmoid_mode != 0u
-            ? 1.0f / (1.0f + expf(-token_logits[best_expert]))
-            : token_logits[best_expert];
+        __syncthreads();
+    }
+    if (tid != 0u) {
+        return;
+    }
+    for (unsigned rank = 0u; rank < selected_len; ++rank) {
+        const unsigned best_expert = selected_ids[rank];
+        selected_values[rank] = best_expert < n_expert
+            ? expert_values[best_expert]
+            : token_logits[0];
     }
     if (sigmoid_mode == 0u && selected_len > 0u) {
         const float selected_max = selected_values[0];
