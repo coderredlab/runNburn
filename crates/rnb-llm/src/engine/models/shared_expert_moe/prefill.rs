@@ -849,12 +849,30 @@ pub(in crate::engine) fn forward_shared_expert_moe(
 
     #[cfg(feature = "cuda")]
     if !trace_prefill_routes
-        && architecture == ModelArchitecture::GlmDsa
         && view.gate_quant == view.up_quant
-        && ((view.gate_quant == GGMLType::IQ2_XXS && view.down_quant == GGMLType::IQ3_XXS)
-            || (super::glm_prefill::ud_iq_batch_enabled()
-                && matches!(view.gate_quant, GGMLType::IQ2_XXS | GGMLType::IQ2_S)
-                && matches!(view.down_quant, GGMLType::IQ3_XXS | GGMLType::IQ4_XS)))
+        && ((architecture == ModelArchitecture::GlmDsa
+            && ((view.gate_quant == GGMLType::IQ2_XXS && view.down_quant == GGMLType::IQ3_XXS)
+                || (super::glm_prefill::ud_iq_batch_enabled()
+                    && matches!(view.gate_quant, GGMLType::IQ2_XXS | GGMLType::IQ2_S)
+                    && matches!(view.down_quant, GGMLType::IQ3_XXS | GGMLType::IQ4_XS))))
+            // Hy3 High tuple: same sigmoid top-k + selection-bias + shared-expert
+            // contract as GLM-DSA, with Q2_K gate/up and Q3_K down by-token
+            // kernels on the CUDA side. Semantics stay owned by GGUF metadata.
+            // The route-slot reuse boundary (N*k >= E*8, i.e. 192 tokens for
+            // top-8/192) keeps short prompts on the host token dispatch, where
+            // the expert union is far from saturated and PCIe upload loses to
+            // host-bandwidth AVX2 execution; past saturation the single
+            // per-layer upload amortizes and the batched CUDA path wins.
+            || (architecture == ModelArchitecture::Hy3
+                && view.gate_quant == GGMLType::Q2_K
+                && view.down_quant == GGMLType::Q3_K
+                && view.expert_gating_func == 2
+                && view.router_selection_bias.is_some()
+                && hy3_q2q3_expert_major_has_reuse(
+                    seq_len,
+                    view.n_expert_used,
+                    view.n_expert,
+                )))
     {
         let sparse_file_regions = moe_w.sparse_expert_file_regions();
         let direct_file = cuda_runtime::glm_moe_direct_file_prefill_enabled(

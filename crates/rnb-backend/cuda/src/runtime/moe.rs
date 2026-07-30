@@ -1,4 +1,5 @@
 mod glm;
+pub(in crate::runtime) mod glm_prefetch;
 mod glm_stream;
 mod nemotron;
 mod q4k_slots;

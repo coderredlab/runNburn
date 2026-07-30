@@ -400,3 +400,11 @@ pub fn glm_shared_expert_iq(
             input,
         )
 }
+
+/// Registers the per-layer `[gate, up, down]` sparse expert file regions in
+/// forward order so the direct-file stream can read the next layer's expert
+/// bytes ahead of its call. `(path, file_offset, len)` triples identify each
+/// region; an empty sequence clears the registration.
+pub fn glm_register_stream_region_sequence(sequence: Vec<[(std::path::PathBuf, u64, usize); 3]>) {
+    super::super::moe::glm_prefetch::register_stream_region_sequence(sequence);
+}

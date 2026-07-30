@@ -31,7 +31,7 @@ pub use gdn::{
 pub use glm_moe::{
     glm_moe_decode_shared_expert_q5k_q6k, glm_moe_decode_sparse_experts_iq2xxs_iq3xxs,
     glm_moe_direct_file_prefill_enabled, glm_moe_prefill_shared_expert_iq,
-    glm_moe_prefill_sparse_experts_iq_by_token,
+    glm_moe_prefill_sparse_experts_iq_by_token, glm_register_stream_region_sequence,
 };
 pub use output::{
     output_logits_enabled, prefill_output_logits, prewarm_output_weight, try_output_argmax_token,

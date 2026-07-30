@@ -4,6 +4,7 @@ pub mod device_prefill;
 
 #[cfg(feature = "cuda")]
 pub mod compute {
+    pub use rnb_backend_cuda::glm_register_stream_region_sequence;
     pub use rnb_backend_cuda::runtime::{
         download_device_tensor_f32, download_device_tensor_f32_row,
         nemotron_q8_shared_q5_sparse_prefill_moe_device,

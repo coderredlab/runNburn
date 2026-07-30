@@ -316,4 +316,73 @@ impl CudaState {
     pub(in crate::runtime) fn cu68_graph_kv_len_ptr(&mut self) -> Result<u64, String> {
         ensure_with_oom_retry!(self, cu68_graph_kv_len, cu68_graph_kv_len_capacity, 4)
     }
+    /// Reused pinned bounce buffer for large host<->device transfers.
+    pub(in crate::runtime) fn host_xfer_slab_ptr(
+        &mut self,
+        bytes: usize,
+    ) -> Result<*mut u8, String> {
+        self.set_current()?;
+        if self.host_xfer_slab_capacity >= bytes {
+            return self
+                .host_xfer_slab
+                .map(|ptr| ptr as *mut u8)
+                .ok_or_else(|| "missing CUDA pinned host xfer slab".to_string());
+        }
+        if let Some(ptr) = self.host_xfer_slab.take() {
+            unsafe { self.api.mem_free_host(ptr as *mut libc::c_void)? };
+        }
+        let ptr = unsafe { self.api.mem_host_alloc(bytes)? };
+        self.host_xfer_slab = Some(ptr as usize);
+        self.host_xfer_slab_capacity = bytes;
+        Ok(ptr.cast::<u8>())
+    }
+
+    /// Downloads device bytes into a host f32 slice through the pinned bounce
+    /// buffer. Pageable async D2H measures ~3 GB/s on the reference box while
+    /// the pinned path runs at the PCIe wire limit, so large activation
+    /// downloads chunk through the slab; small copies keep the direct path.
+    pub(in crate::runtime) fn dtoh_f32_via_pinned(
+        &mut self,
+        src_dev: u64,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        const PINNED_DTOH_MIN_BYTES: usize = 4 << 20;
+        const PINNED_DTOH_CHUNK: usize = 32 << 20;
+        let bytes = std::mem::size_of_val(out);
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes < PINNED_DTOH_MIN_BYTES {
+            unsafe {
+                self.api.memcpy_dtoh_async(
+                    out.as_mut_ptr().cast::<libc::c_void>(),
+                    src_dev,
+                    bytes,
+                    self.stream,
+                )?;
+            }
+            return self.stream_synchronize();
+        }
+        let chunk = PINNED_DTOH_CHUNK.min(bytes);
+        let pinned = self.host_xfer_slab_ptr(chunk)?;
+        let out_bytes = out.as_mut_ptr().cast::<u8>();
+        let mut offset = 0usize;
+        while offset < bytes {
+            let len = chunk.min(bytes - offset);
+            unsafe {
+                self.api.memcpy_dtoh_async(
+                    pinned.cast::<libc::c_void>(),
+                    src_dev + offset as u64,
+                    len,
+                    self.stream,
+                )?;
+            }
+            self.stream_synchronize()?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(pinned, out_bytes.add(offset), len);
+            }
+            offset += len;
+        }
+        Ok(())
+    }
 }

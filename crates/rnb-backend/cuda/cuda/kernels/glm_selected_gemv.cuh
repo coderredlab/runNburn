@@ -724,3 +724,288 @@ extern "C" __global__ void rnb_iq3_xxs_gemv_batch_warp8(
             out, weights, input, rows, blocks_per_row, blockIdx.y);
     }
 }
+
+// ---- Q2_K / Q3_K by-token selected expert kernels (Hy3 High tuple) ----
+// Decode formulas match rnb_q2k_selected_gate_up_gemv_warp8 and
+// rnb_q3k_selected_down_silu_rowreduce exactly: block_q2_K is
+// scales[16] | qs[64] | d | dmin (84 bytes), block_q3_K is
+// hmask[32] | qs[64] | scales[12] | d (110 bytes), index = value position
+// inside the 256-value super-block.
+
+__device__ __forceinline__ float rnb_q2k_value(
+    const unsigned char* block,
+    unsigned index) {
+    const unsigned raw_d = (unsigned)block[80] | ((unsigned)block[81] << 8);
+    const unsigned raw_dmin = (unsigned)block[82] | ((unsigned)block[83] << 8);
+    const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+    const float dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+    const unsigned scale_min = block[index >> 4];
+    const unsigned q_index = (index >> 7) * 32u + (index & 31u);
+    const unsigned shift = ((index & 127u) >> 5) * 2u;
+    const unsigned q = (block[16u + q_index] >> shift) & 3u;
+    return d * (float)(scale_min & 0x0fu) * (float)q
+        - dmin * (float)(scale_min >> 4);
+}
+
+__device__ __forceinline__ float rnb_q3k_value(
+    const unsigned char* block,
+    unsigned index) {
+    const unsigned raw_d = (unsigned)block[108] | ((unsigned)block[109] << 8);
+    const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+    const unsigned scale_idx = index >> 4;
+    const unsigned scale_lane = scale_idx & 3u;
+    const unsigned packed_high = block[104u + scale_lane];
+    unsigned scale_code;
+    if (scale_idx < 4u) {
+        scale_code = (block[96u + scale_lane] & 0x0fu) | ((packed_high & 0x03u) << 4);
+    } else if (scale_idx < 8u) {
+        scale_code =
+            (block[100u + scale_lane] & 0x0fu) | (((packed_high >> 2) & 0x03u) << 4);
+    } else if (scale_idx < 12u) {
+        scale_code = (block[96u + scale_lane] >> 4) | (((packed_high >> 4) & 0x03u) << 4);
+    } else {
+        scale_code = (block[100u + scale_lane] >> 4) | (((packed_high >> 6) & 0x03u) << 4);
+    }
+    const unsigned q_index = (index >> 7) * 32u + (index & 31u);
+    const unsigned shift = ((index & 127u) >> 5) * 2u;
+    const unsigned q = (block[32u + q_index] >> shift) & 3u;
+    const unsigned high_mask = 1u << (index >> 5);
+    const int high = (block[index & 31u] & high_mask) != 0u ? 0 : 4;
+    return d * (float)((int)scale_code - 32) * (float)((int)q - high);
+}
+
+extern "C" __global__ void rnb_q2k_selected_gate_up_gemv_by_token(
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    const unsigned char* const* __restrict__ gate_weights,
+    const unsigned char* const* __restrict__ up_weights,
+    const float* __restrict__ input,
+    const unsigned* __restrict__ token_ids,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned row = blockIdx.x;
+    const unsigned slot = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || tid >= 256u) {
+        return;
+    }
+
+    __shared__ float partial_gate[256];
+    __shared__ float partial_up[256];
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    const unsigned token = token_ids[slot];
+    const float* token_input = input + token * blocks_per_row * 256u;
+    const unsigned row_bytes = blocks_per_row * 84u;
+    const unsigned char* gate_row = gate_weights[slot] + row * row_bytes;
+    const unsigned char* up_row = up_weights[slot] + row * row_bytes;
+    for (unsigned b = 0; b < blocks_per_row; ++b) {
+        const float x = token_input[b * 256u + tid];
+        gate_acc += rnb_q2k_value(gate_row + b * 84u, tid) * x;
+        up_acc += rnb_q2k_value(up_row + b * 84u, tid) * x;
+    }
+
+    partial_gate[tid] = gate_acc;
+    partial_up[tid] = up_acc;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial_gate[tid] += partial_gate[tid + stride];
+            partial_up[tid] += partial_up[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        const unsigned out_idx = slot * rows + row;
+        gate_out[out_idx] = partial_gate[0];
+        up_out[out_idx] = partial_up[0];
+    }
+}
+
+extern "C" __global__ void rnb_q3k_selected_down_silu_rowreduce_by_token(
+    float* __restrict__ out,
+    const unsigned char* const* __restrict__ weights,
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ route,
+    unsigned rows,
+    unsigned slots_per_token,
+    unsigned token_count,
+    unsigned blocks_per_row) {
+    const unsigned row = blockIdx.x;
+    const unsigned token = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || token >= token_count || tid >= 256u) {
+        return;
+    }
+
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 110u;
+    const unsigned first_slot = token * slots_per_token;
+    for (unsigned local_slot = 0; local_slot < slots_per_token; ++local_slot) {
+        const unsigned slot = first_slot + local_slot;
+        const unsigned char* row_ptr = weights[slot] + row * row_bytes;
+        const float* gate_input = gate + slot * blocks_per_row * 256u;
+        const float* up_input = up + slot * blocks_per_row * 256u;
+        float expert_acc = 0.0f;
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const float g = gate_input[b * 256u + tid];
+            const float activation = (g / (1.0f + expf(-g))) * up_input[b * 256u + tid];
+            expert_acc += rnb_q3k_value(row_ptr + b * 110u, tid) * activation;
+        }
+        acc += expert_acc * route[slot];
+    }
+
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        out[token * rows + row] = partial[0];
+    }
+}
+
+extern "C" __global__ void rnb_q2k_selected_gate_up_gemv_by_token_grouped_warp4(
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    const unsigned char* const* __restrict__ gate_weights,
+    const unsigned char* const* __restrict__ up_weights,
+    const float* __restrict__ input,
+    const unsigned* __restrict__ token_ids,
+    const unsigned* __restrict__ group_meta,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned row = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned group = blockIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (row >= rows || lane >= 32u) {
+        return;
+    }
+
+    const unsigned slot_start = group_meta[group * 2u];
+    const unsigned group_len = group_meta[group * 2u + 1u];
+    if (group_len == 0u || group_len > 4u) {
+        return;
+    }
+
+    const unsigned row_bytes = blocks_per_row * 84u;
+    const unsigned char* gate_row = gate_weights[slot_start] + row * row_bytes;
+    const unsigned char* up_row = up_weights[slot_start] + row * row_bytes;
+    const float* input_rows[4];
+#pragma unroll
+    for (unsigned slot = 0; slot < 4u; ++slot) {
+        input_rows[slot] = slot < group_len
+            ? input + token_ids[slot_start + slot] * blocks_per_row * 256u
+            : nullptr;
+    }
+
+    float gate_acc[4] = {};
+    float up_acc[4] = {};
+    for (unsigned b = 0; b < blocks_per_row; ++b) {
+        const unsigned input_base = b * 256u;
+        const unsigned char* gate_block = gate_row + b * 84u;
+        const unsigned char* up_block = up_row + b * 84u;
+        for (unsigned index = lane; index < 256u; index += 32u) {
+            const float gate_weight = rnb_q2k_value(gate_block, index);
+            const float up_weight = rnb_q2k_value(up_block, index);
+            const unsigned input_index = input_base + index;
+#pragma unroll
+            for (unsigned slot = 0; slot < 4u; ++slot) {
+                if (slot < group_len) {
+                    gate_acc[slot] += gate_weight * input_rows[slot][input_index];
+                    up_acc[slot] += up_weight * input_rows[slot][input_index];
+                }
+            }
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (unsigned slot = 0; slot < 4u; ++slot) {
+            gate_acc[slot] += __shfl_down_sync(0xffffffffu, gate_acc[slot], offset);
+            up_acc[slot] += __shfl_down_sync(0xffffffffu, up_acc[slot], offset);
+        }
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (unsigned slot = 0; slot < 4u; ++slot) {
+            if (slot < group_len) {
+                const unsigned output = (slot_start + slot) * rows + row;
+                gate_out[output] = gate_acc[slot];
+                up_out[output] = up_acc[slot];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void rnb_q3k_selected_down_accum_by_token_grouped_warp4(
+    float* __restrict__ out,
+    const unsigned char* const* __restrict__ weights,
+    const float* __restrict__ activation,
+    const float* __restrict__ route,
+    const unsigned* __restrict__ token_ids,
+    const unsigned* __restrict__ group_meta,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned row = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned group = blockIdx.y;
+    const unsigned lane = threadIdx.x;
+    if (row >= rows || lane >= 32u) {
+        return;
+    }
+
+    const unsigned slot_start = group_meta[group * 2u];
+    const unsigned group_len = group_meta[group * 2u + 1u];
+    if (group_len == 0u || group_len > 4u) {
+        return;
+    }
+
+    const unsigned row_bytes = blocks_per_row * 110u;
+    const unsigned char* row_ptr = weights[slot_start] + row * row_bytes;
+    const float* input_rows[4];
+#pragma unroll
+    for (unsigned slot = 0; slot < 4u; ++slot) {
+        input_rows[slot] = slot < group_len
+            ? activation + (slot_start + slot) * blocks_per_row * 256u
+            : nullptr;
+    }
+
+    float acc[4] = {};
+    for (unsigned b = 0; b < blocks_per_row; ++b) {
+        const unsigned input_base = b * 256u;
+        const unsigned char* block = row_ptr + b * 110u;
+        for (unsigned index = lane; index < 256u; index += 32u) {
+            const float weight = rnb_q3k_value(block, index);
+            const unsigned input_index = input_base + index;
+#pragma unroll
+            for (unsigned slot = 0; slot < 4u; ++slot) {
+                if (slot < group_len) {
+                    acc[slot] += weight * input_rows[slot][input_index];
+                }
+            }
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (unsigned slot = 0; slot < 4u; ++slot) {
+            acc[slot] += __shfl_down_sync(0xffffffffu, acc[slot], offset);
+        }
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (unsigned slot = 0; slot < 4u; ++slot) {
+            if (slot < group_len) {
+                atomicAdd(
+                    out + token_ids[slot_start + slot] * rows + row,
+                    acc[slot] * route[slot_start + slot]);
+            }
+        }
+    }
+}
+

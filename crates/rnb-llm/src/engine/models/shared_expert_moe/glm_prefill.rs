@@ -98,14 +98,9 @@ fn compute_shared_batch(
             seq_len.saturating_mul(view.n_ff)
         )));
     }
-    for token in 0..seq_len {
-        let start = token * view.n_ff;
-        apply_model_gate_mul_inplace(
-            &mut gate[start..start + view.n_ff],
-            &up[start..start + view.n_ff],
-            ModelArchitecture::GlmDsa,
-        );
-    }
+    // silu(gate) * up is elementwise, so one whole-buffer call is identical
+    // to the former per-token loop and removes seq_len device round trips.
+    apply_model_gate_mul_inplace(&mut gate, &up, ModelArchitecture::GlmDsa);
     let Some(down_result) = cuda_runtime::prefill_gemv(
         view.shared_down_quant,
         view.shared_down_bytes,
@@ -216,16 +211,17 @@ pub(super) fn forward(
     }
 
     let mut normalized = vec![0.0f32; residual.len()];
-    for token in 0..seq_len {
-        let start = token * hidden_dim;
-        apply_model_norm_into(
-            &residual[start..start + hidden_dim],
-            ffn_norm,
-            norm_eps,
-            &mut normalized[start..start + hidden_dim],
-            ModelArchitecture::GlmDsa,
-        );
-    }
+    // Single rows-batched norm call: both the CUDA and CPU kernels derive the
+    // row count from input.len()/weight.len(), and per-row math is identical
+    // to the former per-token loop, so this only removes seq_len host/device
+    // round trips per layer.
+    apply_model_norm_into(
+        residual,
+        ffn_norm,
+        norm_eps,
+        &mut normalized,
+        ModelArchitecture::GlmDsa,
+    );
 
     let mut router_logits = vec![0.0f32; seq_len * view.n_expert];
     gemv_f32(

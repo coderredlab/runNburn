@@ -329,6 +329,11 @@ impl CudaState {
                 "rnb_iq2_s_selected_gate_up_gemv_by_token",
                 "rnb_iq2_s_selected_gate_up_gemv_by_token_grouped_warp4",
             ),
+            10 => (
+                84usize,
+                "rnb_q2k_selected_gate_up_gemv_by_token",
+                "rnb_q2k_selected_gate_up_gemv_by_token_grouped_warp4",
+            ),
             other => {
                 return Err(format!(
                     "unsupported GLM batched sparse gate/up quant code {other}"
@@ -345,6 +350,11 @@ impl CudaState {
                 136usize,
                 "rnb_iq4_xs_selected_down_silu_rowreduce_by_token",
                 "rnb_iq4_xs_selected_down_accum_by_token_grouped_warp4",
+            ),
+            11 => (
+                110usize,
+                "rnb_q3k_selected_down_silu_rowreduce_by_token",
+                "rnb_q3k_selected_down_accum_by_token_grouped_warp4",
             ),
             other => {
                 return Err(format!(
@@ -479,7 +489,6 @@ impl CudaState {
                     n_embd,
                     input_dev,
                     output_dev,
-                    output_bytes,
                     gate_dev,
                     up_dev,
                 },
@@ -615,15 +624,7 @@ impl CudaState {
         }
 
         let mut output = vec![0.0f32; token_count * n_embd];
-        unsafe {
-            self.api.memcpy_dtoh_async(
-                output.as_mut_ptr().cast::<libc::c_void>(),
-                output_dev,
-                output_bytes,
-                self.stream,
-            )?;
-        }
-        self.stream_synchronize()?;
+        self.dtoh_f32_via_pinned(output_dev, &mut output)?;
         self.release_compute_temp_slab()?;
         Ok(output)
     }
