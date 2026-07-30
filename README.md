@@ -386,6 +386,34 @@ product CLI via `--ram-budget 32GiB`. Slower than a model that fits in
 memory? Yes — the point is that it runs at all, with predictable memory,
 instead of being rejected or OOM-killed.
 
+### Availability comparison: 35.2 GiB full-Q8 MTP on a 14 GiB host
+
+This is an availability result, not a throughput ranking. It uses one machine,
+one model file, and matched generation inputs:
+
+- Hardware: AMD BC-250, 14 GiB RAM, 7.7 GiB swap, 16,896 MiB Vulkan device
+  memory, Mesa RADV.
+- Model: `Qwen3.6-35B-A3B-Q8_0.gguf`, 37,801,097,504 bytes of mapped GGUF
+  weights.
+- Input: raw `대한민국의 수도는` prompt (5 tokens), greedy generation,
+  8 decoded tokens, EOS ignored, 12 CPU threads, and native MTP depth 1 when enabled.
+- Engines: runNburn Vulkan fullpath from change set `d9967dc`; llama.cpp
+  `b1-fb30ba9` with Vulkan auto-fit and native `draft-mtp`.
+
+| Engine and configuration | Observed result |
+|---|---|
+| runNburn Vulkan fullpath | Completed the warmup and six alternating target-only/MTP measurements. The three MTP runs had a 9.157 s median generation time, and all seven runs had SHA-256 `df80205ec3dac2214188a84c0ba30c2d327e9b9d752554e99d09eaafa139eb29`. A separate environment-unset smoke automatically enabled MTP and produced the same hash. |
+| llama.cpp native MTP, 256 MiB fit target | One interactive smoke reached 8-token generation, but a clean single-turn repeat failed to allocate an 897,028,096-byte RADV buffer and its child process was killed. |
+| llama.cpp native MTP, 2 GiB fit target | Did not complete; the host rebooted during the run under memory pressure. |
+
+There is deliberately no speed ratio for this experiment: llama.cpp did not
+produce a repeatable measured set on this host. This also does not claim that
+every llama.cpp configuration fails. Target-only execution or substantially
+less GPU offload may run, but those are different execution and memory
+conditions. The demonstrated claim is narrower: under matched full-Q8 native
+MTP conditions, runNburn completed repeatedly while the reference configuration
+was not memory-stable.
+
 ## Workspace layout
 
 ```text
