@@ -1,4 +1,8 @@
-use std::{cell::OnceCell, ptr::NonNull, sync::OnceLock};
+use std::{
+    cell::OnceCell,
+    ptr::NonNull,
+    sync::{LazyLock, OnceLock},
+};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -11,6 +15,9 @@ use objc2_metal::{
 };
 
 use crate::ffn_chain::QwenMoeLlamaIdError;
+#[path = "nocopy_alignment.rs"]
+mod nocopy_alignment;
+use nocopy_alignment::page_align;
 
 const GEMV_F32_SRC: &str = include_str!("gemv_f32.metal");
 const GEMV_Q4K_SRC: &str = include_str!("gemv_q4k.metal");
@@ -401,23 +408,18 @@ mod env_tests {
     }
 }
 
-/// Apple Silicon page size. 16KB. (sysconf(_SC_PAGESIZE) 로도 얻을 수 있으나
-/// Apple Silicon 은 고정 16384 — 구조적 상수라 하드코딩 허용.)
-const METAL_PAGE: usize = 16384;
+static HOST_PAGE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let raw_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = usize::try_from(raw_page_size)
+        .expect("Metal: sysconf(_SC_PAGESIZE) returned an invalid page size");
+    if !page_size.is_power_of_two() {
+        panic!("Metal: host page size must be a non-zero power of two");
+    }
+    page_size
+});
 
-/// mmap 내부 포인터(`raw.as_ptr() as usize`)와 weight 길이로
-/// NoCopy buffer 인자를 계산한다.
-///
-/// 반환: `(aligned_ptr, page_offset, buf_len)`
-/// - `aligned_ptr`: page 경계로 내린 base (NoCopy buffer 시작).
-/// - `page_offset`: aligned_ptr 부터 실제 weight 까지 byte offset (커널에 전달).
-/// - `buf_len`: `page_offset + raw_len` 을 page 배수로 올림 (NoCopy length).
-fn page_align(ptr: usize, raw_len: usize) -> (usize, usize, usize) {
-    let aligned = ptr & !(METAL_PAGE - 1);
-    let page_offset = ptr - aligned;
-    let span = page_offset + raw_len;
-    let buf_len = span.div_ceil(METAL_PAGE) * METAL_PAGE;
-    (aligned, page_offset, buf_len)
+fn host_page_size() -> usize {
+    *HOST_PAGE_SIZE
 }
 
 // ---------------------------------------------------------------------------
@@ -2700,7 +2702,9 @@ pub(crate) fn wrap_nocopy(
     ctx: &MetalContext,
     raw: &[u8],
 ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u32) {
-    let (aligned, page_off, buf_len) = page_align(raw.as_ptr() as usize, raw.len());
+    let (aligned, page_off, buf_len) =
+        page_align(raw.as_ptr() as usize, raw.len(), host_page_size())
+            .unwrap_or_else(|error| panic!("Metal: failed to align NoCopy weight: {error}"));
     let shared = MTLResourceOptions::StorageModeShared;
     let buf = unsafe {
         let ptr = NonNull::new(aligned as *mut std::ffi::c_void).expect("aligned ptr is null");
@@ -2708,7 +2712,8 @@ pub(crate) fn wrap_nocopy(
             .newBufferWithBytesNoCopy_length_options_deallocator(ptr, buf_len, shared, None)
             .expect("Metal: failed to create NoCopy weight buffer")
     };
-    (buf, page_off as u32)
+    let page_off = u32::try_from(page_off).expect("Metal: NoCopy page offset does not fit in u32");
+    (buf, page_off)
 }
 
 /// per-slot symmetric int8 양자화 reference (CPU ground truth — metal 커널이 1:1 emulate).
@@ -15247,49 +15252,6 @@ pub fn gemv_f32(weight: &[f32], input: &[f32], n: usize, k: usize) -> Vec<f32> {
     out_slice.to_vec()
 }
 
-#[cfg(test)]
-mod align_tests {
-    use super::page_align;
-
-    const PAGE: usize = 16384;
-
-    #[test]
-    fn aligned_ptr_zero_offset() {
-        // ptr 이 page 경계면 offset 0, len 은 raw_len round-up.
-        let (aligned, off, buf_len) = page_align(PAGE, 100);
-        assert_eq!(aligned, PAGE);
-        assert_eq!(off, 0);
-        assert_eq!(buf_len, PAGE); // 100 round-up to 16384
-    }
-
-    #[test]
-    fn mid_page_ptr_has_offset() {
-        // page 중간에서 시작: aligned 는 경계로 내림, off 는 그 차이.
-        let ptr = PAGE + 500;
-        let (aligned, off, buf_len) = page_align(ptr, 200);
-        assert_eq!(aligned, PAGE);
-        assert_eq!(off, 500);
-        assert_eq!(buf_len, PAGE); // 500+200=700 round-up to 16384
-    }
-
-    #[test]
-    fn weight_spanning_two_pages() {
-        // off+len 이 한 page 를 넘으면 buf_len 은 2 page.
-        let ptr = PAGE + 16000;
-        let (aligned, off, buf_len) = page_align(ptr, 1000);
-        assert_eq!(aligned, PAGE);
-        assert_eq!(off, 16000);
-        assert_eq!(buf_len, 2 * PAGE); // 16000+1000=17000 round-up to 32768
-    }
-
-    #[test]
-    fn exact_page_multiple_len() {
-        let (_, off, buf_len) = page_align(PAGE, PAGE);
-        assert_eq!(off, 0);
-        assert_eq!(buf_len, PAGE);
-    }
-}
-
 /// batching 효과 상한 측정: M개 GEMV 를 (A) M번 개별 commit+wait vs
 /// (B) 한 command buffer 에 M dispatch + commit/wait 1번. speedup 상한 정량화.
 /// production 은 GEMV 사이 CPU 의존성으로 이 상한에 못 미치나, 상한이 크면
@@ -16015,7 +15977,9 @@ kernel void argument_buffer_select_probe(
         device: &ProtocolObject<dyn MTLDevice>,
         raw: &[u8],
     ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u32) {
-        let (aligned, page_off, buf_len) = page_align(raw.as_ptr() as usize, raw.len());
+        let (aligned, page_off, buf_len) =
+            page_align(raw.as_ptr() as usize, raw.len(), host_page_size())
+                .expect("NoCopy probe alignment");
         let ptr = NonNull::new(aligned as *mut std::ffi::c_void).expect("aligned ptr");
         let buf = device
             .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -16048,10 +16012,11 @@ kernel void argument_buffer_select_probe(
             .newComputePipelineStateWithFunction_error(&function)
             .unwrap_or_else(|e| panic!("argument-buffer probe pipeline failed: {e:?}"));
 
-        let layout = Layout::from_size_align(METAL_PAGE, METAL_PAGE).expect("page layout");
+        let page_size = host_page_size();
+        let layout = Layout::from_size_align(page_size, page_size).expect("page layout");
         let backing_ptr = unsafe { alloc_zeroed(layout) };
         assert!(!backing_ptr.is_null(), "page allocation failed");
-        let backing = unsafe { std::slice::from_raw_parts_mut(backing_ptr, METAL_PAGE) };
+        let backing = unsafe { std::slice::from_raw_parts_mut(backing_ptr, page_size) };
         backing[64..68].copy_from_slice(&0x1122_3344u32.to_le_bytes());
         backing[128..132].copy_from_slice(&0x5566_7788u32.to_le_bytes());
         backing[192..196].copy_from_slice(&0x99aa_bbccu32.to_le_bytes());
