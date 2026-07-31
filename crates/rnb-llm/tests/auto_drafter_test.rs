@@ -25,6 +25,18 @@ fn finds_assistant_in_mtp_subdir() {
 }
 
 #[test]
+fn finds_q8_mtp_model_in_standard_subdir_for_quantized_target() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("gemma-4-E2B-it-Q4_K_M.gguf");
+    let sub = dir.path().join("MTP");
+    fs::create_dir(&sub).unwrap();
+    let assistant = sub.join("mtp-gemma-4-E2B-it-Q8_0.gguf");
+    fs::write(&target, b"placeholder").unwrap();
+    fs::write(&assistant, b"placeholder").unwrap();
+    assert_eq!(find_sibling_drafter(&target), Some(assistant));
+}
+
+#[test]
 fn returns_none_when_no_sibling() {
     let dir = tempdir().unwrap();
     let target = dir.path().join("qwen3.5-0.8B.gguf");

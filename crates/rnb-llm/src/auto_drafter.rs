@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 
 /// Look for an external drafter GGUF next to the target model.
 ///
-/// Patterns checked in order:
 /// 1. `{target_dir}/{target_stem}-assistant.Q4_K_M.gguf`
 /// 2. `{target_dir}/{target_stem}-assistant.gguf`
-/// 3. `{target_dir}/{target_stem}-mtp/{target_stem}-assistant.*.gguf`
-/// 4. `{target_dir_parent}/{target_dir_name}-mtp/{target_stem}-assistant.*.gguf`
+/// 3. `{target_dir}/MTP/mtp-{target_stem}-Q8_0.gguf`
+/// 4. `{target_dir}/{target_stem}-mtp/{target_stem}-assistant.*.gguf`
+/// 5. `{target_dir_parent}/{target_dir_name}-mtp/{target_stem}-assistant.*.gguf`
 ///    (sibling-of-parent layout used in this repo, e.g.
 ///    `models/gemma-4-E4B-mtp/` next to `models/gemma-4-E4B/`)
 pub fn find_sibling_drafter(target_path: &Path) -> Option<PathBuf> {
@@ -22,6 +22,16 @@ pub fn find_sibling_drafter(target_path: &Path) -> Option<PathBuf> {
             format!("{model_stem}-assistant.gguf"),
         ] {
             let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for model_stem in &model_stems {
+        let name = format!("mtp-{model_stem}-Q8_0.gguf");
+        for subdir in ["MTP", "mtp"] {
+            let candidate = dir.join(subdir).join(&name);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -67,6 +77,9 @@ fn candidate_model_stems(stem: &str) -> Vec<&str> {
             || matches!(suffix.as_str(), "F16" | "F32" | "BF16")
         {
             stems.push(base);
+            if let Some(base_without_ud) = base.strip_suffix("-UD") {
+                stems.push(base_without_ud);
+            }
         }
     }
     stems
@@ -99,6 +112,14 @@ mod tests {
         assert_eq!(
             candidate_model_stems("gemma-4-E4B-it-Q4_K_M"),
             vec!["gemma-4-E4B-it-Q4_K_M", "gemma-4-E4B-it"]
+        );
+        assert_eq!(
+            candidate_model_stems("gemma-4-26B-A4B-it-UD-Q4_K_M"),
+            vec![
+                "gemma-4-26B-A4B-it-UD-Q4_K_M",
+                "gemma-4-26B-A4B-it-UD",
+                "gemma-4-26B-A4B-it"
+            ]
         );
         assert_eq!(
             candidate_model_stems("gemma-4-E4B-it-BF16"),

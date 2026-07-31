@@ -573,13 +573,31 @@ fn mtp_auto_policy_for_model(
         };
     }
     if architecture == ModelArchitecture::Gemma4 {
+        let selected_moe = metadata.expert_used_count > 0;
+        let spec_k = if selected_moe { 1 } else { 3 };
+        let min_free_vram_mib = mtp_device_verify_min_free_vram_mib(metadata, spec_k);
+        let enough_free_vram = resource
+            .as_ref()
+            .is_some_and(|resource| resource.free_vram_mib >= min_free_vram_mib);
+        let enabled = cfg!(feature = "cuda") && enough_free_vram;
+        let reason = if !cfg!(feature = "cuda") {
+            "gemma4-external-cuda-only"
+        } else if resource.is_none() {
+            "cuda-resource-info-unavailable"
+        } else if !enough_free_vram {
+            "insufficient-free-vram-for-gemma4-external-mtp"
+        } else if selected_moe {
+            "gemma4-moe-external-k1-cuda-auto"
+        } else {
+            "gemma4-dense-external-k3-cuda-auto"
+        };
         return MtpAutoPolicy {
-            enabled: false,
-            spec_k: 3,
+            enabled,
+            spec_k,
             device_verify: false,
-            min_free_vram_mib: dense_min_free_vram_mib,
+            min_free_vram_mib,
             resource,
-            reason: "gemma4-external-k3-forced",
+            reason,
         };
     }
     if !device_verify_supported {
@@ -1845,8 +1863,8 @@ mod tests {
     }
 
     #[test]
-    fn mtp_auto_policy_recommends_gemma_external_k3_for_forced_runs() {
-        let policy = mtp_auto_policy_for_model(
+    fn mtp_auto_policy_selects_gemma_external_depth_from_structure() {
+        let dense = mtp_auto_policy_for_model(
             ModelArchitecture::Gemma4,
             &policy_metadata(2560, 42),
             true,
@@ -1854,11 +1872,45 @@ mod tests {
             false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
         );
+        let mut moe_metadata = policy_metadata(2560, 42);
+        moe_metadata.expert_used_count = 4;
+        let selected_moe = mtp_auto_policy_for_model(
+            ModelArchitecture::Gemma4,
+            &moe_metadata,
+            true,
+            false,
+            false,
+            Some(policy_resource(24 * 1024, 20 * 1024)),
+        );
+
+        assert_eq!(dense.spec_k, 3);
+        assert_eq!(selected_moe.spec_k, 1);
+        assert_eq!(dense.enabled, cfg!(feature = "cuda"));
+        assert_eq!(selected_moe.enabled, cfg!(feature = "cuda"));
+        assert!(!dense.device_verify);
+        assert!(!selected_moe.device_verify);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mtp_auto_policy_gates_gemma_external_mtp_on_free_vram() {
+        let metadata = policy_metadata(5376, 62);
+        let min_free_vram_mib = mtp_device_verify_min_free_vram_mib(&metadata, 3);
+        let policy = mtp_auto_policy_for_model(
+            ModelArchitecture::Gemma4,
+            &metadata,
+            true,
+            false,
+            false,
+            Some(policy_resource(12 * 1024, min_free_vram_mib - 1)),
+        );
 
         assert!(!policy.enabled);
         assert_eq!(policy.spec_k, 3);
-        assert!(!policy.device_verify);
-        assert_eq!(policy.reason, "gemma4-external-k3-forced");
+        assert_eq!(
+            policy.reason,
+            "insufficient-free-vram-for-gemma4-external-mtp"
+        );
     }
 
     #[test]
