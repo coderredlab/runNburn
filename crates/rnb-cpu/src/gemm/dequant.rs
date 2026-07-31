@@ -158,8 +158,9 @@ pub fn dequantize_row_to_slice_if_supported(
             }
             let mut tmp = [0.0f32; 256];
             for (bi, chunk) in bytes.chunks_exact(210).enumerate() {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ6_K) };
-                q::dequantize_q6_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ6_K) };
+                q::dequantize_q6_k(&block, &mut tmp);
                 output[bi * 256..(bi + 1) * 256].copy_from_slice(&tmp);
             }
             true
@@ -393,9 +394,9 @@ fn dequant_basic_blocks<T>(
     let n_blocks = bytes.len() / block_bytes;
     let mut out = vec![0.0f32; n_blocks * elems_per_block];
     for (bi, chunk) in bytes.chunks_exact(block_bytes).enumerate() {
-        let block = unsafe { &*(chunk.as_ptr() as *const T) };
+        let block = unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const T) };
         let mut tmp = [0.0f32; 32];
-        dequant_fn(block, &mut tmp);
+        dequant_fn(&block, &mut tmp);
         out[bi * elems_per_block..(bi + 1) * elems_per_block].copy_from_slice(&tmp);
     }
     out
@@ -405,6 +406,20 @@ fn dequant_basic_blocks<T>(
 mod tests {
     use super::{dequantize_bytes_to_f32, dequantize_row_to_slice_if_supported, DequantType};
 
+    fn with_odd_offset_bytes<R>(block: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+        let mut backing = vec![0u16; (block.len() + 2) / 2];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                backing.as_mut_ptr().cast::<u8>(),
+                backing.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let odd_offset = &mut bytes[1..1 + block.len()];
+        odd_offset.copy_from_slice(block);
+        assert_eq!(odd_offset.as_ptr().align_offset(2), 1);
+        f(odd_offset)
+    }
+
     #[test]
     fn dequant_f32_roundtrips_bytes() {
         let bytes = [1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat();
@@ -413,6 +428,55 @@ mod tests {
             dequantize_bytes_to_f32(&bytes, DequantType::F32),
             vec![1.5, -2.0]
         );
+    }
+
+    #[test]
+    fn basic_quant_blocks_accept_odd_byte_offsets() {
+        for (dequant_type, block_bytes) in [
+            (DequantType::Q4_1, 20usize),
+            (DequantType::Q5_0, 22usize),
+            (DequantType::Q5_1, 24usize),
+        ] {
+            let mut block = (0..block_bytes)
+                .map(|index| (index * 37 + 11) as u8)
+                .collect::<Vec<_>>();
+            block[0..2].copy_from_slice(&0x3400u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0xb800u16.to_le_bytes());
+
+            let expected = dequantize_bytes_to_f32(&block, dequant_type);
+            let actual =
+                with_odd_offset_bytes(&block, |bytes| dequantize_bytes_to_f32(bytes, dequant_type));
+            assert_eq!(
+                actual, expected,
+                "{dequant_type:?} differs at an odd byte offset"
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_row_dequant_accepts_odd_byte_offset() {
+        let mut block = (0..210)
+            .map(|index| (index * 29 + 7) as u8)
+            .collect::<Vec<_>>();
+        block[208..210].copy_from_slice(&0x3c00u16.to_le_bytes());
+
+        let mut expected = [0.0f32; 256];
+        assert!(dequantize_row_to_slice_if_supported(
+            &block,
+            DequantType::Q6K,
+            &mut expected
+        ));
+
+        let mut actual = [0.0f32; 256];
+        with_odd_offset_bytes(&block, |bytes| {
+            assert!(dequantize_row_to_slice_if_supported(
+                bytes,
+                DequantType::Q6K,
+                &mut actual
+            ));
+        });
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
