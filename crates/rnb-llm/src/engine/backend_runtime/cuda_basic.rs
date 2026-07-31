@@ -146,7 +146,6 @@ pub(in crate::engine) fn mtp_output_argmax_token_cuda(
         )
     })
 }
-
 #[cfg(feature = "cuda")]
 pub(in crate::engine) fn prefill_gemv_cuda(
     weight: &QuantizedWeight,

@@ -145,6 +145,13 @@ pub(super) fn load_model_weights(
     }
 }
 
+fn mtp_layer_uses_shared_expert_moe(architecture: ModelArchitecture) -> bool {
+    matches!(
+        architecture,
+        ModelArchitecture::Qwen35MoE | ModelArchitecture::Hy3 | ModelArchitecture::GlmDsa
+    )
+}
+
 pub(super) fn load_mtp_layer_weights(model: &LoadedModel) -> Option<MtpLayerWeights> {
     let mtp = model.metadata.mtp.as_ref()?;
     if mtp.nextn_predict_layers == 0 {
@@ -159,10 +166,7 @@ pub(super) fn load_mtp_layer_weights(model: &LoadedModel) -> Option<MtpLayerWeig
     }
 
     let layer_index = mtp.first_mtp_layer;
-    let has_shared_expert_moe = matches!(
-        model.metadata.architecture,
-        ModelArchitecture::Qwen35MoE | ModelArchitecture::GlmDsa
-    );
+    let has_shared_expert_moe = mtp_layer_uses_shared_expert_moe(model.metadata.architecture);
     let shared_expert_moe_weights = shared_expert_moe::load_shared_expert_moe_layer(
         model,
         layer_index,
@@ -246,5 +250,15 @@ mod tests {
         assert_eq!(layer_kind_for_load(&[], 0, 4), ModelLayerKind::Recurrent);
         assert_eq!(layer_kind_for_load(&[], 3, 4), ModelLayerKind::Attention);
         assert_eq!(layer_kind_for_load(&[], 0, 0), ModelLayerKind::Attention);
+    }
+
+    #[test]
+    fn hy3_mtp_layer_uses_shared_expert_moe_weights() {
+        assert!(mtp_layer_uses_shared_expert_moe(ModelArchitecture::Hy3));
+        assert!(mtp_layer_uses_shared_expert_moe(
+            ModelArchitecture::Qwen35MoE
+        ));
+        assert!(mtp_layer_uses_shared_expert_moe(ModelArchitecture::GlmDsa));
+        assert!(!mtp_layer_uses_shared_expert_moe(ModelArchitecture::Gemma4));
     }
 }

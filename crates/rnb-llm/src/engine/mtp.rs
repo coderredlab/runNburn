@@ -572,6 +572,16 @@ fn mtp_auto_policy_for_model(
             reason: "qwen35moe-k1-vulkan-fullpath-auto",
         };
     }
+    if architecture == ModelArchitecture::Gemma4 {
+        return MtpAutoPolicy {
+            enabled: false,
+            spec_k: 3,
+            device_verify: false,
+            min_free_vram_mib: dense_min_free_vram_mib,
+            resource,
+            reason: "gemma4-external-k3-forced",
+        };
+    }
     if !device_verify_supported {
         return MtpAutoPolicy {
             enabled: false,
@@ -714,6 +724,7 @@ impl Engine {
                     &drafter.layers,
                     Some(&drafter.pre_projection),
                     Some(&drafter.post_projection),
+                    Some(&drafter.token_embd),
                 ) {
                     Ok(_n) => {}
                     Err(e) => {
@@ -1834,19 +1845,20 @@ mod tests {
     }
 
     #[test]
-    fn mtp_auto_policy_keeps_gemma_device_verify_off_until_validated() {
+    fn mtp_auto_policy_recommends_gemma_external_k3_for_forced_runs() {
         let policy = mtp_auto_policy_for_model(
             ModelArchitecture::Gemma4,
             &policy_metadata(2560, 42),
             true,
-            true,
+            false,
             false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
         );
 
         assert!(!policy.enabled);
+        assert_eq!(policy.spec_k, 3);
         assert!(!policy.device_verify);
-        assert_eq!(policy.reason, "unmeasured-mtp-policy");
+        assert_eq!(policy.reason, "gemma4-external-k3-forced");
     }
 
     #[test]

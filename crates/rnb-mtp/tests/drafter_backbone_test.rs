@@ -37,6 +37,9 @@ fn mock_shared_kv_states(seq_len: usize) -> SharedKvStates {
         sliding_attention: SharedKvLayer {
             k: vec![0.01f32; sliding_len],
             v: vec![0.01f32; sliding_len],
+            k_f16: None,
+            v_f16: None,
+            source_layer_idx: None,
             n_kv_heads,
             seq_len,
             head_dim: sliding_head_dim,
@@ -44,6 +47,9 @@ fn mock_shared_kv_states(seq_len: usize) -> SharedKvStates {
         full_attention: SharedKvLayer {
             k: vec![0.01f32; full_len],
             v: vec![0.01f32; full_len],
+            k_f16: None,
+            v_f16: None,
+            source_layer_idx: None,
             n_kv_heads,
             seq_len,
             head_dim: full_head_dim,

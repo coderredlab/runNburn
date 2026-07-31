@@ -74,7 +74,7 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
     let hidden = metadata.hidden_size;
     let backbone_hidden = assistant.n_embd_backbone as usize;
     let n_heads = metadata.num_heads;
-    let n_kv_heads = metadata.num_kv_heads;
+    let default_n_kv_heads = metadata.num_kv_heads;
     let head_dim_swa = assistant.key_length_swa as usize;
     let head_dim_full = assistant.key_length_full as usize;
 
@@ -210,42 +210,45 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
 
     // --- Global tensors -----------------------------------------------------
 
-    let token_embd = take_tensor(
+    let token_embd = take_tensor_any(
         "token_embd.weight",
         &[metadata.vocab_size, hidden],
-        GGMLType::Q6_K,
+        &[GGMLType::Q6_K, GGMLType::Q8_0],
     )?;
     let output_norm = take_f32("output_norm.weight", &[hidden])?;
-    // rope_freqs.weight 는 inv freq table: 길이 = key_length_full / 2 (=256).
+    // rope_freqs.weight 는 inv freq table: 길이 = key_length_full / 2.
     let rope_freqs = take_f32("rope_freqs.weight", &[head_dim_full / 2])?;
-    let pre_projection = take_tensor(
-        "mtp.pre_projection.weight",
-        // spec §"Stage B" — pre_projection input = 2 × backbone_hidden
-        // (target current+previous hidden concat 후보; 정확한 의미는 Task 4).
+    let projection_prefix = if tensors.contains_key("nextn.pre_projection.weight") {
+        "nextn"
+    } else {
+        "mtp"
+    };
+    let pre_projection = take_tensor_any(
+        &format!("{projection_prefix}.pre_projection.weight"),
         &[hidden, 2 * backbone_hidden],
-        GGMLType::Q4_K,
+        &[GGMLType::Q4_K, GGMLType::Q8_0],
     )?;
-    let post_projection = take_tensor(
-        "mtp.post_projection.weight",
+    let post_projection = take_tensor_any(
+        &format!("{projection_prefix}.post_projection.weight"),
         &[backbone_hidden, hidden],
-        GGMLType::Q4_K,
+        &[GGMLType::Q4_K, GGMLType::Q8_0],
     )?;
-    let centroids = take_tensor(
-        "mtp.centroids.weight",
-        &[assistant.n_centroids as usize, hidden],
-        GGMLType::Q4_K,
-    )?;
+    let centroids = if assistant.use_ordered_embeddings {
+        Some(take_tensor_any(
+            "mtp.centroids.weight",
+            &[assistant.n_centroids as usize, hidden],
+            &[GGMLType::Q4_K, GGMLType::Q8_0],
+        )?)
+    } else {
+        None
+    };
 
-    // `mtp.token_ordering.weight` I32 [vocab_size] — transformers source
-    // 의 explicit permutation buffer. token_id → cluster slot. Q4_K_M GGUF
-    // 에 함께 박혀있다. byte-wise i32→u32 로 읽어들임 (token id 는 항상
-    // non-negative 이고 i32/u32 byte layout 이 동일).
-    let token_ordering_view = take_tensor(
-        "mtp.token_ordering.weight",
-        &[metadata.vocab_size],
-        GGMLType::I32,
-    )?;
-    let token_ordering = {
+    let token_ordering = if assistant.use_ordered_embeddings {
+        let token_ordering_view = take_tensor(
+            "mtp.token_ordering.weight",
+            &[metadata.vocab_size],
+            GGMLType::I32,
+        )?;
         let bytes = token_ordering_view.as_bytes();
         if bytes.len() != metadata.vocab_size * 4 {
             return Err(DrafterLoadError::Parse(format!(
@@ -254,11 +257,12 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
                 metadata.vocab_size
             )));
         }
-        let mut out = Vec::with_capacity(metadata.vocab_size);
-        for chunk in bytes.chunks_exact(4) {
-            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        out
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    } else {
+        Vec::new()
     };
 
     // --- Per-layer tensors --------------------------------------------------
@@ -280,6 +284,12 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
         // so attn_q output rows = n_heads * 256 = 1024; full uses 512 → 2048.
         let head_dim = if is_swa { head_dim_swa } else { head_dim_full };
         let q_out = n_heads * head_dim;
+        let n_kv_heads = metadata
+            .head_count_kv_per_layer
+            .as_ref()
+            .and_then(|counts| counts.get(layer_idx))
+            .copied()
+            .unwrap_or(default_n_kv_heads);
         let q_norm_len = head_dim;
 
         let prefix = format!("blk.{layer_idx}");
@@ -293,32 +303,30 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
             take_f32(&format!("{prefix}.layer_output_scale.weight"), &[1])?;
         let layer_output_scale = layer_output_scale_vec[0];
 
-        let attn_q = take_tensor(
+        let attn_q = take_tensor_any(
             &format!("{prefix}.attn_q.weight"),
             &[q_out, hidden],
-            GGMLType::Q4_K,
+            &[GGMLType::Q4_K, GGMLType::Q8_0],
         )?;
-        let attn_output = take_tensor(
+        let attn_output = take_tensor_any(
             &format!("{prefix}.attn_output.weight"),
             &[hidden, q_out],
-            GGMLType::Q4_K,
+            &[GGMLType::Q4_K, GGMLType::Q8_0],
         )?;
-        let ffn_gate = take_tensor(
+        let ffn_gate = take_tensor_any(
             &format!("{prefix}.ffn_gate.weight"),
             &[ffn_dim, hidden],
-            GGMLType::Q4_K,
+            &[GGMLType::Q4_K, GGMLType::Q8_0],
         )?;
-        let ffn_up = take_tensor(
+        let ffn_up = take_tensor_any(
             &format!("{prefix}.ffn_up.weight"),
             &[ffn_dim, hidden],
-            GGMLType::Q4_K,
+            &[GGMLType::Q4_K, GGMLType::Q8_0],
         )?;
-        // ffn_down: drafter mixes Q4_K (layers 0-1) and Q6_K (layers 2-3).
-        // We accept both, then the forward kernel dispatches on `ggml_type`.
         let ffn_down = take_tensor_any(
             &format!("{prefix}.ffn_down.weight"),
             &[hidden, ffn_dim],
-            &[GGMLType::Q4_K, GGMLType::Q6_K],
+            &[GGMLType::Q4_K, GGMLType::Q6_K, GGMLType::Q8_0],
         )?;
 
         layers.push(DrafterLayer {
@@ -387,6 +395,15 @@ fn tensor_byte_len(t: &TensorInfo) -> Result<usize, DrafterLoadError> {
                 )));
             }
             Ok((elem_count / 256) * 210)
+        }
+        GGMLType::Q8_0 => {
+            if elem_count % 32 != 0 {
+                return Err(DrafterLoadError::Parse(format!(
+                    "{}: Q8_0 elem_count {elem_count} not multiple of 32",
+                    t.name
+                )));
+            }
+            Ok((elem_count / 32) * 34)
         }
         other => Err(DrafterLoadError::UnsupportedDtype(other)),
     }

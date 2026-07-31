@@ -28,6 +28,46 @@ pub(crate) fn drafter_ffn_cuda(
 ) -> Result<bool, String> {
     use rnb_loader::GGMLType;
 
+    if input.len() < n_embd || output.len() < n_embd {
+        return Err(format!(
+            "drafter_ffn_cuda buffer size mismatch: input={} output={} n_embd={n_embd}",
+            input.len(),
+            output.len()
+        ));
+    }
+
+    if matches!(
+        (
+            gate_weight.ggml_type,
+            up_weight.ggml_type,
+            down_weight.ggml_type
+        ),
+        (GGMLType::Q8_0, GGMLType::Q8_0, GGMLType::Q8_0)
+    ) {
+        let mut gate = rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            gate_weight.as_bytes(),
+            n_ff,
+            n_embd,
+            &input[..n_embd],
+        )?;
+        let up = rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            up_weight.as_bytes(),
+            n_ff,
+            n_embd,
+            &input[..n_embd],
+        )?;
+        for (gate_value, up_value) in gate.iter_mut().zip(up) {
+            *gate_value = *gate_value / (1.0 + (-*gate_value).exp()) * up_value;
+        }
+        let result = rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            down_weight.as_bytes(),
+            n_embd,
+            n_ff,
+            &gate,
+        )?;
+        output[..n_embd].copy_from_slice(&result[..n_embd]);
+        return Ok(true);
+    }
     // dense_q4k_gelu_ffn 의 hot path = gate/up Q4_K + down Q4_K 또는 Q6_K.
     // 다른 quant (F32/F16 등) 은 host fallback.
     if gate_weight.ggml_type != GGMLType::Q4_K || up_weight.ggml_type != GGMLType::Q4_K {
@@ -35,13 +75,6 @@ pub(crate) fn drafter_ffn_cuda(
     }
     if !matches!(down_weight.ggml_type, GGMLType::Q4_K | GGMLType::Q6_K) {
         return Ok(false);
-    }
-    if input.len() < n_embd || output.len() < n_embd {
-        return Err(format!(
-            "drafter_ffn_cuda buffer size mismatch: input={} output={} n_embd={n_embd}",
-            input.len(),
-            output.len()
-        ));
     }
 
     // drafter 는 SwiGLU (silu) activation. seq_len=1 의 batch variant 호출.
@@ -92,7 +125,7 @@ pub(crate) fn drafter_ffn_cuda(
 pub fn drafter_prewarm_weights_cuda(
     layers: &[super::types::DrafterLayer],
 ) -> Result<usize, String> {
-    drafter_prewarm_weights_cuda_full(layers, None, None)
+    drafter_prewarm_weights_cuda_full(layers, None, None, None)
 }
 
 /// cu61: drafter prewarm 의 full variant — layer weight + 글로벌 weight
@@ -102,32 +135,50 @@ pub fn drafter_prewarm_weights_cuda_full(
     layers: &[super::types::DrafterLayer],
     pre_projection: Option<&TensorView>,
     post_projection: Option<&TensorView>,
+    token_embd: Option<&TensorView>,
 ) -> Result<usize, String> {
     use rnb_loader::GGMLType;
 
-    let mut q4k_slices: Vec<&[u8]> = Vec::new();
+    let mut tensors = Vec::with_capacity(layers.len() * 5 + 3);
     for layer in layers {
-        for tensor in [&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down] {
-            if tensor.ggml_type == GGMLType::Q4_K {
-                q4k_slices.push(tensor.as_bytes());
-            }
-        }
-        for tensor in [&layer.attn_q, &layer.attn_output] {
-            if tensor.ggml_type == GGMLType::Q4_K {
-                q4k_slices.push(tensor.as_bytes());
-            }
+        tensors.extend([
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &layer.ffn_down,
+            &layer.attn_q,
+            &layer.attn_output,
+        ]);
+    }
+    tensors.extend(
+        [pre_projection, post_projection, token_embd]
+            .into_iter()
+            .flatten(),
+    );
+
+    let q4k_slices: Vec<&[u8]> = tensors
+        .iter()
+        .filter(|tensor| tensor.ggml_type == GGMLType::Q4_K)
+        .map(|tensor| tensor.as_bytes())
+        .collect();
+    let mut prewarmed = if q4k_slices.is_empty() {
+        0
+    } else {
+        rnb_runtime::cuda_inference::cuda::prewarm_q4k_weight_slices(&q4k_slices)
+            .map_err(|e| format!("drafter prewarm Q4_K failed: {e}"))?
+    };
+
+    for tensor in tensors {
+        if tensor.ggml_type == GGMLType::Q8_0 {
+            rnb_runtime::compute::prewarm_q8_0_weight(
+                tensor.as_bytes(),
+                tensor.shape[0],
+                tensor.shape[1],
+            )
+            .map_err(|e| format!("drafter prewarm Q8_0 failed: {e}"))?;
+            prewarmed += 1;
         }
     }
-    for tensor in [pre_projection, post_projection].into_iter().flatten() {
-        if tensor.ggml_type == GGMLType::Q4_K {
-            q4k_slices.push(tensor.as_bytes());
-        }
-    }
-    if q4k_slices.is_empty() {
-        return Ok(0);
-    }
-    rnb_runtime::cuda_inference::cuda::prewarm_q4k_weight_slices(&q4k_slices)
-        .map_err(|e| format!("drafter prewarm Q4_K failed: {e}"))
+    Ok(prewarmed)
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -135,6 +186,7 @@ pub fn drafter_prewarm_weights_cuda_full(
     _layers: &[super::types::DrafterLayer],
     _pre_projection: Option<&TensorView>,
     _post_projection: Option<&TensorView>,
+    _token_embd: Option<&TensorView>,
 ) -> Result<usize, String> {
     Ok(0)
 }
@@ -166,7 +218,7 @@ pub(crate) fn drafter_attn_q_cuda(
 ) -> Result<bool, String> {
     use rnb_loader::GGMLType;
 
-    if attn_q_weight.ggml_type != GGMLType::Q4_K {
+    if !matches!(attn_q_weight.ggml_type, GGMLType::Q4_K | GGMLType::Q8_0) {
         return Ok(false);
     }
     if hidden.len() < hidden_size || output.len() < q_dim {
@@ -176,12 +228,21 @@ pub(crate) fn drafter_attn_q_cuda(
         ));
     }
 
-    let result = rnb_runtime::cuda_inference::cuda::q4k_gemv(
-        attn_q_weight.as_bytes(),
-        q_dim,
-        hidden_size,
-        &hidden[..hidden_size],
-    )?;
+    let result = match attn_q_weight.ggml_type {
+        GGMLType::Q4_K => rnb_runtime::cuda_inference::cuda::q4k_gemv(
+            attn_q_weight.as_bytes(),
+            q_dim,
+            hidden_size,
+            &hidden[..hidden_size],
+        )?,
+        GGMLType::Q8_0 => rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            attn_q_weight.as_bytes(),
+            q_dim,
+            hidden_size,
+            &hidden[..hidden_size],
+        )?,
+        _ => unreachable!(),
+    };
     if result.len() < q_dim {
         return Err(format!(
             "drafter_attn_q_cuda output len {} < q_dim {}",
@@ -216,7 +277,10 @@ pub(crate) fn drafter_attn_o_cuda(
     q_dim: usize,
 ) -> Result<bool, String> {
     use rnb_loader::GGMLType;
-    if attn_output_weight.ggml_type != GGMLType::Q4_K {
+    if !matches!(
+        attn_output_weight.ggml_type,
+        GGMLType::Q4_K | GGMLType::Q8_0
+    ) {
         return Ok(false);
     }
     if attn_out.len() < q_dim || output.len() < hidden_size {
@@ -225,12 +289,21 @@ pub(crate) fn drafter_attn_o_cuda(
             attn_out.len(), output.len()
         ));
     }
-    let result = rnb_runtime::cuda_inference::cuda::q4k_gemv(
-        attn_output_weight.as_bytes(),
-        hidden_size,
-        q_dim,
-        &attn_out[..q_dim],
-    )?;
+    let result = match attn_output_weight.ggml_type {
+        GGMLType::Q4_K => rnb_runtime::cuda_inference::cuda::q4k_gemv(
+            attn_output_weight.as_bytes(),
+            hidden_size,
+            q_dim,
+            &attn_out[..q_dim],
+        )?,
+        GGMLType::Q8_0 => rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            attn_output_weight.as_bytes(),
+            hidden_size,
+            q_dim,
+            &attn_out[..q_dim],
+        )?,
+        _ => unreachable!(),
+    };
     if result.len() < hidden_size {
         return Err(format!(
             "drafter_attn_o_cuda output len {} < hidden_size {}",
@@ -266,7 +339,7 @@ pub(crate) fn drafter_projection_cuda(
     in_cols: usize,
 ) -> Result<bool, String> {
     use rnb_loader::GGMLType;
-    if projection_weight.ggml_type != GGMLType::Q4_K {
+    if !matches!(projection_weight.ggml_type, GGMLType::Q4_K | GGMLType::Q8_0) {
         return Ok(false);
     }
     if input.len() < in_cols || output.len() < out_rows {
@@ -275,12 +348,21 @@ pub(crate) fn drafter_projection_cuda(
             input.len(), output.len()
         ));
     }
-    let result = rnb_runtime::cuda_inference::cuda::q4k_gemv(
-        projection_weight.as_bytes(),
-        out_rows,
-        in_cols,
-        &input[..in_cols],
-    )?;
+    let result = match projection_weight.ggml_type {
+        GGMLType::Q4_K => rnb_runtime::cuda_inference::cuda::q4k_gemv(
+            projection_weight.as_bytes(),
+            out_rows,
+            in_cols,
+            &input[..in_cols],
+        )?,
+        GGMLType::Q8_0 => rnb_runtime::cuda_inference::cuda::q8_0_gemv(
+            projection_weight.as_bytes(),
+            out_rows,
+            in_cols,
+            &input[..in_cols],
+        )?,
+        _ => unreachable!(),
+    };
     if result.len() < out_rows {
         return Err(format!(
             "drafter_projection_cuda result len {} < out_rows {}",
@@ -302,6 +384,31 @@ pub(crate) fn drafter_projection_cuda(
     _in_cols: usize,
 ) -> Result<bool, String> {
     Ok(false)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn drafter_direct_vocab_argmax(
+    weight: &TensorView,
+    input: &[f32],
+) -> Result<Option<(u32, f32)>, String> {
+    if weight.ggml_type != rnb_loader::GGMLType::Q8_0 {
+        return Ok(None);
+    }
+    rnb_runtime::compute::q8_0_gemv_argmax(
+        weight.as_bytes(),
+        weight.shape[0],
+        weight.shape[1],
+        input,
+    )
+    .map(Some)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn drafter_direct_vocab_argmax(
+    _weight: &TensorView,
+    _input: &[f32],
+) -> Result<Option<(u32, f32)>, String> {
+    Ok(None)
 }
 
 /// cu63: drafter cross_attention_gqa cuda port. cu29 의 decode_attention
@@ -453,6 +560,65 @@ pub(crate) fn drafter_cross_attention_cuda_cached(
     }
     out[..n_heads * head_dim].copy_from_slice(&result[..n_heads * head_dim]);
     Ok(true)
+}
+
+/// Native token-major target K/V를 CUDA incremental cache로 사용한다.
+/// 첫 호출만 전체 K/V를 올리고 이후 round는 새 token suffix만 전송한다.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drafter_cross_attention_cuda_resident(
+    source_layer_idx: usize,
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    seq_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) -> Result<bool, String> {
+    if seq_len == 0 {
+        out.fill(0.0);
+        return Ok(true);
+    }
+    let namespace = 1usize << (usize::BITS - 1);
+    let cache_layer_idx = namespace | source_layer_idx;
+    let result = rnb_runtime::compute::attention_decode_cached(
+        cache_layer_idx,
+        q,
+        k_f16,
+        v_f16,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        1.0,
+    )?;
+    if result.len() < n_heads * head_dim {
+        return Err(format!(
+            "drafter resident cross-attention result len {} < {}",
+            result.len(),
+            n_heads * head_dim
+        ));
+    }
+    out[..n_heads * head_dim].copy_from_slice(&result[..n_heads * head_dim]);
+    Ok(true)
+}
+
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drafter_cross_attention_cuda_resident(
+    _source_layer_idx: usize,
+    _q: &[f32],
+    _k_f16: &[u16],
+    _v_f16: &[u16],
+    _seq_len: usize,
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _out: &mut [f32],
+) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[cfg(not(feature = "cuda"))]

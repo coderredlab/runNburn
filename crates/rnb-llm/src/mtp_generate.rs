@@ -171,6 +171,10 @@ fn mtp_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> b
     cfg!(all(feature = "metal", not(feature = "cuda")))
         && matches!(architecture, rnb_loader::Architecture::GlmDsa)
 }
+fn mtp_external_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> bool {
+    mtp_batch_verify_default_enabled(architecture)
+        || (cfg!(feature = "cuda") && architecture == rnb_loader::Architecture::Gemma4)
+}
 
 fn mtp_batch_verify_requested(forced: bool, disabled: bool, default_enabled: bool) -> bool {
     !disabled && (forced || default_enabled)
@@ -183,7 +187,8 @@ fn mtp_external_batch_verify_allowed(
     default_enabled: bool,
 ) -> bool {
     mtp_batch_verify_requested(forced, disabled, default_enabled)
-        && !mtp_target_needs_sequential(architecture)
+        && (!mtp_target_needs_sequential(architecture)
+            || (architecture == rnb_loader::Architecture::Gemma4 && (forced || default_enabled)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1720,14 +1725,28 @@ fn generate_with_external_drafter(
         engine.architecture(),
         crate::runtime::mtp_batch_verify_enabled(),
         crate::runtime::mtp_batch_verify_disabled(),
-        mtp_batch_verify_default_enabled(engine.architecture()),
+        mtp_external_batch_verify_default_enabled(engine.architecture()),
     );
-    if crate::runtime::mtp_batch_verify_enabled() && target_needs_sequential {
+    if crate::runtime::mtp_batch_verify_enabled()
+        && target_needs_sequential
+        && !external_batch_verify
+    {
         eprintln!(
             "[MTP/ext] batch verify disabled for {:?}; using sequential target verify",
             engine.architecture()
         );
     }
+    if external_batch_verify && engine.architecture() == rnb_loader::Architecture::Gemma4 {
+        let reserve_len = engine
+            .kv_cache
+            .current_len()
+            .saturating_add(tokens_remaining)
+            .saturating_add(draft_n)
+            .saturating_add(1);
+        engine.kv_cache.convert_to_f16(reserve_len);
+    }
+
+    let mut shared_kv = engine.shared_kv_view();
 
     // ── 5. Draft → Verify → Commit 루프 ────────────────────────────────────
     while tokens_remaining > 0 {
@@ -1736,7 +1755,7 @@ fn generate_with_external_drafter(
         //     &self borrow 를 여기서 끝내야 이후 &mut borrow 가 가능하다.
         let t0 = std::time::Instant::now();
         let target_last_hidden: Vec<f32> = engine.last_hidden_for_decode().to_vec();
-        let shared_kv = engine.shared_kv_view(); // owned SharedKvStates
+        engine.refresh_shared_kv_view(&mut shared_kv);
         let position_before_verify = engine.kv_cache.current_len() as u32;
         if timing_enabled {
             t_setup += t0.elapsed().as_secs_f64() * 1000.0;
@@ -1747,7 +1766,7 @@ fn generate_with_external_drafter(
         // 올바른 inputs_embeds 구성 (reference: drafter_backbone_calibrate_test.rs:214-295):
         //   첫 절반 = target.token_embd_row(prev_tok) * sqrt(backbone_hidden)
         //   둘째 절반 = target_last_hidden (매 draft step 고정)
-        //   position_id = last_validated_position + step  (0-based step)
+        //   position_id = current token position, constant across the draft loop
         //
         // 기존 ExternalDrafterStepper::draft_n 은 [last_target_hidden ; last_drafter_hidden]
         // 구성으로 spec drift 가 있었음. Stepper 구조체 자체는 trait completeness 로 keep.
@@ -1770,10 +1789,11 @@ fn generate_with_external_drafter(
 
             let backbone = drafter_arc.backbone_hidden;
             let embed_scale = (backbone as f32).sqrt();
-            // last_validated_position 은 multi-step draft 동안 constant
-            // (backbone.rs:75 의 spec §7). drafter 가 sliding/full attention
-            // 의 cached KV 를 reuse 하므로 position 갱신 불필요.
-            let last_validated_position = position_before_verify.saturating_sub(1);
+            // The current token has not been appended to target KV yet, so its
+            // position is exactly the current KV length. Transformers'
+            // Gemma4CandidateGenerator uses input_ids.shape[1] - 1, which is
+            // the same value under this loop invariant.
+            let current_token_position = position_before_verify;
 
             let mut inputs = vec![0.0f32; 2 * backbone];
             // step 0 의 last_hidden = target 의 prefill 후 last_hidden.
@@ -1797,7 +1817,7 @@ fn generate_with_external_drafter(
                     &drafter_arc,
                     &inputs,
                     &shared_kv,
-                    last_validated_position,
+                    current_token_position,
                 );
                 let tok = crate::external_drafter::argmax(&out.logits);
                 result.push(tok);
@@ -1867,7 +1887,8 @@ fn generate_with_external_drafter(
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
         } else if external_batch_verify {
-            let target_preds = engine.forward_batch_verify(&verify_seq, position_before_verify)?;
+            let (target_preds, output_hidden_rows) =
+                engine.forward_batch_verify(&verify_seq, position_before_verify)?;
             if timing_enabled {
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
@@ -1883,6 +1904,10 @@ fn generate_with_external_drafter(
 
             let new_kv_position = position_before_verify + outcome.accepted_draft_tokens as u32 + 1;
             engine.commit_kv_through(new_kv_position);
+            engine.restore_batch_verify_last_hidden(
+                &output_hidden_rows,
+                outcome.accepted_draft_tokens + 1,
+            )?;
 
             accepted_draft_tokens = outcome.accepted_draft_tokens;
             stats.accepted += outcome.accepted_draft_tokens;
@@ -2316,15 +2341,27 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_external_mtp_verify_stays_sequential_until_batch_parity_exists() {
+    fn gemma4_external_mtp_verify_uses_cuda_parallel_default_with_opt_out() {
         assert!(mtp_target_needs_sequential(
             rnb_loader::Architecture::Gemma4
         ));
-        assert!(!mtp_external_batch_verify_allowed(
+        assert!(mtp_external_batch_verify_allowed(
             rnb_loader::Architecture::Gemma4,
             true,
             false,
             false
+        ));
+        assert!(mtp_external_batch_verify_allowed(
+            rnb_loader::Architecture::Gemma4,
+            false,
+            false,
+            true
+        ));
+        assert!(!mtp_external_batch_verify_allowed(
+            rnb_loader::Architecture::Gemma4,
+            false,
+            true,
+            true
         ));
     }
 

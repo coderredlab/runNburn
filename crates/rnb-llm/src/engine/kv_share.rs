@@ -152,15 +152,36 @@ impl Engine {
             "kv_dim {kv_dim} not divisible by head_dim {head_dim} at layer {layer_idx}"
         );
 
-        let k_raw = kv.k_layer(layer_idx);
-        let v_raw = kv.v_layer(layer_idx);
-
-        let k = transpose_to_head_major(&k_raw, seq_len, n_kv_heads, head_dim);
-        let v = transpose_to_head_major(&v_raw, seq_len, n_kv_heads, head_dim);
+        let use_native_cuda_kv =
+            cfg!(feature = "cuda") && crate::runtime::policy::drafter_cuda_enabled();
+        let (k, v, k_f16, v_f16, source_layer_idx) = if use_native_cuda_kv {
+            let raw = self.kv_cache.read_up_to(layer_idx, seq_len);
+            let (k_bits, v_bits) = raw.as_slices();
+            (
+                Vec::new(),
+                Vec::new(),
+                Some(k_bits.to_vec()),
+                Some(v_bits.to_vec()),
+                Some(layer_idx),
+            )
+        } else {
+            let k_raw = kv.k_layer(layer_idx);
+            let v_raw = kv.v_layer(layer_idx);
+            (
+                transpose_to_head_major(&k_raw, seq_len, n_kv_heads, head_dim),
+                transpose_to_head_major(&v_raw, seq_len, n_kv_heads, head_dim),
+                None,
+                None,
+                None,
+            )
+        };
 
         SharedKvLayer {
             k,
             v,
+            k_f16,
+            v_f16,
+            source_layer_idx,
             n_kv_heads,
             seq_len,
             head_dim,
@@ -199,6 +220,46 @@ impl Engine {
         self.shared_kv_states_for_drafter()
     }
 
+    /// 이미 materialize한 native F16 shared K/V에 새 committed token suffix만 붙인다.
+    pub(crate) fn refresh_shared_kv_view(&self, shared_kv: &mut SharedKvStates) {
+        if shared_kv.sliding_attention.source_layer_idx.is_none()
+            || shared_kv.full_attention.source_layer_idx.is_none()
+        {
+            *shared_kv = self.shared_kv_states_for_drafter();
+            return;
+        }
+        self.refresh_shared_kv_layer(&mut shared_kv.sliding_attention);
+        self.refresh_shared_kv_layer(&mut shared_kv.full_attention);
+    }
+
+    fn refresh_shared_kv_layer(&self, layer: &mut SharedKvLayer) {
+        let source_layer_idx = layer
+            .source_layer_idx
+            .expect("native shared KV source layer missing");
+        let end = self.kv_cache.current_len();
+        let start = layer.seq_len;
+        assert!(
+            end >= start,
+            "shared KV committed length moved backwards: {start} -> {end}"
+        );
+        if end == start {
+            return;
+        }
+        let raw = self.kv_cache.read_range(source_layer_idx, start, end);
+        let (k_bits, v_bits) = raw.as_slices();
+        layer
+            .k_f16
+            .as_mut()
+            .expect("native shared K cache missing")
+            .extend_from_slice(k_bits);
+        layer
+            .v_f16
+            .as_mut()
+            .expect("native shared V cache missing")
+            .extend_from_slice(v_bits);
+        layer.seq_len = end;
+    }
+
     /// N+1 token parallel forward for MTP verify (mc78 Task 10).
     ///
     /// `tokens` 슬라이스 (보통 `[anchor_token, draft_t1, ..., draft_tN]`, 길이 N+1) 를
@@ -219,14 +280,14 @@ impl Engine {
         &mut self,
         tokens: &[u32],
         _position_offset: u32,
-    ) -> crate::error::Result<Vec<u32>> {
+    ) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
         // mc78 verify wall fix: 기존 forward_prefill_all_logits 는 host CPU lm_head
         // (모든 N+1 position × 262144 vocab × 1536 hidden Q6_K dequant + matmul)
-        // 로 verify wall 의 큰 부분. forward_prefill_argmax_tokens_collect_mtp 가
-        // GPU argmax-only path (cu39 의 prefill_output_argmax_token_cuda 활용) 로
-        // logits 전체 안 만들고 token id 만 반환 — 훨씬 빠름.
-        let result = self.forward_prefill_argmax_tokens_collect_mtp(tokens)?;
-        Ok(result.target_tokens)
+        // 로 verify wall 의 큰 부분. GPU argmax-only path 는 logits 전체 대신 token
+        // id 와 rollback 가능한 output-normalized hidden row 만 반환한다.
+        let (result, output_hidden_rows) =
+            self.forward_prefill_argmax_tokens_collect_output_hidden(tokens)?;
+        Ok((result.target_tokens, output_hidden_rows))
     }
 
     /// Target Engine 의 KV cache 를 `new_position` 으로 truncate 한다.
@@ -244,6 +305,40 @@ impl Engine {
     pub(crate) fn commit_kv_through(&mut self, new_position: u32) {
         let new_len = (new_position as usize).min(self.kv_cache.max_seq_len);
         self.kv_cache.set_len(new_len);
+    }
+    pub(crate) fn restore_batch_verify_last_hidden(
+        &mut self,
+        output_hidden_rows: &[f32],
+        committed_tokens: usize,
+    ) -> crate::error::Result<()> {
+        if committed_tokens == 0 {
+            return Err(crate::error::LlmError::Forward(
+                "batch verify must commit at least the anchor token".to_string(),
+            ));
+        }
+        let hidden_dim = self.metadata.hidden_dim;
+        let start = committed_tokens
+            .checked_sub(1)
+            .and_then(|row| row.checked_mul(hidden_dim))
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "batch verify committed hidden row offset overflow".to_string(),
+                )
+            })?;
+        let end = start.checked_add(hidden_dim).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "batch verify committed hidden row length overflow".to_string(),
+            )
+        })?;
+        let row = output_hidden_rows.get(start..end).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "batch verify hidden rows too short: committed={committed_tokens}, values={}, hidden_dim={hidden_dim}",
+                output_hidden_rows.len()
+            ))
+        })?;
+        self.last_layer_hidden_cached.clear();
+        self.last_layer_hidden_cached.extend_from_slice(row);
+        Ok(())
     }
 
     /// Target `token_embd.weight` 의 row `[token_id]` 를 f32 로 dequant 한 결과.

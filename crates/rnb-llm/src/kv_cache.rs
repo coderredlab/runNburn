@@ -76,6 +76,25 @@ impl LayerCache {
             max_seq_len,
         })
     }
+    fn convert_to_f16(&mut self, current_len: usize, reserve_len: usize) {
+        let stride = self.num_kv_heads * self.head_dim;
+        let reserve_len = reserve_len.max(current_len).min(self.max_seq_len);
+        let value_count = reserve_len * stride;
+        match &mut self.storage {
+            LayerCacheStorage::F16 { key, value } => {
+                key.resize(value_count, 0);
+                value.resize(value_count, 0);
+            }
+            LayerCacheStorage::Kvarn(cache) => {
+                let (source_key, source_value) = cache.materialize(current_len);
+                let mut key = vec![0u16; value_count];
+                let mut value = vec![0u16; value_count];
+                key[..source_key.len()].copy_from_slice(&source_key);
+                value[..source_value.len()].copy_from_slice(&source_value);
+                self.storage = LayerCacheStorage::F16 { key, value };
+            }
+        }
+    }
 
     fn write_at(&mut self, pos: usize, k_slice: &[f32], v_slice: &[f32]) {
         assert!(pos < self.max_seq_len, "KV cache overflow");
@@ -83,6 +102,9 @@ impl LayerCache {
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
                 let start = pos * stride;
+                let end = start + stride;
+                key.resize(end, 0);
+                value.resize(end, 0);
                 for i in 0..stride {
                     key[start + i] = half::f16::from_f32(k_slice[i]).to_bits();
                     value[start + i] = half::f16::from_f32(v_slice[i]).to_bits();
@@ -115,6 +137,20 @@ impl LayerCache {
         }
     }
 
+    fn read_range_materialized(&self, start: usize, end: usize) -> LayerCacheRead<'_> {
+        let stride = self.num_kv_heads * self.head_dim;
+        match &self.storage {
+            LayerCacheStorage::F16 { key, value } => LayerCacheRead::Borrowed {
+                key: &key[start * stride..end * stride],
+                value: &value[start * stride..end * stride],
+            },
+            LayerCacheStorage::Kvarn(cache) => {
+                let (key, value) = cache.materialize_range(start, end);
+                LayerCacheRead::Materialized { key, value }
+            }
+        }
+    }
+
     #[cfg(any(feature = "cuda", test))]
     pub(crate) fn read_up_to_materialized_if_initialized(
         &self,
@@ -130,7 +166,11 @@ impl LayerCache {
     fn bits_up_to_mut(&mut self, len: usize) -> (&mut [u16], &mut [u16]) {
         let count = len * self.num_kv_heads * self.head_dim;
         match &mut self.storage {
-            LayerCacheStorage::F16 { key, value } => (&mut key[..count], &mut value[..count]),
+            LayerCacheStorage::F16 { key, value } => {
+                key.resize(count, 0);
+                value.resize(count, 0);
+                (&mut key[..count], &mut value[..count])
+            }
             LayerCacheStorage::Kvarn(_) => {
                 panic!("mutable contiguous K/V is unavailable for a KVarN cache")
             }
@@ -146,6 +186,8 @@ impl LayerCache {
         );
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
+                key.resize(count, 0);
+                value.resize(count, 0);
                 key[..count].copy_from_slice(&k_bits[..count]);
                 value[..count].copy_from_slice(&v_bits[..count]);
             }
@@ -172,10 +214,9 @@ impl LayerCache {
         );
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
-                assert!(
-                    end <= key.len() && end <= value.len(),
-                    "KV bits range overflow"
-                );
+                assert!(end <= self.max_seq_len * stride, "KV bits range overflow");
+                key.resize(end, 0);
+                value.resize(end, 0);
                 key[start..end].copy_from_slice(&k_bits[..count]);
                 value[start..end].copy_from_slice(&v_bits[..count]);
             }
@@ -449,6 +490,12 @@ impl KVCache {
             glm_indexer_top_k: 0,
         })
     }
+    pub(crate) fn convert_to_f16(&mut self, reserve_len: usize) {
+        let current_len = self.current_len;
+        for layer in &mut self.layers {
+            layer.convert_to_f16(current_len, reserve_len);
+        }
+    }
 
     /// pm119: GLM DSA indexer key 캐시 활성화 (엔진 init 에서 indexer weight
     /// 로드 확인 후 호출). `top_k` 는 attend 길이가 이를 넘을 때 selected-set
@@ -552,6 +599,9 @@ impl KVCache {
     }
     pub(crate) fn read_up_to(&self, layer: usize, len: usize) -> LayerCacheRead<'_> {
         self.layers[layer].read_up_to_materialized(len)
+    }
+    pub(crate) fn read_range(&self, layer: usize, start: usize, end: usize) -> LayerCacheRead<'_> {
+        self.layers[layer].read_range_materialized(start, end)
     }
 
     #[cfg(test)]
@@ -1480,5 +1530,43 @@ mod tests {
         cache.compact_layer(0).unwrap();
         assert_eq!(cache.current_len(), 201);
         assert_eq!(cache.read_up_to(0, 201).as_slices().0.len(), 201 * width);
+    }
+    #[test]
+    fn kvarn_to_f16_conversion_preserves_rows_and_grows_on_append() {
+        let width = 16;
+        let mut cache = KVCache::new_per_layer_with_formats(
+            384,
+            &[1],
+            &[width],
+            &[KvCacheFormat::KvarnK4V4G64],
+        )
+        .unwrap();
+        let key = (0..96 * width)
+            .map(|index| half::f16::from_f32((index as f32 * 0.013).sin()).to_bits())
+            .collect::<Vec<_>>();
+        let value = (0..96 * width)
+            .map(|index| half::f16::from_f32((index as f32 * 0.017).cos()).to_bits())
+            .collect::<Vec<_>>();
+        cache.append_bits_range(0, 0, 96, &key, &value);
+        cache.compact_layer(0).unwrap();
+        let expected = {
+            let materialized = cache.read_up_to(0, 96);
+            let (key, value) = materialized.as_slices();
+            (key.to_vec(), value.to_vec())
+        };
+
+        cache.convert_to_f16(96);
+
+        assert!(!cache.layer_uses_kvarn(0));
+        assert_eq!(cache.current_len(), 96);
+        assert_eq!(
+            cache.read_up_to(0, 96).as_slices(),
+            (expected.0.as_slice(), expected.1.as_slice())
+        );
+
+        cache.append(0, 96, &vec![0.5; width], &vec![-0.25; width]);
+        assert_eq!(cache.current_len(), 97);
+        let grown = cache.read_up_to(0, 97);
+        assert_eq!(grown.as_slices().0.len(), 97 * width);
     }
 }

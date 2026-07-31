@@ -49,7 +49,11 @@ fn loads_e4b_assistant_drafter() {
         &[2560, 256],
         "mtp.post_projection",
     );
-    assert_shape(&drafter.centroids, &[2048, 256], "mtp.centroids");
+    assert_shape(
+        drafter.centroids.as_ref().expect("masked head centroids"),
+        &[2048, 256],
+        "mtp.centroids",
+    );
 
     // --- SWA pattern: layers 0,1,2 sliding window; layer 3 full -------------
     assert!(drafter.layers[0].is_sliding_window);
@@ -127,7 +131,10 @@ fn loads_e4b_assistant_drafter() {
     probe(&drafter.token_embd, "token_embd");
     probe(&drafter.pre_projection, "pre_projection");
     probe(&drafter.post_projection, "post_projection");
-    probe(&drafter.centroids, "centroids");
+    probe(
+        drafter.centroids.as_ref().expect("masked head centroids"),
+        "centroids",
+    );
     for layer in &drafter.layers {
         probe(&layer.attn_q, &format!("blk.{}.attn_q", layer.layer_idx));
         probe(

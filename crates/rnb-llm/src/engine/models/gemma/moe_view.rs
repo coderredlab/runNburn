@@ -47,6 +47,15 @@ fn gemma4_moe_decode_q8k_enabled() -> bool {
         .unwrap_or(cfg!(target_os = "android"))
 }
 
+fn gemma4_moe_cuda_enabled() -> bool {
+    crate::engine::policy::env_string("RNB_CUDA_GEMMA4_MOE").is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 impl<'a> MoeLayerView<'a> {
     #[inline]
     pub fn per_expert_gate_up_bytes(&self) -> usize {
@@ -82,6 +91,16 @@ impl<'a> MoeLayerView<'a> {
         let (idx, exps) = select_experts_from_logits(logits, self.n_expert_used);
         if let Some(layer) = self.layer_idx {
             crate::engine::moe_trace::record_selection(layer, &idx);
+        }
+
+        #[cfg(feature = "cuda")]
+        if gemma4_moe_cuda_enabled() {
+            match self.forward_selected_cuda(h, &idx, &exps, out) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("[WARN] Gemma4 CUDA MoE decode failed, using CPU: {error}");
+                }
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -182,5 +201,44 @@ impl<'a> MoeLayerView<'a> {
                 out[i] += expert_out[i];
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_selected_cuda(
+        &self,
+        h: &[f32],
+        idx: &[usize],
+        expert_weights: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        let gate_up_rows = self.n_ff * 2;
+        let per_gate_up = self.per_expert_gate_up_bytes();
+        let per_down = self.per_expert_down_bytes();
+        out.fill(0.0);
+
+        for (slot, &expert) in idx.iter().enumerate() {
+            let gate_up_bytes =
+                &self.gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
+            let down_bytes = &self.down_bytes[expert * per_down..(expert + 1) * per_down];
+            let mut gate_up =
+                crate::runtime::cuda::q4k_gemv(gate_up_bytes, gate_up_rows, self.n_embd, h)?;
+            let (gate, up) = gate_up.split_at_mut(self.n_ff);
+            apply_model_gate_mul_inplace(gate, up, ModelArchitecture::Gemma4);
+
+            let expert_out = match self.down_quant {
+                GGMLType::Q5_1 => {
+                    crate::runtime::cuda::q5_1_gemv(down_bytes, self.n_embd, self.n_ff, gate)?
+                }
+                GGMLType::Q8_0 => {
+                    crate::runtime::cuda::q8_0_gemv(down_bytes, self.n_embd, self.n_ff, gate)?
+                }
+                other => return Err(format!("unsupported Gemma4 CUDA MoE down quant {other:?}")),
+            };
+            let scale = expert_weights[slot] * self.down_scale[expert];
+            for (dst, value) in out.iter_mut().zip(expert_out) {
+                *dst += value * scale;
+            }
+        }
+        Ok(())
     }
 }

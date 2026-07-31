@@ -10,8 +10,8 @@
 //! 따라 정한다.
 
 use super::types::TensorView;
-use rnb_cpu::quantize::blocks::{BlockQ4_K, BlockQ6_K};
-use rnb_cpu::quantize::dequant::{dequantize_q4_k, dequantize_q6_k};
+use rnb_cpu::quantize::blocks::{BlockQ4_K, BlockQ6_K, BlockQ8_0};
+use rnb_cpu::quantize::dequant::{dequantize_q4_k, dequantize_q6_k, dequantize_q8_0};
 use rnb_loader::gguf::types::GGMLType;
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -102,6 +102,27 @@ fn dequant_to_f32_uncached(view: &TensorView) -> Vec<f32> {
                 };
                 dequantize_q6_k(&block, &mut tmp);
                 out[bi * 256..(bi + 1) * 256].copy_from_slice(&tmp);
+            }
+        }
+        GGMLType::Q8_0 => {
+            assert!(
+                elem_count % 32 == 0,
+                "Q8_0 elem_count {elem_count} not multiple of 32"
+            );
+            let n_blocks = elem_count / 32;
+            assert_eq!(
+                bytes.len(),
+                n_blocks * size_of::<BlockQ8_0>(),
+                "Q8_0 byte length mismatch"
+            );
+            let mut tmp = [0.0f32; 32];
+            for bi in 0..n_blocks {
+                let offset = bi * size_of::<BlockQ8_0>();
+                let block: BlockQ8_0 = unsafe {
+                    std::ptr::read_unaligned(bytes.as_ptr().add(offset) as *const BlockQ8_0)
+                };
+                dequantize_q8_0(&block, &mut tmp);
+                out[bi * 32..(bi + 1) * 32].copy_from_slice(&tmp);
             }
         }
         other => panic!("dequant_to_f32: unsupported dtype {other:?}"),

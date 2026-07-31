@@ -10,6 +10,12 @@ pub struct SharedKvLayer {
     pub k: Vec<f32>,
     /// 동일 layout.
     pub v: Vec<f32>,
+    /// CUDA fast path의 native token-major F16 K/V. 존재하면 f32 transpose와
+    /// 매 draft-step 재변환을 건너뛴다.
+    pub k_f16: Option<Vec<u16>>,
+    pub v_f16: Option<Vec<u16>>,
+    /// CUDA incremental resident-cache namespace를 만드는 target source layer.
+    pub source_layer_idx: Option<usize>,
     pub n_kv_heads: usize,
     pub seq_len: usize,
     pub head_dim: usize,

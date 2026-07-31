@@ -887,14 +887,16 @@ where
             kv_cache.replace_layer_f16_range(kv_cache_layer, pos_start, seq_len, &k_bits, &v_bits);
         }
         let cached_kv_f16_storage = if owns_kv && pos_start == 0 {
-            Some((k_bits, v_bits))
+            Some(crate::kv_cache::LayerCacheRead::Materialized {
+                key: k_bits,
+                value: v_bits,
+            })
         } else {
-            let cached = kv_cache.read_up_to(kv_cache_layer, kv_len);
-            let (k, v) = cached.as_slices();
-            Some((k.to_vec(), v.to_vec()))
+            Some(kv_cache.read_up_to(kv_cache_layer, kv_len))
         };
         if kv_trace_enabled() {
-            if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16_storage.as_ref() {
+            if let Some(storage) = cached_kv_f16_storage.as_ref() {
+                let (cached_k_f16, cached_v_f16) = storage.as_slices();
                 eprintln!(
                             "[kv-trace][prefill-read] layer={} cache_layer={} kv_len={} cached_k={} cached_v={} expected={}",
                             layer_idx,
@@ -1013,26 +1015,26 @@ where
         let cached_kv_f16_storage = if owns_kv && pos_start == 0 && !prefill_force_f16 {
             None
         } else {
-            let (cached_k_f16, cached_v_f16) = if owns_kv && pos_start == 0 {
-                if let Some((k_bits, v_bits)) = prefill_batch_bits {
+            let cached = if owns_kv && pos_start == 0 {
+                let (key, value) = if let Some((k_bits, v_bits)) = prefill_batch_bits {
                     (k_bits, v_bits)
                 } else {
-                    let cached_k_owned: Vec<u16> = k_data
+                    let key = k_data
                         .unwrap()
                         .iter()
                         .map(|&x| half::f16::from_f32(x).to_bits())
                         .collect();
-                    let cached_v_owned: Vec<u16> = v_data
+                    let value = v_data
                         .iter()
                         .map(|&x| half::f16::from_f32(x).to_bits())
                         .collect();
-                    (cached_k_owned, cached_v_owned)
-                }
+                    (key, value)
+                };
+                crate::kv_cache::LayerCacheRead::Materialized { key, value }
             } else {
-                let cached = kv_cache.read_up_to(kv_cache_layer, kv_len);
-                let (k, v) = cached.as_slices();
-                (k.to_vec(), v.to_vec())
+                kv_cache.read_up_to(kv_cache_layer, kv_len)
             };
+            let (cached_k_f16, cached_v_f16) = cached.as_slices();
             if kv_trace_enabled() {
                 eprintln!(
                             "[kv-trace][prefill-read] layer={} cache_layer={} kv_len={} cached_k={} cached_v={} expected={}",
@@ -1044,7 +1046,7 @@ where
                             kv_len * kv_dim
                         );
             }
-            Some((cached_k_f16, cached_v_f16))
+            Some(cached)
         };
         let cached_k_tensor = if cached_kv_f16_storage.is_none() {
             Some(Tensor::from_slice(k_data.unwrap(), &[kv_len, kv_dim]))
@@ -1062,9 +1064,10 @@ where
         || targeted_attn_trace_enabled(layer_idx)
         || (gemma4_reuse_q_only && super::policy::gemma_reused_reapply_k_norm_enabled());
     if must_materialize_cached_kv && cached_k_tensor.is_none() {
-        let (cached_k_f16, cached_v_f16) = cached_kv_f16_storage
+        let storage = cached_kv_f16_storage
             .as_ref()
             .expect("cached f16 KV storage available");
+        let (cached_k_f16, cached_v_f16) = storage.as_slices();
         let (k_tensor, v_tensor) =
             materialize_f16_kv_tensors(cached_k_f16, cached_v_f16, kv_len, kv_dim);
         cached_k_tensor = Some(k_tensor);
@@ -1131,7 +1134,7 @@ where
     let cached_kv_f16 = if cached_k_tensor.is_none() && cached_v_tensor.is_none() {
         cached_kv_f16_storage
             .as_ref()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .map(crate::kv_cache::LayerCacheRead::as_slices)
     } else {
         None
     };

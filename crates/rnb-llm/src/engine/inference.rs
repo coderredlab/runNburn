@@ -524,6 +524,7 @@ impl Engine {
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true)
+            .map(|(result, _)| result)
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_prefix_state(
@@ -532,6 +533,7 @@ impl Engine {
         prefix_tokens: usize,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, Some(vec![prefix_tokens]), true)
+            .map(|(result, _)| result)
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_deferred_observe(
@@ -539,6 +541,7 @@ impl Engine {
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, false)
+            .map(|(result, _)| result)
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_prefix_state_deferred_observe(
@@ -551,6 +554,7 @@ impl Engine {
             Some(vec![prefix_tokens]),
             false,
         )
+        .map(|(result, _)| result)
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_prefix_states_deferred_observe(
@@ -563,6 +567,13 @@ impl Engine {
             Some(prefix_tokens.to_vec()),
             false,
         )
+        .map(|(result, _)| result)
+    }
+    pub(crate) fn forward_prefill_argmax_tokens_collect_output_hidden(
+        &mut self,
+        tokens: &[u32],
+    ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true)
     }
 
     pub(crate) fn forward_mtp_device_verify_window_argmax_collect_mtp(
@@ -786,22 +797,25 @@ impl Engine {
         tokens: &[u32],
         prefix_tokens: Option<Vec<usize>>,
         observe_mtp: bool,
-    ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
+    ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
         let weights = match &self.weights {
             Some(w) => w,
             None => {
                 let token = self.metadata.vocab_size.saturating_sub(1) as u32;
-                return Ok(crate::engine::verify_window::VerifyWindowResult {
-                    target_tokens: vec![token; tokens.len()],
-                    mtp_hidden_rows: Vec::new(),
-                    hidden_dim: self.metadata.hidden_dim,
-                    prefix_state: None,
-                    prefix_states: Vec::new(),
-                    #[cfg(any(feature = "cuda", test))]
-                    ssm_final_states: Vec::new(),
-                    #[cfg(any(feature = "cuda", test))]
-                    attention_kv_states: Vec::new(),
-                });
+                return Ok((
+                    crate::engine::verify_window::VerifyWindowResult {
+                        target_tokens: vec![token; tokens.len()],
+                        mtp_hidden_rows: Vec::new(),
+                        hidden_dim: self.metadata.hidden_dim,
+                        prefix_state: None,
+                        prefix_states: Vec::new(),
+                        #[cfg(any(feature = "cuda", test))]
+                        ssm_final_states: Vec::new(),
+                        #[cfg(any(feature = "cuda", test))]
+                        attention_kv_states: Vec::new(),
+                    },
+                    Vec::new(),
+                ));
             }
         };
 
@@ -888,7 +902,7 @@ impl Engine {
         let mtp_hidden_rows = self
             .mtp_spec_requested()
             .then(|| kernels::tensor_as_f32_slice(&hidden).to_vec());
-        let target_tokens = finalize_prefill_argmax_tokens(
+        let (target_tokens, output_hidden_rows) = finalize_prefill_argmax_tokens(
             &mut self.kv_cache,
             &self.metadata,
             self.architecture,
@@ -898,6 +912,13 @@ impl Engine {
             pos_start,
             norm_eps,
         )?;
+        if let Some(last_hidden) = output_hidden_rows
+            .chunks_exact(self.metadata.hidden_dim)
+            .next_back()
+        {
+            self.last_layer_hidden_cached.clear();
+            self.last_layer_hidden_cached.extend_from_slice(last_hidden);
+        }
         if verify_profiling {
             vp_ms[2] = vp_mark.elapsed().as_secs_f64() * 1000.0;
             vp_mark = std::time::Instant::now();
@@ -931,17 +952,20 @@ impl Engine {
                 vp_ms[0], vp_ms[1], vp_ms[2], vp_ms[3]
             );
         }
-        Ok(crate::engine::verify_window::VerifyWindowResult {
-            target_tokens,
-            mtp_hidden_rows: mtp_hidden_rows.unwrap_or_default(),
-            hidden_dim: self.metadata.hidden_dim,
-            prefix_state,
-            prefix_states,
-            #[cfg(any(feature = "cuda", test))]
-            ssm_final_states: Vec::new(),
-            #[cfg(any(feature = "cuda", test))]
-            attention_kv_states: Vec::new(),
-        })
+        Ok((
+            crate::engine::verify_window::VerifyWindowResult {
+                target_tokens,
+                mtp_hidden_rows: mtp_hidden_rows.unwrap_or_default(),
+                hidden_dim: self.metadata.hidden_dim,
+                prefix_state,
+                prefix_states,
+                #[cfg(any(feature = "cuda", test))]
+                ssm_final_states: Vec::new(),
+                #[cfg(any(feature = "cuda", test))]
+                attention_kv_states: Vec::new(),
+            },
+            output_hidden_rows,
+        ))
     }
 
     pub(crate) fn restore_verify_window_prefix_state(

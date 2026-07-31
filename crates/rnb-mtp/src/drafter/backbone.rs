@@ -37,7 +37,9 @@
 
 use super::dequant::dequant_to_f32;
 use super::types::{Drafter, DrafterLayer};
-use super::vq_head::{vocab_logits_in_top_k_clusters, vq_head_forward, ClusterTokenTable};
+use super::vq_head::{
+    direct_vocab_argmax_logits, vocab_logits_in_top_k_clusters, vq_head_forward, ClusterTokenTable,
+};
 use super::{SharedKvLayer, SharedKvStates};
 
 /// SWA layer 의 RoPE frequency base. Gemma 4 standard (`rope.freq_base_swa`).
@@ -192,12 +194,19 @@ pub fn drafter_forward(
                 f.as_ref().map(|(k, v)| (k.as_slice(), v.as_slice()))
             }
         });
+        let native_kv_f16 = shared_kv
+            .k_f16
+            .as_deref()
+            .zip(shared_kv.v_f16.as_deref())
+            .zip(shared_kv.source_layer_idx)
+            .map(|((k, v), source_layer_idx)| (k, v, source_layer_idx));
         decoder_layer_forward(
             layer,
             drafter.hidden,
             &mut hidden,
             shared_kv,
             kv_f16,
+            native_kv_f16,
             position_id,
             rope_base,
         );
@@ -245,25 +254,23 @@ pub fn drafter_forward(
         );
     }
 
-    // ----- Step 5: VQ masked embedding (mt83 vq_head.rs verbatim) ---------------
-    //
-    // Spec §5 의 `Gemma4AssistantMaskedEmbedder.forward` 는 lm_head 가
-    // `model.embed_tokens.weight` 와 tied — drafter 의 `token_embd.weight` Q6_K
-    // [262144, 256] 그대로 사용. dim = drafter.hidden (256), not
-    // backbone_hidden (2560). mt83 `vq_head.rs` 의 `vq_head_forward` +
-    // `vocab_logits_in_top_k_clusters` 가 이 architecture 와 1:1 매칭.
-    let vq = vq_head_forward(drafter, &last_hidden);
-    let cluster_table = ClusterTokenTable::permutation(
-        drafter.token_ordering.clone(),
-        drafter.n_centroids as usize,
-    );
-    let logits = vocab_logits_in_top_k_clusters(
-        drafter,
-        &vq.cluster_logits,
-        &last_hidden,
-        drafter.centroid_top_k as usize,
-        &cluster_table,
-    );
+    // ----- Step 5: tied LM head -------------------------------------------------
+    let logits = if drafter.centroids.is_some() {
+        let vq = vq_head_forward(drafter, &last_hidden);
+        let cluster_table = ClusterTokenTable::permutation(
+            drafter.token_ordering.clone(),
+            drafter.n_centroids as usize,
+        );
+        vocab_logits_in_top_k_clusters(
+            drafter,
+            &vq.cluster_logits,
+            &last_hidden,
+            drafter.centroid_top_k as usize,
+            &cluster_table,
+        )
+    } else {
+        direct_vocab_argmax_logits(drafter, &last_hidden)
+    };
 
     DrafterForwardOutput {
         logits,
@@ -285,6 +292,7 @@ fn decoder_layer_forward(
     hidden: &mut [f32],
     shared_kv: &SharedKvLayer,
     kv_f16: Option<(&[u16], &[u16])>,
+    native_kv_f16: Option<(&[u16], &[u16], usize)>,
     position_id: u32,
     rope_base: f32,
 ) {
@@ -348,7 +356,24 @@ fn decoder_layer_forward(
     let mut attn_out = vec![0.0f32; q_dim];
     // cu66 Phase 4 step 2: cross_attention cuda 의 K/V f16 cache 활용.
     // forward-scoped cache 가 있으면 변환 안 함 (cu63 의 saturation 해소).
-    let attn_cuda_ok = if let Some((k_f16, v_f16)) = kv_f16 {
+    let attn_cuda_ok = if let Some((k_f16, v_f16, source_layer_idx)) = native_kv_f16 {
+        if rnb_runtime::policy::drafter_cuda_enabled() {
+            super::cuda::drafter_cross_attention_cuda_resident(
+                source_layer_idx,
+                &q,
+                k_f16,
+                v_f16,
+                shared_kv.seq_len,
+                layer.n_heads,
+                shared_kv.n_kv_heads,
+                layer.head_dim,
+                &mut attn_out,
+            )
+            .unwrap_or_else(|err| panic!("CUDA drafter resident cross-attention failed: {err}"))
+        } else {
+            false
+        }
+    } else if let Some((k_f16, v_f16)) = kv_f16 {
         rnb_runtime::policy::drafter_cuda_enabled()
             && super::cuda::drafter_cross_attention_cuda_cached(
                 &q,

@@ -264,6 +264,53 @@ impl KvarnLayerCache {
         (key, value)
     }
 
+    pub(super) fn materialize_range(&self, start: usize, end: usize) -> (Vec<u16>, Vec<u16>) {
+        assert!(
+            start <= end && end <= self.stored_len,
+            "KVarN range read exceeds initialized rows"
+        );
+        let width = self.row_width();
+        let count = (end - start) * width;
+        let mut key = Vec::with_capacity(count);
+        let mut value = Vec::with_capacity(count);
+        let mut append_overlap =
+            |region_start: usize, region_rows: usize, region_key: &[u16], region_value: &[u16]| {
+                let overlap_start = start.max(region_start);
+                let overlap_end = end.min(region_start + region_rows);
+                if overlap_start >= overlap_end {
+                    return;
+                }
+                let local_start = (overlap_start - region_start) * width;
+                let local_end = (overlap_end - region_start) * width;
+                key.extend_from_slice(&region_key[local_start..local_end]);
+                value.extend_from_slice(&region_value[local_start..local_end]);
+            };
+
+        let sink_rows = self.stored_len.min(self.config.sink_tokens);
+        append_overlap(0, sink_rows, &self.sink_key, &self.sink_value);
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let block_start = self.config.sink_tokens + block_index * self.config.group;
+            if block_start >= end {
+                break;
+            }
+            if block_start + self.config.group <= start {
+                continue;
+            }
+            let (block_key, block_value) = block.dequantize_f16();
+            append_overlap(block_start, self.config.group, &block_key, &block_value);
+        }
+        let tail_start = self.config.sink_tokens + self.blocks.len() * self.config.group;
+        append_overlap(
+            tail_start,
+            self.stored_len.saturating_sub(tail_start),
+            &self.tail_key,
+            &self.tail_value,
+        );
+        debug_assert_eq!(key.len(), count);
+        debug_assert_eq!(value.len(), count);
+        (key, value)
+    }
+
     pub(super) fn view(&self, len: usize) -> KvarnKvView<'_> {
         assert!(
             len <= self.stored_len,

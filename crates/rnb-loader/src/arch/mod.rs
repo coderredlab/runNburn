@@ -157,7 +157,7 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
         "llama" => Ok(Architecture::LLaMA),
         "gemma" | "gemma2" | "gemma3" | "gemma3n" => Ok(Architecture::Gemma),
         "gemma4" => Ok(Architecture::Gemma4),
-        "gemma4_assistant" => Ok(Architecture::Gemma4Assistant),
+        "gemma4_assistant" | "gemma4-assistant" => Ok(Architecture::Gemma4Assistant),
         "phi" => Ok(Architecture::Phi),
         "qwen2" => Ok(Architecture::Qwen2),
         "qwen35" => Ok(Architecture::Qwen35),
@@ -201,8 +201,16 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
 
     let hidden_size = get_u32(metadata, &format!("{prefix}.embedding_length"))? as usize;
     let total_block_count = get_u32(metadata, &format!("{prefix}.block_count"))? as usize;
-    let nextn_predict_layers =
+    let declared_nextn_predict_layers =
         get_u32_opt(metadata, &format!("{prefix}.nextn_predict_layers")).unwrap_or(0) as usize;
+    // External Gemma4 assistant GGUFs use `nextn_predict_layers` to describe
+    // their own decoder depth. Unlike an in-model MTP tail, those blocks are
+    // all executable drafter layers and must not be subtracted from block_count.
+    let nextn_predict_layers = if arch == Architecture::Gemma4Assistant {
+        0
+    } else {
+        declared_nextn_predict_layers
+    };
     if nextn_predict_layers > total_block_count {
         return Err(LoaderError::ParseError {
             offset: 0,
@@ -391,17 +399,20 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         vocab_size
     };
 
-    // Gemma4 assistant (drafter) 전용 key 추출. dense/MoE target 모델은 None.
-    // sliding_window_pattern, key_length_full/swa, rope.freq_base_swa 같은 sub-namespace 키는
-    // `{prefix}.<sub>` 형태로 쌓이고, prefix 는 known_prefix == "gemma4_assistant" 와 동일.
+    // Gemma4 assistant (drafter) 전용 key 추출. 2026-07 포맷은
+    // `gemma4-assistant` + `nextn.*` direct-vocab head를 쓰고, 이전 포맷은
+    // `gemma4_assistant` + centroid-masked head를 쓴다. 공통 runtime
+    // metadata로 정규화하되 head 선택 정보는 optional 값으로 보존한다.
     let assistant = if arch == Architecture::Gemma4Assistant {
         Some(AssistantMetadata {
-            n_centroids: get_u32(metadata, &format!("{prefix}.n_centroids"))?,
-            centroid_top_k: get_u32(metadata, &format!("{prefix}.centroid_top_k"))?,
-            n_embd_backbone: get_u32(metadata, &format!("{prefix}.n_embd_backbone"))?,
+            n_centroids: get_u32_opt(metadata, &format!("{prefix}.n_centroids")).unwrap_or(0),
+            centroid_top_k: get_u32_opt(metadata, &format!("{prefix}.centroid_top_k")).unwrap_or(0),
+            n_embd_backbone: get_u32(metadata, &format!("{prefix}.n_embd_backbone"))
+                .or_else(|_| get_u32(metadata, &format!("{prefix}.embedding_length_out")))?,
             use_ordered_embeddings: get_bool(metadata, &format!("{prefix}.use_ordered_embeddings"))
                 .unwrap_or(false),
-            requires_target_arch: get_string(metadata, &format!("{prefix}.requires_target_arch"))?
+            requires_target_arch: get_string(metadata, &format!("{prefix}.requires_target_arch"))
+                .unwrap_or("gemma4")
                 .to_string(),
             shared_kv_layers: get_u32(metadata, &format!("{prefix}.attention.shared_kv_layers"))?,
             sliding_window_pattern: get_bool_array(
@@ -679,6 +690,18 @@ mod tests {
         let meta = vec![(
             "general.architecture".to_string(),
             GGUFValue::String("gemma4_assistant".to_string()),
+        )];
+        assert_eq!(
+            detect_architecture(&meta).unwrap(),
+            Architecture::Gemma4Assistant
+        );
+    }
+
+    #[test]
+    fn test_detect_gemma4_assistant_hyphenated_is_dedicated_variant() {
+        let meta = vec![(
+            "general.architecture".to_string(),
+            GGUFValue::String("gemma4-assistant".to_string()),
         )];
         assert_eq!(
             detect_architecture(&meta).unwrap(),

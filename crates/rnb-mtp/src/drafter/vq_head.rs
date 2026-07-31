@@ -16,6 +16,10 @@
 
 use super::dequant::dequant_to_f32;
 use super::types::Drafter;
+use rnb_cpu::quantize::blocks::BlockQ8_0;
+use rnb_cpu::quantize::dequant::dequantize_q8_0;
+use rnb_loader::gguf::types::GGMLType;
+use std::mem::size_of;
 
 /// VQ head 의 결과.
 ///
@@ -42,19 +46,23 @@ pub fn vq_head_forward(drafter: &Drafter, x_norm: &[f32]) -> VqHeadOutput {
         drafter.hidden
     );
 
+    let centroids = drafter
+        .centroids
+        .as_ref()
+        .expect("vq_head_forward requires centroid-masked assistant weights");
     let n_centroids = drafter.n_centroids as usize;
     assert_eq!(
-        drafter.centroids.shape.len(),
+        centroids.shape.len(),
         2,
         "centroids shape rank != 2: {:?}",
-        drafter.centroids.shape
+        centroids.shape
     );
     assert_eq!(
-        drafter.centroids.shape[0], n_centroids,
+        centroids.shape[0], n_centroids,
         "centroids shape[0]={} != n_centroids={}",
-        drafter.centroids.shape[0], n_centroids
+        centroids.shape[0], n_centroids
     );
-    let centroid_dim = drafter.centroids.shape[1];
+    let centroid_dim = centroids.shape[1];
     assert_eq!(
         centroid_dim, drafter.hidden,
         "centroid_dim {} != drafter.hidden {} (post_projection 전 단계 가정)",
@@ -66,7 +74,7 @@ pub fn vq_head_forward(drafter: &Drafter, x_norm: &[f32]) -> VqHeadOutput {
     // cu67: vq_head centroids GEMV cuda port (env opt-in).
     let cuda_ok = rnb_runtime::policy::drafter_cuda_enabled()
         && super::cuda::drafter_vq_head_cuda(
-            &drafter.centroids,
+            centroids,
             x_norm,
             &mut cluster_logits,
             n_centroids,
@@ -74,7 +82,7 @@ pub fn vq_head_forward(drafter: &Drafter, x_norm: &[f32]) -> VqHeadOutput {
         )
         .unwrap_or(false);
     if !cuda_ok {
-        let centroids = dequant_to_f32(&drafter.centroids);
+        let centroids = dequant_to_f32(centroids);
         for c in 0..n_centroids {
             let row = &centroids[c * centroid_dim..(c + 1) * centroid_dim];
             let mut acc = 0.0f32;
@@ -287,4 +295,73 @@ pub fn vocab_logits_in_top_k_clusters(
     // post_projection 은 vocab logit 경로에서 쓰이지 않음 (tied lm_head 라 hidden=256
     // 공간에서 바로 dot product). dequant 호출도 제거되어 함수가 가벼워진다.
     vocab_logits
+}
+
+/// Direct tied-lm-head assistant의 greedy argmax를 sparse logits로 반환한다.
+///
+/// External Gemma4 MTP는 greedy verify만 허용하므로 전체 262k logits를
+/// materialize하지 않는다. CUDA에서는 Q8_0 argmax kernel을 쓰고, CPU
+/// fallback은 한 행씩 dequant해 같은 argmax 계약을 보존한다.
+pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> Vec<f32> {
+    assert_eq!(x_norm.len(), drafter.hidden);
+    assert_eq!(drafter.token_embd.shape.len(), 2);
+    let vocab_size = drafter.token_embd.shape[0];
+    let hidden = drafter.token_embd.shape[1];
+    assert_eq!(hidden, drafter.hidden);
+    assert_eq!(
+        drafter.token_embd.ggml_type,
+        GGMLType::Q8_0,
+        "direct Gemma4 assistant lm_head must be Q8_0"
+    );
+
+    let cuda_argmax = if rnb_runtime::policy::drafter_cuda_enabled() {
+        match super::cuda::drafter_direct_vocab_argmax(&drafter.token_embd, x_norm) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("[WARN] direct drafter CUDA lm_head failed: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (token, value) = cuda_argmax
+        .map(|(token, value)| (token as usize, value))
+        .unwrap_or_else(|| q8_0_argmax_cpu(&drafter.token_embd, x_norm));
+
+    let mut logits = vec![f32::NEG_INFINITY; vocab_size];
+    logits[token] = value;
+    logits
+}
+
+fn q8_0_argmax_cpu(weight: &super::types::TensorView, input: &[f32]) -> (usize, f32) {
+    let rows = weight.shape[0];
+    let cols = weight.shape[1];
+    assert_eq!(cols % 32, 0);
+    let blocks_per_row = cols / 32;
+    let bytes_per_row = blocks_per_row * size_of::<BlockQ8_0>();
+    let bytes = weight.as_bytes();
+    assert_eq!(bytes.len(), rows * bytes_per_row);
+
+    let mut best = (0usize, f32::NEG_INFINITY);
+    let mut block_values = [0.0f32; 32];
+    for row in 0..rows {
+        let row_bytes = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let mut acc = 0.0f32;
+        for block_idx in 0..blocks_per_row {
+            let offset = block_idx * size_of::<BlockQ8_0>();
+            let block = unsafe {
+                std::ptr::read_unaligned(row_bytes.as_ptr().add(offset) as *const BlockQ8_0)
+            };
+            dequantize_q8_0(&block, &mut block_values);
+            let input_block = &input[block_idx * 32..(block_idx + 1) * 32];
+            for lane in 0..32 {
+                acc += block_values[lane] * input_block[lane];
+            }
+        }
+        if acc > best.1 {
+            best = (row, acc);
+        }
+    }
+    best
 }

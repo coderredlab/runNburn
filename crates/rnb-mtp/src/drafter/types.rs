@@ -97,7 +97,8 @@ pub struct Drafter {
     pub rope_freqs: Vec<f32>,
     pub pre_projection: TensorView,
     pub post_projection: TensorView,
-    pub centroids: TensorView,
+    /// Centroid-masked head weight. `None` for the direct-vocab assistant format.
+    pub centroids: Option<TensorView>,
 
     /// `mtp.token_ordering.weight` I32 [vocab_size]. transformers source
     /// (`Gemma4AssistantMaskedEmbedder.forward`) 에 따르면 token_id → cluster

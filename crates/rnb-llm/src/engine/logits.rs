@@ -426,11 +426,12 @@ pub(super) fn finalize_prefill_argmax_tokens(
     seq_len: usize,
     pos_start: usize,
     norm_eps: f32,
-) -> crate::error::Result<Vec<u32>> {
+) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
     let hidden_data = kernels::tensor_as_f32_slice(&hidden);
     let hidden_dim = metadata.hidden_dim;
     let gemma_runtime_flavor = detect_gemma_runtime_flavor(metadata, weights);
     let mut target_tokens = Vec::with_capacity(seq_len);
+    let mut output_hidden_rows = Vec::with_capacity(seq_len * hidden_dim);
 
     for t in 0..seq_len {
         let start = t * hidden_dim;
@@ -447,6 +448,7 @@ pub(super) fn finalize_prefill_argmax_tokens(
                 .map_err(|e| crate::error::LlmError::Forward(e.to_string()))?
         };
         let normed_data = kernels::tensor_as_f32_slice(&normed);
+        output_hidden_rows.extend_from_slice(normed_data);
         let exact_output = policy::exact_output_gemv_enabled();
         #[cfg(feature = "cuda")]
         if !use_token_embedding_as_output() && !exact_output {
@@ -471,5 +473,5 @@ pub(super) fn finalize_prefill_argmax_tokens(
     }
 
     kv_cache.set_len(pos_start + seq_len);
-    Ok(target_tokens)
+    Ok((target_tokens, output_hidden_rows))
 }
