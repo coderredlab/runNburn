@@ -37,21 +37,35 @@ pub fn cuda_memory_info() -> Result<CudaMemoryInfo, String> {
     })
 }
 
-pub fn gemma4_selected_moe_admitted(
+fn selected_moe_transient_required_bytes(
     gate_up_weight_bytes: usize,
     down_weight_bytes: usize,
     n_embd: usize,
     n_ff: usize,
-) -> Result<bool, String> {
+) -> usize {
     let weight_bytes = gate_up_weight_bytes.max(down_weight_bytes);
     let input_bytes = n_embd.max(n_ff).saturating_mul(std::mem::size_of::<f32>());
     let output_bytes = n_ff
         .saturating_mul(2)
         .max(n_embd)
         .saturating_mul(std::mem::size_of::<f32>());
-    let required_bytes = weight_bytes
+    weight_bytes
         .saturating_add(input_bytes)
-        .saturating_add(output_bytes);
+        .saturating_add(output_bytes)
+}
+
+pub fn gemma4_selected_moe_admitted(
+    gate_up_weight_bytes: usize,
+    down_weight_bytes: usize,
+    n_embd: usize,
+    n_ff: usize,
+) -> Result<bool, String> {
+    let required_bytes = selected_moe_transient_required_bytes(
+        gate_up_weight_bytes,
+        down_weight_bytes,
+        n_embd,
+        n_ff,
+    );
 
     let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
     let mut guard = compute
@@ -165,4 +179,21 @@ pub fn release_q8_0_prefill_f32_after_prefill() -> Result<(), String> {
         return Ok(());
     };
     state.clear_resident_q8_prefill_projection_cache()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_moe_transient_required_bytes;
+
+    #[test]
+    fn selected_moe_transient_budget_uses_largest_weight_and_shape_scaled_scratch() {
+        assert_eq!(
+            selected_moe_transient_required_bytes(3_000, 5_000, 100, 200),
+            5_000 + 200 * 4 + 400 * 4
+        );
+        assert_eq!(
+            selected_moe_transient_required_bytes(7_000, 5_000, 300, 100),
+            7_000 + 300 * 4 + 300 * 4
+        );
+    }
 }

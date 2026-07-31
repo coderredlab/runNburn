@@ -47,6 +47,7 @@ fn gemma4_moe_decode_q8k_enabled() -> bool {
         .unwrap_or(cfg!(target_os = "android"))
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn gemma4_moe_cuda_override(raw: Option<&str>) -> Option<bool> {
     raw.map(|value| {
         matches!(
@@ -277,6 +278,10 @@ impl<'a> MoeLayerView<'a> {
 #[cfg(test)]
 mod tests {
     use super::gemma4_moe_cuda_override;
+    #[cfg(feature = "cuda")]
+    use super::gemma4_moe_cuda_quant_supported;
+    #[cfg(feature = "cuda")]
+    use rnb_loader::GGMLType;
 
     #[test]
     fn gemma4_cuda_moe_unset_selects_auto_policy() {
@@ -290,5 +295,14 @@ mod tests {
         assert_eq!(gemma4_moe_cuda_override(Some("0")), Some(false));
         assert_eq!(gemma4_moe_cuda_override(Some("off")), Some(false));
         assert_eq!(gemma4_moe_cuda_override(Some("invalid")), Some(false));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gemma4_cuda_moe_auto_accepts_only_implemented_down_quants() {
+        assert!(gemma4_moe_cuda_quant_supported(GGMLType::Q5_1));
+        assert!(gemma4_moe_cuda_quant_supported(GGMLType::Q8_0));
+        assert!(!gemma4_moe_cuda_quant_supported(GGMLType::Q5_0));
+        assert!(!gemma4_moe_cuda_quant_supported(GGMLType::Q4_K));
     }
 }
