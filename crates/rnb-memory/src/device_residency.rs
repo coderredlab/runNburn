@@ -17,6 +17,27 @@ pub struct DeviceResidencyPlan {
     pub resident_limit_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceTransientAdmissionPlan {
+    pub total_bytes: usize,
+    pub current_free_bytes: usize,
+    pub reclaimable_resident_bytes: usize,
+    pub protected_reserve_bytes: usize,
+}
+
+impl DeviceTransientAdmissionPlan {
+    pub fn allows(self, required_bytes: usize) -> bool {
+        let usable_total = self
+            .total_bytes
+            .saturating_sub(self.protected_reserve_bytes);
+        let usable_now = self
+            .current_free_bytes
+            .saturating_add(self.reclaimable_resident_bytes)
+            .saturating_sub(self.protected_reserve_bytes);
+        required_bytes <= usable_total && required_bytes <= usable_now
+    }
+}
+
 impl DeviceResidencyPlan {
     pub fn from_snapshot(
         total_bytes: usize,
@@ -112,5 +133,29 @@ mod tests {
         let plan = DeviceResidencyPlan::from_snapshot(24 * GIB, 23 * GIB, 4 * GIB);
         assert_eq!(plan.transient_reclaim_bytes(6 * GIB, GIB), 0);
         assert_eq!(plan.transient_reclaim_bytes(4 * GIB, 2 * GIB), 2 * GIB);
+    }
+
+    #[test]
+    fn transient_admission_scales_with_free_and_reclaimable_memory() {
+        let plan = DeviceTransientAdmissionPlan {
+            total_bytes: 24 * GIB,
+            current_free_bytes: 2 * GIB,
+            reclaimable_resident_bytes: GIB,
+            protected_reserve_bytes: 2 * GIB,
+        };
+        assert!(plan.allows(GIB));
+        assert!(!plan.allows(GIB + 1));
+    }
+
+    #[test]
+    fn transient_admission_rejects_working_sets_larger_than_device_budget() {
+        let plan = DeviceTransientAdmissionPlan {
+            total_bytes: 4 * GIB,
+            current_free_bytes: 4 * GIB,
+            reclaimable_resident_bytes: 0,
+            protected_reserve_bytes: 512 * MIB,
+        };
+        assert!(plan.allows(3 * GIB));
+        assert!(!plan.allows(4 * GIB));
     }
 }

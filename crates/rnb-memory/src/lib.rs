@@ -8,7 +8,9 @@
 pub mod byte_lru;
 pub use byte_lru::ByteLruPolicy;
 pub mod device_residency;
-pub use device_residency::{default_device_dynamic_reserve_bytes, DeviceResidencyPlan};
+pub use device_residency::{
+    default_device_dynamic_reserve_bytes, DeviceResidencyPlan, DeviceTransientAdmissionPlan,
+};
 pub mod memtrace;
 pub mod mlock;
 pub mod moe_cold_io;

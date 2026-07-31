@@ -826,6 +826,15 @@ pub fn cuda_memory_info() -> Result<CudaMemoryInfo> {
     backend::cuda_memory_info()
 }
 
+pub fn gemma4_selected_moe_admitted(
+    gate_up_weight_bytes: usize,
+    down_weight_bytes: usize,
+    n_embd: usize,
+    n_ff: usize,
+) -> Result<bool> {
+    backend::gemma4_selected_moe_admitted(gate_up_weight_bytes, down_weight_bytes, n_embd, n_ff)
+}
+
 pub fn clear_moe_layer_cache() -> Result<()> {
     backend::clear_moe_layer_cache().map_err(|err| err)
 }

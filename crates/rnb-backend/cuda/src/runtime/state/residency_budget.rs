@@ -44,6 +44,30 @@ impl CudaState {
         )
     }
 
+    fn transient_reclaimable_resident_bytes(&self) -> usize {
+        self.resident_q8_f32_bytes
+            .saturating_add(self.resident_q4_f32_bytes)
+            .saturating_add(self.resident_q6_f32_bytes)
+            .saturating_add(self.resident_q6_f16_bytes)
+            .saturating_add(self.resident_q4_packed_bytes)
+            .saturating_add(self.resident_q6_packed_bytes)
+            .saturating_add(self.resident_moe_layer_bytes)
+    }
+
+    pub(in crate::runtime) fn selected_moe_transient_admission_allowed(
+        &self,
+        required_bytes: usize,
+    ) -> Result<bool, String> {
+        let (current_free_bytes, total_bytes) = unsafe { self.api.mem_get_info() }?;
+        Ok(rnb_memory::DeviceTransientAdmissionPlan {
+            total_bytes,
+            current_free_bytes,
+            reclaimable_resident_bytes: self.transient_reclaimable_resident_bytes(),
+            protected_reserve_bytes: self.device_residency_plan.dynamic_reserve_bytes,
+        }
+        .allows(required_bytes))
+    }
+
     pub(in crate::runtime) fn resident_admission_allowed(
         &self,
         incoming_bytes: usize,

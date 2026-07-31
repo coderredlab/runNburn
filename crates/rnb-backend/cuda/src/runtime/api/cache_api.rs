@@ -37,6 +37,35 @@ pub fn cuda_memory_info() -> Result<CudaMemoryInfo, String> {
     })
 }
 
+pub fn gemma4_selected_moe_admitted(
+    gate_up_weight_bytes: usize,
+    down_weight_bytes: usize,
+    n_embd: usize,
+    n_ff: usize,
+) -> Result<bool, String> {
+    let weight_bytes = gate_up_weight_bytes.max(down_weight_bytes);
+    let input_bytes = n_embd.max(n_ff).saturating_mul(std::mem::size_of::<f32>());
+    let output_bytes = n_ff
+        .saturating_mul(2)
+        .max(n_embd)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let required_bytes = weight_bytes
+        .saturating_add(input_bytes)
+        .saturating_add(output_bytes);
+
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_ref()
+        .expect("cuda compute state initialized")
+        .selected_moe_transient_admission_allowed(required_bytes)
+}
+
 pub fn cuda_weight_residency_counters() -> Result<CudaWeightResidencyCounters, String> {
     let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
     let guard = compute

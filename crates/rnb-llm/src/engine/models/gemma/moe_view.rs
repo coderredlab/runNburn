@@ -47,13 +47,18 @@ fn gemma4_moe_decode_q8k_enabled() -> bool {
         .unwrap_or(cfg!(target_os = "android"))
 }
 
-fn gemma4_moe_cuda_enabled() -> bool {
-    crate::engine::policy::env_string("RNB_CUDA_GEMMA4_MOE").is_some_and(|value| {
+fn gemma4_moe_cuda_override(raw: Option<&str>) -> Option<bool> {
+    raw.map(|value| {
         matches!(
             value.to_ascii_lowercase().as_str(),
             "1" | "true" | "on" | "yes"
         )
     })
+}
+
+#[cfg(feature = "cuda")]
+fn gemma4_moe_cuda_quant_supported(quant: GGMLType) -> bool {
+    matches!(quant, GGMLType::Q5_1 | GGMLType::Q8_0)
 }
 
 impl<'a> MoeLayerView<'a> {
@@ -67,6 +72,32 @@ impl<'a> MoeLayerView<'a> {
     pub fn per_expert_down_bytes(&self) -> usize {
         // rows = n_embd, cols = n_ff
         self.n_embd * down_bytes_per_row(self.n_ff, self.down_quant)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn gemma4_moe_cuda_enabled(&self) -> bool {
+        let configured = crate::engine::policy::env_string("RNB_CUDA_GEMMA4_MOE");
+        if let Some(enabled) = gemma4_moe_cuda_override(configured.as_deref()) {
+            return enabled;
+        }
+        if !gemma4_moe_cuda_quant_supported(self.down_quant) {
+            return false;
+        }
+        match crate::runtime::cuda::gemma4_selected_moe_admitted(
+            self.per_expert_gate_up_bytes(),
+            self.per_expert_down_bytes(),
+            self.n_embd,
+            self.n_ff,
+        ) {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| {
+                    eprintln!("[WARN] Gemma4 CUDA MoE memory admission failed, using CPU: {error}");
+                });
+                false
+            }
+        }
     }
 
     /// One MoE FFN forward: `out[n_embd] = Σ_k softmax(router @ h)[e_k] · expert_k(h)`.
@@ -94,7 +125,7 @@ impl<'a> MoeLayerView<'a> {
         }
 
         #[cfg(feature = "cuda")]
-        if gemma4_moe_cuda_enabled() {
+        if self.gemma4_moe_cuda_enabled() {
             match self.forward_selected_cuda(h, &idx, &exps, out) {
                 Ok(()) => return,
                 Err(error) => {
@@ -240,5 +271,24 @@ impl<'a> MoeLayerView<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemma4_moe_cuda_override;
+
+    #[test]
+    fn gemma4_cuda_moe_unset_selects_auto_policy() {
+        assert_eq!(gemma4_moe_cuda_override(None), None);
+    }
+
+    #[test]
+    fn gemma4_cuda_moe_explicit_values_override_auto_policy() {
+        assert_eq!(gemma4_moe_cuda_override(Some("1")), Some(true));
+        assert_eq!(gemma4_moe_cuda_override(Some("yes")), Some(true));
+        assert_eq!(gemma4_moe_cuda_override(Some("0")), Some(false));
+        assert_eq!(gemma4_moe_cuda_override(Some("off")), Some(false));
+        assert_eq!(gemma4_moe_cuda_override(Some("invalid")), Some(false));
     }
 }
