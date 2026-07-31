@@ -31,8 +31,12 @@ pub(super) unsafe fn neon_dot_f32(a: *const f32, b: *const f32, len: usize) -> f
         acc0 = vfmaq_f32(acc0, a0, b0);
         i += 4;
     }
-    acc0 = vaddq_f32(acc0, acc1);
-    vaddvq_f32(acc0)
+    let mut sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    while i < len {
+        sum += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    sum
 }
 
 /// out[d] += scale * v[d], NEON accelerated
@@ -48,6 +52,11 @@ pub(super) unsafe fn neon_scaled_add(out: *mut f32, v: *const f32, scale: f32, l
         vst1q_f32(out.add(i), vfmaq_f32(o, x, s));
         i += 4;
     }
+    while i < len {
+        let out_i = out.add(i);
+        *out_i = (*v.add(i)).mul_add(scale, *out_i);
+        i += 1;
+    }
 }
 
 /// out[d] *= scale, NEON accelerated
@@ -61,6 +70,11 @@ pub(super) unsafe fn neon_scale(out: *mut f32, scale: f32, len: usize) {
         let o = vld1q_f32(out.add(i));
         vst1q_f32(out.add(i), vmulq_f32(o, s));
         i += 4;
+    }
+    while i < len {
+        let out_i = out.add(i);
+        *out_i *= scale;
+        i += 1;
     }
 }
 
@@ -149,7 +163,12 @@ pub(super) unsafe fn neon_dot_f32_f16(a: *const f32, b_f16: *const u16, len: usi
     let s02 = vaddq_f32(sum0, sum2);
     let s13 = vaddq_f32(sum1, sum3);
     let s = vaddq_f32(s02, s13);
-    vaddvq_f32(s)
+    let mut sum = vaddvq_f32(s);
+    while i < len {
+        sum += *a.add(i) * half::f16::from_bits(*b_f16.add(i)).to_f32();
+        i += 1;
+    }
+    sum
 }
 
 /// out[d] += scale * v_f16[d], NEON accelerated with F16→F32 conversion
@@ -171,6 +190,12 @@ pub(super) unsafe fn neon_scaled_add_f16(out: *mut f32, v_f16: *const u16, scale
         );
         vst1q_f32(out.add(i), vfmaq_f32(o, v_f32, s));
         i += 4;
+    }
+    while i < len {
+        let out_i = out.add(i);
+        let value = half::f16::from_bits(*v_f16.add(i)).to_f32();
+        *out_i = value.mul_add(scale, *out_i);
+        i += 1;
     }
 }
 

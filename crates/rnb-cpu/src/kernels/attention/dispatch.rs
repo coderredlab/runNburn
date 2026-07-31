@@ -112,3 +112,51 @@ pub(super) fn scaled_add_f32(out: &mut [f32], v: &[f32], scale: f32) {
         out[d] += scale * v[d];
     }
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::{dot_f32, dot_f32_f16, scale_f32, scaled_add_f16, scaled_add_f32};
+
+    const VALUES: [f32; 5] = [1.0, 2.0, 3.0, 4.0, 5.0];
+    const LENGTHS: [usize; 3] = [1, 3, 5];
+
+    #[test]
+    fn neon_dot_helpers_handle_non_vector_tails() {
+        let values_f16 = VALUES.map(|value| half::f16::from_f32(value).to_bits());
+
+        for len in LENGTHS {
+            let expected: f32 = VALUES[..len].iter().map(|value| value * value).sum();
+            assert_eq!(dot_f32(&VALUES, &VALUES, len), expected);
+            assert_eq!(dot_f32_f16(&VALUES, &values_f16, len), expected);
+        }
+    }
+
+    #[test]
+    fn neon_scale_f32_handles_non_vector_tails() {
+        for len in LENGTHS {
+            let mut output = VALUES[..len].to_vec();
+            scale_f32(&mut output, 2.0);
+            let expected: Vec<f32> = VALUES[..len].iter().map(|value| value * 2.0).collect();
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn neon_scaled_add_helpers_handle_non_vector_tails() {
+        let values_f16 = VALUES.map(|value| half::f16::from_f32(value).to_bits());
+
+        for len in LENGTHS {
+            let mut output_f32 = vec![1.0; len];
+            scaled_add_f32(&mut output_f32, &VALUES[..len], 2.0);
+            let expected: Vec<f32> = VALUES[..len]
+                .iter()
+                .map(|value| 1.0 + value * 2.0)
+                .collect();
+            assert_eq!(output_f32, expected);
+
+            let mut output_f16 = vec![1.0; len];
+            scaled_add_f16(&mut output_f16, &values_f16[..len], 2.0);
+            assert_eq!(output_f16, expected);
+        }
+    }
+}
