@@ -42,6 +42,13 @@ pub fn gemm_q4k_packed(
     cols: usize,
     seq_len: usize,
 ) {
+    let required_output_len = rows
+        .checked_mul(seq_len)
+        .expect("Q4_K GEMM output length overflow");
+    assert!(
+        output.len() >= required_output_len,
+        "Q4_K GEMM output is shorter than seq_len * rows"
+    );
     if is_q4k_compact_len(packed.len(), rows, cols) {
         return gemm_q4k_compact(
             packed,
@@ -163,7 +170,13 @@ pub fn gemm_q4k_raw_meta(
     assert!(input_qs.len() >= seq_len * cols * 256);
     assert!(input_d.len() >= seq_len * cols);
     assert!(input_bsums.len() >= seq_len * cols * 8);
-    assert!(output.len() >= seq_len * rows);
+    let required_output_len = rows
+        .checked_mul(seq_len)
+        .expect("Q4_K raw-meta GEMM output length overflow");
+    assert!(
+        output.len() >= required_output_len,
+        "Q4_K raw-meta GEMM output is shorter than seq_len * rows"
+    );
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -227,8 +240,9 @@ fn gemm_q4k_raw_meta_scalar(
 
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
-    (0..rows).into_par_iter().for_each(|row| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
+    (0..rows).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 1, rows);
+        let row = row_range.start;
         for s in 0..seq_len {
             let mut acc = 0.0f32;
             for bi in 0..cols {
@@ -243,7 +257,9 @@ fn gemm_q4k_raw_meta_scalar(
                     &input_bsums[bsum_off..bsum_off + 8],
                 );
             }
-            out_slice[s * rows + row] = acc;
+            unsafe {
+                q4k_parallel_output_write(out_addr, output_len, &row_range, row, s, rows, acc);
+            }
         }
     });
 }
@@ -267,11 +283,11 @@ unsafe fn gemm_q4k_raw_meta_i8mm(
     let row_pairs = rows.div_ceil(2);
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
-    (0..row_pairs).into_par_iter().for_each(|rp| {
-        let r0 = rp * 2;
+    (0..row_pairs).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 2, rows);
+        let r0 = row_range.start;
         let r1 = r0 + 1;
-        let has_r1 = r1 < rows;
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
+        let has_r1 = r1 < row_range.end;
 
         let mut s = 0usize;
         while has_r1 && s + 7 < seq_len {
@@ -296,8 +312,26 @@ unsafe fn gemm_q4k_raw_meta_i8mm(
                 }
             }
             for t in 0..8usize {
-                out_slice[(s + t) * rows + r0] = acc[t][0];
-                out_slice[(s + t) * rows + r1] = acc[t][1];
+                unsafe {
+                    q4k_parallel_output_write(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        r0,
+                        s + t,
+                        rows,
+                        acc[t][0],
+                    );
+                    q4k_parallel_output_write(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        r1,
+                        s + t,
+                        rows,
+                        acc[t][1],
+                    );
+                }
             }
             s += 8;
         }
@@ -327,9 +361,11 @@ unsafe fn gemm_q4k_raw_meta_i8mm(
                     );
                 }
             }
-            out_slice[s * rows + r0] = acc0;
-            if has_r1 {
-                out_slice[s * rows + r1] = acc1;
+            unsafe {
+                q4k_parallel_output_write(out_addr, output_len, &row_range, r0, s, rows, acc0);
+                if has_r1 {
+                    q4k_parallel_output_write(out_addr, output_len, &row_range, r1, s, rows, acc1);
+                }
             }
             s += 1;
         }
@@ -456,8 +492,9 @@ unsafe fn gemm_q4k_raw_meta_neon(
 
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
-    (0..rows).into_par_iter().for_each(|row| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
+    (0..rows).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 1, rows);
+        let row = row_range.start;
         let mut s = 0usize;
         while s + 7 < seq_len {
             let mut acc = [0.0f32; 8];
@@ -478,7 +515,17 @@ unsafe fn gemm_q4k_raw_meta_neon(
                 }
             }
             for t in 0..8usize {
-                out_slice[(s + t) * rows + row] = acc[t];
+                unsafe {
+                    q4k_parallel_output_write(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        row,
+                        s + t,
+                        rows,
+                        acc[t],
+                    );
+                }
             }
             s += 8;
         }
@@ -497,7 +544,9 @@ unsafe fn gemm_q4k_raw_meta_neon(
                     &input_bsums[bsum_off..bsum_off + 8],
                 );
             }
-            out_slice[s * rows + row] = acc;
+            unsafe {
+                q4k_parallel_output_write(out_addr, output_len, &row_range, row, s, rows, acc);
+            }
             s += 1;
         }
     });
@@ -606,6 +655,61 @@ fn is_q4k_compact_len(len: usize, rows: usize, cols: usize) -> bool {
     len == rows.div_ceil(8) * cols * Q4K_COMPACT_BLOCK_BYTES
 }
 
+#[inline(always)]
+fn q4k_parallel_row_range(
+    task: usize,
+    rows_per_task: usize,
+    rows: usize,
+) -> std::ops::Range<usize> {
+    debug_assert!(rows_per_task > 0);
+    let start = task * rows_per_task;
+    start..start.saturating_add(rows_per_task).min(rows)
+}
+
+/// # Safety
+///
+/// Concurrent callers must use disjoint `row_range` values. `output_len` must
+/// describe an allocation beginning at `out_addr`.
+#[inline(always)]
+unsafe fn q4k_parallel_output_write(
+    out_addr: usize,
+    output_len: usize,
+    row_range: &std::ops::Range<usize>,
+    row: usize,
+    token: usize,
+    rows: usize,
+    value: f32,
+) {
+    debug_assert!(row_range.contains(&row));
+    let index = token * rows + row;
+    debug_assert!(index < output_len);
+    unsafe {
+        (out_addr as *mut f32).add(index).write(value);
+    }
+}
+
+/// # Safety
+///
+/// Same requirements as [`q4k_parallel_output_write`].
+#[inline(always)]
+unsafe fn q4k_parallel_output_add(
+    out_addr: usize,
+    output_len: usize,
+    row_range: &std::ops::Range<usize>,
+    row: usize,
+    token: usize,
+    rows: usize,
+    value: f32,
+) {
+    debug_assert!(row_range.contains(&row));
+    let index = token * rows + row;
+    debug_assert!(index < output_len);
+    unsafe {
+        let ptr = (out_addr as *mut f32).add(index);
+        ptr.write(ptr.read() + value);
+    }
+}
+
 // ─── 스칼라 레퍼런스 ──────────────────────────────────────────────────────────
 
 fn gemm_q4k_packed_scalar(
@@ -702,8 +806,9 @@ fn gemm_q4k_compact(
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
 
-    (0..rows).into_par_iter().for_each(|row| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
+    (0..rows).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 1, rows);
+        let row = row_range.start;
         for s in 0..seq_len {
             let mut acc = 0.0f32;
             for bi in 0..cols {
@@ -721,7 +826,9 @@ fn gemm_q4k_compact(
                     &input_bsums[bsum_base..bsum_base + 8],
                 );
             }
-            out_slice[s * rows + row] += acc;
+            unsafe {
+                q4k_parallel_output_add(out_addr, output_len, &row_range, row, s, rows, acc);
+            }
         }
     });
 }
@@ -887,10 +994,10 @@ unsafe fn gemm_q4k_packed_neon(
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
 
-    (0..row_groups).into_par_iter().for_each(|rg| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
-
-        let rows_in_group = (rows - rg * 8).min(8);
+    (0..row_groups).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 8, rows);
+        let rg = row_range.start / 8;
+        let rows_in_group = row_range.len();
 
         // Per-token accumulator for 8 rows
         let mut acc = vec![0.0f32; seq_len * 8];
@@ -970,10 +1077,21 @@ unsafe fn gemm_q4k_packed_neon(
             }
         }
 
-        // Write output
+        // Each Rayon task owns a disjoint logical row range.
         for s in 0..seq_len {
             for r in 0..rows_in_group {
-                out_slice[s * rows + rg * 8 + r] += acc[s * 8 + r];
+                let row = row_range.start + r;
+                unsafe {
+                    q4k_parallel_output_add(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        row,
+                        s,
+                        rows,
+                        acc[s * 8 + r],
+                    );
+                }
             }
         }
     });
@@ -1011,10 +1129,10 @@ unsafe fn gemm_q4k_packed_i8mm(
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
 
-    (0..row_groups).into_par_iter().for_each(|rg| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
-
-        let rows_in_group = (rows - rg * 8).min(8);
+    (0..row_groups).into_par_iter().for_each(|task| {
+        let row_range = q4k_parallel_row_range(task, 8, rows);
+        let rg = row_range.start / 8;
+        let rows_in_group = row_range.len();
         let row_pairs = (rows_in_group + 1) / 2;
 
         // Per-token accumulator for 8 rows
@@ -1334,10 +1452,21 @@ unsafe fn gemm_q4k_packed_i8mm(
             }
         }
 
-        // Write output
+        // Each Rayon task owns a disjoint logical row range.
         for s in 0..seq_len {
             for r in 0..rows_in_group {
-                out_slice[s * rows + rg * 8 + r] += acc[s * 8 + r];
+                let row = row_range.start + r;
+                unsafe {
+                    q4k_parallel_output_add(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        row,
+                        s,
+                        rows,
+                        acc[s * 8 + r],
+                    );
+                }
             }
         }
     });
@@ -1512,6 +1641,35 @@ mod tests {
     };
     use half::f16;
 
+    #[test]
+    fn q4k_parallel_row_tasks_are_disjoint_and_cover_all_rows() {
+        for rows in 1usize..18 {
+            for rows_per_task in [1usize, 2, 8] {
+                let ranges = (0..rows.div_ceil(rows_per_task))
+                    .map(|task| q4k_parallel_row_range(task, rows_per_task, rows))
+                    .collect::<Vec<_>>();
+
+                assert_eq!(ranges.first().unwrap().start, 0);
+                assert_eq!(ranges.last().unwrap().end, rows);
+                assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Q4_K GEMM output is shorter than seq_len * rows")]
+    fn q4k_gemm_rejects_short_output_before_parallel_write() {
+        let mut output = [];
+        gemm_q4k_packed(&[], &[], &[], &[], &mut output, 1, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Q4_K raw-meta GEMM output length overflow")]
+    fn q4k_raw_meta_gemm_rejects_output_length_overflow() {
+        let mut output = [];
+        gemm_q4k_raw_meta(&[], &[], &[], &[], &mut output, 2, 0, usize::MAX / 2 + 1);
+    }
+
     // ─── 테스트 헬퍼 ─────────────────────────────────────────────
 
     /// Q4_K 더미 블록 생성 (144 bytes)
@@ -1647,7 +1805,7 @@ mod tests {
     fn test_q4k_compact_matches_exact_q8_reference() {
         let rows = 11;
         let cols = 3;
-        let seq_len = 2;
+        let seq_len = 9;
 
         let mut src = Vec::new();
         for row in 0..rows {
