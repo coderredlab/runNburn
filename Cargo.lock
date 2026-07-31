@@ -988,6 +988,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "rnb-backend-api",
+ "rnb-core",
  "rnb-cpu",
  "rnb-memory",
  "rnb-platform",

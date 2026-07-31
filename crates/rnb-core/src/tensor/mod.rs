@@ -7,7 +7,7 @@ pub mod tensor;
 pub use dtype::{DType, TensorElement};
 pub use quant::{QuantMeta, QuantScheme};
 pub use storage::{
-    host_storage_identity, Buffer, DeviceBuffer, FileBackedRegion, FileMmapStorage,
-    HostStorageIdentity, Storage,
+    host_storage_identity, host_storage_lease, Buffer, DeviceBuffer, FileBackedRegion,
+    FileMmapStorage, HostStorageIdentity, HostStorageLease, Storage,
 };
 pub use tensor::Tensor;

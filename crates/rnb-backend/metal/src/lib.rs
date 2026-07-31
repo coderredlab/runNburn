@@ -22,6 +22,8 @@ use objc2_metal::{
     MTLResidencySetDescriptor, MTLResourceOptions, MTLSize,
 };
 #[cfg(target_os = "macos")]
+use rnb_core::tensor::HostStorageLease;
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -92,6 +94,12 @@ pub use gdn_proj_chain::{PrefillProjTrace, TensoropsQuant};
 
 #[cfg(target_os = "macos")]
 type ResidentKey = (usize, usize);
+#[cfg(target_os = "macos")]
+type ResidentEntry = (
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    u32,
+    HostStorageLease,
+);
 
 #[cfg(target_os = "macos")]
 /// pm112: GLM MoE decode 의 UD-quant 레이어 조합 선택. 기본값은
@@ -198,6 +206,19 @@ fn glm_direct_run_preads(
 #[cfg(target_os = "macos")]
 fn resident_key(raw: &[u8]) -> ResidentKey {
     (raw.as_ptr() as usize, raw.len())
+}
+
+#[cfg(target_os = "macos")]
+fn resident_source(raw: &[u8]) -> HostStorageLease {
+    rnb_core::tensor::host_storage_lease(raw)
+        .unwrap_or_else(|| panic!("Metal NoCopy weights must belong to registered host storage"))
+}
+
+#[cfg(target_os = "macos")]
+fn resident_cache_entry(ctx: &compute::MetalContext, raw: &[u8]) -> ResidentEntry {
+    let source = resident_source(raw);
+    let (buffer, page_offset) = compute::wrap_nocopy(ctx, raw);
+    (buffer, page_offset, source)
 }
 
 /// pm115 M1: GLM prefill direct-file 소스 — expert weight 를 mmap 대신 파일에서
@@ -1374,10 +1395,6 @@ mod tests_fixture;
 pub struct MetalBackend {
     device_name: Option<String>,
     ctx: Option<compute::MetalContext>,
-    /// weight slice identity(`raw.as_ptr() as usize`, `raw.len()`) → (NoCopy buffer, page_offset).
-    /// 같은 weight 재호출 시 wrap 생략(zero-copy residency). `MTLBuffer` 가
-    /// `!Send+!Sync` 라 `RefCell` + 단일 스레드(thread_local) 사용 전제.
-    resident: RefCell<HashMap<ResidentKey, (Retained<ProtocolObject<dyn MTLBuffer>>, u32)>>,
     /// Immutable small constants copied once and reused by the whole-model decode chain.
     constant_f32: RefCell<HashMap<ResidentKey, Retained<ProtocolObject<dyn MTLBuffer>>>>,
     constant_u32: RefCell<HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>>>,
@@ -1537,6 +1554,12 @@ pub struct MetalBackend {
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
     attn_batch_carriers: RefCell<HashMap<(usize, usize), attn_chain::AttnBatchCarrier>>,
+    /// Registered host weight slice identity(`raw.as_ptr() as usize`, `raw.len()`) →
+    /// NoCopy buffer, page offset, and a strong source-storage lease. The lease
+    /// prevents the loader mapping from being released while any cached NoCopy
+    /// buffer can still refer to it. Declared last so carrier-held buffer clones
+    /// are dropped before these source leases.
+    resident: RefCell<HashMap<ResidentKey, ResidentEntry>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2587,7 +2610,7 @@ impl MetalBackend {
             let key = resident_key(raw);
             let entry = resident
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1 as usize)
         };
         let weights = specs
@@ -3484,7 +3507,7 @@ impl MetalBackend {
             let mut wrap = |raw: &[u8]| {
                 let entry = resident
                     .entry(resident_key(raw))
-                    .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
                 (entry.0.clone(), entry.1)
             };
             let (q_w_buf, q_w_off) = wrap(req.q_weight.raw);
@@ -3799,7 +3822,7 @@ impl MetalBackend {
             let mut wrap = |raw: &[u8]| {
                 let entry = resident
                     .entry(resident_key(raw))
-                    .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
                 (entry.0.clone(), entry.1)
             };
             let (q_w_buf, q_w_off) = wrap(core.q_weight.raw);
@@ -3989,7 +4012,7 @@ impl MetalBackend {
         let mut cache = self.resident.borrow_mut();
         let entry = cache
             .entry(key)
-            .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+            .or_insert_with(|| resident_cache_entry(ctx, raw));
         compute::gemv_q6k_simd_dispatch(ctx, &entry.0, entry.1, input, n, k)
     }
 
@@ -4007,7 +4030,7 @@ impl MetalBackend {
             let mut cache = self.resident.borrow_mut();
             let entry = cache
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         let use_scratch = std::env::var("RNB_METAL_OUTPUT_ARGMAX_SCRATCH")
@@ -4218,8 +4241,8 @@ impl MetalBackend {
         compute::kvarn_attention_decode_with_ctx(ctx, resident, request)
     }
 
-    /// zero-copy NoCopy Q4_K GEMV. `raw` 는 mmap 내부 포인터(loader 소유)로,
-    /// 복사 없이 `newBufferWithBytesNoCopy` 로 wrap 해 GPU 가 직접 읽는다.
+    /// zero-copy NoCopy Q4_K GEMV. `raw` 는 등록된 mmap storage 내부 포인터이며,
+    /// cache entry 가 storage lease 를 함께 보유해 `MTLBuffer` 보다 먼저 해제되지 않는다.
     /// weight `(ptr,len)` 로 resident 캐싱 — 첫 호출만 wrap(복사 0), 이후 재사용.
     pub fn gemv_q4k_resident(&self, raw: &[u8], input: &[f32], n: usize, k: usize) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
@@ -4227,7 +4250,7 @@ impl MetalBackend {
         let mut cache = self.resident.borrow_mut();
         let entry = cache
             .entry(key)
-            .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+            .or_insert_with(|| resident_cache_entry(ctx, raw));
         compute::gemv_q4k_dispatch(ctx, &entry.0, entry.1, input, n, k)
     }
 
@@ -4245,12 +4268,12 @@ impl MetalBackend {
         let mut cache = self.resident.borrow_mut();
         let entry = cache
             .entry(key)
-            .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+            .or_insert_with(|| resident_cache_entry(ctx, raw));
         compute::gemv_q4k_simd_dispatch(ctx, &entry.0, entry.1, input, n, k)
     }
 
-    /// pm112: GLM MLA decode 용 Q5_K GEMV. weight 는 `(ptr,len)` resident 캐시로
-    /// 1회 zero-copy wrap, 이후 input 만 업로드.
+    /// pm112: GLM MLA decode 용 Q5_K GEMV. 등록된 weight storage 를 보유하는
+    /// `(ptr,len)` resident cache 로 1회 zero-copy wrap, 이후 input 만 업로드.
     pub fn gemv_q5k_mla_resident(&self, raw: &[u8], input: &[f32], n: usize, k: usize) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
         self.ensure_weight_residency(ctx);
@@ -4259,7 +4282,7 @@ impl MetalBackend {
             let mut cache = self.resident.borrow_mut();
             let entry = cache
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         self.touch_weight_residency(key, &buf);
@@ -4281,7 +4304,7 @@ impl MetalBackend {
             let mut cache = self.resident.borrow_mut();
             let entry = cache
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         self.touch_weight_residency(key, &buf);
@@ -4305,7 +4328,7 @@ impl MetalBackend {
             let mut cache = self.resident.borrow_mut();
             let entry = cache
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         self.touch_weight_residency(key, &buf);
@@ -4536,7 +4559,7 @@ impl MetalBackend {
             let mut cache = self.resident.borrow_mut();
             let entry = cache
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         self.touch_weight_residency(key, &buf);
@@ -4637,8 +4660,9 @@ impl MetalBackend {
     }
 
     /// pm33: prefill FFN chain(M>1). normed[seq_len*hidden] + gate/up(Q4_K)/down(Q4_K|Q6_K)
-    /// raw weight → down 결과[seq_len*hidden](residual 전). weight 는 `(ptr,len)` 키로 resident wrap,
-    /// carrier 는 (hidden,ffn,seq_len) 키로 1회 alloc. 단일 command buffer batch GEMM chain.
+    /// raw weight → down 결과[seq_len*hidden](residual 전). weight 는 source storage lease 와
+    /// 함께 `(ptr,len)` 키로 resident wrap, carrier 는 (hidden,ffn,seq_len) 키로 1회 alloc.
+    /// 단일 command buffer batch GEMM chain.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_ffn_chain(
         &self,
@@ -4656,7 +4680,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (gate_wb, gate_off) = wrap(gate_w);
@@ -5011,7 +5035,7 @@ impl MetalBackend {
             let mut resident = self.resident.borrow_mut();
             let entry = resident
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1 as usize)
         };
         let (gate_all, gate_all_offset) = resident_weight(request.gate_all);
@@ -5920,7 +5944,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (gate_all_wb, gate_all_off) = wrap(gate_all);
@@ -6714,7 +6738,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (gate_all_wb, gate_all_off) = wrap(gate_all);
@@ -6787,7 +6811,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let mut gate_w = Vec::with_capacity(route_weights.len());
@@ -6866,7 +6890,7 @@ impl MetalBackend {
             let mut resident = self.resident.borrow_mut();
             let entry = resident
                 .entry(key)
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             if residency_enabled {
                 if let Some(lru) = self.weight_residency.borrow_mut().as_mut() {
                     lru.touch(key, &entry.0);
@@ -7163,7 +7187,7 @@ impl MetalBackend {
                     let mut resident = self.resident.borrow_mut();
                     let entry = resident
                         .entry(key)
-                        .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                        .or_insert_with(|| resident_cache_entry(ctx, raw));
                     if residency_enabled {
                         if let Some(lru) = self.weight_residency.borrow_mut().as_mut() {
                             lru.touch(key, &entry.0);
@@ -7305,7 +7329,7 @@ impl MetalBackend {
                             let mut resident = self.resident.borrow_mut();
                             let entry = resident
                                 .entry(key)
-                                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                                .or_insert_with(|| resident_cache_entry(ctx, raw));
                             if residency_enabled {
                                 if let Some(lru) = self.weight_residency.borrow_mut().as_mut() {
                                     lru.touch(key, &entry.0);
@@ -7399,7 +7423,7 @@ impl MetalBackend {
     }
 
     /// pm35 M2: prefill GDN proj(in_proj/gate) single batch GEMM. normed[seq*hidden] + weight raw
-    /// (Q4_K|Q6_K) → out[seq*n_out]. weight `(ptr,len)` 키 resident wrap, carrier (hidden,n_out,seq) 키.
+    /// (Q4_K|Q6_K) → out[seq*n_out]. weight storage 를 보유하는 `(ptr,len)` resident wrap, carrier (hidden,n_out,seq) 키.
     pub fn prefill_gdn_proj(
         &self,
         normed: &[f32],
@@ -7429,7 +7453,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(weight))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, weight));
+                .or_insert_with(|| resident_cache_entry(ctx, weight));
             (e.0.clone(), e.1)
         };
         let off_buf = gdn_proj_chain::u32_buf(ctx, off);
@@ -7463,7 +7487,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (left_wb, left_off) = wrap(left_weight);
@@ -7515,7 +7539,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (left_wb, left_off) = wrap(left_weight);
@@ -7564,7 +7588,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(router_bytes))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, router_bytes));
+                .or_insert_with(|| resident_cache_entry(ctx, router_bytes));
             (e.0.clone(), e.1)
         };
         let off_buf = gdn_proj_chain::u32_buf(ctx, off);
@@ -7612,7 +7636,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(router_bytes))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, router_bytes));
+                .or_insert_with(|| resident_cache_entry(ctx, router_bytes));
             (e.0.clone(), e.1)
         };
         let off_buf = gdn_proj_chain::u32_buf(ctx, off);
@@ -7699,7 +7723,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(weight))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, weight));
+                .or_insert_with(|| resident_cache_entry(ctx, weight));
             (e.0.clone(), e.1)
         };
         let off_buf = gdn_proj_chain::u32_buf(ctx, off);
@@ -7817,7 +7841,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(ssm_out_weight))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, ssm_out_weight));
+                .or_insert_with(|| resident_cache_entry(ctx, ssm_out_weight));
             (e.0.clone(), e.1)
         };
         let off_buf = gdn_proj_chain::u32_buf(ctx, off);
@@ -7918,7 +7942,7 @@ impl MetalBackend {
             let mut resident = self.resident.borrow_mut();
             let entry = resident
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (entry.0.clone(), entry.1)
         };
         let (ssm_out_buf, ssm_out_off) = wrap_weight(ssm_out_weight);
@@ -8002,7 +8026,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(o_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, o_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, o_raw));
             (e.0.clone(), e.1)
         };
         let o_off_buf = ffn_chain::u32_buf(ctx, o_off);
@@ -8016,8 +8040,8 @@ impl MetalBackend {
     }
 
     /// GDN qkv+gate device-resident chain (Q4_K, 단일 command buffer 2 GEMV).
-    /// norm_input(host)은 norm 완료된 것. qkv/gate weight raw 는 mmap(loader 소유)
-    /// resident NoCopy. carrier shape 별 재사용. 반환: (qkv, gate).
+    /// norm_input(host)은 norm 완료된 것. qkv/gate weight raw 는 등록된 mmap storage 를
+    /// resident cache 가 보유하는 NoCopy view 다. carrier shape 별 재사용. 반환: (qkv, gate).
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_inproj_chain_resident(
         &self,
@@ -8033,14 +8057,14 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(qkv_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, qkv_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, qkv_raw));
             (e.0.clone(), e.1)
         };
         let (gate_w, gate_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(gate_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, gate_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, gate_raw));
             (e.0.clone(), e.1)
         };
         let qkv_off_buf = ffn_chain::u32_buf(ctx, qkv_off);
@@ -8065,8 +8089,8 @@ impl MetalBackend {
     }
 
     /// QKV projection device-resident chain (Q4_K q/k/v, 단일 command buffer 3 GEMV).
-    /// norm_input(host)은 chain 진입 전 norm 완료된 것. q/k/v weight raw 는 mmap 포인터
-    /// (loader 소유) — resident NoCopy 캐시 재사용. carrier 는 shape 별 재사용.
+    /// norm_input(host)은 chain 진입 전 norm 완료된 것. q/k/v weight raw 의 등록된 mmap
+    /// storage 를 resident NoCopy cache 가 보유한다. carrier 는 shape 별 재사용.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_qkv_chain_resident(
         &self,
@@ -8085,21 +8109,21 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(q_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, q_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, q_raw));
             (e.0.clone(), e.1)
         };
         let (k_w, k_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(k_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, k_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, k_raw));
             (e.0.clone(), e.1)
         };
         let (v_w, v_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(v_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, v_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, v_raw));
             (e.0.clone(), e.1)
         };
         let q_off_buf = ffn_chain::u32_buf(ctx, q_off);
@@ -8117,7 +8141,7 @@ impl MetalBackend {
     }
 
     /// FFN device-resident chain (Q4_K gate/up + Q4_K|Q6_K down + RMSNorm/SiLU/residual).
-    /// weight raw 는 mmap 포인터(loader 소유) — resident NoCopy 캐시 재사용.
+    /// weight raw 의 등록된 mmap storage 를 resident NoCopy cache 가 보유한다.
     /// norm weight 는 작아서 복사 업로드. carrier 는 (hidden_dim, ffn_dim) 별 재사용.
     /// `down_is_q6k`: down weight 가 Q6_K(block 210B) 면 true, Q4_K(144B) 면 false.
     #[allow(clippy::too_many_arguments)]
@@ -8140,21 +8164,21 @@ impl MetalBackend {
             let mut resident = self.resident.borrow_mut();
             let e = resident
                 .entry(resident_key(gate_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, gate_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, gate_raw));
             (e.0.clone(), e.1)
         };
         let (up_w, up_off) = {
             let mut resident = self.resident.borrow_mut();
             let e = resident
                 .entry(resident_key(up_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, up_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, up_raw));
             (e.0.clone(), e.1)
         };
         let (down_w, down_off) = {
             let mut resident = self.resident.borrow_mut();
             let e = resident
                 .entry(resident_key(down_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, down_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, down_raw));
             (e.0.clone(), e.1)
         };
 
@@ -8189,8 +8213,8 @@ impl MetalBackend {
 
     /// Attention layer 전체 device-resident chain (표준 Qwen3: norm→q/k/v GEMV→
     /// q/k norm→rope→kv_append→attn→o→residual, 단일 command buffer). q/k/v/o weight
-    /// raw 는 mmap 포인터(loader 소유) resident NoCopy. norm/q_norm/k_norm 은 작아서
-    /// 복사 업로드. carrier 는 layer 별 재사용(KV state 분리). prior_k/prior_v 는 이전
+    /// raw 의 등록된 mmap storage 를 resident NoCopy cache 가 보유한다. norm/q_norm/k_norm 은
+    /// 작아서 복사 업로드. carrier 는 layer 별 재사용(KV state 분리). prior_k/prior_v 는 이전
     /// 토큰들(host f16 bits, [pos*kv_dim]) — KV_dev[0..pos] 동기화용. 반환: residual hidden.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_layer_resident(
@@ -8229,33 +8253,33 @@ impl MetalBackend {
     ) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
 
-        // q/k/v/o weight NoCopy resident 캐시 (gemv_q4k_resident 와 동일 키=raw ptr).
+        // q/k/v/o weight NoCopy resident 캐시 (동일 `(ptr,len)` 키 + source storage lease).
         let (q_w, q_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(q_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, q_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, q_raw));
             (e.0.clone(), e.1)
         };
         let (k_w, k_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(k_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, k_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, k_raw));
             (e.0.clone(), e.1)
         };
         let (v_w, v_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(v_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, v_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, v_raw));
             (e.0.clone(), e.1)
         };
         let (o_w, o_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(o_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, o_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, o_raw));
             (e.0.clone(), e.1)
         };
         // FFN gate/up/down weight NoCopy resident 캐시.
@@ -8263,21 +8287,21 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(ffn_gate_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, ffn_gate_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, ffn_gate_raw));
             (e.0.clone(), e.1)
         };
         let (ffn_up_w, ffn_up_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(ffn_up_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, ffn_up_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, ffn_up_raw));
             (e.0.clone(), e.1)
         };
         let (ffn_down_w, ffn_down_off) = {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(ffn_down_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, ffn_down_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, ffn_down_raw));
             (e.0.clone(), e.1)
         };
         let q_off_buf = ffn_chain::u32_buf(ctx, q_off);
@@ -8390,12 +8414,12 @@ impl MetalBackend {
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
 
-        // Q4_K GEMV weight NoCopy resident 캐시(raw `(ptr,len)` 키).
+        // Q4_K GEMV weight NoCopy resident 캐시(`(ptr,len)` 키 + source storage lease).
         let wrap = |raw: &[u8]| {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (qkv_w, qkv_off) = wrap(qkv_raw);
@@ -8521,7 +8545,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let (qkv_w, qkv_off) = wrap(qkv_raw);
@@ -8646,7 +8670,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let router_bytes = unsafe {
@@ -9066,7 +9090,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
 
@@ -10193,7 +10217,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
 
@@ -10503,7 +10527,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, raw));
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
         let router_bytes = unsafe {
@@ -10617,7 +10641,7 @@ impl MetalBackend {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(tail.output_raw))
-                .or_insert_with(|| compute::wrap_nocopy(ctx, tail.output_raw));
+                .or_insert_with(|| resident_cache_entry(ctx, tail.output_raw));
             (e.0.clone(), e.1)
         };
         let hidden_dev = ffn_chain::shared_f32_buf(ctx, hidden); // [batch*hidden_dim]
@@ -10760,6 +10784,15 @@ mod tests {
             }
         }
     }
+    fn mapped_test_tensor(raw: &[u8]) -> rnb_core::tensor::Tensor {
+        let mut mmap = memmap2::MmapMut::map_anon(raw.len()).expect("anonymous mmap");
+        mmap.copy_from_slice(raw);
+        let storage = std::sync::Arc::new(rnb_core::tensor::Storage::Mmap(
+            mmap.make_read_only().expect("read-only mmap"),
+        ));
+        rnb_core::tensor::Tensor::from_mmap(storage, 0, &[raw.len()], rnb_core::tensor::DType::U8)
+            .expect("mapped tensor")
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -10770,6 +10803,55 @@ mod tests {
 
         assert_eq!(short.as_ptr(), long.as_ptr());
         assert_ne!(resident_key(short), resident_key(long));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_resident_entry_retains_mapping_until_cache_removal() {
+        struct BufferDropProbe(std::sync::Weak<rnb_core::tensor::Storage>);
+
+        impl Drop for BufferDropProbe {
+            fn drop(&mut self) {
+                assert!(
+                    self.0.upgrade().is_some(),
+                    "source mapping must outlive cached buffer destruction"
+                );
+            }
+        }
+
+        let mmap = memmap2::MmapMut::map_anon(4096)
+            .expect("anonymous mmap")
+            .make_read_only()
+            .expect("read-only mmap");
+        let storage = std::sync::Arc::new(rnb_core::tensor::Storage::Mmap(mmap));
+        let weak_storage = std::sync::Arc::downgrade(&storage);
+        let tensor = rnb_core::tensor::Tensor::from_mmap(
+            std::sync::Arc::clone(&storage),
+            0,
+            &[4096],
+            rnb_core::tensor::DType::U8,
+        )
+        .expect("mapped tensor");
+        let (key, source) = {
+            let raw = tensor.as_bytes().expect("mapped bytes");
+            (resident_key(raw), resident_source(raw))
+        };
+        let mut cache: HashMap<ResidentKey, (BufferDropProbe, u32, HostStorageLease)> =
+            HashMap::new();
+        cache.insert(key, (BufferDropProbe(weak_storage.clone()), 0, source));
+
+        drop(tensor);
+        drop(storage);
+        assert!(
+            weak_storage.upgrade().is_some(),
+            "resident entry must retain the source mapping"
+        );
+
+        cache.remove(&key);
+        assert!(
+            weak_storage.upgrade().is_none(),
+            "source mapping must be released with the resident entry"
+        );
     }
 
     #[test]
@@ -11471,10 +11553,9 @@ mod tests {
         let backend = MetalBackend::new();
         let fixture = QwenMoeLlamaIdFixture::new(QwenMoeLlamaIdQuant::Q5K);
         let mapped = |raw: &[u8]| {
-            let mut map = memmap2::MmapMut::map_anon(OFFSET + raw.len()).expect("anonymous mmap");
-            map[..OFFSET].fill(0xff);
-            map[OFFSET..].copy_from_slice(raw);
-            map
+            let mut prefixed = vec![0xff; OFFSET];
+            prefixed.extend_from_slice(raw);
+            mapped_test_tensor(&prefixed)
         };
         let gate_all = mapped(&fixture.gate_all);
         let up_all = mapped(&fixture.up_all);
@@ -11483,12 +11564,12 @@ mod tests {
         let shared_up = mapped(&fixture.shared_up);
         let shared_down = mapped(&fixture.shared_down);
         let raw_weights = [
-            &gate_all[OFFSET..],
-            &up_all[OFFSET..],
-            &down_all[OFFSET..],
-            &shared_gate[OFFSET..],
-            &shared_up[OFFSET..],
-            &shared_down[OFFSET..],
+            &gate_all.as_bytes().expect("gate bytes")[OFFSET..],
+            &up_all.as_bytes().expect("up bytes")[OFFSET..],
+            &down_all.as_bytes().expect("down bytes")[OFFSET..],
+            &shared_gate.as_bytes().expect("shared gate bytes")[OFFSET..],
+            &shared_up.as_bytes().expect("shared up bytes")[OFFSET..],
+            &shared_down.as_bytes().expect("shared down bytes")[OFFSET..],
         ];
         for raw in raw_weights {
             assert_eq!(
@@ -11499,12 +11580,12 @@ mod tests {
         }
         let request = || {
             let mut request = fixture.request();
-            request.gate_all = &gate_all[OFFSET..];
-            request.up_all = &up_all[OFFSET..];
-            request.down_all = &down_all[OFFSET..];
-            request.shared_gate = &shared_gate[OFFSET..];
-            request.shared_up = &shared_up[OFFSET..];
-            request.shared_down = &shared_down[OFFSET..];
+            request.gate_all = &gate_all.as_bytes().expect("gate bytes")[OFFSET..];
+            request.up_all = &up_all.as_bytes().expect("up bytes")[OFFSET..];
+            request.down_all = &down_all.as_bytes().expect("down bytes")[OFFSET..];
+            request.shared_gate = &shared_gate.as_bytes().expect("shared gate bytes")[OFFSET..];
+            request.shared_up = &shared_up.as_bytes().expect("shared up bytes")[OFFSET..];
+            request.shared_down = &shared_down.as_bytes().expect("shared down bytes")[OFFSET..];
             request
         };
 
@@ -11526,7 +11607,7 @@ mod tests {
         }
         let resident = backend.resident.borrow();
         for raw in raw_weights {
-            let (_, offset) = resident
+            let (_, offset, _) = resident
                 .get(&resident_key(raw))
                 .expect("raw weight resident");
             assert_eq!(*offset as usize, OFFSET);
@@ -11561,6 +11642,12 @@ mod tests {
             let token_scale = if index < DIM { 0.5 } else { 0.75 };
             *value = token_scale * ((index % DIM + 1) as f32 / DIM as f32);
         }
+        let gate_all = mapped_test_tensor(&fixture.gate_all);
+        let up_all = mapped_test_tensor(&fixture.up_all);
+        let down_all = mapped_test_tensor(&fixture.down_all);
+        let shared_gate = mapped_test_tensor(&fixture.shared_gate);
+        let shared_up = mapped_test_tensor(&fixture.shared_up);
+        let shared_down = mapped_test_tensor(&fixture.shared_down);
 
         let selected_a = [0, 1, 0, 1];
         let weights_a = [0.8, 0.2, 0.65, 0.35];
@@ -11570,6 +11657,12 @@ mod tests {
         let shared_b = [0.2, 0.7];
         let request = |selected_experts, route_weights, shared_route_weights| {
             let mut request = fixture.request();
+            request.gate_all = gate_all.as_bytes().expect("gate bytes");
+            request.up_all = up_all.as_bytes().expect("up bytes");
+            request.down_all = down_all.as_bytes().expect("down bytes");
+            request.shared_gate = shared_gate.as_bytes().expect("shared gate bytes");
+            request.shared_up = shared_up.as_bytes().expect("shared up bytes");
+            request.shared_down = shared_down.as_bytes().expect("shared down bytes");
             request.selected_experts = selected_experts;
             request.route_weights = route_weights;
             request.shared_route_weights = shared_route_weights;
@@ -12513,6 +12606,12 @@ mod tests {
         let gate_w = quantize_rows_q4k(&det_vals(ffn * hid, 0.05), ffn, hid);
         let up_w = quantize_rows_q4k(&det_vals(ffn * hid, 0.04), ffn, hid);
         let down_w = build_q6k_rows(hid, ffn);
+        let gate_mapped = mapped_test_tensor(&gate_w);
+        let up_mapped = mapped_test_tensor(&up_w);
+        let down_mapped = mapped_test_tensor(&down_w);
+        let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
+        let up_raw = up_mapped.as_bytes().expect("up bytes");
+        let down_raw = down_mapped.as_bytes().expect("down bytes");
         let normed = det_vals(m * hid, 0.1);
 
         // CPU reference: gate/up GEMM → silu → down GEMM.
@@ -12525,7 +12624,7 @@ mod tests {
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m); // [m, hid]
 
-        let gpu = backend.prefill_ffn_chain(&normed, &gate_w, &up_w, &down_w, true, m, hid, ffn);
+        let gpu = backend.prefill_ffn_chain(&normed, gate_raw, up_raw, down_raw, true, m, hid, ffn);
         assert_eq!(gpu.len(), m * hid);
         // pm34 M7: M5 default = tensorops(half staging) → global rel(half GEMM 표준). 비-M5 는
         // naive(f32)라 더 작음. element-wise rel 은 want≈0 에서 ill-defined.
@@ -12556,6 +12655,12 @@ mod tests {
         let gate_w = quantize_rows_q4k(&det_vals(ffn * hid, 0.05), ffn, hid);
         let up_w = quantize_rows_q4k(&det_vals(ffn * hid, 0.04), ffn, hid);
         let down_w = build_q6k_rows(hid, ffn);
+        let gate_mapped = mapped_test_tensor(&gate_w);
+        let up_mapped = mapped_test_tensor(&up_w);
+        let down_mapped = mapped_test_tensor(&down_w);
+        let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
+        let up_raw = up_mapped.as_bytes().expect("up bytes");
+        let down_raw = down_mapped.as_bytes().expect("down bytes");
         let normed = det_vals(m * hid, 0.1);
         let g = cpu_q4k_gemm_reference(&gate_w, ffn, hid, &normed, m);
         let u = cpu_q4k_gemm_reference(&up_w, ffn, hid, &normed, m);
@@ -12565,7 +12670,7 @@ mod tests {
             .map(|(&a, &b)| (a / (1.0 + (-a).exp())) * b)
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m);
-        let gpu = backend.prefill_ffn_chain(&normed, &gate_w, &up_w, &down_w, true, m, hid, ffn);
+        let gpu = backend.prefill_ffn_chain(&normed, gate_raw, up_raw, down_raw, true, m, hid, ffn);
         std::env::remove_var("RNB_METAL_PREFILL_FFN_KERNEL");
         assert_eq!(gpu.len(), m * hid);
         // naive = f32 staging → element-wise rel<1e-3 정밀 검증.
@@ -15987,6 +16092,14 @@ kernel void q4k_ro_vec4(
         let up_q4 = quantize_rows_q4k(&det_vals(ffn_dim * hidden_dim, 0.017), ffn_dim, hidden_dim);
         let down_q4 =
             quantize_rows_q4k(&det_vals(hidden_dim * ffn_dim, 0.013), hidden_dim, ffn_dim);
+        let ssm_out_mapped = mapped_test_tensor(&ssm_out_q4);
+        let gate_mapped = mapped_test_tensor(&gate_q4);
+        let up_mapped = mapped_test_tensor(&up_q4);
+        let down_mapped = mapped_test_tensor(&down_q4);
+        let ssm_out_raw = ssm_out_mapped.as_bytes().expect("ssm out bytes");
+        let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
+        let up_raw = up_mapped.as_bytes().expect("up bytes");
+        let down_raw = down_mapped.as_bytes().expect("down bytes");
 
         let (proj, state_expected) = backend.prefill_gdn_full_chain(
             &conv_input,
@@ -15996,7 +16109,7 @@ kernel void q4k_ro_vec4(
             &state,
             &z,
             &ssm_norm,
-            &ssm_out_q4,
+            ssm_out_raw,
             TensoropsQuant::Q4K,
             seq,
             conv_channels,
@@ -16026,7 +16139,7 @@ kernel void q4k_ro_vec4(
             }
         }
         let ffn_down = backend.prefill_ffn_chain(
-            &normed, &gate_q4, &up_q4, &down_q4, false, seq, hidden_dim, ffn_dim,
+            &normed, gate_raw, up_raw, down_raw, false, seq, hidden_dim, ffn_dim,
         );
         let mut expected = hidden_plus;
         for i in 0..expected.len() {
@@ -16043,12 +16156,12 @@ kernel void q4k_ro_vec4(
                 &state,
                 &z,
                 &ssm_norm,
-                &ssm_out_q4,
+                ssm_out_raw,
                 TensoropsQuant::Q4K,
                 &post_norm,
-                &gate_q4,
-                &up_q4,
-                &down_q4,
+                gate_raw,
+                up_raw,
+                down_raw,
                 false,
                 seq,
                 conv_channels,
@@ -16960,9 +17073,11 @@ kernel void q4k_ro_vec4(
             .copied()
             .collect();
         let input: Vec<f32> = (0..k).map(|i| ((i % 11) as f32 - 5.0) * 0.07).collect();
+        let weight_mapped = mapped_test_tensor(&weight);
+        let resident_weight = weight_mapped.as_bytes().expect("weight bytes");
 
         let copy = backend.gemv_q6k_simd(&weight, &input, n, k);
-        let resident = backend.gemv_q6k_simd_resident(&weight, &input, n, k);
+        let resident = backend.gemv_q6k_simd_resident(resident_weight, &input, n, k);
 
         assert_eq!(resident.len(), n);
         for i in 0..n {
@@ -16995,15 +17110,17 @@ kernel void q4k_ro_vec4(
             .copied()
             .collect();
         let input: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) * 0.03).collect();
+        let weight_mapped = mapped_test_tensor(&weight);
+        let resident_weight = weight_mapped.as_bytes().expect("weight bytes");
 
-        let logits = backend.gemv_q6k_simd_resident(&weight, &input, n, k);
+        let logits = backend.gemv_q6k_simd_resident(resident_weight, &input, n, k);
         let expected = logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(idx, _)| idx as u32);
 
-        let report = backend.output_argmax_q6k_simd_resident(&weight, &input, n, k);
+        let report = backend.output_argmax_q6k_simd_resident(resident_weight, &input, n, k);
 
         assert!(report.did_run);
         assert_eq!(report.token_id, expected);
@@ -17030,15 +17147,17 @@ kernel void q4k_ro_vec4(
             .copied()
             .collect();
         let input: Vec<f32> = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.025).collect();
+        let weight_mapped = mapped_test_tensor(&weight);
+        let resident_weight = weight_mapped.as_bytes().expect("weight bytes");
 
-        let logits = backend.gemv_q4k_simd_resident(&weight, &input, n, k);
+        let logits = backend.gemv_q4k_simd_resident(resident_weight, &input, n, k);
         let expected = logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(idx, _)| idx as u32);
 
-        let report = backend.output_argmax_q4k_simd_resident(&weight, &input, n, k);
+        let report = backend.output_argmax_q4k_simd_resident(resident_weight, &input, n, k);
 
         assert!(report.did_run);
         assert_eq!(report.token_id, expected);
@@ -17101,13 +17220,12 @@ kernel void q4k_ro_vec4(
         let reference = tests_fixture::q4k_dequant_sum(&block);
 
         const PAGE: usize = 16384;
+        const OFFSET: usize = 500;
         let mut buf = vec![0u8; 3 * PAGE];
-        let base = buf.as_ptr() as usize;
-        let first_page = (base + PAGE - 1) & !(PAGE - 1); // buf 내부 첫 page 경계
-        let target = first_page + 500; // page 중간(off=500), buf 내부 보장
-        let off = target - base;
-        buf[off..off + block.len()].copy_from_slice(&block);
-        let raw = &buf[off..off + block.len()];
+        buf[OFFSET..OFFSET + block.len()].copy_from_slice(&block);
+        let mapped = mapped_test_tensor(&buf);
+        let mapped_bytes = mapped.as_bytes().expect("mapped bytes");
+        let raw = &mapped_bytes[OFFSET..OFFSET + block.len()];
         assert_ne!((raw.as_ptr() as usize) % PAGE, 0, "page_off ≠ 0 강제");
 
         let backend = MetalBackend::new();
@@ -17127,12 +17245,12 @@ kernel void q4k_ro_vec4(
         let reference = tests_fixture::q4k_dequant_sum(&block);
 
         const PAGE: usize = 16384;
+        const OFFSET: usize = 500;
         let mut buf = vec![0u8; 3 * PAGE];
-        let base = buf.as_ptr() as usize;
-        let first_page = (base + PAGE - 1) & !(PAGE - 1);
-        let off = first_page + 500 - base;
-        buf[off..off + block.len()].copy_from_slice(&block);
-        let raw = &buf[off..off + block.len()];
+        buf[OFFSET..OFFSET + block.len()].copy_from_slice(&block);
+        let mapped = mapped_test_tensor(&buf);
+        let mapped_bytes = mapped.as_bytes().expect("mapped bytes");
+        let raw = &mapped_bytes[OFFSET..OFFSET + block.len()];
 
         let backend = MetalBackend::new();
         // 같은 raw 슬라이스로 2회 — 2번째는 캐시 hit.
@@ -17155,6 +17273,8 @@ kernel void q4k_ro_vec4(
         let tokens = 2usize;
         let slots = tokens * heads;
         let raw = tests_fixture::scaled_q8_0_matrix(heads * n_per_head, k, 7);
+        let raw_mapped = mapped_test_tensor(&raw);
+        let resident_raw = raw_mapped.as_bytes().expect("weight bytes");
 
         let mut input = vec![0.0f32; slots * k];
         for (i, v) in input.iter_mut().enumerate() {
@@ -17181,8 +17301,14 @@ kernel void q4k_ro_vec4(
         }
 
         let backend = MetalBackend::new();
-        let out = backend
-            .glm_mla_head_gemv_q8_0_slots_resident(&raw, &input, slots, heads, n_per_head, k);
+        let out = backend.glm_mla_head_gemv_q8_0_slots_resident(
+            resident_raw,
+            &input,
+            slots,
+            heads,
+            n_per_head,
+            k,
+        );
         assert_eq!(out.len(), reference.len());
         for (i, (&metal_v, &cpu_v)) in out.iter().zip(&reference).enumerate() {
             let rel = (metal_v - cpu_v).abs() / cpu_v.abs().max(1e-5);
@@ -17205,6 +17331,8 @@ kernel void q4k_ro_vec4(
         let tokens = 2usize;
         let slots = tokens * heads;
         let raw = tests_fixture::scaled_q5k_matrix(heads * n_per_head, k, 5);
+        let raw_mapped = mapped_test_tensor(&raw);
+        let resident_raw = raw_mapped.as_bytes().expect("weight bytes");
 
         let mut input = vec![0.0f32; slots * k];
         for (i, v) in input.iter_mut().enumerate() {
@@ -17231,8 +17359,14 @@ kernel void q4k_ro_vec4(
         }
 
         let backend = MetalBackend::new();
-        let out =
-            backend.glm_mla_head_gemv_q5k_slots_resident(&raw, &input, slots, heads, n_per_head, k);
+        let out = backend.glm_mla_head_gemv_q5k_slots_resident(
+            resident_raw,
+            &input,
+            slots,
+            heads,
+            n_per_head,
+            k,
+        );
         assert_eq!(out.len(), reference.len());
         for (i, (&metal_v, &cpu_v)) in out.iter().zip(&reference).enumerate() {
             let rel = (metal_v - cpu_v).abs() / cpu_v.abs().max(1e-5);
@@ -17275,6 +17409,18 @@ kernel void q4k_ro_vec4(
         let kb_raw = tests_fixture::scaled_q8_0_matrix(heads * kv_rank, q_nope_dim, 11);
         let vb_raw = tests_fixture::scaled_q8_0_matrix(heads * value_dim, kv_rank, 13);
         let o_raw = tests_fixture::scaled_q5k_matrix(o_rows, o_cols, 15);
+        let qa_mapped = mapped_test_tensor(&qa_raw);
+        let qb_mapped = mapped_test_tensor(&qb_raw);
+        let kva_mapped = mapped_test_tensor(&kva_raw);
+        let kb_mapped = mapped_test_tensor(&kb_raw);
+        let vb_mapped = mapped_test_tensor(&vb_raw);
+        let o_mapped = mapped_test_tensor(&o_raw);
+        let qa_bytes = qa_mapped.as_bytes().expect("qa bytes");
+        let qb_bytes = qb_mapped.as_bytes().expect("qb bytes");
+        let kva_bytes = kva_mapped.as_bytes().expect("kva bytes");
+        let kb_bytes = kb_mapped.as_bytes().expect("kb bytes");
+        let vb_bytes = vb_mapped.as_bytes().expect("vb bytes");
+        let o_bytes = o_mapped.as_bytes().expect("o bytes");
         let mut qa_norm_w = vec![0.0f32; q_rank];
         for (i, v) in qa_norm_w.iter_mut().enumerate() {
             *v = 1.0 + ((i % 7) as f32 - 3.0) * 0.05;
@@ -17295,7 +17441,7 @@ kernel void q4k_ro_vec4(
         let backend = MetalBackend::new();
         // ---- CPU 참조 체인 (분리 slots dispatch + CPU rms/rope/f16/attn) ----
         let qa = backend
-            .glm_mla_head_gemv_q5k_slots_resident(&qa_raw, &normed, seq_len, 1, q_rank, hidden);
+            .glm_mla_head_gemv_q5k_slots_resident(qa_bytes, &normed, seq_len, 1, q_rank, hidden);
         let mut qa_norm = vec![0.0f32; qa.len()];
         for token in 0..seq_len {
             let row = &qa[token * q_rank..(token + 1) * q_rank];
@@ -17309,9 +17455,10 @@ kernel void q4k_ro_vec4(
             }
         }
         let q_ref = backend
-            .glm_mla_head_gemv_q8_0_slots_resident(&qb_raw, &qa_norm, seq_len, 1, q_dim, q_rank);
-        let kv_ref = backend
-            .glm_mla_head_gemv_q8_0_slots_resident(&kva_raw, &normed, seq_len, 1, kv_width, hidden);
+            .glm_mla_head_gemv_q8_0_slots_resident(qb_bytes, &qa_norm, seq_len, 1, q_dim, q_rank);
+        let kv_ref = backend.glm_mla_head_gemv_q8_0_slots_resident(
+            kva_bytes, &normed, seq_len, 1, kv_width, hidden,
+        );
         let slots = seq_len * heads;
         let mut qnope = vec![0.0f32; slots * q_nope_dim];
         for slot in 0..slots {
@@ -17322,7 +17469,7 @@ kernel void q4k_ro_vec4(
                 .copy_from_slice(&q_ref[base..base + q_nope_dim]);
         }
         let qabs_ref = backend.glm_mla_head_gemv_q8_0_slots_resident(
-            &kb_raw, &qnope, slots, heads, kv_rank, q_nope_dim,
+            kb_bytes, &qnope, slots, heads, kv_rank, q_nope_dim,
         );
         // CPU rope (rope_inplace 수식) — theta_scale 누적곱.
         let theta_scale = theta.powf(-2.0f32 / rope_dim as f32);
@@ -17371,7 +17518,7 @@ kernel void q4k_ro_vec4(
             &qabs_ref, &qpe_ref, &cache_ref, slots, heads, kv_rank, rope_dim, pos_start, scale,
         );
         let concat_ref = backend.glm_mla_head_gemv_q8_0_slots_resident(
-            &vb_raw,
+            vb_bytes,
             &latent_ref,
             slots,
             heads,
@@ -17379,7 +17526,7 @@ kernel void q4k_ro_vec4(
             kv_rank,
         );
         let projected_ref = backend.glm_mla_head_gemv_q5k_slots_resident(
-            &o_raw,
+            o_bytes,
             &concat_ref,
             seq_len,
             1,
@@ -17389,15 +17536,15 @@ kernel void q4k_ro_vec4(
 
         // ---- fused ----
         let out = backend.glm_mla_layer_fused_resident(
-            &qa_raw,
+            qa_bytes,
             &qa_norm_w,
-            &qb_raw,
-            &kva_raw,
-            &kb_raw,
+            qb_bytes,
+            kva_bytes,
+            kb_bytes,
             &kv_norm_w,
             &cache_base,
-            &vb_raw,
-            &o_raw,
+            vb_bytes,
+            o_bytes,
             true,
             &normed,
             seq_len,
@@ -17462,6 +17609,14 @@ kernel void q4k_ro_vec4(
         let qb_raw = tests_fixture::scaled_q8_0_matrix(q_dim, q_rank, 7);
         let kva_raw = tests_fixture::scaled_q8_0_matrix(kv_width, hidden, 9);
         let kb_raw = tests_fixture::scaled_q8_0_matrix(heads * kv_rank, q_nope_dim, 11);
+        let qa_mapped = mapped_test_tensor(&qa_raw);
+        let qb_mapped = mapped_test_tensor(&qb_raw);
+        let kva_mapped = mapped_test_tensor(&kva_raw);
+        let kb_mapped = mapped_test_tensor(&kb_raw);
+        let qa_bytes = qa_mapped.as_bytes().expect("qa bytes");
+        let qb_bytes = qb_mapped.as_bytes().expect("qb bytes");
+        let kva_bytes = kva_mapped.as_bytes().expect("kva bytes");
+        let kb_bytes = kb_mapped.as_bytes().expect("kb bytes");
         let mut qa_norm_w = vec![0.0f32; q_rank];
         for (i, v) in qa_norm_w.iter_mut().enumerate() {
             *v = 1.0 + ((i % 7) as f32 - 3.0) * 0.05;
@@ -17474,7 +17629,7 @@ kernel void q4k_ro_vec4(
         let backend = MetalBackend::new();
         // 참조 체인: 분리 slots dispatch + CPU rms.
         let qa = backend
-            .glm_mla_head_gemv_q5k_slots_resident(&qa_raw, &normed, seq_len, 1, q_rank, hidden);
+            .glm_mla_head_gemv_q5k_slots_resident(qa_bytes, &normed, seq_len, 1, q_rank, hidden);
         let mut qa_norm = vec![0.0f32; qa.len()];
         for token in 0..seq_len {
             let row = &qa[token * q_rank..(token + 1) * q_rank];
@@ -17488,9 +17643,10 @@ kernel void q4k_ro_vec4(
             }
         }
         let q_ref = backend
-            .glm_mla_head_gemv_q8_0_slots_resident(&qb_raw, &qa_norm, seq_len, 1, q_dim, q_rank);
-        let kv_ref = backend
-            .glm_mla_head_gemv_q8_0_slots_resident(&kva_raw, &normed, seq_len, 1, kv_width, hidden);
+            .glm_mla_head_gemv_q8_0_slots_resident(qb_bytes, &qa_norm, seq_len, 1, q_dim, q_rank);
+        let kv_ref = backend.glm_mla_head_gemv_q8_0_slots_resident(
+            kva_bytes, &normed, seq_len, 1, kv_width, hidden,
+        );
         let slots = seq_len * heads;
         let mut qnope = vec![0.0f32; slots * q_nope_dim];
         for slot in 0..slots {
@@ -17501,11 +17657,11 @@ kernel void q4k_ro_vec4(
                 .copy_from_slice(&q_ref[base..base + q_nope_dim]);
         }
         let qabs_ref = backend.glm_mla_head_gemv_q8_0_slots_resident(
-            &kb_raw, &qnope, slots, heads, kv_rank, q_nope_dim,
+            kb_bytes, &qnope, slots, heads, kv_rank, q_nope_dim,
         );
 
         let (q, kv_raw, qabs) = backend.glm_mla_front_slots_fused_resident(
-            &qa_raw, &qa_norm_w, &qb_raw, &kva_raw, &kb_raw, &normed, seq_len, hidden, q_rank,
+            qa_bytes, &qa_norm_w, qb_bytes, kva_bytes, kb_bytes, &normed, seq_len, hidden, q_rank,
             q_dim, kv_width, heads, qk_dim, q_nope_dim, kv_rank, eps,
         );
         let assert_close = |name: &str, got: &[f32], want: &[f32]| {
@@ -17538,6 +17694,10 @@ kernel void q4k_ro_vec4(
         let o_cols = heads * value_dim;
         let vb_raw = tests_fixture::scaled_q8_0_matrix(heads * value_dim, kv_rank, 7);
         let o_raw = tests_fixture::scaled_q5k_matrix(o_rows, o_cols, 5);
+        let vb_mapped = mapped_test_tensor(&vb_raw);
+        let o_mapped = mapped_test_tensor(&o_raw);
+        let vb_bytes = vb_mapped.as_bytes().expect("vb bytes");
+        let o_bytes = o_mapped.as_bytes().expect("o bytes");
 
         let mut latent = vec![0.0f32; slots * kv_rank];
         for (i, v) in latent.iter_mut().enumerate() {
@@ -17546,12 +17706,12 @@ kernel void q4k_ro_vec4(
 
         let backend = MetalBackend::new();
         let mid = backend.glm_mla_head_gemv_q8_0_slots_resident(
-            &vb_raw, &latent, slots, heads, value_dim, kv_rank,
+            vb_bytes, &latent, slots, heads, value_dim, kv_rank,
         );
         let reference =
-            backend.glm_mla_head_gemv_q5k_slots_resident(&o_raw, &mid, tokens, 1, o_rows, o_cols);
+            backend.glm_mla_head_gemv_q5k_slots_resident(o_bytes, &mid, tokens, 1, o_rows, o_cols);
         let fused = backend.glm_mla_vb_o_fused_resident(
-            &vb_raw, &o_raw, true, &latent, slots, heads, value_dim, kv_rank, o_rows,
+            vb_bytes, o_bytes, true, &latent, slots, heads, value_dim, kv_rank, o_rows,
         );
         assert_eq!(fused, reference, "fused vs split must be bit-identical");
     }

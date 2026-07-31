@@ -6253,11 +6253,11 @@ pub(crate) struct QwenMoeDecodeChainCarrier {
     up_shared_off_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     down_shared_off_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     zero_off_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    selected_slice_cache:
-        RefCell<HashMap<(usize, usize), (Retained<ProtocolObject<dyn MTLBuffer>>, u32)>>,
     table_cache: RefCell<HashMap<QwenMoeDecodeTableKey, QwenMoeDecodeTableSet>>,
     // B-fusion: batch 별 fused-shared scratch(normed/gate/up/down all-lane), warmup 후 재사용.
     batch_scratch: RefCell<HashMap<usize, QwenMoeBatchScratch>>,
+    // Keep source leases after the argument-table buffer clones during field drop.
+    selected_slice_cache: RefCell<HashMap<crate::ResidentKey, crate::ResidentEntry>>,
 }
 
 impl QwenMoeDecodeChainCarrier {
@@ -6409,11 +6409,11 @@ impl QwenMoeDecodeChainCarrier {
         ctx: &MetalContext,
         raw: &[u8],
     ) -> (Retained<ProtocolObject<dyn MTLBuffer>>, u32) {
-        let key = (raw.as_ptr() as usize, raw.len());
+        let key = crate::resident_key(raw);
         let mut cache = self.selected_slice_cache.borrow_mut();
         let entry = cache
             .entry(key)
-            .or_insert_with(|| crate::compute::wrap_nocopy(ctx, raw));
+            .or_insert_with(|| crate::resident_cache_entry(ctx, raw));
         (entry.0.clone(), entry.1)
     }
 

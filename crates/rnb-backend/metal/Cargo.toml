@@ -9,6 +9,7 @@ metal = []
 
 [dependencies]
 rnb-backend-api = { path = "../api" }
+rnb-core = { path = "../../rnb-core" }
 rnb-memory = { path = "../../rnb-memory" }
 rnb-platform = { path = "../../rnb-platform" }
 half = "2"

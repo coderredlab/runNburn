@@ -204,6 +204,23 @@ pub struct HostStorageIdentity {
     pub byte_offset: usize,
     pub len: usize,
 }
+/// Strong lease for a registered host storage allocation.
+///
+/// Keeping this value alive keeps the allocation behind a resolved byte range
+/// alive, so external zero-copy views cannot outlive their source memory.
+#[derive(Clone)]
+pub struct HostStorageLease {
+    identity: HostStorageIdentity,
+    _storage: Arc<Storage>,
+}
+
+impl std::fmt::Debug for HostStorageLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostStorageLease")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
 
 struct HostStorageRegistration {
     allocation_id: u64,
@@ -266,6 +283,31 @@ pub fn host_storage_identity(bytes: &[u8]) -> Option<HostStorageIdentity> {
     })
 }
 
+/// Resolves a byte slice and retains its registered storage allocation.
+///
+/// Unlike [`host_storage_identity`], the returned lease is an owning lifetime
+/// link suitable for caches of external zero-copy views.
+pub fn host_storage_lease(bytes: &[u8]) -> Option<HostStorageLease> {
+    let start = bytes.as_ptr() as usize;
+    let end = start.checked_add(bytes.len())?;
+    let registrations = HOST_STORAGE_REGISTRY.read().ok()?;
+    registrations.iter().find_map(|entry| {
+        let storage = entry.storage.upgrade()?;
+        let storage_end = entry.base.checked_add(entry.len)?;
+        if start < entry.base || end > storage_end {
+            return None;
+        }
+        Some(HostStorageLease {
+            identity: HostStorageIdentity {
+                allocation_id: entry.allocation_id,
+                byte_offset: start - entry.base,
+                len: bytes.len(),
+            },
+            _storage: storage,
+        })
+    })
+}
+
 pub enum Storage {
     Owned(Buffer),
     Mmap(memmap2::Mmap),
@@ -323,5 +365,26 @@ mod tests {
         let buf = Buffer::alloc(32, 8);
         let storage = Storage::Owned(buf);
         assert_eq!(storage.as_slice().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn host_storage_lease_keeps_registered_allocation_alive() {
+        let storage = Arc::new(Storage::Owned(Buffer::from_vec(vec![0u8; 32])));
+        register_host_storage(&storage);
+        let weak_storage = Arc::downgrade(&storage);
+        let lease = host_storage_lease(storage.as_slice().expect("host storage"))
+            .expect("registered storage lease");
+
+        drop(storage);
+        assert!(
+            weak_storage.upgrade().is_some(),
+            "lease must retain the registered allocation"
+        );
+
+        drop(lease);
+        assert!(
+            weak_storage.upgrade().is_none(),
+            "allocation must be released with its last lease"
+        );
     }
 }
