@@ -167,6 +167,16 @@ pub fn gemv_f32(
 
 #[inline]
 pub fn dot_f32_row(a: &[f32], b: &[f32], n: usize) -> f32 {
+    assert!(
+        a.len() >= n,
+        "dot_f32_row: left input length {} is shorter than n {n}",
+        a.len()
+    );
+    assert!(
+        b.len() >= n,
+        "dot_f32_row: right input length {} is shorter than n {n}",
+        b.len()
+    );
     #[cfg(target_arch = "aarch64")]
     unsafe {
         crate::gemm::neon_dot::dot_f32_neon(a.as_ptr(), b.as_ptr(), n)
@@ -266,7 +276,24 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{gemv_bf16, gemv_f16, gemv_f32};
+    use super::{dot_f32_row, gemv_bf16, gemv_f16, gemv_f32};
+
+    #[test]
+    fn dot_f32_row_uses_requested_prefix() {
+        assert_eq!(dot_f32_row(&[1.0, 2.0, 100.0], &[3.0, 4.0, 100.0], 2), 11.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "dot_f32_row: left input length")]
+    fn dot_f32_row_rejects_short_left_input() {
+        let _ = dot_f32_row(&[1.0], &[2.0, 3.0], 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "dot_f32_row: right input length")]
+    fn dot_f32_row_rejects_short_right_input() {
+        let _ = dot_f32_row(&[1.0, 2.0], &[3.0], 2);
+    }
 
     #[test]
     fn gemv_f32_writes_seq_major_output() {
