@@ -152,9 +152,11 @@ fn dot_basic_blocks_scalar(row_bytes: &[u8], x: &[f32], cols: usize, quant: Quan
         let n_blocks = cols / 32;
         let mut acc = 0.0f32;
         for bi in 0..n_blocks {
-            let block = unsafe { &*(row_bytes.as_ptr().add(bi * 24) as *const q::BlockQ5_1) };
+            let block = unsafe {
+                std::ptr::read_unaligned(row_bytes.as_ptr().add(bi * 24) as *const q::BlockQ5_1)
+            };
             let xb_ptr = unsafe { x.as_ptr().add(bi * 32) };
-            acc += unsafe { q::dot_q5_1_fused_neon(block, xb_ptr) };
+            acc += unsafe { q::dot_q5_1_fused_neon(&block, xb_ptr) };
         }
         return acc;
     }
@@ -163,10 +165,12 @@ fn dot_basic_blocks_scalar(row_bytes: &[u8], x: &[f32], cols: usize, quant: Quan
         let n_blocks = cols / 32;
         let mut acc = 0.0f32;
         for bi in 0..n_blocks {
-            let block = unsafe { &*(row_bytes.as_ptr().add(bi * 24) as *const q::BlockQ5_1) };
+            let block = unsafe {
+                std::ptr::read_unaligned(row_bytes.as_ptr().add(bi * 24) as *const q::BlockQ5_1)
+            };
             let xb_ptr = unsafe { x.as_ptr().add(bi * 32) };
             let xb_arr: &[f32; 32] = unsafe { &*(xb_ptr as *const [f32; 32]) };
-            acc += q::dot_q5_1_chunked_scalar(block, xb_arr);
+            acc += q::dot_q5_1_chunked_scalar(&block, xb_arr);
         }
         return acc;
     }
@@ -179,27 +183,33 @@ fn dot_basic_blocks_scalar(row_bytes: &[u8], x: &[f32], cols: usize, quant: Quan
         let chunk = &row_bytes[bi * block_bytes..(bi + 1) * block_bytes];
         match quant {
             QuantGemvType::Q4_0 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ4_0) };
-                q::dequantize_q4_0(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ4_0) };
+                q::dequantize_q4_0(&block, &mut tmp);
             }
             QuantGemvType::Q4_1 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ4_1) };
-                q::dequantize_q4_1(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ4_1) };
+                q::dequantize_q4_1(&block, &mut tmp);
             }
             QuantGemvType::Q5_0 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ5_0) };
-                q::dequantize_q5_0(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ5_0) };
+                q::dequantize_q5_0(&block, &mut tmp);
             }
             QuantGemvType::Q5_1 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ5_1) };
-                q::dequantize_q5_1(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ5_1) };
+                q::dequantize_q5_1(&block, &mut tmp);
             }
             QuantGemvType::Q8_0 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ8_0) };
-                q::dequantize_q8_0(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ8_0) };
+                q::dequantize_q8_0(&block, &mut tmp);
             }
             QuantGemvType::Q8_1 => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ8_1) };
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ8_1) };
                 for (dst, &value) in tmp.iter_mut().zip(&block.qs) {
                     *dst = block.d.to_f32() * value as f32;
                 }
@@ -240,38 +250,43 @@ pub fn dot_quantized_row(row_bytes: &[u8], x: &[f32], cols: usize, quant: QuantG
 
         #[cfg(target_arch = "aarch64")]
         if matches!(quant, QuantGemvType::Q4K) {
-            let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ4_K) };
-            acc += unsafe { q::dot_q4k_fused_neon(block, xb.as_ptr()) };
+            let block = unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ4_K) };
+            acc += unsafe { q::dot_q4k_fused_neon(&block, xb.as_ptr()) };
             continue;
         }
 
         #[cfg(target_arch = "aarch64")]
         if matches!(quant, QuantGemvType::Q2K) {
-            let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ2_K) };
-            acc += unsafe { q::dot_q2k_fused_neon(block, xb.as_ptr()) };
+            let block = unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ2_K) };
+            acc += unsafe { q::dot_q2k_fused_neon(&block, xb.as_ptr()) };
             continue;
         }
 
         match quant {
             QuantGemvType::Q4K => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ4_K) };
-                q::dequantize_q4_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ4_K) };
+                q::dequantize_q4_k(&block, &mut tmp);
             }
             QuantGemvType::Q5K => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ5_K) };
-                q::dequantize_q5_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ5_K) };
+                q::dequantize_q5_k(&block, &mut tmp);
             }
             QuantGemvType::Q6K => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ6_K) };
-                q::dequantize_q6_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ6_K) };
+                q::dequantize_q6_k(&block, &mut tmp);
             }
             QuantGemvType::Q3K => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ3_K) };
-                q::dequantize_q3_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ3_K) };
+                q::dequantize_q3_k(&block, &mut tmp);
             }
             QuantGemvType::Q2K => {
-                let block = unsafe { &*(chunk.as_ptr() as *const q::BlockQ2_K) };
-                q::dequantize_q2_k(block, &mut tmp);
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ2_K) };
+                q::dequantize_q2_k(&block, &mut tmp);
             }
             QuantGemvType::IQ2XXS => q::iq::dequantize_iq2_xxs_block(chunk, &mut tmp),
             QuantGemvType::IQ2S => q::iq::dequantize_iq2_s_block(chunk, &mut tmp),
@@ -1128,6 +1143,96 @@ mod tests {
         QuantGemvType,
     };
     use half::f16;
+
+    fn with_odd_offset_bytes<R>(block: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+        let mut backing = vec![0u16; (block.len() + 2) / 2];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                backing.as_mut_ptr().cast::<u8>(),
+                backing.len() * std::mem::size_of::<u16>(),
+            )
+        };
+        let odd_offset = &mut bytes[1..1 + block.len()];
+        odd_offset.copy_from_slice(block);
+        assert_eq!(odd_offset.as_ptr().align_offset(2), 1);
+        f(odd_offset)
+    }
+
+    fn quant_block_fixture(quant: QuantGemvType) -> Vec<u8> {
+        let mut block = (0..quant.block_bytes())
+            .map(|index| (index * 37 + 11) as u8)
+            .collect::<Vec<_>>();
+        let d = 0x3c00u16.to_le_bytes();
+        let dmin = 0x3800u16.to_le_bytes();
+        match quant {
+            QuantGemvType::Q4_0 | QuantGemvType::Q5_0 | QuantGemvType::Q8_0 => {
+                block[0..2].copy_from_slice(&d);
+            }
+            QuantGemvType::Q4_1 | QuantGemvType::Q5_1 | QuantGemvType::Q8_1 => {
+                block[0..2].copy_from_slice(&d);
+                block[2..4].copy_from_slice(&dmin);
+            }
+            QuantGemvType::Q2K => {
+                block[80..82].copy_from_slice(&d);
+                block[82..84].copy_from_slice(&dmin);
+            }
+            QuantGemvType::Q3K => block[108..110].copy_from_slice(&d),
+            QuantGemvType::Q4K | QuantGemvType::Q5K => {
+                block[0..2].copy_from_slice(&d);
+                block[2..4].copy_from_slice(&dmin);
+            }
+            QuantGemvType::Q6K => block[208..210].copy_from_slice(&d),
+            _ => unreachable!("typed quant block expected"),
+        }
+        block
+    }
+
+    fn quant_input(quant: QuantGemvType) -> Vec<f32> {
+        (0..quant.block_elems())
+            .map(|index| (index % 17) as f32 * 0.125 - 1.0)
+            .collect()
+    }
+
+    #[test]
+    fn basic_quantized_rows_accept_odd_byte_offsets() {
+        for quant in [
+            QuantGemvType::Q4_0,
+            QuantGemvType::Q4_1,
+            QuantGemvType::Q5_0,
+            QuantGemvType::Q5_1,
+            QuantGemvType::Q8_0,
+            QuantGemvType::Q8_1,
+        ] {
+            let block = quant_block_fixture(quant);
+            let input = quant_input(quant);
+            let expected = dot_quantized_row(&block, &input, quant.block_elems(), quant);
+            assert!(expected.is_finite(), "{quant:?}");
+            let actual = with_odd_offset_bytes(&block, |bytes| {
+                dot_quantized_row(bytes, &input, quant.block_elems(), quant)
+            });
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{quant:?}");
+        }
+    }
+
+    #[test]
+    fn k_quantized_rows_accept_odd_byte_offsets() {
+        for quant in [
+            QuantGemvType::Q2K,
+            QuantGemvType::Q3K,
+            QuantGemvType::Q4K,
+            QuantGemvType::Q5K,
+            QuantGemvType::Q6K,
+        ] {
+            let block = quant_block_fixture(quant);
+            let input = quant_input(quant);
+            let expected = dot_quantized_row(&block, &input, quant.block_elems(), quant);
+            assert!(expected.is_finite(), "{quant:?}");
+            let actual = with_odd_offset_bytes(&block, |bytes| {
+                dot_quantized_row(bytes, &input, quant.block_elems(), quant)
+            });
+            assert_eq!(actual.to_bits(), expected.to_bits(), "{quant:?}");
+        }
+    }
 
     #[test]
     fn iq_rows_use_stack_dequantization_without_losing_values() {
