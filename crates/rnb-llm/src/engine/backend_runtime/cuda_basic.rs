@@ -22,6 +22,51 @@ fn cuda_error(err: String) -> crate::error::LlmError {
 }
 
 #[cfg(feature = "cuda")]
+pub(in crate::engine) fn gemma4_moe_admitted(
+    gate_up_weight_bytes: usize,
+    down_weight_bytes: usize,
+    n_embd: usize,
+    n_ff: usize,
+) -> Result<bool, String> {
+    cuda_runtime::gemma4_selected_moe_admitted(
+        gate_up_weight_bytes,
+        down_weight_bytes,
+        n_embd,
+        n_ff,
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn gemma4_moe_q4k_gemv(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+) -> Result<Vec<f32>, String> {
+    cuda_runtime::q4k_gemv(weights, rows, cols, input)
+}
+
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn gemma4_moe_q5_1_gemv(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+) -> Result<Vec<f32>, String> {
+    cuda_runtime::q5_1_gemv(weights, rows, cols, input)
+}
+
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn gemma4_moe_q8_0_gemv(
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+) -> Result<Vec<f32>, String> {
+    cuda_runtime::q8_0_gemv(weights, rows, cols, input)
+}
+
+#[cfg(feature = "cuda")]
 fn gemma4_ple_fusion_trace_enabled() -> bool {
     crate::engine::policy::env_string("RNB_CUDA_GEMMA_PLE_FUSION_TRACE")
         .map(|value| {

@@ -153,7 +153,7 @@ impl Engine {
         );
 
         let use_native_cuda_kv =
-            cfg!(feature = "cuda") && crate::runtime::policy::drafter_cuda_enabled();
+            cfg!(feature = "cuda") && crate::engine::policy::drafter_cuda_enabled();
         let (k, v, k_f16, v_f16, source_layer_idx) = if use_native_cuda_kv {
             let raw = self.kv_cache.read_up_to(layer_idx, seq_len);
             let (k_bits, v_bits) = raw.as_slices();

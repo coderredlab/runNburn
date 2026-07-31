@@ -51,6 +51,7 @@ pub(super) use cuda_basic::{
     cuda_axpby_f32_inplace, cuda_cache_snapshot, cuda_gdn_prepare_delta_gate_beta_f32,
     cuda_hadamard_f32_inplace, cuda_l2_norm_rows, cuda_mul_rows_f32_inplace, cuda_rms_norm_rows,
     cuda_rope_f32_inplace, cuda_scale_f32_inplace, cuda_sigmoid_mul_f32_inplace, decode_gemv_cuda,
+    gemma4_moe_admitted, gemma4_moe_q4k_gemv, gemma4_moe_q5_1_gemv, gemma4_moe_q8_0_gemv,
     mtp_output_argmax_token_cuda, prefill_gemv_cuda, prefill_output_argmax_token_cuda,
     prefill_output_logits_cuda, CudaForwardRopeMode,
 };
