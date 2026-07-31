@@ -48,6 +48,16 @@ impl LayerCacheRead<'_> {
     }
 }
 
+#[inline]
+fn grow_f16_buffers(key: &mut Vec<u16>, value: &mut Vec<u16>, len: usize) {
+    if key.len() < len {
+        key.resize(len, 0);
+    }
+    if value.len() < len {
+        value.resize(len, 0);
+    }
+}
+
 impl LayerCache {
     fn new(
         max_seq_len: usize,
@@ -82,8 +92,7 @@ impl LayerCache {
         let value_count = reserve_len * stride;
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
-                key.resize(value_count, 0);
-                value.resize(value_count, 0);
+                grow_f16_buffers(key, value, value_count);
             }
             LayerCacheStorage::Kvarn(cache) => {
                 let initialized_len = current_len.min(cache.stored_len());
@@ -104,8 +113,7 @@ impl LayerCache {
             LayerCacheStorage::F16 { key, value } => {
                 let start = pos * stride;
                 let end = start + stride;
-                key.resize(end, 0);
-                value.resize(end, 0);
+                grow_f16_buffers(key, value, end);
                 for i in 0..stride {
                     key[start + i] = half::f16::from_f32(k_slice[i]).to_bits();
                     value[start + i] = half::f16::from_f32(v_slice[i]).to_bits();
@@ -168,8 +176,7 @@ impl LayerCache {
         let count = len * self.num_kv_heads * self.head_dim;
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
-                key.resize(count, 0);
-                value.resize(count, 0);
+                grow_f16_buffers(key, value, count);
                 (&mut key[..count], &mut value[..count])
             }
             LayerCacheStorage::Kvarn(_) => {
@@ -187,8 +194,7 @@ impl LayerCache {
         );
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
-                key.resize(count, 0);
-                value.resize(count, 0);
+                grow_f16_buffers(key, value, count);
                 key[..count].copy_from_slice(&k_bits[..count]);
                 value[..count].copy_from_slice(&v_bits[..count]);
             }
@@ -216,8 +222,7 @@ impl LayerCache {
         match &mut self.storage {
             LayerCacheStorage::F16 { key, value } => {
                 assert!(end <= self.max_seq_len * stride, "KV bits range overflow");
-                key.resize(end, 0);
-                value.resize(end, 0);
+                grow_f16_buffers(key, value, end);
                 key[start..end].copy_from_slice(&k_bits[..count]);
                 value[start..end].copy_from_slice(&v_bits[..count]);
             }
