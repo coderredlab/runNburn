@@ -1,7 +1,8 @@
 use std::alloc::{self, Layout};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 pub struct Buffer {
     ptr: NonNull<u8>,
@@ -191,6 +192,78 @@ impl FileBackedRegion {
 pub struct DeviceBuffer {
     pub id: u64,
     pub size: usize,
+}
+
+/// Stable identity for an immutable byte range within a registered host storage.
+///
+/// `allocation_id` changes when a storage allocation is recreated, even if the
+/// allocator reuses the same virtual address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostStorageIdentity {
+    pub allocation_id: u64,
+    pub byte_offset: usize,
+    pub len: usize,
+}
+
+struct HostStorageRegistration {
+    allocation_id: u64,
+    storage: Weak<Storage>,
+    base: usize,
+    len: usize,
+}
+
+static NEXT_HOST_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
+static HOST_STORAGE_REGISTRY: LazyLock<RwLock<Vec<HostStorageRegistration>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Registers model storage whose byte ranges need allocation-stable identities.
+///
+/// Registrations hold only a `Weak` reference and therefore do not extend the
+/// storage lifetime.
+pub(crate) fn register_host_storage(storage: &Arc<Storage>) {
+    let Some(bytes) = storage.as_slice() else {
+        return;
+    };
+    let base = bytes.as_ptr() as usize;
+    let len = bytes.len();
+    let weak = Arc::downgrade(storage);
+    let mut registrations = HOST_STORAGE_REGISTRY
+        .write()
+        .expect("host storage registry lock poisoned");
+    registrations.retain(|entry| entry.storage.strong_count() > 0);
+    if registrations
+        .iter()
+        .any(|entry| Weak::ptr_eq(&entry.storage, &weak))
+    {
+        return;
+    }
+    registrations.push(HostStorageRegistration {
+        allocation_id: NEXT_HOST_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
+        storage: weak,
+        base,
+        len,
+    });
+}
+
+/// Resolves a byte slice to its registered storage allocation and relative range.
+///
+/// Returns `None` for ordinary transient buffers and after their storage dies.
+pub fn host_storage_identity(bytes: &[u8]) -> Option<HostStorageIdentity> {
+    let start = bytes.as_ptr() as usize;
+    let end = start.checked_add(bytes.len())?;
+    let registrations = HOST_STORAGE_REGISTRY.read().ok()?;
+    registrations.iter().find_map(|entry| {
+        entry.storage.upgrade()?;
+        let storage_end = entry.base.checked_add(entry.len)?;
+        if start < entry.base || end > storage_end {
+            return None;
+        }
+        Some(HostStorageIdentity {
+            allocation_id: entry.allocation_id,
+            byte_offset: start - entry.base,
+            len: bytes.len(),
+        })
+    })
 }
 
 pub enum Storage {

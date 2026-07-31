@@ -971,6 +971,36 @@ fn cuda_weight_residency_q4_packed_admission_records_packed_counter() {
 }
 
 #[test]
+fn q4k_resident_key_distinguishes_weights_that_only_differ_in_the_middle() {
+    let left = vec![0x5a; 2048];
+    let mut right = left.clone();
+    right[1024] ^= 0xff;
+
+    assert_ne!(q4k_resident_key(&left), q4k_resident_key(&right));
+}
+
+#[test]
+fn q4k_resident_key_uses_registered_storage_range_identity() {
+    let left = vec![0x5a; 2048];
+    let mut right = left.clone();
+    right[1024] ^= 0xff;
+    let mut storage_bytes = left;
+    storage_bytes.extend_from_slice(&right);
+    let storage = std::sync::Arc::new(rnb_core::tensor::Storage::Owned(
+        rnb_core::tensor::Buffer::from_vec(storage_bytes),
+    ));
+    let tensor =
+        rnb_core::tensor::Tensor::from_mmap(storage, 0, &[4096], rnb_core::tensor::DType::U8)
+            .unwrap();
+    let bytes = tensor.as_bytes().unwrap();
+
+    assert_ne!(
+        q4k_resident_key(&bytes[..2048]),
+        q4k_resident_key(&bytes[2048..])
+    );
+}
+
+#[test]
 #[ignore = "requires CUDA"]
 fn cuda_q4_raw_resident_admission_records_raw_quant_without_expanded() {
     let _guard = runtime_test_lock();

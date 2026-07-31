@@ -818,6 +818,7 @@ fn dequant_type(ggml_type: GGMLType) -> DequantType {
 
 pub fn reset_state_for_engine_init() -> Result<()> {
     backend::clear_moe_layer_cache().map_err(|err| err)?;
+    backend::clear_q4k_cache().map_err(|err| err)?;
     backend::reset_delta_state_cache().map_err(|err| err)
 }
 
@@ -1751,4 +1752,29 @@ pub fn nemotron_q5_sparse_relu_sqr_cached_layer_by_token(
         input,
     )
     .map_err(|err| format!("CUDA Nemotron cached-layer Q5 sparse batch failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn engine_init_reset_releases_pinned_q4k_residents() {
+        let weights = vec![0x5a; 2048];
+        backend::clear_q4k_cache().expect("clear Q4 cache before reset regression");
+        backend::prewarm_q4k_weights_pinned(&[&weights]).expect("prewarm pinned Q4 weight");
+
+        reset_state_for_engine_init().expect("reset CUDA state for new engine");
+        let before_reload = backend::cuda_cache_snapshot();
+        backend::prewarm_q4k_weights_pinned(&[&weights]).expect("reload Q4 weight after reset");
+        let after_reload = backend::cuda_cache_snapshot();
+
+        assert_eq!(after_reload.misses, before_reload.misses + 1);
+        assert_eq!(
+            after_reload.resident_upload_bytes,
+            before_reload.resident_upload_bytes + weights.len() as u64
+        );
+        backend::clear_q4k_cache().expect("clear Q4 cache after reset regression");
+    }
 }

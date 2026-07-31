@@ -1,22 +1,41 @@
 use super::*;
 
 pub(super) fn q4k_resident_key(weights: &[u8]) -> (usize, usize) {
-    // cu114: content(len + 앞뒤 샘플 hash) 기반 키. 이전 ptr 기반은 같은 weight 가
-    // 매 forward 다른 slice 주소로 와서 cache miss → prewarm 이 매 prefill·decode token
-    // 마다 10MB weight 를 재 H2D upload(decode dispatch 의 주범). 전체 10MB hash 는
-    // 매 lookup 비싸서 len + 앞512 + 끝512 bytes FNV 샘플로 식별(같은 weight=같은 키).
-    let n = weights.len();
-    let sample = 512.min(n);
-    let mut h = 0xcbf29ce484222325_u64;
-    for &b in &weights[..sample] {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    const FNV_OFFSET_1: u64 = 0xcbf29ce484222325;
+    const FNV_OFFSET_2: u64 = 0x84222325cbf29ce4;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut first = FNV_OFFSET_1;
+    let mut second = FNV_OFFSET_2;
+    let mut mix = |byte: u8| {
+        first ^= byte as u64;
+        first = first.wrapping_mul(FNV_PRIME);
+        second ^= byte as u64;
+        second = second.wrapping_mul(FNV_PRIME);
+    };
+
+    if let Some(identity) = rnb_core::tensor::host_storage_identity(weights) {
+        mix(0);
+        for byte in identity.allocation_id.to_le_bytes() {
+            mix(byte);
+        }
+        for byte in identity.byte_offset.to_le_bytes() {
+            mix(byte);
+        }
+        for byte in identity.len.to_le_bytes() {
+            mix(byte);
+        }
+    } else {
+        mix(1);
+        for &byte in weights {
+            mix(byte);
+        }
+        for byte in weights.len().to_le_bytes() {
+            mix(byte);
+        }
     }
-    for &b in &weights[n - sample..] {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (n, h as usize)
+
+    (first as usize, second as usize)
 }
 
 pub(super) fn unique_q4k_slot_bytes<'a>(slots: impl Iterator<Item = &'a &'a [u8]>) -> usize {

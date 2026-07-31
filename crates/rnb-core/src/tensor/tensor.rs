@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::error::{Result, RnbError};
 use crate::tensor::dtype::{DType, TensorElement};
 use crate::tensor::quant::QuantMeta;
-use crate::tensor::storage::{Buffer, FileBackedRegion, Storage};
+use crate::tensor::storage::{register_host_storage, Buffer, FileBackedRegion, Storage};
 
 #[derive(Clone)]
 pub struct Tensor {
@@ -34,8 +34,9 @@ impl Tensor {
         let size = numel * dtype.size_bytes();
         let buf = Buffer::alloc(size, 64);
         let strides = compute_strides(shape);
+        let storage = Arc::new(Storage::Owned(buf));
         Self {
-            storage: Arc::new(Storage::Owned(buf)),
+            storage,
             shape: shape.to_vec(),
             strides,
             offset: 0,
@@ -53,8 +54,9 @@ impl Tensor {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.as_mut_ptr(), byte_len);
         }
         let strides = compute_strides(shape);
+        let storage = Arc::new(Storage::Owned(buf));
         Self {
-            storage: Arc::new(Storage::Owned(buf)),
+            storage,
             shape: shape.to_vec(),
             strides,
             offset: 0,
@@ -69,8 +71,9 @@ impl Tensor {
         assert_eq!(data.len(), numel, "data length must match shape");
         let buf = Buffer::from_vec(data);
         let strides = compute_strides(shape);
+        let storage = Arc::new(Storage::Owned(buf));
         Self {
-            storage: Arc::new(Storage::Owned(buf)),
+            storage,
             shape: shape.to_vec(),
             strides,
             offset: 0,
@@ -179,8 +182,9 @@ impl Tensor {
                 src_indices[d] = 0;
             }
         }
+        let storage = Arc::new(Storage::Owned(buf));
         Self {
-            storage: Arc::new(Storage::Owned(buf)),
+            storage,
             shape: self.shape.clone(),
             strides: compute_strides(&self.shape),
             offset: 0,
@@ -308,6 +312,7 @@ impl Tensor {
                 "byte_offset {byte_offset} not aligned to element size {elem_size}"
             )));
         }
+        register_host_storage(&storage);
         let elem_offset = byte_offset / elem_size;
         let strides = compute_strides(shape);
         Ok(Self {
@@ -419,6 +424,25 @@ mod tests {
         let s = t.slice(&[1..3, 0..4]).unwrap();
         assert_eq!(s.shape(), &[2, 4]);
     }
+    #[test]
+    fn host_storage_identity_tracks_allocation_and_subslice_offset() {
+        let storage = Arc::new(Storage::Owned(Buffer::from_vec(vec![0u8; 32])));
+        let tensor = Tensor::from_mmap(storage, 0, &[32], DType::U8).unwrap();
+        let bytes = tensor.as_bytes().unwrap();
+        let full = crate::tensor::host_storage_identity(bytes).unwrap();
+        let middle = crate::tensor::host_storage_identity(&bytes[7..19]).unwrap();
+
+        assert_eq!(middle.allocation_id, full.allocation_id);
+        assert_eq!(middle.byte_offset, full.byte_offset + 7);
+        assert_eq!(middle.len, 12);
+
+        let other_storage = Arc::new(Storage::Owned(Buffer::from_vec(vec![0u8; 32])));
+        let other = Tensor::from_mmap(other_storage, 0, &[32], DType::U8).unwrap();
+        let other_identity =
+            crate::tensor::host_storage_identity(other.as_bytes().unwrap()).unwrap();
+        assert_ne!(other_identity.allocation_id, full.allocation_id);
+    }
+
     #[cfg(unix)]
     #[test]
     fn reclaim_file_mmap_range_preserves_file_backed_bytes() {
