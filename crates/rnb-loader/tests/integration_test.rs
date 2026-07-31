@@ -5,7 +5,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 
 /// 최소 LLaMA GGUF 파일 생성 (token_embd.weight F32 [32, 64] 텐서 1개)
-fn write_mini_llama_gguf() -> NamedTempFile {
+fn write_mini_llama_gguf(architecture: &str) -> NamedTempFile {
     let mut buf: Vec<u8> = Vec::new();
 
     // Magic + version 3
@@ -38,7 +38,7 @@ fn write_mini_llama_gguf() -> NamedTempFile {
         buf.extend_from_slice(&v.to_le_bytes());
     };
 
-    kv_str(&mut buf, "general.architecture", "llama");
+    kv_str(&mut buf, "general.architecture", architecture);
     kv_u32(&mut buf, "llama.embedding_length", 64);
     kv_u32(&mut buf, "llama.block_count", 2);
     kv_u32(&mut buf, "llama.attention.head_count", 4);
@@ -151,7 +151,7 @@ fn write_mini_qwen35moe_mtp_gguf() -> NamedTempFile {
 
 #[test]
 fn test_load_model_llama_end_to_end() {
-    let f = write_mini_llama_gguf();
+    let f = write_mini_llama_gguf("llama");
     let model = load_model(f.path()).expect("load_model should succeed");
 
     assert_eq!(model.metadata.architecture, Architecture::LLaMA);
@@ -166,6 +166,16 @@ fn test_load_model_llama_end_to_end() {
     assert!(model.graph.validate().is_ok());
     assert!(model.graph.topological_order().is_ok());
     assert_eq!(model.graph.output_nodes().len(), 1);
+}
+
+#[test]
+fn test_load_model_rejects_unknown_architecture() {
+    let f = write_mini_llama_gguf("mixtral");
+
+    assert!(matches!(
+        load_model(f.path()),
+        Err(LoaderError::UnsupportedArchitecture(architecture)) if architecture == "mixtral"
+    ));
 }
 
 #[test]

@@ -165,13 +165,7 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
         "nemotron_h_moe" => Ok(Architecture::NemotronHMoE),
         "hy_v3" => Ok(Architecture::Hy3),
         "glm-dsa" => Ok(Architecture::GlmDsa),
-        // LLaMA 호환 아키텍처는 자동 fallback
-        other => {
-            eprintln!(
-                "Warning: unknown architecture '{other}', falling back to LLaMA-compatible mode"
-            );
-            Ok(Architecture::LLaMA)
-        }
+        other => Err(LoaderError::UnsupportedArchitecture(other.to_string())),
     }
 }
 
@@ -1082,13 +1076,17 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_unknown_falls_back_to_llama() {
+    fn test_detect_unknown_architecture_is_rejected() {
         let meta = vec![(
             "general.architecture".to_string(),
             GGUFValue::String("mixtral".to_string()),
         )];
-        // 알 수 없는 아키텍처는 LLaMA로 fallback
-        assert_eq!(detect_architecture(&meta).unwrap(), Architecture::LLaMA);
+
+        let error = detect_architecture(&meta).unwrap_err();
+        assert!(matches!(
+            error,
+            LoaderError::UnsupportedArchitecture(architecture) if architecture == "mixtral"
+        ));
     }
 
     #[test]
