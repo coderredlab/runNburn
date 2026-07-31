@@ -121,11 +121,11 @@ impl PrefillAttnChainCarrier {
                 src.len(),
             );
         };
-        debug_assert_eq!(q_in.len(), self.seq_len * self.q_dim, "q_in len");
-        debug_assert_eq!(k_in.len(), self.seq_len * self.kv_dim, "k_in len");
-        debug_assert_eq!(v_in.len(), self.seq_len * self.kv_dim, "v_in len");
-        debug_assert_eq!(q_norm_w.len(), self.head_dim, "q_norm_w len");
-        debug_assert_eq!(k_norm_w.len(), self.head_dim, "k_norm_w len");
+        assert_eq!(q_in.len(), self.seq_len * self.q_dim, "q_in len");
+        assert_eq!(k_in.len(), self.seq_len * self.kv_dim, "k_in len");
+        assert_eq!(v_in.len(), self.seq_len * self.kv_dim, "v_in len");
+        assert_eq!(q_norm_w.len(), self.head_dim, "q_norm_w len");
+        assert_eq!(k_norm_w.len(), self.head_dim, "k_norm_w len");
         cp(q_in, &self.q_in_dev);
         cp(k_in, &self.k_in_dev);
         cp(v_in, &self.v_in_dev);

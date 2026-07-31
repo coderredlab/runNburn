@@ -209,7 +209,11 @@ impl AttnCarrier {
 
     /// hidden host slice → hidden_dev 업로드(StorageModeShared contents 직접 쓰기).
     fn upload_hidden(&self, hidden: &[f32]) {
-        debug_assert_eq!(hidden.len(), self.hidden_dim);
+        crate::carrier_validation::assert_exact_len(
+            "attention hidden",
+            hidden.len(),
+            self.hidden_dim,
+        );
         let contents = self.hidden_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1096,6 +1100,16 @@ impl AttnBatchCarrier {
         theta: f32,
         scale: f32,
     ) -> Self {
+        let resident_kv_dim = crate::carrier_validation::checked_product(
+            "attention KV dimension",
+            num_kv_heads,
+            head_dim,
+        );
+        crate::carrier_validation::assert_exact_len(
+            "attention KV dimension",
+            kv_dim,
+            resident_kv_dim,
+        );
         // host `rope_partial_inplace` 와 동일 식(AttnCarrier::new 와 일치).
         let nr = n_rot.min(head_dim);
         let theta_scale: f32 = theta.powf(-2.0_f32 / nr as f32);
@@ -1138,17 +1152,30 @@ impl AttnBatchCarrier {
     /// chain 진입 전: 이 layer 의 prior KV([0..base_pos], host f16 bits, [base_pos*kv_dim])를
     /// device KV cache 의 slot 0.. 에 **무조건** upload(배치 경로는 host state 가 source of
     /// truth — MTP verify 마다 base_pos/prior 가 다르므로 incremental filled 가드를 쓰지 않는다).
-    pub(crate) fn upload_prior(&self, prior_k: &[u16], prior_v: &[u16]) {
-        debug_assert_eq!(prior_k.len(), prior_v.len());
-        debug_assert!(
-            prior_k.len() <= self.capacity * self.kv_dim,
-            "prior KV exceeds carrier capacity"
+    pub(crate) fn upload_prior(&self, prior_k: &[u16], prior_v: &[u16], base_pos: usize) {
+        crate::carrier_validation::assert_exact_len(
+            "attention KV dimension",
+            self.kv_dim,
+            self.kv.kv_dim,
         );
+        crate::carrier_validation::checked_slot_range_end(
+            "attention prior KV",
+            0,
+            base_pos,
+            self.kv.capacity,
+        );
+        let expected = crate::carrier_validation::checked_product(
+            "attention prior KV",
+            base_pos,
+            self.kv.kv_dim,
+        );
+        crate::carrier_validation::assert_exact_len("attention prior K", prior_k.len(), expected);
+        crate::carrier_validation::assert_exact_len("attention prior V", prior_v.len(), expected);
         unsafe {
             let kp = self.kv.k_buf.contents().as_ptr() as *mut u16;
             let vp = self.kv.v_buf.contents().as_ptr() as *mut u16;
-            std::ptr::copy_nonoverlapping(prior_k.as_ptr(), kp, prior_k.len());
-            std::ptr::copy_nonoverlapping(prior_v.as_ptr(), vp, prior_v.len());
+            std::ptr::copy_nonoverlapping(prior_k.as_ptr(), kp, expected);
+            std::ptr::copy_nonoverlapping(prior_v.as_ptr(), vp, expected);
         }
     }
 
@@ -1162,12 +1189,27 @@ impl AttnBatchCarrier {
         start_slot: usize,
         count: usize,
     ) -> (Vec<u16>, Vec<u16>) {
-        debug_assert!(
-            start_slot + count <= self.capacity,
-            "readback_kv_slots range exceeds capacity"
+        crate::carrier_validation::assert_exact_len(
+            "attention KV dimension",
+            self.kv_dim,
+            self.kv.kv_dim,
         );
-        let start = start_slot * self.kv_dim;
-        let len = count * self.kv_dim;
+        crate::carrier_validation::checked_slot_range_end(
+            "attention KV readback",
+            start_slot,
+            count,
+            self.kv.capacity,
+        );
+        let start = crate::carrier_validation::checked_product(
+            "attention KV readback offset",
+            start_slot,
+            self.kv.kv_dim,
+        );
+        let len = crate::carrier_validation::checked_product(
+            "attention KV readback length",
+            count,
+            self.kv.kv_dim,
+        );
         unsafe {
             let kp = self.kv.k_buf.contents().as_ptr() as *const u16;
             let vp = self.kv.v_buf.contents().as_ptr() as *const u16;
@@ -1217,13 +1259,34 @@ pub(crate) fn attn_core_chain_encode_bcol(
     let num_kv_heads = carrier.num_kv_heads;
     let head_dim = carrier.head_dim;
     let f32b = std::mem::size_of::<f32>();
+    crate::carrier_validation::assert_exact_len(
+        "attention KV dimension",
+        kv_dim,
+        carrier.kv.kv_dim,
+    );
+    crate::carrier_validation::checked_slot_range_end(
+        "attention KV encode",
+        base_pos,
+        b,
+        carrier.kv.capacity,
+    );
 
     // per-lane pos(base_pos+i) / kv_len(base_pos+i+1) scalar buffers.
     let pos_bufs: Vec<_> = (0..b)
-        .map(|i| u32_buf(ctx, (base_pos + i) as u32))
+        .map(|i| {
+            u32_buf(
+                ctx,
+                u32::try_from(base_pos + i).expect("validated attention KV position"),
+            )
+        })
         .collect();
     let kl_bufs: Vec<_> = (0..b)
-        .map(|i| u32_buf(ctx, (base_pos + i + 1) as u32))
+        .map(|i| {
+            u32_buf(
+                ctx,
+                u32::try_from(base_pos + i + 1).expect("validated attention KV length"),
+            )
+        })
         .collect();
 
     // 1. per-lane rms_norm: shared_hidden[i] -> normed_all[i].

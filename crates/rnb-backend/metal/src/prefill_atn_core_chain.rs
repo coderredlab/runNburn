@@ -181,10 +181,10 @@ impl PrefillAtnCoreCarrier {
     }
 
     fn upload(&self, hidden: &[f32], attn_norm_w: &[f32], q_norm_w: &[f32], k_norm_w: &[f32]) {
-        debug_assert_eq!(hidden.len(), self.seq_len * self.hidden_dim);
-        debug_assert_eq!(attn_norm_w.len(), self.hidden_dim);
-        debug_assert_eq!(q_norm_w.len(), self.head_dim);
-        debug_assert_eq!(k_norm_w.len(), self.head_dim);
+        assert_eq!(hidden.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(attn_norm_w.len(), self.hidden_dim);
+        assert_eq!(q_norm_w.len(), self.head_dim);
+        assert_eq!(k_norm_w.len(), self.head_dim);
         copy_f32(hidden, &self.hidden_dev);
         copy_f32(attn_norm_w, &self.attn_norm_w_dev);
         copy_f32(q_norm_w, &self.q_norm_w_dev);
@@ -252,7 +252,7 @@ impl PrefillAtnFullLayerCarrier {
         ffn_norm_w: &[f32],
     ) {
         self.core.upload(hidden, attn_norm_w, q_norm_w, k_norm_w);
-        debug_assert_eq!(ffn_norm_w.len(), self.core.hidden_dim);
+        assert_eq!(ffn_norm_w.len(), self.core.hidden_dim);
         copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
     }
 }
@@ -298,7 +298,7 @@ impl PrefillAtnOTailCarrier {
     }
 
     fn upload_hidden(&self, hidden: &[f32]) {
-        debug_assert_eq!(hidden.len(), self.core.seq_len * self.core.hidden_dim);
+        assert_eq!(hidden.len(), self.core.seq_len * self.core.hidden_dim);
         copy_f32(hidden, &self.core.hidden_dev);
     }
 }

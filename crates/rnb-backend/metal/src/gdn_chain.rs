@@ -182,8 +182,8 @@ impl GdnCarrier {
     /// conv_state 는 `conv_input_dev[0..conv_state_len]` 에, delta_state 는 `delta_state_dev` 에.
     /// 1.3/1.4 에서 `gdn_decode_chain_run` 이 호출.
     pub(crate) fn upload_states(&self, conv_state: &[f32], delta_state: &[f32]) {
-        debug_assert_eq!(conv_state.len(), self.conv_state_len);
-        debug_assert_eq!(delta_state.len(), self.delta_state_len);
+        assert_eq!(conv_state.len(), self.conv_state_len);
+        assert_eq!(delta_state.len(), self.delta_state_len);
         Self::upload(&self.conv_input_dev, conv_state);
         Self::upload(&self.delta_state_dev, delta_state);
     }
@@ -206,8 +206,8 @@ impl GdnCarrier {
     /// 이후 토큰은 delta upload 를 skip → `delta_state_dev` 가 토큰 간 device 잔류하며
     /// `delta_net_step` 이 in-place 누적(host↔device 왕복 제거, 96.7% bytes).
     pub(crate) fn upload_states_resident(&mut self, conv_state: &[f32], delta_state: &[f32]) {
-        debug_assert_eq!(conv_state.len(), self.conv_state_len);
-        debug_assert_eq!(delta_state.len(), self.delta_state_len);
+        assert_eq!(conv_state.len(), self.conv_state_len);
+        assert_eq!(delta_state.len(), self.delta_state_len);
         Self::upload(&self.conv_input_dev, conv_state);
         if !self.delta_seeded {
             Self::upload(&self.delta_state_dev, delta_state);
@@ -369,8 +369,8 @@ impl GdnBatchCarrier {
     /// delta_state 를 device delta buffer 로 올린다(매 chain 호출마다 — batched 경로는
     /// single-token delta residency 와 독립, host state 가 source of truth).
     pub(crate) fn upload_states(&self, conv_state: &[f32], delta_state: &[f32]) {
-        debug_assert_eq!(conv_state.len(), self.conv_state_len);
-        debug_assert_eq!(delta_state.len(), self.delta_state_len);
+        assert_eq!(conv_state.len(), self.conv_state_len);
+        assert_eq!(delta_state.len(), self.delta_state_len);
         Self::upload(&self.conv_roll, conv_state);
         // delta_all slot 0 = 진입 초기값(lane 0 이 여기서 읽어 slot 1 에 쓴다).
         Self::upload(&self.delta_all, delta_state);
@@ -386,7 +386,7 @@ impl GdnBatchCarrier {
     /// conv = rolling buffer window `[n*conv_channels .. +conv_state_len]`, delta = delta_all
     /// slot n. `n == b` 는 `readback_states`(final)와 동일. `1 <= n <= b`.
     pub(crate) fn readback_prefix_states(&self, n: usize) -> (Vec<f32>, Vec<f32>) {
-        debug_assert!(n >= 1 && n <= self.b, "prefix n out of range");
+        assert!(n >= 1 && n <= self.b, "prefix n out of range");
         let conv_new =
             Self::readback_at(&self.conv_roll, n * self.conv_channels, self.conv_state_len);
         let delta_new = Self::readback_at(
@@ -1399,9 +1399,9 @@ pub(crate) fn gdn_chain_dispatch(
     let conv_channels = carrier.conv_channels;
     let conv_state_len = carrier.conv_state_len;
 
-    debug_assert_eq!(hidden.len(), hidden_dim);
-    debug_assert_eq!(conv_state.len(), conv_state_len);
-    debug_assert_eq!(delta_state.len(), carrier.delta_state_len);
+    assert_eq!(hidden.len(), hidden_dim);
+    assert_eq!(conv_state.len(), conv_state_len);
+    assert_eq!(delta_state.len(), carrier.delta_state_len);
 
     // host → device sync (dispatch 경계). delta resident 모드는 첫 토큰만 seed 하고
     // 이후 토큰은 device 누적 state를 유지한다.
@@ -1504,9 +1504,9 @@ pub(crate) fn gdn_core_chain_dispatch(
     let conv_channels = carrier.conv_channels;
     let conv_state_len = carrier.conv_state_len;
 
-    debug_assert_eq!(hidden.len(), hidden_dim);
-    debug_assert_eq!(conv_state.len(), conv_state_len);
-    debug_assert_eq!(delta_state.len(), carrier.delta_state_len);
+    assert_eq!(hidden.len(), hidden_dim);
+    assert_eq!(conv_state.len(), conv_state_len);
+    assert_eq!(delta_state.len(), carrier.delta_state_len);
 
     GdnCarrier::upload(&carrier.hidden_dev, hidden);
     if delta_resident {
@@ -1669,9 +1669,9 @@ pub(crate) fn gdn_moe_chain_dispatch(
     let conv_channels = carrier.conv_channels;
     let conv_state_len = carrier.conv_state_len;
 
-    debug_assert_eq!(hidden.len(), hidden_dim);
-    debug_assert_eq!(conv_state.len(), conv_state_len);
-    debug_assert_eq!(delta_state.len(), carrier.delta_state_len);
+    assert_eq!(hidden.len(), hidden_dim);
+    assert_eq!(conv_state.len(), conv_state_len);
+    assert_eq!(delta_state.len(), carrier.delta_state_len);
 
     GdnCarrier::upload(&carrier.hidden_dev, hidden);
     GdnCarrier::upload(&carrier.conv_input_dev, conv_state);

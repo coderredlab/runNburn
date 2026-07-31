@@ -9,6 +9,8 @@ use rnb_backend_api::{
 #[cfg(test)]
 pub(crate) static METAL_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+mod carrier_validation;
+
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
@@ -1807,7 +1809,7 @@ impl MetalBackend {
         let Some(carrier) = carriers.get(&layer) else {
             return false;
         };
-        debug_assert_eq!(out.len(), carrier.delta_state_len);
+        assert_eq!(out.len(), carrier.delta_state_len);
         out.copy_from_slice(&carrier.readback_delta_state());
         true
     }
@@ -6163,8 +6165,8 @@ impl MetalBackend {
                     group_count += 1;
                     group_start = group_end;
                 }
-                debug_assert!(!block_experts.is_empty());
-                debug_assert_eq!(block_experts.len(), block_local0.len());
+                assert!(!block_experts.is_empty());
+                assert_eq!(block_experts.len(), block_local0.len());
                 let block_count = block_experts.len();
 
                 let expert_offsets_buf = ffn_chain::shared_u32_buf(ctx, &expert_offsets);
@@ -6405,8 +6407,8 @@ impl MetalBackend {
                     group_count += 1;
                     group_start = group_end;
                 }
-                debug_assert!(!block_experts.is_empty());
-                debug_assert_eq!(block_experts.len(), block_local0.len());
+                assert!(!block_experts.is_empty());
+                assert_eq!(block_experts.len(), block_local0.len());
                 let block_count = block_experts.len();
 
                 let expert_offsets_buf = ffn_chain::shared_u32_buf(ctx, &expert_offsets);
@@ -10329,7 +10331,7 @@ impl MetalBackend {
                                 s.scale,
                             )
                         });
-                        carrier.upload_prior(s.prior_k, s.prior_v);
+                        carrier.upload_prior(s.prior_k, s.prior_v, s.pos);
                         attn_chain::attn_core_chain_encode_bcol(
                             ctx,
                             &enc,
@@ -10412,7 +10414,7 @@ impl MetalBackend {
         // post-rope f16 K/V 를 layer 순서로 readback → out_attn_kv(attn=Some, 그 외 None).
         // 엔진이 MTP accept-n 커밋에서 host kv_cache 에 append 한다(slot-major [batch*kv_dim]).
         if let Some(out_kv) = out_attn_kv {
-            debug_assert_eq!(out_kv.len(), specs.len());
+            assert_eq!(out_kv.len(), specs.len());
             let carriers = self.attn_batch_carriers.borrow();
             for (spec, slot) in specs.iter().zip(out_kv.iter_mut()) {
                 match spec {

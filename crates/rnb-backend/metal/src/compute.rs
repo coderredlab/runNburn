@@ -11349,7 +11349,13 @@ impl KvResident {
         capacity: usize,
         kv_int8: bool,
     ) -> Self {
-        let kv_dim = num_kv_heads * head_dim;
+        let kv_dim = crate::carrier_validation::checked_product(
+            "KV resident dimension",
+            num_kv_heads,
+            head_dim,
+        );
+        let value_elements =
+            crate::carrier_validation::checked_product("KV resident values", capacity, kv_dim);
         let shared = MTLResourceOptions::StorageModeShared;
         let mkb = |n: usize| {
             ctx.device
@@ -11360,8 +11366,17 @@ impl KvResident {
             // int8 경로: per-slot int8 값 + per-slot scale 만 alloc.
             // f16 k_buf/v_buf 는 1-byte dummy — Task 6 가드가 f16 커널 진입을
             // panic 으로 막아 dummy 는 절대 read 되지 않는다.
-            let i8b = capacity * kv_dim; // char = 1byte
-            let scb = capacity * num_kv_heads * std::mem::size_of::<f32>();
+            let i8b = value_elements; // char = 1byte
+            let scale_elements = crate::carrier_validation::checked_product(
+                "KV resident scales",
+                capacity,
+                num_kv_heads,
+            );
+            let scb = crate::carrier_validation::checked_product(
+                "KV resident scale bytes",
+                scale_elements,
+                std::mem::size_of::<f32>(),
+            );
             Self {
                 k_buf: mkb(1),
                 v_buf: mkb(1),
@@ -11377,7 +11392,11 @@ impl KvResident {
                 kv_int8: true,
             }
         } else {
-            let bytes = capacity * kv_dim * std::mem::size_of::<u16>();
+            let bytes = crate::carrier_validation::checked_product(
+                "KV resident f16 bytes",
+                value_elements,
+                std::mem::size_of::<u16>(),
+            );
             Self {
                 k_buf: mkb(bytes),
                 v_buf: mkb(bytes),

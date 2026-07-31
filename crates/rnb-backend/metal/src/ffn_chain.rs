@@ -492,7 +492,7 @@ impl FfnCarrier {
 
     /// hidden host slice → hidden_dev 업로드 (StorageModeShared contents 직접 쓰기).
     fn upload_hidden(&self, hidden: &[f32]) {
-        debug_assert_eq!(hidden.len(), self.hidden_dim);
+        crate::carrier_validation::assert_exact_len("FFN hidden", hidden.len(), self.hidden_dim);
         let contents = self.hidden_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -5544,7 +5544,7 @@ impl QwenMoePrefillAccumCarrier {
     }
 
     pub(crate) fn upload_norm_all(&self, norm_all: &[f32]) {
-        debug_assert_eq!(norm_all.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(norm_all.len(), self.seq_len * self.hidden_dim);
         let contents = self.norm_all_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -5761,7 +5761,7 @@ impl QwenMoeDecodeCarrier {
     }
 
     fn upload_input(&self, input: &[f32]) {
-        debug_assert_eq!(input.len(), self.n_embd);
+        assert_eq!(input.len(), self.n_embd);
         let contents = self.input_dev.contents();
         unsafe {
             let dst = contents.as_ptr() as *mut f32;
@@ -5789,28 +5789,28 @@ impl QwenMoeDecodeCarrier {
 
     // pm116 M2: staged 경로는 텐서별 pread 완료 시점이 달라 offset 도 텐서별 업로드.
     pub(crate) fn upload_gate_offsets(&self, gate_off: &[u32]) {
-        debug_assert_eq!(gate_off.len(), self.slots);
+        assert_eq!(gate_off.len(), self.slots);
         for slot in 0..self.slots {
             Self::store_offset(&self.gate_off_buf[slot], gate_off[slot]);
         }
     }
 
     pub(crate) fn upload_up_offsets(&self, up_off: &[u32]) {
-        debug_assert_eq!(up_off.len(), self.slots);
+        assert_eq!(up_off.len(), self.slots);
         for slot in 0..self.slots {
             Self::store_offset(&self.up_off_buf[slot], up_off[slot]);
         }
     }
 
     pub(crate) fn upload_down_offsets(&self, down_off: &[u32]) {
-        debug_assert_eq!(down_off.len(), self.slots);
+        assert_eq!(down_off.len(), self.slots);
         for slot in 0..self.slots {
             Self::store_offset(&self.down_off_buf[slot], down_off[slot]);
         }
     }
 
     fn upload_route_weights(&self, route_weights: &[f32]) {
-        debug_assert_eq!(route_weights.len(), self.slots);
+        assert_eq!(route_weights.len(), self.slots);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 route_weights.as_ptr(),
@@ -5871,9 +5871,9 @@ pub(crate) fn glm_moe_prefill_iq_stage_gate_up_dispatch(
     shared_gate_up_q6k: bool,
 ) {
     let slots = sparse_slots + 1;
-    debug_assert_eq!(slots, carrier.slots);
-    debug_assert_eq!(w.len(), seq_len * slots);
-    debug_assert_eq!(off.len(), seq_len * slots);
+    assert_eq!(slots, carrier.slots);
+    assert_eq!(w.len(), seq_len * slots);
+    assert_eq!(off.len(), seq_len * slots);
     let n_ff = carrier.n_ff;
     let n_embd = carrier.n_embd;
     let f32_bytes = std::mem::size_of::<f32>();
@@ -5948,9 +5948,9 @@ pub(crate) fn glm_moe_prefill_iq_stage_tail_dispatch(
     shared_down_q8_0: bool,
 ) -> Vec<f32> {
     let slots = sparse_slots + 1;
-    debug_assert_eq!(slots, carrier.slots);
-    debug_assert_eq!(down_w.len(), seq_len * slots);
-    debug_assert_eq!(route_weights_all.len(), seq_len * slots);
+    assert_eq!(slots, carrier.slots);
+    assert_eq!(down_w.len(), seq_len * slots);
+    assert_eq!(route_weights_all.len(), seq_len * slots);
     let n_ff = carrier.n_ff;
     let n_embd = carrier.n_embd;
     let f32_bytes = std::mem::size_of::<f32>();
@@ -6156,7 +6156,7 @@ impl QwenMoeDecodeIdCarrier {
     }
 
     fn upload_input(&self, input: &[f32]) {
-        debug_assert_eq!(input.len(), self.n_embd);
+        assert_eq!(input.len(), self.n_embd);
         let contents = self.input_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -6168,8 +6168,8 @@ impl QwenMoeDecodeIdCarrier {
     }
 
     fn upload_routes(&self, expert_ids: &[u32], route_weights: &[f32]) {
-        debug_assert_eq!(expert_ids.len(), self.slots);
-        debug_assert_eq!(route_weights.len(), self.slots);
+        assert_eq!(expert_ids.len(), self.slots);
+        assert_eq!(route_weights.len(), self.slots);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 expert_ids.as_ptr(),
@@ -6364,8 +6364,8 @@ impl QwenMoeDecodeChainCarrier {
     }
 
     pub(crate) fn upload_routes(&self, expert_ids: &[u32], route_weights: &[f32]) {
-        debug_assert_eq!(expert_ids.len(), self.slots);
-        debug_assert_eq!(route_weights.len(), self.slots);
+        assert_eq!(expert_ids.len(), self.slots);
+        assert_eq!(route_weights.len(), self.slots);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 expert_ids.as_ptr(),
@@ -6752,9 +6752,9 @@ fn set_qwen_moe_selected_weight_buffers(
     weights: &[Retained<ProtocolObject<dyn MTLBuffer>>],
     offsets: &[u32],
 ) {
-    debug_assert!(!weights.is_empty());
-    debug_assert_eq!(weights.len(), offsets.len());
-    debug_assert!(weights.len() <= 9);
+    assert!(!weights.is_empty());
+    assert_eq!(weights.len(), offsets.len());
+    assert!(weights.len() <= 9);
     for index in 0..9usize {
         let slot = index.min(weights.len() - 1);
         unsafe {
@@ -6774,8 +6774,8 @@ fn set_qwen_moe_selected_weight_buffers_from_ids(
     shared_byte_offset: u32,
     per_expert_bytes: u32,
 ) {
-    debug_assert!(!expert_ids.is_empty());
-    debug_assert!(expert_ids.len() <= 9);
+    assert!(!expert_ids.is_empty());
+    assert!(expert_ids.len() <= 9);
     for index in 0..9usize {
         let slot = index.min(expert_ids.len() - 1);
         let expert = expert_ids[slot];
@@ -6806,9 +6806,9 @@ fn encode_qwen_moe_decode_q4k_selected_slots(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(weights.len(), slots);
-    debug_assert_eq!(offsets.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(weights.len(), slots);
+    assert_eq!(offsets.len(), slots);
     if std::env::var_os("RNB_METAL_QWEN35_MOE_SELECTED_Q4K_NSG2").is_some() {
         if let Some(pipeline) = ctx
             .qwen_moe_decode_q4k_selected_slots_nsg2_pipeline
@@ -6878,11 +6878,11 @@ fn encode_qwen_moe_decode_q4k_selected_pair_slots(
     n: usize,
     slots: usize,
 ) -> bool {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(gate_weights.len(), slots);
-    debug_assert_eq!(gate_offsets.len(), slots);
-    debug_assert_eq!(up_weights.len(), slots);
-    debug_assert_eq!(up_offsets.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(gate_weights.len(), slots);
+    assert_eq!(gate_offsets.len(), slots);
+    assert_eq!(up_weights.len(), slots);
+    assert_eq!(up_offsets.len(), slots);
     let Some(pipeline) = ctx
         .qwen_moe_decode_q4k_selected_pair_slots_pipeline
         .as_ref()
@@ -6948,8 +6948,8 @@ fn encode_qwen_moe_decode_q4k_selected_id_offsets(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(expert_ids.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(expert_ids.len(), slots);
     enc.setComputePipelineState(ctx.qwen_moe_decode_q4k_selected_slots_coalesced_pipeline());
     set_qwen_moe_selected_weight_buffers_from_ids(
         enc,
@@ -7055,8 +7055,8 @@ fn encode_qwen_moe_decode_q6k_selected_id_offsets(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(expert_ids.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(expert_ids.len(), slots);
     enc.setComputePipelineState(ctx.qwen_moe_decode_q6k_selected_slots_pipeline());
     set_qwen_moe_selected_weight_buffers_from_ids(
         enc,
@@ -7108,8 +7108,8 @@ fn encode_qwen_moe_decode_q5k_selected_id_offsets(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(expert_ids.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(expert_ids.len(), slots);
     enc.setComputePipelineState(ctx.qwen_moe_decode_q5k_selected_slots_pipeline());
     set_qwen_moe_selected_weight_buffers_from_ids(
         enc,
@@ -7155,9 +7155,9 @@ fn encode_qwen_moe_decode_q5k_selected_slots(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(weights.len(), slots);
-    debug_assert_eq!(offsets.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(weights.len(), slots);
+    assert_eq!(offsets.len(), slots);
     enc.setComputePipelineState(ctx.qwen_moe_decode_q5k_selected_slots_pipeline());
     set_qwen_moe_selected_weight_buffers(enc, weights, offsets);
     unsafe {
@@ -7194,9 +7194,9 @@ fn encode_qwen_moe_decode_q6k_selected_slots(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(weights.len(), slots);
-    debug_assert_eq!(offsets.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(weights.len(), slots);
+    assert_eq!(offsets.len(), slots);
     enc.setComputePipelineState(ctx.qwen_moe_decode_q6k_selected_slots_pipeline());
     set_qwen_moe_selected_weight_buffers(enc, weights, offsets);
     unsafe {
@@ -7258,9 +7258,9 @@ fn encode_glm_moe_decode_iq_selected_slots_at(
     n: usize,
     slots: usize,
 ) {
-    debug_assert!(slots > 0 && slots <= 9);
-    debug_assert_eq!(weights.len(), slots);
-    debug_assert_eq!(offsets.len(), slots);
+    assert!(slots > 0 && slots <= 9);
+    assert_eq!(weights.len(), slots);
+    assert_eq!(offsets.len(), slots);
     enc.setComputePipelineState(pipeline);
     set_qwen_moe_selected_weight_buffers(enc, weights, offsets);
     unsafe {
@@ -7297,7 +7297,7 @@ fn use_qwen_moe_argument_table(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     table: &QwenMoeArgumentWeightTable,
 ) {
-    debug_assert_eq!(table.weights.len(), table.weight_resources.len());
+    assert_eq!(table.weights.len(), table.weight_resources.len());
     use_mtl_buffer_resource(enc, &table.argument_buf, MTLResourceUsage::Read);
     if !table.weight_resources.is_empty() {
         unsafe {
@@ -7527,7 +7527,7 @@ pub(crate) fn qwen_moe_decode_chain_encode_router_logits(
     );
 
     if let Some(residual) = residual_buf {
-        debug_assert_eq!(
+        assert_eq!(
             hidden_off_bytes, 0,
             "fused residual+norm requires hidden_off=0"
         );
@@ -7595,7 +7595,7 @@ pub(crate) fn qwen_moe_decode_chain_encode_route(
     down_quant: u8,
     hidden_off_bytes: usize,
 ) {
-    debug_assert_eq!(carrier.slots, carrier.n_used + 1);
+    assert_eq!(carrier.slots, carrier.n_used + 1);
     debug_assert!(
         matches!(down_quant, 0 | 1 | 2),
         "Qwen MoE decode chain supports Q4_K/Q5_K/Q6_K down"
@@ -7653,7 +7653,7 @@ pub(crate) fn qwen_moe_decode_chain_encode_after_route(
     down_shared_off: u32,
     hidden_off_bytes: usize,
 ) {
-    debug_assert_eq!(carrier.slots, carrier.n_used + 1);
+    assert_eq!(carrier.slots, carrier.n_used + 1);
     debug_assert!(
         matches!(down_quant, 0 | 1 | 2),
         "Qwen MoE decode chain supports Q4_K/Q5_K/Q6_K down"
@@ -7858,9 +7858,9 @@ pub(crate) fn qwen_moe_decode_chain_encode_after_route_bound_offsets(
     route_weights: &[f32],
     down_quant: u8,
 ) -> bool {
-    debug_assert_eq!(carrier.slots, carrier.n_used + 1);
-    debug_assert_eq!(expert_ids.len(), carrier.slots);
-    debug_assert_eq!(route_weights.len(), carrier.slots);
+    assert_eq!(carrier.slots, carrier.n_used + 1);
+    assert_eq!(expert_ids.len(), carrier.slots);
+    assert_eq!(route_weights.len(), carrier.slots);
     if !matches!(down_quant, 1 | 2) || carrier.slots > 9 {
         return false;
     }
@@ -7996,15 +7996,15 @@ pub(crate) fn qwen_moe_decode_chain_encode_after_route_selected_buffers(
     route_weights: &[f32],
     down_quant: u8,
 ) -> bool {
-    debug_assert_eq!(carrier.slots, carrier.n_used + 1);
-    debug_assert_eq!(expert_ids.len(), carrier.slots);
-    debug_assert_eq!(route_weights.len(), carrier.slots);
-    debug_assert_eq!(gate_w.len(), carrier.slots);
-    debug_assert_eq!(gate_off.len(), carrier.slots);
-    debug_assert_eq!(up_w.len(), carrier.slots);
-    debug_assert_eq!(up_off.len(), carrier.slots);
-    debug_assert_eq!(down_w.len(), carrier.slots);
-    debug_assert_eq!(down_off.len(), carrier.slots);
+    assert_eq!(carrier.slots, carrier.n_used + 1);
+    assert_eq!(expert_ids.len(), carrier.slots);
+    assert_eq!(route_weights.len(), carrier.slots);
+    assert_eq!(gate_w.len(), carrier.slots);
+    assert_eq!(gate_off.len(), carrier.slots);
+    assert_eq!(up_w.len(), carrier.slots);
+    assert_eq!(up_off.len(), carrier.slots);
+    assert_eq!(down_w.len(), carrier.slots);
+    assert_eq!(down_off.len(), carrier.slots);
     if !matches!(down_quant, 1 | 2) || carrier.slots > 9 {
         return false;
     }
@@ -8117,7 +8117,7 @@ pub(crate) fn qwen_moe_decode_chain_encode_after_route_argument_table(
     down_shared_raw: &[u8],
     down_quant: u8,
 ) -> bool {
-    debug_assert_eq!(carrier.slots, carrier.n_used + 1);
+    assert_eq!(carrier.slots, carrier.n_used + 1);
     if !matches!(down_quant, 1 | 2) || carrier.n_expert + 1 > QWEN_MOE_WEIGHT_TABLE_CAP {
         return false;
     }
@@ -8806,13 +8806,13 @@ pub(crate) fn qwen_moe_decode_dispatch(
     down_quant: u8,
 ) -> Vec<f32> {
     let slots = route_weights.len();
-    debug_assert_eq!(slots, carrier.slots);
-    debug_assert_eq!(gate_w.len(), slots);
-    debug_assert_eq!(gate_off.len(), slots);
-    debug_assert_eq!(up_w.len(), slots);
-    debug_assert_eq!(up_off.len(), slots);
-    debug_assert_eq!(down_w.len(), slots);
-    debug_assert_eq!(down_off.len(), slots);
+    assert_eq!(slots, carrier.slots);
+    assert_eq!(gate_w.len(), slots);
+    assert_eq!(gate_off.len(), slots);
+    assert_eq!(up_w.len(), slots);
+    assert_eq!(up_off.len(), slots);
+    assert_eq!(down_w.len(), slots);
+    assert_eq!(down_off.len(), slots);
 
     carrier.upload_input(input);
     carrier.upload_offsets(gate_off, up_off, down_off);
@@ -9018,16 +9018,16 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
     select: crate::GlmMoeQuantSelect,
 ) -> Vec<f32> {
     let slots = sparse_slots + 1;
-    debug_assert_eq!(slots, carrier.slots);
-    debug_assert!(sparse_slots > 0 && sparse_slots <= 8);
-    debug_assert_eq!(gate_w.len(), seq_len * slots);
-    debug_assert_eq!(gate_off.len(), seq_len * slots);
-    debug_assert_eq!(up_w.len(), seq_len * slots);
-    debug_assert_eq!(up_off.len(), seq_len * slots);
-    debug_assert_eq!(down_w.len(), seq_len * slots);
-    debug_assert_eq!(down_off.len(), seq_len * slots);
-    debug_assert_eq!(route_weights_all.len(), seq_len * slots);
-    debug_assert_eq!(input_all.len(), seq_len * carrier.n_embd);
+    assert_eq!(slots, carrier.slots);
+    assert!(sparse_slots > 0 && sparse_slots <= 8);
+    assert_eq!(gate_w.len(), seq_len * slots);
+    assert_eq!(gate_off.len(), seq_len * slots);
+    assert_eq!(up_w.len(), seq_len * slots);
+    assert_eq!(up_off.len(), seq_len * slots);
+    assert_eq!(down_w.len(), seq_len * slots);
+    assert_eq!(down_off.len(), seq_len * slots);
+    assert_eq!(route_weights_all.len(), seq_len * slots);
+    assert_eq!(input_all.len(), seq_len * carrier.n_embd);
 
     // pm116: encode/gpu/readback 분해 — lib.rs 의 pread/wrap 줄과 같은 게이트.
     let profiling = std::env::var("RNB_METAL_GLM_MOE_PREFILL_PROFILE").as_deref() == Ok("1");
@@ -9249,15 +9249,15 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     select: crate::GlmMoeQuantSelect,
 ) -> Vec<f32> {
     let slots = route_weights.len();
-    debug_assert_eq!(slots, carrier.slots);
-    debug_assert_eq!(sparse_slots + 1, slots);
-    debug_assert!(sparse_slots > 0 && sparse_slots <= 8);
-    debug_assert_eq!(gate_w.len(), slots);
-    debug_assert_eq!(gate_off.len(), slots);
-    debug_assert_eq!(up_w.len(), slots);
-    debug_assert_eq!(up_off.len(), slots);
-    debug_assert_eq!(down_w.len(), slots);
-    debug_assert_eq!(down_off.len(), slots);
+    assert_eq!(slots, carrier.slots);
+    assert_eq!(sparse_slots + 1, slots);
+    assert!(sparse_slots > 0 && sparse_slots <= 8);
+    assert_eq!(gate_w.len(), slots);
+    assert_eq!(gate_off.len(), slots);
+    assert_eq!(up_w.len(), slots);
+    assert_eq!(up_off.len(), slots);
+    assert_eq!(down_w.len(), slots);
+    assert_eq!(down_off.len(), slots);
     let profile_start = (std::env::var("RNB_METAL_GLM_MOE_PROFILE").as_deref() == Ok("1"))
         .then(std::time::Instant::now);
 
@@ -9587,10 +9587,10 @@ pub(crate) fn glm_mla_front_dispatch(
     kv_out: &mut [f32],
     qabs_out: &mut [f32],
 ) {
-    debug_assert_eq!(input.len(), carrier.hidden);
-    debug_assert_eq!(q_out.len(), carrier.q_dim);
-    debug_assert_eq!(kv_out.len(), carrier.kv_dim);
-    debug_assert_eq!(qabs_out.len(), carrier.heads * carrier.kv_rank);
+    assert_eq!(input.len(), carrier.hidden);
+    assert_eq!(q_out.len(), carrier.q_dim);
+    assert_eq!(kv_out.len(), carrier.kv_dim);
+    assert_eq!(qabs_out.len(), carrier.heads * carrier.kv_rank);
     GlmMlaCarrier::upload(&carrier.input_dev, input);
     let qa_off_buf = u32_buf(ctx, qa_w.1);
     let qb_off_buf = u32_buf(ctx, qb_w.1);
@@ -9678,8 +9678,8 @@ pub(crate) fn glm_mla_back_dispatch(
     latent: &[f32],
     out: &mut [f32],
 ) {
-    debug_assert_eq!(latent.len(), carrier.heads * carrier.kv_rank);
-    debug_assert_eq!(out.len(), carrier.hidden);
+    assert_eq!(latent.len(), carrier.heads * carrier.kv_rank);
+    assert_eq!(out.len(), carrier.hidden);
     GlmMlaCarrier::upload(&carrier.latent_dev, latent);
     let o_off_buf = u32_buf(ctx, o_w.1);
 
@@ -9810,7 +9810,7 @@ impl PrefillFfnCarrier {
 
     /// normed host slice[seq_len*hidden_dim] → normed_dev 업로드.
     fn upload_normed(&self, normed: &[f32]) {
-        debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         let contents = self.normed_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -10264,8 +10264,8 @@ pub(crate) fn qwen_moe_prefill_mulmmid_v4_encode(
     {
         return Err(QwenMoeIdPreflightReason::RankCountMismatch);
     }
-    debug_assert_eq!(carrier.hidden_dim, accum.hidden_dim);
-    debug_assert_eq!(carrier.slots, accum.seq_len * carrier.n_expert_used);
+    assert_eq!(carrier.hidden_dim, accum.hidden_dim);
+    assert_eq!(carrier.slots, accum.seq_len * carrier.n_expert_used);
     crate::compute::encode_gemm_q4k_tensorops_id_f16(
         ctx,
         enc,
@@ -10376,7 +10376,7 @@ pub(crate) fn qwen_moe_prefill_id_gate_up_down_scatter_encode(
     route_weights_buf: &ProtocolObject<dyn MTLBuffer>,
 ) {
     debug_assert!(prefill_ffn_chain_v2_scatter_supported(ctx, down_is_q6k));
-    debug_assert_eq!(group_carrier.seq_len, group_len);
+    assert_eq!(group_carrier.seq_len, group_len);
     let hidden_dim = group_carrier.hidden_dim;
 
     encode_silu_mul_to_f16_slice(
@@ -10499,7 +10499,7 @@ pub(crate) fn qwen_moe_prefill_id_gate_up_f16_down_scatter_encode(
     route_weights_buf: &ProtocolObject<dyn MTLBuffer>,
 ) {
     debug_assert!(prefill_ffn_chain_v2_scatter_supported(ctx, down_is_q6k));
-    debug_assert_eq!(group_carrier.seq_len, group_len);
+    assert_eq!(group_carrier.seq_len, group_len);
     let hidden_dim = group_carrier.hidden_dim;
 
     encode_silu_mul_half_to_f16_slice(
@@ -10633,8 +10633,8 @@ pub(crate) fn qwen_moe_prefill_id_matmul_encode(
     n_expert: usize,
 ) {
     debug_assert!(qwen_moe_prefill_id_matmul_supported(ctx, true));
-    debug_assert_eq!(expert_offsets.len(), n_expert);
-    debug_assert_eq!(expert_counts.len(), n_expert);
+    assert_eq!(expert_offsets.len(), n_expert);
+    assert_eq!(expert_counts.len(), n_expert);
     let hidden_dim = carrier.hidden_dim;
     let ffn_dim = carrier.ffn_dim;
 
@@ -10761,7 +10761,7 @@ fn prefill_ffn_chain_v2_scatter_accum_encode_from_input(
 ) {
     debug_assert!(prefill_ffn_chain_v2_scatter_supported(ctx, down_is_q6k));
     let hidden_dim = carrier.hidden_dim;
-    debug_assert_eq!(m, carrier.seq_len);
+    assert_eq!(m, carrier.seq_len);
 
     crate::compute::encode_cast_f32_to_f16(
         ctx,
@@ -10816,7 +10816,7 @@ fn prefill_ffn_chain_v2_scatter_accum_encode_from_f16(
     debug_assert!(prefill_ffn_chain_v2_scatter_supported(ctx, down_is_q6k));
     let hidden_dim = carrier.hidden_dim;
     let ffn_dim = carrier.ffn_dim;
-    debug_assert_eq!(m, carrier.seq_len);
+    assert_eq!(m, carrier.seq_len);
 
     let used_gate_up_pair = crate::compute::encode_gemm_q4k_tensorops_v2_pair(
         ctx,
@@ -11027,7 +11027,7 @@ pub(crate) fn prefill_ffn_chain_v2_scatter_accum_encode_gather(
     group_start: u32,
     total_elems: u32,
 ) {
-    debug_assert_eq!(m, carrier.seq_len);
+    assert_eq!(m, carrier.seq_len);
 
     if qwen_moe_prefill_gather_f16_requested() {
         enc.setComputePipelineState(&ctx.qwen_moe_prefill_gather_f16_pipeline);
@@ -11559,7 +11559,7 @@ impl QkvCarrier {
 
     /// norm host slice → norm_dev 업로드.
     fn upload_norm(&self, norm: &[f32]) {
-        debug_assert_eq!(norm.len(), self.hidden_dim);
+        assert_eq!(norm.len(), self.hidden_dim);
         let contents = self.norm_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -11680,7 +11680,7 @@ impl GdnInprojCarrier {
     }
 
     fn upload_norm(&self, norm: &[f32]) {
-        debug_assert_eq!(norm.len(), self.hidden_dim);
+        assert_eq!(norm.len(), self.hidden_dim);
         let contents = self.norm_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -11774,8 +11774,8 @@ impl OChainCarrier {
     }
 
     fn upload(&self, attn_out: &[f32], hidden: &[f32]) {
-        debug_assert_eq!(attn_out.len(), self.q_dim);
-        debug_assert_eq!(hidden.len(), self.hidden_dim);
+        assert_eq!(attn_out.len(), self.q_dim);
+        assert_eq!(hidden.len(), self.hidden_dim);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 attn_out.as_ptr(),

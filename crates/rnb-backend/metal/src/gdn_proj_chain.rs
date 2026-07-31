@@ -67,7 +67,7 @@ impl PrefillGdnProjCarrier {
         }
     }
     fn upload_normed(&self, normed: &[f32]) {
-        debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         let c = self.normed_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(normed.as_ptr(), c.as_ptr() as *mut f32, normed.len());
@@ -107,7 +107,7 @@ impl PrefillGdnF32DualCarrier {
     }
 
     fn upload_normed(&self, normed: &[f32]) {
-        debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         let c = self.normed_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(normed.as_ptr(), c.as_ptr() as *mut f32, normed.len());
@@ -141,7 +141,7 @@ impl PrefillF32ProjCarrier {
     }
 
     fn upload_normed(&self, normed: &[f32]) {
-        debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
+        assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         let c = self.normed_dev.contents();
         unsafe {
             std::ptr::copy_nonoverlapping(normed.as_ptr(), c.as_ptr() as *mut f32, normed.len());

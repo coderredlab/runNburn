@@ -166,19 +166,19 @@ impl PrefillGdnConvDeltaCarrier {
         state: &[f32],
     ) {
         let total_conv_len = (self.conv_kernel - 1) + self.seq_len;
-        debug_assert_eq!(
+        assert_eq!(
             conv_input.len(),
             total_conv_len * self.conv_channels,
             "conv_input len"
         );
-        debug_assert_eq!(
+        assert_eq!(
             conv_weight.len(),
             self.conv_kernel * self.conv_channels,
             "conv_weight len"
         );
-        debug_assert_eq!(gate.len(), self.seq_len * self.num_v_heads, "gate len");
-        debug_assert_eq!(beta.len(), self.seq_len * self.num_v_heads, "beta len");
-        debug_assert_eq!(
+        assert_eq!(gate.len(), self.seq_len * self.num_v_heads, "gate len");
+        assert_eq!(beta.len(), self.seq_len * self.num_v_heads, "beta len");
+        assert_eq!(
             state.len(),
             self.num_v_heads * self.head_v_dim * self.head_k_dim,
             "state len"
@@ -425,8 +425,8 @@ impl PrefillGdnFullCarrier {
     /// M1 입력(z, ssm_norm) device upload. M2 입력(conv_input/weight/gate/beta/state)은
     /// dispatch 안에서 inner.upload 로 처리.
     fn upload_m1(&self, z: &[f32], ssm_norm: &[f32]) {
-        debug_assert_eq!(z.len(), self.inner.seq_len * self.d_inner, "z len");
-        debug_assert_eq!(ssm_norm.len(), self.inner.head_v_dim, "ssm_norm len");
+        assert_eq!(z.len(), self.inner.seq_len * self.d_inner, "z len");
+        assert_eq!(ssm_norm.len(), self.inner.head_v_dim, "ssm_norm len");
         unsafe {
             std::ptr::copy_nonoverlapping(
                 z.as_ptr(),
@@ -515,12 +515,12 @@ impl PrefillGdnFullFfnCarrier {
     }
 
     fn upload_tail_inputs(&self, hidden: &[f32], post_norm_w: &[f32]) {
-        debug_assert_eq!(
+        assert_eq!(
             hidden.len(),
             self.full.inner.seq_len * self.hidden_dim,
             "hidden len"
         );
-        debug_assert_eq!(post_norm_w.len(), self.hidden_dim, "post_norm_w len");
+        assert_eq!(post_norm_w.len(), self.hidden_dim, "post_norm_w len");
         unsafe {
             std::ptr::copy_nonoverlapping(
                 hidden.as_ptr(),

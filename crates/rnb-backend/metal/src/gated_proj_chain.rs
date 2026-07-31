@@ -39,7 +39,7 @@ impl PrefillGdnGatedProjCarrier {
         n_out: usize,
         norm_eps: f32,
     ) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             d_inner % head_v_dim,
             0,
             "d_inner must be num_v_heads*head_v_dim"
@@ -72,9 +72,9 @@ impl PrefillGdnGatedProjCarrier {
     }
 
     fn upload(&self, out_in: &[f32], z: &[f32], norm: &[f32]) {
-        debug_assert_eq!(out_in.len(), self.seq_len * self.d_inner);
-        debug_assert_eq!(z.len(), self.seq_len * self.d_inner);
-        debug_assert_eq!(norm.len(), self.head_v_dim);
+        assert_eq!(out_in.len(), self.seq_len * self.d_inner);
+        assert_eq!(z.len(), self.seq_len * self.d_inner);
+        assert_eq!(norm.len(), self.head_v_dim);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 out_in.as_ptr(),
