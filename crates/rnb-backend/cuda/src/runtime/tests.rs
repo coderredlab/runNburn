@@ -12,8 +12,6 @@ use rnb_memory::{ExpertBundleCacheStats, ExpertBundleObservationReceipt};
 #[path = "tests/mtp_verify.rs"]
 mod mtp_verify_tests;
 
-static CUDA_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-
 struct RuntimeTestGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
@@ -4734,18 +4732,8 @@ fn nemotron_workspace_moe_mid_inactive_records_miss_without_live_lease() {
     assert_eq!(summary.owned_alloc_count, 2);
 }
 
-fn cuda_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    CUDA_TEST_LOCK
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 fn runtime_test_lock() -> RuntimeTestGuard {
-    let guard = CUDA_TEST_LOCK
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = cuda_test_env_lock();
     reset_default_cuda_compute_for_test();
     RuntimeTestGuard { _guard: guard }
 }
@@ -22735,12 +22723,12 @@ fn cuda_qwen35_sparse_experts_by_token_q6_pack4_gate_up_q8dot_group16_matches_gr
         .unwrap_or_else(|err| panic!("CUDA q6 pack4 Q8-dot MMQ opt-out path failed: {err}"))
     };
 
-    let (max_idx, max_abs, max_rel) = max_abs_rel(&fused, &baseline);
-    assert!(
-        max_abs <= 1.0e-4,
-        "Q6 pack4 group8 len16 gate/up fused path changed baseline output: idx={max_idx} baseline={:.9} fused={:.9} abs={max_abs:.9} rel={max_rel:.9}",
-        baseline[max_idx],
-        fused[max_idx]
+    assert_close_rows_abs_rel(
+        "Q6 pack4 group8 len16 gate/up fused path",
+        &fused,
+        &baseline,
+        1.0e-4,
+        1.0e-6,
     );
     let output_max = fused.iter().fold(0.0f32, |max, value| max.max(value.abs()));
     let (q8_max_idx, q8_max_abs, q8_max_rel) = max_abs_rel(&q8dot_group8, &fused);
@@ -22748,15 +22736,19 @@ fn cuda_qwen35_sparse_experts_by_token_q6_pack4_gate_up_q8dot_group16_matches_gr
         q8_max_abs <= output_max * 0.003,
         "Q6 pack4 group8 Q8-dot gate/up changed output beyond 0.3% of output scale: idx={q8_max_idx} abs={q8_max_abs:.6} rel={q8_max_rel:.6} output_max={output_max:.6}"
     );
-    let (group16_idx, group16_abs, group16_rel) = max_abs_rel(&q8dot_group16, &q8dot_group8);
-    assert!(
-        group16_abs <= 1.0e-4,
-        "Q6 pack4 group16 Q8-dot changed group8 output: idx={group16_idx} abs={group16_abs:.6} rel={group16_rel:.6}"
+    assert_close_rows_abs_rel(
+        "Q6 pack4 group16 Q8-dot vs group8",
+        &q8dot_group16,
+        &q8dot_group8,
+        1.0e-4,
+        1.0e-6,
     );
-    let (group32_idx, group32_abs, group32_rel) = max_abs_rel(&q8dot_group32, &q8dot_group16);
-    assert!(
-        group32_abs <= 1.0e-4,
-        "Q6 pack4 group32 Q8-dot changed group16 output: idx={group32_idx} abs={group32_abs:.6} rel={group32_rel:.6}"
+    assert_close_rows_abs_rel(
+        "Q6 pack4 group32 Q8-dot vs group16",
+        &q8dot_group32,
+        &q8dot_group16,
+        1.0e-4,
+        1.0e-6,
     );
     let (opt_out_idx, opt_out_abs, opt_out_rel) = max_abs_rel(&q8dot_mmq_opt_out, &q8dot_group8);
     assert!(

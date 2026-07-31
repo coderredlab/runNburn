@@ -591,13 +591,9 @@ fn dense_q4k_gemv_q8dot_enabled(default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{dense_q4_batch_dev_input_q8dot_enabled, dense_q4_batch_f16_gate_up_enabled_for};
-    use std::sync::Mutex;
-
-    static GATE_UP_ENV_LOCK: Mutex<()> = Mutex::new(());
-    static Q4_BATCH_DEV_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_clean_gate_up_env(test: impl FnOnce()) {
-        let _guard = GATE_UP_ENV_LOCK.lock().expect("gate/up env lock");
+        let _guard = crate::runtime::cuda_test_env_lock();
         let prev_allow = std::env::var("RNB_CUDA_ALLOW_EXPANDED_WEIGHT_CACHE").ok();
         let prev = std::env::var("RNB_CUDA_Q4K_BATCH_F16_GATE_UP").ok();
         let prev_mtp = std::env::var("RNB_MTP_DEVICE_VERIFY").ok();
@@ -619,7 +615,7 @@ mod tests {
     }
 
     fn with_clean_q4_batch_dev_env(test: impl FnOnce()) {
-        let _guard = Q4_BATCH_DEV_ENV_LOCK.lock().expect("Q4 batch dev env lock");
+        let _guard = crate::runtime::cuda_test_env_lock();
         let prev_dev = std::env::var("RNB_CUDA_Q4K_BATCH_Q8DOT_DEV").ok();
         let prev_batch = std::env::var("RNB_CUDA_Q4K_BATCH_Q8DOT").ok();
         std::env::remove_var("RNB_CUDA_Q4K_BATCH_Q8DOT_DEV");

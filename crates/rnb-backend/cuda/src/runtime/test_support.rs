@@ -1,6 +1,15 @@
 use super::*;
 use crate::runtime::state::{pack_q4k_for_q8dot, pack_q6k_for_q8dot};
 
+static CUDA_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+pub(crate) fn cuda_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    CUDA_TEST_LOCK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 pub fn launch_smoke_add_one_for_test(input: f32) -> Result<f32, String> {
     let state = CudaState::open()?;

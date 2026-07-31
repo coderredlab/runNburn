@@ -1269,9 +1269,6 @@ pub fn prewarm_q4k_f32_weights(weights: &[(&[u8], usize, usize)]) -> Result<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static Q4_F32_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn restore_env(name: &str, previous: Option<String>) {
         unsafe {
@@ -1285,7 +1282,7 @@ mod tests {
 
     #[test]
     fn q4k_f32_gemm_batch_cached_requires_expanded_gate() {
-        let _guard = Q4_F32_ENV_LOCK.lock().expect("Q4 F32 env lock");
+        let _guard = crate::runtime::cuda_test_env_lock();
         let prev_allow = std::env::var("RNB_CUDA_ALLOW_EXPANDED_WEIGHT_CACHE").ok();
         let prev_q4_f32 = std::env::var("RNB_CUDA_Q4K_PREFILL_F32_GEMM").ok();
         unsafe {

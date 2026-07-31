@@ -1068,6 +1068,7 @@ mod tests {
 
     #[test]
     fn defaults_match_cuda_runtime_policy() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_OUTPUT_LOGITS");
             std::env::remove_var("RNB_CUDA_OUTPUT_ARGMAX");
@@ -1319,6 +1320,7 @@ mod tests {
 
     #[test]
     fn qwen35_short_window_prefill_policy_is_opt_in() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_GDN_PREFILL_GEMV");
             std::env::remove_var("RNB_CUDA_GDN_GATED_NORM_GEMM");
@@ -2340,6 +2342,7 @@ mod tests {
 
     #[test]
     fn q4k_prefill_f16_split_flags_follow_global_and_allow_overrides() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_ALLOW_EXPANDED_WEIGHT_CACHE");
             std::env::remove_var("RNB_CUDA_Q4K_PREFILL_F16_GEMM");
