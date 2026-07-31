@@ -33,6 +33,17 @@ impl GpuBuffer {
     }
 }
 
+unsafe fn destroy_buffer_then_free_memory(
+    device: VkDevice,
+    buffer: VkBuffer,
+    memory: VkDeviceMemory,
+    destroy_buffer: unsafe extern "C" fn(VkDevice, VkBuffer, *const c_void),
+    free_memory: unsafe extern "C" fn(VkDevice, VkDeviceMemory, *const c_void),
+) {
+    destroy_buffer(device, buffer, ptr::null());
+    free_memory(device, memory, ptr::null());
+}
+
 #[derive(Debug)]
 pub(crate) enum BufferCreateError {
     Vulkan {
@@ -299,8 +310,13 @@ impl VulkanContext {
 
         let result = (self.vk.bind_buffer_memory)(self.device, buffer, memory, 0);
         if result != VK_SUCCESS {
-            (self.vk.free_memory)(self.device, memory, ptr::null());
-            (self.vk.destroy_buffer)(self.device, buffer, ptr::null());
+            destroy_buffer_then_free_memory(
+                self.device,
+                buffer,
+                memory,
+                self.vk.destroy_buffer,
+                self.vk.free_memory,
+            );
             return Err(BufferCreateError::Vulkan {
                 operation: "vkBindBufferMemory",
                 result,
@@ -473,8 +489,13 @@ impl VulkanContext {
     }
 
     pub(crate) unsafe fn destroy_buffer(&self, buf: GpuBuffer) {
-        (self.vk.free_memory)(self.device, buf.memory, ptr::null());
-        (self.vk.destroy_buffer)(self.device, buf.buffer, ptr::null());
+        destroy_buffer_then_free_memory(
+            self.device,
+            buf.buffer,
+            buf.memory,
+            self.vk.destroy_buffer,
+            self.vk.free_memory,
+        );
     }
 }
 
@@ -484,5 +505,57 @@ impl Drop for VulkanContext {
             (self.vk.destroy_device)(self.device, ptr::null());
             (self.vk.destroy_instance)(self.instance, ptr::null());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const CLEANUP_ORDER_VIOLATION: u8 = u8::MAX;
+    static CLEANUP_STEP: AtomicU8 = AtomicU8::new(0);
+
+    unsafe extern "C" fn record_destroy_buffer(
+        _device: VkDevice,
+        _buffer: VkBuffer,
+        _allocator: *const c_void,
+    ) {
+        if CLEANUP_STEP
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            CLEANUP_STEP.store(CLEANUP_ORDER_VIOLATION, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn record_free_memory(
+        _device: VkDevice,
+        _memory: VkDeviceMemory,
+        _allocator: *const c_void,
+    ) {
+        if CLEANUP_STEP
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            CLEANUP_STEP.store(CLEANUP_ORDER_VIOLATION, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn buffer_memory_cleanup_destroys_buffer_before_freeing_memory() {
+        CLEANUP_STEP.store(0, Ordering::SeqCst);
+
+        unsafe {
+            destroy_buffer_then_free_memory(
+                std::ptr::null_mut(),
+                VK_NULL_HANDLE,
+                VK_NULL_HANDLE,
+                record_destroy_buffer,
+                record_free_memory,
+            );
+        }
+
+        assert_eq!(CLEANUP_STEP.load(Ordering::SeqCst), 2);
     }
 }
