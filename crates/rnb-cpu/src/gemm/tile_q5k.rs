@@ -39,6 +39,13 @@ pub fn gemm_q5k_packed(
     cols: usize,
     seq_len: usize,
 ) {
+    let required_output_len = rows
+        .checked_mul(seq_len)
+        .expect("Q5_K GEMM output length overflow");
+    assert!(
+        output.len() >= required_output_len,
+        "Q5_K GEMM output is shorter than seq_len * rows"
+    );
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("i8mm") {
@@ -124,6 +131,37 @@ pub fn gemv_q5k_packed(
         cols,
         1,
     );
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+#[inline(always)]
+fn q5k_parallel_row_range(task: usize, rows: usize) -> std::ops::Range<usize> {
+    let start = task * 8;
+    start..start.saturating_add(8).min(rows)
+}
+
+#[cfg(target_arch = "aarch64")]
+/// # Safety
+///
+/// Concurrent callers must use disjoint `row_range` values. `output_len` must
+/// describe an allocation beginning at `out_addr`.
+#[inline(always)]
+unsafe fn q5k_parallel_output_add(
+    out_addr: usize,
+    output_len: usize,
+    row_range: &std::ops::Range<usize>,
+    row: usize,
+    token: usize,
+    rows: usize,
+    value: f32,
+) {
+    debug_assert!(row_range.contains(&row));
+    let index = token * rows + row;
+    debug_assert!(index < output_len);
+    unsafe {
+        let ptr = (out_addr as *mut f32).add(index);
+        ptr.write(ptr.read() + value);
+    }
 }
 
 // ─── 스칼라 레퍼런스 ──────────────────────────────────────────────────────────
@@ -228,10 +266,10 @@ unsafe fn gemm_q5k_packed_neon(
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
 
-    (0..row_groups).into_par_iter().for_each(|rg| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
-
-        let rows_in_group = (rows - rg * 8).min(8);
+    (0..row_groups).into_par_iter().for_each(|task| {
+        let row_range = q5k_parallel_row_range(task, rows);
+        let rg = row_range.start / 8;
+        let rows_in_group = row_range.len();
 
         // Per-token accumulator for 8 rows
         let mut acc = vec![0.0f32; seq_len * 8];
@@ -311,10 +349,21 @@ unsafe fn gemm_q5k_packed_neon(
             }
         }
 
-        // Write output
+        // Each Rayon task owns a disjoint logical row range.
         for s in 0..seq_len {
             for r in 0..rows_in_group {
-                out_slice[s * rows + rg * 8 + r] += acc[s * 8 + r];
+                let row = row_range.start + r;
+                unsafe {
+                    q5k_parallel_output_add(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        row,
+                        s,
+                        rows,
+                        acc[s * 8 + r],
+                    );
+                }
             }
         }
     });
@@ -341,10 +390,10 @@ unsafe fn gemm_q5k_packed_i8mm(
     let out_addr = output.as_mut_ptr() as usize;
     let output_len = output.len();
 
-    (0..row_groups).into_par_iter().for_each(|rg| {
-        let out_slice = unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, output_len) };
-
-        let rows_in_group = (rows - rg * 8).min(8);
+    (0..row_groups).into_par_iter().for_each(|task| {
+        let row_range = q5k_parallel_row_range(task, rows);
+        let rg = row_range.start / 8;
+        let rows_in_group = row_range.len();
         let row_pairs = (rows_in_group + 1) / 2;
 
         // Per-token accumulator for 8 rows
@@ -674,10 +723,21 @@ unsafe fn gemm_q5k_packed_i8mm(
             }
         }
 
-        // Write output
+        // Each Rayon task owns a disjoint logical row range.
         for s in 0..seq_len {
             for r in 0..rows_in_group {
-                out_slice[s * rows + rg * 8 + r] += acc[s * 8 + r];
+                let row = row_range.start + r;
+                unsafe {
+                    q5k_parallel_output_add(
+                        out_addr,
+                        output_len,
+                        &row_range,
+                        row,
+                        s,
+                        rows,
+                        acc[s * 8 + r],
+                    );
+                }
             }
         }
     });
@@ -813,6 +873,33 @@ mod tests {
     use crate::gemm::pack_q4k::decode_q4k_scales;
     use crate::gemm::pack_q5k::pack_q5k;
     use half::f16;
+
+    #[test]
+    fn q5k_parallel_row_tasks_are_disjoint_and_cover_all_rows() {
+        for rows in 1usize..18 {
+            let ranges = (0..rows.div_ceil(8))
+                .map(|task| q5k_parallel_row_range(task, rows))
+                .collect::<Vec<_>>();
+
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert_eq!(ranges.last().unwrap().end, rows);
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Q5_K GEMM output is shorter than seq_len * rows")]
+    fn q5k_gemm_rejects_short_output_before_parallel_write() {
+        let mut output = [];
+        gemm_q5k_packed(&[], &[], &[], &[], &mut output, 1, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Q5_K GEMM output length overflow")]
+    fn q5k_gemm_rejects_output_length_overflow() {
+        let mut output = [];
+        gemm_q5k_packed(&[], &[], &[], &[], &mut output, 2, 0, usize::MAX / 2 + 1);
+    }
 
     // ─── 테스트 헬퍼 ─────────────────────────────────────────────
 
@@ -1393,9 +1480,9 @@ mod tests {
     fn test_q5k_packed_matches_exact_q8_reference() {
         use std::f32::consts::PI;
 
-        let rows = 24;
+        let rows = 25;
         let cols = 3;
-        let seq_len = 5;
+        let seq_len = 9;
 
         let mut src = Vec::new();
         for row in 0..rows {
@@ -1442,7 +1529,10 @@ mod tests {
             input_bsums_flat[t * 8..(t + 1) * 8].copy_from_slice(&bsums);
         }
 
-        let mut output_gemm = vec![0.0f32; seq_len * rows];
+        let initial_output = (0..seq_len * rows)
+            .map(|i| (i % 7) as f32 * 0.125 - 0.375)
+            .collect::<Vec<_>>();
+        let mut output_gemm = initial_output.clone();
         gemm_q5k_packed(
             &packed,
             &input_qs_flat,
@@ -1453,6 +1543,46 @@ mod tests {
             cols,
             seq_len,
         );
+
+        #[cfg(target_arch = "aarch64")]
+        let mut outputs = vec![("dispatch", output_gemm)];
+        #[cfg(not(target_arch = "aarch64"))]
+        let outputs = vec![("dispatch", output_gemm)];
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                let mut output_neon = initial_output.clone();
+                unsafe {
+                    gemm_q5k_packed_neon(
+                        &packed,
+                        &input_qs_flat,
+                        &input_d_flat,
+                        &input_bsums_flat,
+                        &mut output_neon,
+                        rows,
+                        cols,
+                        seq_len,
+                    );
+                }
+                outputs.push(("neon", output_neon));
+            }
+            if std::arch::is_aarch64_feature_detected!("i8mm") {
+                let mut output_i8mm = initial_output.clone();
+                unsafe {
+                    gemm_q5k_packed_i8mm(
+                        &packed,
+                        &input_qs_flat,
+                        &input_d_flat,
+                        &input_bsums_flat,
+                        &mut output_i8mm,
+                        rows,
+                        cols,
+                        seq_len,
+                    );
+                }
+                outputs.push(("i8mm", output_i8mm));
+            }
+        }
 
         let output_ref = q5k_q8k_exact_ref(
             &src,
@@ -1465,16 +1595,18 @@ mod tests {
         );
 
         let mut max_abs_err = 0.0f32;
-        for s in 0..seq_len {
-            for row in 0..rows {
-                let got = output_gemm[s * rows + row];
-                let exp = output_ref[s * rows + row];
-                let abs_err = (got - exp).abs();
-                max_abs_err = max_abs_err.max(abs_err);
-                assert!(
-                    abs_err < 1e-4,
-                    "packed-vs-exact mismatch: s={s} row={row} got={got:.8} ref={exp:.8} abs_err={abs_err:.8}"
-                );
+        for (path, output) in outputs {
+            for s in 0..seq_len {
+                for row in 0..rows {
+                    let got = output[s * rows + row];
+                    let exp = initial_output[s * rows + row] + output_ref[s * rows + row];
+                    let abs_err = (got - exp).abs();
+                    max_abs_err = max_abs_err.max(abs_err);
+                    assert!(
+                        abs_err < 1e-4,
+                        "{path} packed-vs-exact mismatch: s={s} row={row} got={got:.8} ref={exp:.8} abs_err={abs_err:.8}"
+                    );
+                }
             }
         }
 
