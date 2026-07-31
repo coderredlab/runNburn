@@ -1201,6 +1201,10 @@ fn make_decode_test_engine(vocab_size: usize) -> Engine {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_prepare_gemma_per_layer_base_uses_token_branch_when_model_proj_is_zero() {
     let metadata = make_gemma_per_layer_metadata();
     let gemma = make_dummy_gemma_per_layer_weights();
@@ -4409,6 +4413,10 @@ fn test_forward_attention_layer_gemma4_reused_layer_skips_kv_projection() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a tiny CPU attention fixture unsupported by the strict CUDA path"
+)]
 fn test_decode_attention_layer_gemma4_reused_layer_skips_kv_projection() {
     let metadata = ModelMetadata {
         num_layers: 4,
@@ -4508,6 +4516,10 @@ fn test_decode_attention_layer_gemma4_reused_layer_skips_kv_projection() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a tiny CPU attention fixture unsupported by the strict CUDA path"
+)]
 fn test_gemma4_reused_layer_prefill_decode_match() {
     let metadata = ModelMetadata {
         num_layers: 4,
@@ -4636,6 +4648,10 @@ fn test_gemma4_reused_layer_prefill_decode_match() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a tiny CPU attention fixture unsupported by the strict CUDA path"
+)]
 fn test_gemma4_owned_full_attention_prefill_decode_match_with_norms() {
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -4805,6 +4821,10 @@ fn test_gemma4_owned_full_attention_prefill_decode_match_with_norms() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a tiny CPU attention fixture unsupported by the strict CUDA path"
+)]
 fn test_gemma4_owned_swa_prefill_decode_match_with_norms() {
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -4998,6 +5018,10 @@ fn test_engine_kv_cache_initial() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_engine_decode_with_profiling_enabled() {
     let _guard = env_lock().lock().expect("env lock poisoned");
     let prev = crate::engine::policy::env_string("RNB_PROFILE");
@@ -5024,6 +5048,10 @@ fn test_engine_decode_with_profiling_enabled() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_prefill_with_q_norm_without_gated_q_layout_succeeds() {
     let mut engine = make_decode_test_engine(32);
 
@@ -5158,6 +5186,10 @@ fn test_gpu_prefill_executor_is_available_only_for_hybrid_slice1_models() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_engine_can_materialize_slice_window_handoff_from_current_kv_state() {
     let mut engine = make_decode_test_engine(64);
     let _ = engine.forward(&[1, 2, 3]).expect("prefill should succeed");
@@ -5172,6 +5204,10 @@ fn test_engine_can_materialize_slice_window_handoff_from_current_kv_state() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_debug_prefill_layer_logits_matches_final_forward_logits() {
     let mut engine = make_decode_test_engine(64);
     let tokens = [1u32, 2, 3];
@@ -5333,6 +5369,10 @@ fn test_engine_select_prefill_path_falls_back_to_cpu_without_active_gpu() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_slice1_candidate_prefill_matches_cpu_prefill_on_segmented_attention_stack() {
     let mut cpu_engine = make_multi_layer_attention_engine(32, 4, 0);
     let mut segmented_engine = make_multi_layer_attention_engine(32, 4, 4);
@@ -5353,6 +5393,10 @@ fn test_slice1_candidate_prefill_matches_cpu_prefill_on_segmented_attention_stac
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_forward_uses_segmented_slice1_candidate_without_changing_prefill_result() {
     let mut cpu_engine = make_multi_layer_attention_engine(32, 4, 0);
     let mut segmented_engine = make_multi_layer_attention_engine(32, 4, 4);
@@ -5378,6 +5422,10 @@ fn test_engine_exposes_prefill_runtime_counters() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_gpu_prefill_executor_runs_slice1_window_and_returns_handoff() {
     let mut engine = make_multi_layer_attention_engine(32, 4, 4);
     let tokens = [1u32, 2, 3, 4];
@@ -5445,6 +5493,10 @@ fn test_gpu_prefill_executor_runs_slice1_window_and_returns_handoff() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_gpu_prefill_executor_run_returns_decode_ready_prefill_handoff() {
     let mut engine = make_multi_layer_attention_engine(32, 4, 4);
     let tokens = [1u32, 2, 3, 4];
@@ -5478,6 +5530,10 @@ fn test_gpu_prefill_executor_run_returns_decode_ready_prefill_handoff() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_prefill_handoff_preserves_next_decode_logits() {
     let mut baseline = make_multi_layer_attention_engine(32, 4, 4);
     let mut handoff_engine = make_multi_layer_attention_engine(32, 4, 4);
@@ -5528,6 +5584,10 @@ fn test_prefill_handoff_preserves_next_decode_logits() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "cuda",
+    ignore = "uses a four-wide CPU fixture unsupported by the strict CUDA path"
+)]
 fn test_slice_window_handoff_preserves_suffix_reentry_hidden() {
     let mut cpu_engine = make_multi_layer_attention_engine(32, 4, 4);
     let mut handoff_engine = make_multi_layer_attention_engine(32, 4, 4);

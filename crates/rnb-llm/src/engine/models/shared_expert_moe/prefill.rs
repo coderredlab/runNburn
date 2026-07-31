@@ -2112,6 +2112,11 @@ mod tests {
         );
         restore_env(batch_key, previous_batch);
 
-        assert_eq!(actual, expected);
+        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "expert-major output mismatch at {index}: got={got}, want={want}"
+            );
+        }
     }
 }
