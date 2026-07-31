@@ -86,7 +86,8 @@ impl LayerCache {
                 value.resize(value_count, 0);
             }
             LayerCacheStorage::Kvarn(cache) => {
-                let (source_key, source_value) = cache.materialize(current_len);
+                let initialized_len = current_len.min(cache.stored_len());
+                let (source_key, source_value) = cache.materialize(initialized_len);
                 let mut key = vec![0u16; value_count];
                 let mut value = vec![0u16; value_count];
                 key[..source_key.len()].copy_from_slice(&source_key);
@@ -1568,5 +1569,29 @@ mod tests {
         assert_eq!(cache.current_len(), 97);
         let grown = cache.read_up_to(0, 97);
         assert_eq!(grown.as_slices().0.len(), 97 * width);
+    }
+
+    #[test]
+    fn kvarn_to_f16_conversion_handles_uninitialized_shared_kv_layers() {
+        let width = 16;
+        let mut cache = KVCache::new_per_layer_with_formats(
+            64,
+            &[1, 1],
+            &[width, width],
+            &[KvCacheFormat::KvarnK4V4G64; 2],
+        )
+        .unwrap();
+        let key = vec![half::f16::from_f32(0.5).to_bits(); 8 * width];
+        let value = vec![half::f16::from_f32(-0.25).to_bits(); 8 * width];
+        cache.append_bits_range(1, 0, 8, &key, &value);
+
+        cache.convert_to_f16(16);
+
+        assert_eq!(cache.current_len(), 8);
+        assert_eq!(cache.read_up_to(0, 8).as_slices().0, vec![0; 8 * width]);
+        assert_eq!(
+            cache.read_up_to(1, 8).as_slices(),
+            (key.as_slice(), value.as_slice())
+        );
     }
 }

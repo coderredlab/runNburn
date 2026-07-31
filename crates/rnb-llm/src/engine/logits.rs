@@ -96,10 +96,28 @@ impl super::Engine {
         .map_err(|error| crate::error::LlmError::Forward(error.to_string()))?;
         let normed_data = kernels::tensor_as_f32_slice(&normed);
 
+        self.target_argmax_excluding_from_output_hidden(normed_data, excluded_token)
+    }
+
+    pub(crate) fn target_argmax_excluding_from_output_hidden(
+        &self,
+        output_hidden: &[f32],
+        excluded_token: u32,
+    ) -> crate::error::Result<u32> {
+        if output_hidden.len() != self.metadata.hidden_dim {
+            return Err(crate::error::LlmError::Forward(format!(
+                "excluded-token target output hidden width mismatch: got {}, expected {}",
+                output_hidden.len(),
+                self.metadata.hidden_dim
+            )));
+        }
+        let weights = self.weights.as_ref().ok_or_else(|| {
+            crate::error::LlmError::Forward("model weights not loaded".to_string())
+        })?;
         #[cfg(feature = "cuda")]
         let backend_logits =
             if !use_token_embedding_as_output() && !policy::exact_output_gemv_enabled() {
-                prefill_output_logits_cuda(weights, normed_data)
+                prefill_output_logits_cuda(weights, output_hidden)
             } else {
                 None
             };
@@ -107,8 +125,10 @@ impl super::Engine {
         let backend_logits: Option<Vec<f32>> = None;
         let mut logits = match backend_logits {
             Some(logits) => logits,
-            None if use_token_embedding_as_output() => weights.token_embd.gemv_vec(normed_data)?,
-            None => weights.output.gemv_vec(normed_data)?,
+            None if use_token_embedding_as_output() => {
+                weights.token_embd.gemv_vec(output_hidden)?
+            }
+            None => weights.output.gemv_vec(output_hidden)?,
         };
         apply_logit_softcapping(&mut logits, self.metadata.final_logit_softcapping);
         let logits_len = logits.len();

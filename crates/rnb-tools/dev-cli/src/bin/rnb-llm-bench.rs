@@ -1326,6 +1326,7 @@ fn validate_mtp_abab_path(
     draft_only: bool,
     has_weights: bool,
     has_mtp: bool,
+    requires_batch_verify_toggle: bool,
     architecture: rnb_loader::Architecture,
 ) -> Result<(), &'static str> {
     if spec_mode == Some("2") {
@@ -1349,7 +1350,7 @@ fn validate_mtp_abab_path(
     if !has_mtp {
         return Err("RNB_MTP_ABAB_REPEAT requires a ready in-model MTP runtime and weights");
     }
-    if architecture == rnb_loader::Architecture::Gemma4 {
+    if requires_batch_verify_toggle && architecture == rnb_loader::Architecture::Gemma4 {
         return Err(
             "RNB_MTP_ABAB_REPEAT does not support the Gemma4 external drafter runtime because it does not consume the batch verify toggle",
         );
@@ -1576,6 +1577,13 @@ fn run_mtp_onoff_abab(
             result.generated_token_ids.len(),
             exact_match,
         );
+        if !exact_match {
+            let diff = first_token_diff(&canonical_tokens, &result.generated_token_ids);
+            eprintln!(
+                "[MTP_ONOFF_ABAB] mismatch first_diff={diff:?} expected={:?} actual={:?}",
+                canonical_tokens, result.generated_token_ids
+            );
+        }
         assert!(
             exact_match,
             "MTP on/off ABAB token mismatch at run {} ({})",
@@ -2245,6 +2253,7 @@ fn main() {
             draft_only,
             engine.has_weights(),
             engine.has_mtp(),
+            mtp_abab_repeat.is_some(),
             engine.architecture(),
         )
         .unwrap_or_else(|err| panic!("{err}"));
@@ -3779,6 +3788,7 @@ mod tests {
             false,
             true,
             true,
+            true,
             rnb_loader::Architecture::Qwen35,
         );
         assert_eq!(valid, Ok(()));
@@ -3787,6 +3797,7 @@ mod tests {
             false,
             None,
             false,
+            true,
             true,
             true,
             rnb_loader::Architecture::Qwen35,
@@ -3799,6 +3810,7 @@ mod tests {
             false,
             true,
             true,
+            true,
             rnb_loader::Architecture::Qwen35,
         );
         assert!(speculative.unwrap_err().contains("RNB_SPEC=2"));
@@ -3806,6 +3818,7 @@ mod tests {
         let draft_only = validate_mtp_abab_path(
             true,
             None,
+            true,
             true,
             true,
             true,
@@ -3819,15 +3832,28 @@ mod tests {
             false,
             true,
             true,
+            true,
             rnb_loader::Architecture::Gemma4,
         );
         assert!(external.unwrap_err().contains("external drafter"));
+
+        let external_onoff = validate_mtp_abab_path(
+            true,
+            None,
+            false,
+            true,
+            true,
+            false,
+            rnb_loader::Architecture::Gemma4,
+        );
+        assert_eq!(external_onoff, Ok(()));
 
         let no_weights = validate_mtp_abab_path(
             true,
             None,
             false,
             false,
+            true,
             true,
             rnb_loader::Architecture::Qwen35,
         );
@@ -3839,6 +3865,7 @@ mod tests {
             false,
             true,
             false,
+            true,
             rnb_loader::Architecture::Qwen35,
         );
         assert!(no_mtp.unwrap_err().contains("MTP runtime"));

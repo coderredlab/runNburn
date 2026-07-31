@@ -523,6 +523,20 @@ fn replace_ignored_eos_target(
     }
 }
 
+fn replace_ignored_eos_output_target(
+    engine: &Engine,
+    params: &GenerateParams,
+    target_token: u32,
+    output_hidden: &[f32],
+    eos: u32,
+) -> crate::error::Result<u32> {
+    if params.ignore_eos && target_token == eos {
+        engine.target_argmax_excluding_from_output_hidden(output_hidden, eos)
+    } else {
+        Ok(target_token)
+    }
+}
+
 pub(crate) fn generate_stream_mtp(
     engine: &mut Engine,
     prompt: &str,
@@ -1887,8 +1901,27 @@ fn generate_with_external_drafter(
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
         } else if external_batch_verify {
-            let (target_preds, output_hidden_rows) =
+            let (mut target_preds, output_hidden_rows) =
                 engine.forward_batch_verify(&verify_seq, position_before_verify)?;
+            if params.ignore_eos {
+                let hidden_dim = engine.metadata.hidden_dim;
+                for (index, target_token) in target_preds.iter_mut().enumerate() {
+                    let start = index * hidden_dim;
+                    let end = start + hidden_dim;
+                    let hidden = output_hidden_rows.get(start..end).ok_or_else(|| {
+                        crate::error::LlmError::Forward(format!(
+                            "external batch verify hidden row missing at index {index}"
+                        ))
+                    })?;
+                    *target_token = replace_ignored_eos_output_target(
+                        engine,
+                        params,
+                        *target_token,
+                        hidden,
+                        eos,
+                    )?;
+                }
+            }
             if timing_enabled {
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
@@ -1917,6 +1950,13 @@ fn generate_with_external_drafter(
             for i in 0..effective_n {
                 let (target_tok, _) =
                     engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[i])?;
+                let target_tok = replace_ignored_eos_output_target(
+                    engine,
+                    params,
+                    target_tok,
+                    engine.last_hidden_for_decode(),
+                    eos,
+                )?;
                 stats.add_target_verify(1, 1);
                 if target_tok != drafts_used[i] {
                     target_token = Some(target_tok);
@@ -1925,7 +1965,7 @@ fn generate_with_external_drafter(
                 accepted_draft_tokens += 1;
                 stats.accepted += 1;
                 let tok = drafts_used[i];
-                if params.stop_tokens.contains(&tok) || tok == eos {
+                if params.should_stop(tok, eos) {
                     stopped = true;
                     break;
                 }
@@ -1945,6 +1985,13 @@ fn generate_with_external_drafter(
             if !stopped && tokens_remaining > 0 && accepted_draft_tokens == effective_n {
                 let (target_tok, _) =
                     engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[effective_n])?;
+                let target_tok = replace_ignored_eos_output_target(
+                    engine,
+                    params,
+                    target_tok,
+                    engine.last_hidden_for_decode(),
+                    eos,
+                )?;
                 stats.add_target_verify(1, 1);
                 target_token = Some(target_tok);
             }
@@ -1957,7 +2004,7 @@ fn generate_with_external_drafter(
             // 5f. accept 된 draft 토큰 emit.
             for i in 0..accepted_draft_tokens {
                 let tok = drafts_used[i];
-                if params.stop_tokens.contains(&tok) || tok == eos {
+                if params.should_stop(tok, eos) {
                     stopped = true;
                     break;
                 }
@@ -1983,7 +2030,7 @@ fn generate_with_external_drafter(
                     "external drafter verify did not produce target token".to_string(),
                 )
             })?;
-            if params.stop_tokens.contains(&target_tok) || target_tok == eos {
+            if params.should_stop(target_tok, eos) {
                 stopped = true;
             } else {
                 generated_tokens.push(target_tok);
