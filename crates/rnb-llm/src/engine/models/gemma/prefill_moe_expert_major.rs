@@ -383,6 +383,8 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     #[cfg(not(target_arch = "aarch64"))]
     let mut expert_mid = vec![0.0f32; max_group * moe_w.n_ff];
     #[cfg(not(target_arch = "aarch64"))]
+    let mut expert_up = vec![0.0f32; max_group * moe_w.n_ff];
+    #[cfg(not(target_arch = "aarch64"))]
     let mut expert_output = vec![0.0f32; max_group * hidden_dim];
     let mut ranked_output = vec![0.0f32; slots.len() * hidden_dim];
     finish_expert_major_stage(
@@ -477,14 +479,24 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
                 gate_up_elapsed += gate_up_start.elapsed();
             }
             let activation_start = profile_enabled.then(Instant::now);
-            for group_row in 0..group_len {
-                let gate_up_row =
-                    &mut gate_up_output[group_row * gate_up_rows..(group_row + 1) * gate_up_rows];
-                let (gate, up) = gate_up_row.split_at_mut(moe_w.n_ff);
-                apply_model_gate_mul_inplace(gate, up, ModelArchitecture::Gemma4);
-                expert_mid[group_row * moe_w.n_ff..(group_row + 1) * moe_w.n_ff]
-                    .copy_from_slice(gate);
+            for (gate_up_row, (expert_mid_row, expert_up_row)) in gate_up_output
+                [..group_len * gate_up_rows]
+                .chunks_exact(gate_up_rows)
+                .zip(
+                    expert_mid[..group_len * moe_w.n_ff]
+                        .chunks_exact_mut(moe_w.n_ff)
+                        .zip(expert_up[..group_len * moe_w.n_ff].chunks_exact_mut(moe_w.n_ff)),
+                )
+            {
+                let (gate, up) = gate_up_row.split_at(moe_w.n_ff);
+                expert_mid_row.copy_from_slice(gate);
+                expert_up_row.copy_from_slice(up);
             }
+            apply_model_gate_mul_inplace(
+                &mut expert_mid[..group_len * moe_w.n_ff],
+                &expert_up[..group_len * moe_w.n_ff],
+                ModelArchitecture::Gemma4,
+            );
             if let Some(activation_start) = activation_start {
                 activation_elapsed += activation_start.elapsed();
             }
@@ -556,7 +568,7 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
         #[cfg(not(target_arch = "aarch64"))]
         let scratch_bytes = expert_input.len() * std::mem::size_of::<f32>()
             + gate_up_output.len() * std::mem::size_of::<f32>()
-            + (expert_mid.len() + expert_output.len() + ranked_output.len())
+            + (expert_mid.len() + expert_up.len() + expert_output.len() + ranked_output.len())
                 * std::mem::size_of::<f32>();
         #[cfg(target_arch = "aarch64")]
         let scratch_bytes =
