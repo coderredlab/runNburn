@@ -36,6 +36,41 @@ extern "C" __global__ void rnb_deinterleave_gate_up_f32(
     up[idx] = fused[fused_base + n_ff + col];
 }
 
+extern "C" __global__ void rnb_gather_rows_f32(
+    const float* __restrict__ input,
+    const unsigned* __restrict__ token_ids,
+    float* __restrict__ output,
+    unsigned row_width,
+    unsigned row_count) {
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned total = row_width * row_count;
+    if (idx >= total) {
+        return;
+    }
+    const unsigned row = idx / row_width;
+    const unsigned col = idx - row * row_width;
+    output[idx] = input[(unsigned long long)token_ids[row] * row_width + col];
+}
+
+extern "C" __global__ void rnb_scatter_add_weighted_rows_f32(
+    const float* __restrict__ input,
+    const unsigned* __restrict__ token_ids,
+    const float* __restrict__ weights,
+    float* __restrict__ output,
+    unsigned row_width,
+    unsigned row_count) {
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned total = row_width * row_count;
+    if (idx >= total) {
+        return;
+    }
+    const unsigned row = idx / row_width;
+    const unsigned col = idx - row * row_width;
+    atomicAdd(
+        output + (unsigned long long)token_ids[row] * row_width + col,
+        input[idx] * weights[row]);
+}
+
 extern "C" __global__ void rnb_q4k_gemv_batch(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,

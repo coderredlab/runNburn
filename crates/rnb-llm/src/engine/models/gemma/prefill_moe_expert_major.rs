@@ -374,10 +374,49 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
         compute_slots(),
     );
     let (group_count, max_group) = gemma_expert_group_shape(&slots);
+    #[cfg(all(not(target_arch = "aarch64"), feature = "cuda"))]
+    let (selected_fused_output, selected_fused_elapsed) = {
+        let selected_start = profile_enabled.then(Instant::now);
+        let expert_ids = slots
+            .iter()
+            .map(|slot| slot.expert as u32)
+            .collect::<Vec<_>>();
+        let token_ids = slots
+            .iter()
+            .map(|slot| slot.token as u32)
+            .collect::<Vec<_>>();
+        let route_weights = slots
+            .iter()
+            .map(|slot| slot.weight * down_scale[slot.expert])
+            .collect::<Vec<_>>();
+        let output = backend_runtime::gemma4_moe_gelu_selected_if_supported(
+            gate_up_bytes,
+            down_bytes,
+            moe_w.down_quant,
+            moe_w.n_expert,
+            moe_w.n_ff,
+            hidden_dim,
+            seq_len,
+            &expert_ids,
+            &token_ids,
+            &route_weights,
+            &moe_input,
+        )?;
+        (
+            output,
+            selected_start.map_or(Duration::ZERO, |start| start.elapsed()),
+        )
+    };
+    #[cfg(not(all(not(target_arch = "aarch64"), feature = "cuda")))]
+    let (selected_fused_output, selected_fused_elapsed) = (None::<Vec<f32>>, Duration::ZERO);
     let scratch_start = profile_enabled.then(Instant::now);
 
     #[cfg(not(target_arch = "aarch64"))]
-    let mut expert_input = vec![0.0f32; max_group * hidden_dim];
+    let mut expert_input = if selected_fused_output.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0f32; max_group * hidden_dim]
+    };
     #[cfg(not(target_arch = "aarch64"))]
     let mut gate_up_output = Vec::<f32>::new();
     #[cfg(not(target_arch = "aarch64"))]
@@ -386,7 +425,11 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     let mut expert_up = Vec::<f32>::new();
     #[cfg(not(target_arch = "aarch64"))]
     let mut expert_output = Vec::<f32>::new();
-    let mut ranked_output = vec![0.0f32; slots.len() * hidden_dim];
+    let mut ranked_output = if selected_fused_output.is_some() {
+        Vec::new()
+    } else {
+        vec![0.0f32; slots.len() * hidden_dim]
+    };
     finish_expert_major_stage(
         "gemma4:prefill:expert_major:scratch",
         layer_idx,
@@ -397,7 +440,6 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     let mut gate_up_elapsed = Duration::ZERO;
     let mut activation_elapsed = Duration::ZERO;
     let mut down_elapsed = Duration::ZERO;
-    let mut fused_ffn_elapsed = Duration::ZERO;
     let mut scatter_elapsed = Duration::ZERO;
 
     #[cfg(target_arch = "aarch64")]
@@ -444,127 +486,100 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let mut start = 0usize;
-        while start < slots.len() {
-            let expert = slots[start].expert;
-            let mut end = start + 1;
-            while end < slots.len() && slots[end].expert == expert {
-                end += 1;
-            }
-            let group_slots = &slots[start..end];
-            let group_len = group_slots.len();
+        if selected_fused_output.is_none() {
+            let mut start = 0usize;
+            while start < slots.len() {
+                let expert = slots[start].expert;
+                let mut end = start + 1;
+                while end < slots.len() && slots[end].expert == expert {
+                    end += 1;
+                }
+                let group_slots = &slots[start..end];
+                let group_len = group_slots.len();
 
-            let gather_start = profile_enabled.then(Instant::now);
-            for (group_row, slot) in group_slots.iter().enumerate() {
-                expert_input[group_row * hidden_dim..(group_row + 1) * hidden_dim].copy_from_slice(
-                    &moe_input[slot.token * hidden_dim..(slot.token + 1) * hidden_dim],
-                );
-            }
-            if let Some(gather_start) = gather_start {
-                gather_elapsed += gather_start.elapsed();
-            }
-            let gate_up_slice = &gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
-            let down_slice = &down_bytes[expert * per_down..(expert + 1) * per_down];
-            #[cfg(feature = "cuda")]
-            {
-                let fused_start = profile_enabled.then(Instant::now);
-                if let Some(fused_output) = backend_runtime::gemma4_moe_gelu_ffn_batch_if_supported(
+                let gather_start = profile_enabled.then(Instant::now);
+                for (group_row, slot) in group_slots.iter().enumerate() {
+                    expert_input[group_row * hidden_dim..(group_row + 1) * hidden_dim]
+                        .copy_from_slice(
+                            &moe_input[slot.token * hidden_dim..(slot.token + 1) * hidden_dim],
+                        );
+                }
+                if let Some(gather_start) = gather_start {
+                    gather_elapsed += gather_start.elapsed();
+                }
+                let gate_up_slice =
+                    &gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
+                let down_slice = &down_bytes[expert * per_down..(expert + 1) * per_down];
+
+                gate_up_output.resize(group_len * gate_up_rows, 0.0);
+                expert_mid.resize(group_len * moe_w.n_ff, 0.0);
+                expert_up.resize(group_len * moe_w.n_ff, 0.0);
+                expert_output.resize(group_len * hidden_dim, 0.0);
+                let gate_up_start = profile_enabled.then(Instant::now);
+                prefill_raw_quantized_batch(
                     gate_up_slice,
-                    down_slice,
-                    moe_w.down_quant,
-                    moe_w.n_ff,
+                    &expert_input[..group_len * hidden_dim],
+                    &mut gate_up_output[..group_len * gate_up_rows],
+                    gate_up_rows,
                     hidden_dim,
                     group_len,
-                    &expert_input[..group_len * hidden_dim],
-                )? {
-                    if let Some(fused_start) = fused_start {
-                        fused_ffn_elapsed += fused_start.elapsed();
-                    }
-                    let scatter_start = profile_enabled.then(Instant::now);
-                    scatter_weighted_expert_group(
-                        group_slots,
-                        &fused_output,
-                        down_scale[expert],
-                        moe_w.n_expert_used,
-                        hidden_dim,
-                        &mut ranked_output,
-                    );
-                    if let Some(scatter_start) = scatter_start {
-                        scatter_elapsed += scatter_start.elapsed();
-                    }
-                    start = end;
-                    continue;
+                    gate_up_bytes_per_row,
+                    GGMLType::Q4_K,
+                );
+                if let Some(gate_up_start) = gate_up_start {
+                    gate_up_elapsed += gate_up_start.elapsed();
                 }
-            }
+                let activation_start = profile_enabled.then(Instant::now);
+                for (gate_up_row, (expert_mid_row, expert_up_row)) in gate_up_output
+                    [..group_len * gate_up_rows]
+                    .chunks_exact(gate_up_rows)
+                    .zip(
+                        expert_mid[..group_len * moe_w.n_ff]
+                            .chunks_exact_mut(moe_w.n_ff)
+                            .zip(expert_up[..group_len * moe_w.n_ff].chunks_exact_mut(moe_w.n_ff)),
+                    )
+                {
+                    let (gate, up) = gate_up_row.split_at(moe_w.n_ff);
+                    expert_mid_row.copy_from_slice(gate);
+                    expert_up_row.copy_from_slice(up);
+                }
+                apply_model_gate_mul_inplace(
+                    &mut expert_mid[..group_len * moe_w.n_ff],
+                    &expert_up[..group_len * moe_w.n_ff],
+                    ModelArchitecture::Gemma4,
+                );
+                if let Some(activation_start) = activation_start {
+                    activation_elapsed += activation_start.elapsed();
+                }
 
-            gate_up_output.resize(group_len * gate_up_rows, 0.0);
-            expert_mid.resize(group_len * moe_w.n_ff, 0.0);
-            expert_up.resize(group_len * moe_w.n_ff, 0.0);
-            expert_output.resize(group_len * hidden_dim, 0.0);
-            let gate_up_start = profile_enabled.then(Instant::now);
-            prefill_raw_quantized_batch(
-                gate_up_slice,
-                &expert_input[..group_len * hidden_dim],
-                &mut gate_up_output[..group_len * gate_up_rows],
-                gate_up_rows,
-                hidden_dim,
-                group_len,
-                gate_up_bytes_per_row,
-                GGMLType::Q4_K,
-            );
-            if let Some(gate_up_start) = gate_up_start {
-                gate_up_elapsed += gate_up_start.elapsed();
+                let down_start = profile_enabled.then(Instant::now);
+                prefill_raw_quantized_batch(
+                    down_slice,
+                    &expert_mid[..group_len * moe_w.n_ff],
+                    &mut expert_output[..group_len * hidden_dim],
+                    hidden_dim,
+                    moe_w.n_ff,
+                    group_len,
+                    down_bytes_per_row,
+                    moe_w.down_quant,
+                );
+                if let Some(down_start) = down_start {
+                    down_elapsed += down_start.elapsed();
+                }
+                let scatter_start = profile_enabled.then(Instant::now);
+                scatter_weighted_expert_group(
+                    group_slots,
+                    &expert_output[..group_len * hidden_dim],
+                    down_scale[expert],
+                    moe_w.n_expert_used,
+                    hidden_dim,
+                    &mut ranked_output,
+                );
+                if let Some(scatter_start) = scatter_start {
+                    scatter_elapsed += scatter_start.elapsed();
+                }
+                start = end;
             }
-            let activation_start = profile_enabled.then(Instant::now);
-            for (gate_up_row, (expert_mid_row, expert_up_row)) in gate_up_output
-                [..group_len * gate_up_rows]
-                .chunks_exact(gate_up_rows)
-                .zip(
-                    expert_mid[..group_len * moe_w.n_ff]
-                        .chunks_exact_mut(moe_w.n_ff)
-                        .zip(expert_up[..group_len * moe_w.n_ff].chunks_exact_mut(moe_w.n_ff)),
-                )
-            {
-                let (gate, up) = gate_up_row.split_at(moe_w.n_ff);
-                expert_mid_row.copy_from_slice(gate);
-                expert_up_row.copy_from_slice(up);
-            }
-            apply_model_gate_mul_inplace(
-                &mut expert_mid[..group_len * moe_w.n_ff],
-                &expert_up[..group_len * moe_w.n_ff],
-                ModelArchitecture::Gemma4,
-            );
-            if let Some(activation_start) = activation_start {
-                activation_elapsed += activation_start.elapsed();
-            }
-
-            let down_start = profile_enabled.then(Instant::now);
-            prefill_raw_quantized_batch(
-                down_slice,
-                &expert_mid[..group_len * moe_w.n_ff],
-                &mut expert_output[..group_len * hidden_dim],
-                hidden_dim,
-                moe_w.n_ff,
-                group_len,
-                down_bytes_per_row,
-                moe_w.down_quant,
-            );
-            if let Some(down_start) = down_start {
-                down_elapsed += down_start.elapsed();
-            }
-            let scatter_start = profile_enabled.then(Instant::now);
-            scatter_weighted_expert_group(
-                group_slots,
-                &expert_output[..group_len * hidden_dim],
-                down_scale[expert],
-                moe_w.n_expert_used,
-                hidden_dim,
-                &mut ranked_output,
-            );
-            if let Some(scatter_start) = scatter_start {
-                scatter_elapsed += scatter_start.elapsed();
-            }
-            start = end;
         }
     }
     if profile_enabled {
@@ -593,10 +608,10 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             down_elapsed,
         );
         record_expert_major_duration(
-            "gemma4:prefill:expert_major:fused_ffn",
+            "gemma4:prefill:expert_major:selected_fused",
             layer_idx,
-            "fused_ffn",
-            fused_ffn_elapsed,
+            "selected_fused",
+            selected_fused_elapsed,
         );
         record_expert_major_duration(
             "gemma4:prefill:expert_major:scatter",
@@ -627,13 +642,17 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     }
 
     let finalize_start = profile_enabled.then(Instant::now);
-    reduce_ranked_expert_output_into(
-        &ranked_output,
-        seq_len,
-        moe_w.n_expert_used,
-        hidden_dim,
-        &mut router_input,
-    );
+    if let Some(selected_fused_output) = selected_fused_output.as_ref() {
+        router_input.copy_from_slice(selected_fused_output);
+    } else {
+        reduce_ranked_expert_output_into(
+            &ranked_output,
+            seq_len,
+            moe_w.n_expert_used,
+            hidden_dim,
+            &mut router_input,
+        );
+    }
     let post_ffw_norm = w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice);
     apply_model_norm_into(
         &router_input,

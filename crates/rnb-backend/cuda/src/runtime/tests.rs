@@ -12241,58 +12241,87 @@ fn cuda_dense_q4k_gelu_ffn_batch_matches_cpu_reference() {
 }
 
 #[test]
-fn cuda_dense_q4k_fused_gate_up_gelu_ffn_batch_matches_cpu_reference() {
+fn cuda_gemma4_grouped_moe_gelu_matches_cpu_reference() {
     let _guard = runtime_test_lock();
+    let n_expert = 2usize;
     let n_embd = 512usize;
     let n_ff = 512usize;
     let seq_len = 3usize;
     let gate_blocks = n_embd / 256;
-    let gate = make_test_q4k_weights(1, n_ff, gate_blocks, 137)
-        .pop()
-        .unwrap();
-    let up = make_test_q4k_weights(1, n_ff, gate_blocks, 149)
-        .pop()
-        .unwrap();
-    let mut gate_up = gate.clone();
-    gate_up.extend_from_slice(&up);
+    let gates = make_test_q4k_weights(n_expert, n_ff, gate_blocks, 167);
+    let ups = make_test_q4k_weights(n_expert, n_ff, gate_blocks, 173);
+    let mut gate_up_experts = Vec::new();
+    for expert in 0..n_expert {
+        gate_up_experts.extend_from_slice(&gates[expert]);
+        gate_up_experts.extend_from_slice(&ups[expert]);
+    }
+    let expert_ids = [0u32, 0, 1, 1];
+    let token_ids = [0u32, 2, 0, 1];
+    let route_weights = [0.625f32, 0.375, 0.75, 0.25];
     let input = (0..seq_len * n_embd)
-        .map(|i| ((i as f32 % 43.0) - 21.0) * 0.0078125)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
         .collect::<Vec<_>>();
 
-    for (label, down_quant, down) in [
+    for (label, down_quant, down_block_bytes, down_experts) in [
         (
             "Q5_1",
             7u32,
-            make_test_q5_basic_weights(n_embd, n_ff, 24, true, 157),
+            24usize,
+            make_test_q5_basic_weights(n_expert * n_embd, n_ff, 24, true, 179),
         ),
-        ("Q8_0", 8u32, make_test_q8_0_weights(n_embd, n_ff, 163)),
+        (
+            "Q8_0",
+            8u32,
+            34usize,
+            make_test_q8_0_weights(n_expert * n_embd, n_ff, 181),
+        ),
     ] {
-        let mut expected = Vec::with_capacity(seq_len * n_embd);
-        for input_row in input.chunks_exact(n_embd) {
-            let mut gate_out = cpu_q4k_gemv_rows(&gate, n_ff, gate_blocks, input_row);
-            let up_out = cpu_q4k_gemv_rows(&up, n_ff, gate_blocks, input_row);
+        let per_down = n_embd * (n_ff / 32) * down_block_bytes;
+        let mut expected = vec![0.0f32; seq_len * n_embd];
+        for slot in 0..expert_ids.len() {
+            let expert = expert_ids[slot] as usize;
+            let token = token_ids[slot] as usize;
+            let input_row = &input[token * n_embd..(token + 1) * n_embd];
+            let mut gate_out = cpu_q4k_gemv_rows(&gates[expert], n_ff, gate_blocks, input_row);
+            let up_out = cpu_q4k_gemv_rows(&ups[expert], n_ff, gate_blocks, input_row);
             for (gate_value, up_value) in gate_out.iter_mut().zip(up_out.iter()) {
                 let x = *gate_value;
                 let x3 = x * x * x;
                 let gelu = 0.5 * x * (1.0 + (0.7978845608028654 * (x + 0.044715 * x3)).tanh());
                 *gate_value = gelu * *up_value;
             }
-            if down_quant == 7 {
-                expected.extend(cpu_q5_basic_rows(&down, n_embd, n_ff, 24, true, &gate_out));
+            let down = &down_experts[expert * per_down..(expert + 1) * per_down];
+            let expert_output = if down_quant == 7 {
+                cpu_q5_basic_rows(down, n_embd, n_ff, 24, true, &gate_out)
             } else {
-                expected.extend(cpu_q8_0_rows(&down, n_embd, n_ff, &gate_out));
+                cpu_q8_0_rows(down, n_embd, n_ff, &gate_out)
+            };
+            let destination = &mut expected[token * n_embd..(token + 1) * n_embd];
+            for (dst, value) in destination.iter_mut().zip(expert_output) {
+                *dst += value * route_weights[slot];
             }
         }
 
-        let actual = dense_q4k_gelu_ffn_batch_fused_gate_up(
-            &gate_up, &down, down_quant, n_ff, n_embd, seq_len, &input,
+        let actual = gemma4_moe_gelu_selected(
+            &gate_up_experts,
+            &down_experts,
+            down_quant,
+            n_expert,
+            n_ff,
+            n_embd,
+            seq_len,
+            &expert_ids,
+            &token_ids,
+            &route_weights,
+            &input,
         )
-        .expect("CUDA dense Q4_K fused gate/up GELU FFN batch");
-        assert_close_rows(
-            &format!("dense Q4_K fused gate/up GELU FFN batch {label}"),
+        .expect("CUDA Gemma4 grouped MoE GELU");
+        assert_close_rows_abs_rel(
+            &format!("Gemma4 grouped MoE GELU {label}"),
             &actual,
             &expected,
             0.2,
+            1e-5,
         );
     }
 }

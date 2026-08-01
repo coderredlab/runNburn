@@ -294,44 +294,6 @@ pub fn dense_q4k_gelu_ffn_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn dense_q4k_gelu_ffn_batch_fused_gate_up(
-    gate_up_weights: &[u8],
-    down_weights: &[u8],
-    down_quant: u32,
-    n_ff: usize,
-    n_embd: usize,
-    seq_len: usize,
-    input: &[f32],
-) -> Result<Vec<f32>, String> {
-    if input.len() != seq_len * n_embd {
-        return Err(format!(
-            "dense GELU FFN batch input length mismatch: got {}, expected {}",
-            input.len(),
-            seq_len * n_embd
-        ));
-    }
-    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
-    let mut guard = compute
-        .lock()
-        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
-    if guard.is_none() {
-        *guard = Some(CudaState::open()?);
-    }
-    guard
-        .as_mut()
-        .expect("cuda compute state initialized")
-        .dense_q4k_gelu_ffn_batch_fused_gate_up(
-            gate_up_weights,
-            down_weights,
-            down_quant,
-            n_ff,
-            n_embd,
-            seq_len,
-            input,
-        )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn dense_q4k_silu_ffn_batch(
     gate_weights: &[u8],
     up_weights: &[u8],

@@ -1061,13 +1061,12 @@ impl CudaState {
             n_embd,
             seq_len,
             input,
-            None,
             true,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn dense_q4k_gelu_ffn_batch_fused_gate_up(
+    pub(in crate::runtime) fn gemma4_moe_gelu_ffn_batch_dev_input_to_dev(
         &mut self,
         gate_up_weights: &[u8],
         down_weights: &[u8],
@@ -1075,33 +1074,63 @@ impl CudaState {
         n_ff: usize,
         n_embd: usize,
         seq_len: usize,
-        input: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        let gate_row_bytes = (n_embd / 256)
-            .checked_mul(144)
-            .ok_or_else(|| "dense GELU fused gate/up row byte overflow".to_string())?;
-        let matrix_bytes = n_ff
-            .checked_mul(gate_row_bytes)
-            .ok_or_else(|| "dense GELU fused gate/up matrix byte overflow".to_string())?;
-        if gate_up_weights.len() != matrix_bytes * 2 {
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let gate_blocks = n_embd / 256;
+        let gate_matrix_bytes = n_ff
+            .checked_mul(gate_blocks)
+            .and_then(|blocks| blocks.checked_mul(144))
+            .ok_or_else(|| "Gemma4 device FFN gate byte size overflow".to_string())?;
+        if gate_up_weights.len() != gate_matrix_bytes * 2 {
             return Err(format!(
-                "dense GELU fused gate/up byte mismatch: got {}, expected {}",
+                "Gemma4 device FFN gate/up byte mismatch: got {}, expected {}",
                 gate_up_weights.len(),
-                matrix_bytes * 2
+                gate_matrix_bytes * 2
             ));
         }
-        let (gate_weights, up_weights) = gate_up_weights.split_at(matrix_bytes);
-        self.dense_q4k_ffn_batch(
-            gate_weights,
-            up_weights,
-            down_weights,
-            down_quant,
-            n_ff,
-            n_embd,
+        let (down_kernel, down_block_bytes) = match down_quant {
+            7 => ("rnb_q5_1_gemv_batch", 24usize),
+            8 => ("rnb_q8_0_gemv_batch", 34usize),
+            other => {
+                return Err(format!(
+                    "Gemma4 device FFN unsupported down quant code {other}"
+                ))
+            }
+        };
+        let expected_down = n_embd
+            .checked_mul(n_ff / 32)
+            .and_then(|blocks| blocks.checked_mul(down_block_bytes))
+            .ok_or_else(|| "Gemma4 device FFN down byte size overflow".to_string())?;
+        if down_weights.len() != expected_down {
+            return Err(format!(
+                "Gemma4 device FFN down byte mismatch: got {}, expected {expected_down}",
+                down_weights.len()
+            ));
+        }
+
+        let gate_dev = self.compute_mid_a_ptr(seq_len * n_ff * std::mem::size_of::<f32>())?;
+        let up_dev = self.compute_mid_b_ptr(seq_len * n_ff * std::mem::size_of::<f32>())?;
+        let fused_dev =
+            self.compute_aux_output_ptr(seq_len * n_ff * 2 * std::mem::size_of::<f32>())?;
+        self.q4k_batch_dev_input_to_dev(
+            gate_up_weights,
+            n_ff * 2,
+            gate_blocks,
             seq_len,
-            input,
-            Some(gate_up_weights),
-            true,
+            input_dev,
+            fused_dev,
+        )?;
+        self.launch_deinterleave_gate_up_f32(fused_dev, gate_dev, up_dev, n_ff, seq_len)?;
+        self.launch_gelu_mul(gate_dev, up_dev, seq_len * n_ff)?;
+        self.quant_gemv_batch_dev_input_to_dev(
+            down_kernel,
+            down_weights,
+            n_embd,
+            n_ff / 32,
+            seq_len,
+            gate_dev,
+            output_dev,
         )
     }
 
@@ -1126,7 +1155,6 @@ impl CudaState {
             n_embd,
             seq_len,
             input,
-            None,
             false,
         )
     }
@@ -1142,7 +1170,6 @@ impl CudaState {
         n_embd: usize,
         seq_len: usize,
         input: &[f32],
-        fused_gate_up_weights: Option<&[u8]>,
         gelu: bool,
     ) -> Result<Vec<f32>, String> {
         let activation_name = if gelu { "GELU" } else { "SiLU" };
@@ -1209,21 +1236,16 @@ impl CudaState {
         let output_bytes = output_len * std::mem::size_of::<f32>();
         let output_dev = self.compute_output_ptr(output_bytes)?;
 
-        let q8dot_gate_up = fused_gate_up_weights.is_none()
-            && dense_q8dot_gate_up_enabled(n_ff >= 1024 && gate_blocks >= 4);
+        let q8dot_gate_up = dense_q8dot_gate_up_enabled(n_ff >= 1024 && gate_blocks >= 4);
         let packed_gate_up_supported =
             q8dot_gate_up && seq_len == 2 && tuning::q4k_gate_up_batch_seq2_q8dot_enabled();
-        let gate_up_plan = if fused_gate_up_weights.is_some() {
-            DenseGateUpDispatchPlan::RawQuant
-        } else {
-            dense_q4_gate_up_dispatch_plan(
-                seq_len,
-                n_ff,
-                n_embd,
-                q8dot_gate_up,
-                packed_gate_up_supported,
-            )
-        };
+        let gate_up_plan = dense_q4_gate_up_dispatch_plan(
+            seq_len,
+            n_ff,
+            n_embd,
+            q8dot_gate_up,
+            packed_gate_up_supported,
+        );
         let packed_gate_up = if matches!(gate_up_plan, DenseGateUpDispatchPlan::PackedQ8Dot) {
             let gate = self.resident_q4k_packed_ptrs(gate_weights, n_ff, gate_blocks)?;
             let up = self.resident_q4k_packed_ptrs(up_weights, n_ff, gate_blocks)?;
@@ -1251,34 +1273,7 @@ impl CudaState {
         } else {
             None
         };
-        if let Some(fused_gate_up_weights) = fused_gate_up_weights {
-            let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
-            unsafe {
-                self.api.memcpy_htod_async(
-                    input_dev,
-                    input.as_ptr().cast::<libc::c_void>(),
-                    std::mem::size_of_val(input),
-                    self.stream,
-                )?;
-            }
-            self.trace_dense_stage(
-                trace_call,
-                "cuda-dense-batch",
-                "input_h2d",
-                &mut trace_stage,
-            )?;
-            let fused_dev =
-                self.compute_aux_output_ptr(seq_len * n_ff * 2 * std::mem::size_of::<f32>())?;
-            self.q4k_batch_dev_input_to_dev(
-                fused_gate_up_weights,
-                n_ff * 2,
-                gate_blocks,
-                seq_len,
-                input_dev,
-                fused_dev,
-            )?;
-            self.launch_deinterleave_gate_up_f32(fused_dev, gate_dev, up_dev, n_ff, seq_len)?;
-        } else if let Some((gate_w_dev, up_w_dev)) = f16_gate_up {
+        if let Some((gate_w_dev, up_w_dev)) = f16_gate_up {
             let input_f16 = f32_to_f16_bits(input);
             let input_dev = self.compute_input_ptr(std::mem::size_of_val(input_f16.as_slice()))?;
             unsafe {

@@ -1,3 +1,5 @@
+mod gemma_moe_api;
+pub use gemma_moe_api::*;
 mod glm_moe_api;
 pub use glm_moe_api::*;
 mod quant_api;

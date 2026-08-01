@@ -1,3 +1,4 @@
+mod gemma;
 mod glm;
 pub(in crate::runtime) mod glm_prefetch;
 mod glm_stream;

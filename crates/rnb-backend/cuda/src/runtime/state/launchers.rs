@@ -933,6 +933,89 @@ impl CudaState {
         )
     }
 
+    pub(in crate::runtime) fn launch_gather_rows_f32(
+        &mut self,
+        input_dev: u64,
+        token_ids_dev: u64,
+        output_dev: u64,
+        row_width: usize,
+        row_count: usize,
+    ) -> Result<(), String> {
+        self.launch_indexed_rows_f32(
+            "rnb_gather_rows_f32",
+            input_dev,
+            token_ids_dev,
+            None,
+            output_dev,
+            row_width,
+            row_count,
+        )
+    }
+
+    pub(in crate::runtime) fn launch_scatter_add_weighted_rows_f32(
+        &mut self,
+        input_dev: u64,
+        token_ids_dev: u64,
+        weights_dev: u64,
+        output_dev: u64,
+        row_width: usize,
+        row_count: usize,
+    ) -> Result<(), String> {
+        self.launch_indexed_rows_f32(
+            "rnb_scatter_add_weighted_rows_f32",
+            input_dev,
+            token_ids_dev,
+            Some(weights_dev),
+            output_dev,
+            row_width,
+            row_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_indexed_rows_f32(
+        &mut self,
+        kernel: &'static str,
+        input_dev: u64,
+        token_ids_dev: u64,
+        weights_dev: Option<u64>,
+        output_dev: u64,
+        row_width: usize,
+        row_count: usize,
+    ) -> Result<(), String> {
+        let total = row_width
+            .checked_mul(row_count)
+            .ok_or_else(|| format!("{kernel} size overflow: {row_count}x{row_width}"))?;
+        let total_u32 =
+            u32::try_from(total).map_err(|_| format!("{kernel} len exceeds u32: {total}"))?;
+        let mut input_arg = input_dev;
+        let mut token_ids_arg = token_ids_dev;
+        let mut weights_arg = weights_dev.unwrap_or(0);
+        let mut output_arg = output_dev;
+        let mut row_width_arg = u32::try_from(row_width)
+            .map_err(|_| format!("{kernel} row width exceeds u32: {row_width}"))?;
+        let mut row_count_arg = u32::try_from(row_count)
+            .map_err(|_| format!("{kernel} row count exceeds u32: {row_count}"))?;
+        let mut args = vec![
+            (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+            (&mut token_ids_arg as *mut u64).cast::<libc::c_void>(),
+        ];
+        if weights_dev.is_some() {
+            args.push((&mut weights_arg as *mut u64).cast::<libc::c_void>());
+        }
+        args.extend([
+            (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+            (&mut row_width_arg as *mut u32).cast::<libc::c_void>(),
+            (&mut row_count_arg as *mut u32).cast::<libc::c_void>(),
+        ]);
+        self.launch_cached_gemv(
+            kernel,
+            &args,
+            ((total_u32.saturating_add(255)) / 256, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_split_gated_attention_q_f32(
         &mut self,
         q_full_dev: u64,

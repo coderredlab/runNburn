@@ -1065,25 +1065,33 @@ pub fn dense_q4k_gelu_ffn_batch(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn dense_q4k_gelu_ffn_batch_fused_gate_up(
-    gate_up: &[u8],
-    down: &[u8],
+pub fn gemma4_moe_gelu_selected(
+    gate_up_experts: &[u8],
+    down_experts: &[u8],
     down_quant: GGMLType,
+    n_expert: usize,
     n_ff: usize,
     n_embd: usize,
     seq_len: usize,
+    expert_ids: &[u32],
+    token_ids: &[u32],
+    route_weights: &[f32],
     input: &[f32],
 ) -> Result<Vec<f32>> {
-    backend::dense_q4k_gelu_ffn_batch_fused_gate_up(
-        gate_up,
-        down,
+    backend::gemma4_moe_gelu_selected(
+        gate_up_experts,
+        down_experts,
         down_quant as u32,
+        n_expert,
         n_ff,
         n_embd,
         seq_len,
+        expert_ids,
+        token_ids,
+        route_weights,
         input,
     )
-    .map_err(|err| format!("CUDA dense Q4_K fused gate/up GELU FFN batch failed: {err}"))
+    .map_err(|err| format!("CUDA Gemma4 selected MoE GELU failed: {err}"))
 }
 
 // cu46: drafter SwiGLU FFN port — silu_mul activation 의 batch variant.
