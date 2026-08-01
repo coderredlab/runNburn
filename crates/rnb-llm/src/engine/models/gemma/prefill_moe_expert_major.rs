@@ -175,15 +175,13 @@ fn compute_shared_output(
     apply_model_gate_mul_inplace(&mut shared_gate, &shared_up, architecture);
     let shared_down = w.ffn_down_weight.gemv_vec(&shared_gate)?;
     let mut shared_output = vec![0.0f32; seq_len * hidden_dim];
-    for token in 0..seq_len {
-        apply_model_norm_into(
-            &shared_down[token * hidden_dim..(token + 1) * hidden_dim],
-            post_norm_1_data,
-            norm_eps,
-            &mut shared_output[token * hidden_dim..(token + 1) * hidden_dim],
-            architecture,
-        );
-    }
+    apply_model_norm_into(
+        &shared_down,
+        post_norm_1_data,
+        norm_eps,
+        &mut shared_output,
+        architecture,
+    );
     finish_expert_major_stage(
         "gemma4:prefill:expert_major:shared",
         layer_idx,
@@ -237,22 +235,22 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     let mut moe_input = vec![0.0f32; seq_len * hidden_dim];
     let mut router_input = vec![0.0f32; seq_len * hidden_dim];
     let inv_sqrt_n = 1.0 / (hidden_dim as f32).sqrt();
+    apply_model_norm_into(
+        &attn_out_data,
+        ffn_norm_data,
+        norm_eps,
+        &mut shared_norm,
+        architecture,
+    );
+    apply_model_norm_into(
+        &attn_out_data,
+        pre_norm_2_data,
+        norm_eps,
+        &mut moe_input,
+        architecture,
+    );
     for token in 0..seq_len {
         let attn_out = &attn_out_data[token * hidden_dim..(token + 1) * hidden_dim];
-        apply_model_norm_into(
-            attn_out,
-            ffn_norm_data,
-            norm_eps,
-            &mut shared_norm[token * hidden_dim..(token + 1) * hidden_dim],
-            architecture,
-        );
-        apply_model_norm_into(
-            attn_out,
-            pre_norm_2_data,
-            norm_eps,
-            &mut moe_input[token * hidden_dim..(token + 1) * hidden_dim],
-            architecture,
-        );
 
         let sum_sq: f32 = attn_out.iter().map(|value| value * value).sum();
         let rrms = 1.0 / (sum_sq / hidden_dim as f32 + norm_eps).sqrt();
@@ -593,37 +591,25 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
         &mut router_input,
     );
     let post_ffw_norm = w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice);
-    for token in 0..seq_len {
-        let token_range = token * hidden_dim..(token + 1) * hidden_dim;
+    apply_model_norm_into(
+        &router_input,
+        post_norm_2_data,
+        norm_eps,
+        &mut shared_norm,
+        architecture,
+    );
+    add_f32_inplace(&mut shared_output, &shared_norm);
+    if let Some(post_norm) = post_ffw_norm {
         apply_model_norm_into(
-            &router_input[token_range.clone()],
-            post_norm_2_data,
+            &shared_output,
+            post_norm,
             norm_eps,
-            &mut shared_norm[token_range.clone()],
+            &mut router_input,
             architecture,
         );
-        add_f32_inplace(
-            &mut shared_output[token_range.clone()],
-            &shared_norm[token_range.clone()],
-        );
-        if let Some(post_norm) = post_ffw_norm {
-            apply_model_norm_into(
-                &shared_output[token_range.clone()],
-                post_norm,
-                norm_eps,
-                &mut router_input[token_range.clone()],
-                architecture,
-            );
-            add_f32_inplace(
-                &mut attn_out_data[token_range.clone()],
-                &router_input[token_range],
-            );
-        } else {
-            add_f32_inplace(
-                &mut attn_out_data[token_range.clone()],
-                &shared_output[token_range],
-            );
-        }
+        add_f32_inplace(&mut attn_out_data, &router_input);
+    } else {
+        add_f32_inplace(&mut attn_out_data, &shared_output);
     }
 
     let result = Ok(Tensor::from_vec(attn_out_data, &[seq_len, hidden_dim]));
