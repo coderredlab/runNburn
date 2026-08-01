@@ -1,6 +1,7 @@
 use crate::engine::cpu_runtime::quantize::kvarn::{
     KvarnBlock, KvarnConfig, KvarnDeviceRecordLayout, KvarnKvView,
 };
+use rayon::prelude::*;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,18 +174,38 @@ impl KvarnLayerCache {
             return Ok(());
         }
         let consumed = full_blocks * block_elements;
-        for block_index in 0..full_blocks {
-            let start = block_index * block_elements;
-            let end = start + block_elements;
+        if full_blocks == 1 {
             let block = KvarnBlock::quantize(
                 self.config,
                 self.num_kv_heads,
                 self.head_dim,
-                &self.tail_key[start..end],
-                &self.tail_value[start..end],
+                &self.tail_key[..block_elements],
+                &self.tail_value[..block_elements],
             )?;
             block.append_device_record(&mut self.device_blocks);
             self.blocks.push(block);
+        } else {
+            let blocks = (0..full_blocks)
+                .into_par_iter()
+                .map(|block_index| {
+                    let start = block_index * block_elements;
+                    let end = start + block_elements;
+                    KvarnBlock::quantize(
+                        self.config,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        &self.tail_key[start..end],
+                        &self.tail_value[start..end],
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.blocks.reserve(blocks.len());
+            self.device_blocks
+                .reserve(blocks.len() * self.device_layout.block_bytes);
+            for block in blocks {
+                block.append_device_record(&mut self.device_blocks);
+                self.blocks.push(block);
+            }
         }
         self.tail_key = self.tail_key.split_off(consumed);
         self.tail_value = self.tail_value.split_off(consumed);
