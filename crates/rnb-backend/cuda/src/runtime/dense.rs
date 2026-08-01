@@ -1061,6 +1061,46 @@ impl CudaState {
             n_embd,
             seq_len,
             input,
+            None,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dense_q4k_gelu_ffn_batch_fused_gate_up(
+        &mut self,
+        gate_up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        n_ff: usize,
+        n_embd: usize,
+        seq_len: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let gate_row_bytes = (n_embd / 256)
+            .checked_mul(144)
+            .ok_or_else(|| "dense GELU fused gate/up row byte overflow".to_string())?;
+        let matrix_bytes = n_ff
+            .checked_mul(gate_row_bytes)
+            .ok_or_else(|| "dense GELU fused gate/up matrix byte overflow".to_string())?;
+        if gate_up_weights.len() != matrix_bytes * 2 {
+            return Err(format!(
+                "dense GELU fused gate/up byte mismatch: got {}, expected {}",
+                gate_up_weights.len(),
+                matrix_bytes * 2
+            ));
+        }
+        let (gate_weights, up_weights) = gate_up_weights.split_at(matrix_bytes);
+        self.dense_q4k_ffn_batch(
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            n_ff,
+            n_embd,
+            seq_len,
+            input,
+            Some(gate_up_weights),
             true,
         )
     }
@@ -1086,6 +1126,7 @@ impl CudaState {
             n_embd,
             seq_len,
             input,
+            None,
             false,
         )
     }
@@ -1101,6 +1142,7 @@ impl CudaState {
         n_embd: usize,
         seq_len: usize,
         input: &[f32],
+        fused_gate_up_weights: Option<&[u8]>,
         gelu: bool,
     ) -> Result<Vec<f32>, String> {
         let activation_name = if gelu { "GELU" } else { "SiLU" };
@@ -1116,18 +1158,20 @@ impl CudaState {
                 seq_len * n_embd
             ));
         }
-        if n_embd % 256 != 0 || n_ff % 256 != 0 {
+        let down_block_size = if matches!(down_quant, 7 | 8) { 32 } else { 256 };
+        if n_embd % 256 != 0 || n_ff % down_block_size != 0 {
             return Err(format!(
-                "dense {activation_name} FFN batch dims must be divisible by 256, got n_ff={n_ff} n_embd={n_embd}"
+                "dense {activation_name} FFN batch dims must align to gate/down blocks, got n_ff={n_ff} down_block={down_block_size} n_embd={n_embd}"
             ));
         }
         let gate_blocks = n_embd / 256;
-        let down_blocks = n_ff / 256;
         let gate_row_bytes = gate_blocks * 144;
-        let down_row_bytes = match down_quant {
-            12 => down_blocks * 144,
-            13 => down_blocks * 176,
-            14 => down_blocks * 210,
+        let (down_blocks, down_row_bytes) = match down_quant {
+            7 => (n_ff / 32, (n_ff / 32) * 24),
+            8 => (n_ff / 32, (n_ff / 32) * 34),
+            12 => (n_ff / 256, (n_ff / 256) * 144),
+            13 => (n_ff / 256, (n_ff / 256) * 176),
+            14 => (n_ff / 256, (n_ff / 256) * 210),
             other => {
                 return Err(format!(
                     "unsupported dense {activation_name} FFN batch down quant code {other}"
@@ -1165,16 +1209,21 @@ impl CudaState {
         let output_bytes = output_len * std::mem::size_of::<f32>();
         let output_dev = self.compute_output_ptr(output_bytes)?;
 
-        let q8dot_gate_up = dense_q8dot_gate_up_enabled(n_ff >= 1024 && gate_blocks >= 4);
+        let q8dot_gate_up = fused_gate_up_weights.is_none()
+            && dense_q8dot_gate_up_enabled(n_ff >= 1024 && gate_blocks >= 4);
         let packed_gate_up_supported =
             q8dot_gate_up && seq_len == 2 && tuning::q4k_gate_up_batch_seq2_q8dot_enabled();
-        let gate_up_plan = dense_q4_gate_up_dispatch_plan(
-            seq_len,
-            n_ff,
-            n_embd,
-            q8dot_gate_up,
-            packed_gate_up_supported,
-        );
+        let gate_up_plan = if fused_gate_up_weights.is_some() {
+            DenseGateUpDispatchPlan::RawQuant
+        } else {
+            dense_q4_gate_up_dispatch_plan(
+                seq_len,
+                n_ff,
+                n_embd,
+                q8dot_gate_up,
+                packed_gate_up_supported,
+            )
+        };
         let packed_gate_up = if matches!(gate_up_plan, DenseGateUpDispatchPlan::PackedQ8Dot) {
             let gate = self.resident_q4k_packed_ptrs(gate_weights, n_ff, gate_blocks)?;
             let up = self.resident_q4k_packed_ptrs(up_weights, n_ff, gate_blocks)?;
@@ -1202,7 +1251,34 @@ impl CudaState {
         } else {
             None
         };
-        if let Some((gate_w_dev, up_w_dev)) = f16_gate_up {
+        if let Some(fused_gate_up_weights) = fused_gate_up_weights {
+            let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input),
+                    self.stream,
+                )?;
+            }
+            self.trace_dense_stage(
+                trace_call,
+                "cuda-dense-batch",
+                "input_h2d",
+                &mut trace_stage,
+            )?;
+            let fused_dev =
+                self.compute_aux_output_ptr(seq_len * n_ff * 2 * std::mem::size_of::<f32>())?;
+            self.q4k_batch_dev_input_to_dev(
+                fused_gate_up_weights,
+                n_ff * 2,
+                gate_blocks,
+                seq_len,
+                input_dev,
+                fused_dev,
+            )?;
+            self.launch_deinterleave_gate_up_f32(fused_dev, gate_dev, up_dev, n_ff, seq_len)?;
+        } else if let Some((gate_w_dev, up_w_dev)) = f16_gate_up {
             let input_f16 = f32_to_f16_bits(input);
             let input_dev = self.compute_input_ptr(std::mem::size_of_val(input_f16.as_slice()))?;
             unsafe {
@@ -1415,6 +1491,24 @@ impl CudaState {
         )?;
 
         match down_quant {
+            7 => self.quant_gemv_batch_dev_input_to_dev(
+                "rnb_q5_1_gemv_batch",
+                down_weights,
+                n_embd,
+                down_blocks,
+                seq_len,
+                gate_dev,
+                output_dev,
+            ),
+            8 => self.quant_gemv_batch_dev_input_to_dev(
+                "rnb_q8_0_gemv_batch",
+                down_weights,
+                n_embd,
+                down_blocks,
+                seq_len,
+                gate_dev,
+                output_dev,
+            ),
             12 => {
                 if let Some(down_w_dev) = f16_q4_down {
                     let down_input_f16_dev =

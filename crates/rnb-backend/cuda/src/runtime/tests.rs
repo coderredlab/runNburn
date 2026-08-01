@@ -12241,6 +12241,63 @@ fn cuda_dense_q4k_gelu_ffn_batch_matches_cpu_reference() {
 }
 
 #[test]
+fn cuda_dense_q4k_fused_gate_up_gelu_ffn_batch_matches_cpu_reference() {
+    let _guard = runtime_test_lock();
+    let n_embd = 512usize;
+    let n_ff = 512usize;
+    let seq_len = 3usize;
+    let gate_blocks = n_embd / 256;
+    let gate = make_test_q4k_weights(1, n_ff, gate_blocks, 137)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, gate_blocks, 149)
+        .pop()
+        .unwrap();
+    let mut gate_up = gate.clone();
+    gate_up.extend_from_slice(&up);
+    let input = (0..seq_len * n_embd)
+        .map(|i| ((i as f32 % 43.0) - 21.0) * 0.0078125)
+        .collect::<Vec<_>>();
+
+    for (label, down_quant, down) in [
+        (
+            "Q5_1",
+            7u32,
+            make_test_q5_basic_weights(n_embd, n_ff, 24, true, 157),
+        ),
+        ("Q8_0", 8u32, make_test_q8_0_weights(n_embd, n_ff, 163)),
+    ] {
+        let mut expected = Vec::with_capacity(seq_len * n_embd);
+        for input_row in input.chunks_exact(n_embd) {
+            let mut gate_out = cpu_q4k_gemv_rows(&gate, n_ff, gate_blocks, input_row);
+            let up_out = cpu_q4k_gemv_rows(&up, n_ff, gate_blocks, input_row);
+            for (gate_value, up_value) in gate_out.iter_mut().zip(up_out.iter()) {
+                let x = *gate_value;
+                let x3 = x * x * x;
+                let gelu = 0.5 * x * (1.0 + (0.7978845608028654 * (x + 0.044715 * x3)).tanh());
+                *gate_value = gelu * *up_value;
+            }
+            if down_quant == 7 {
+                expected.extend(cpu_q5_basic_rows(&down, n_embd, n_ff, 24, true, &gate_out));
+            } else {
+                expected.extend(cpu_q8_0_rows(&down, n_embd, n_ff, &gate_out));
+            }
+        }
+
+        let actual = dense_q4k_gelu_ffn_batch_fused_gate_up(
+            &gate_up, &down, down_quant, n_ff, n_embd, seq_len, &input,
+        )
+        .expect("CUDA dense Q4_K fused gate/up GELU FFN batch");
+        assert_close_rows(
+            &format!("dense Q4_K fused gate/up GELU FFN batch {label}"),
+            &actual,
+            &expected,
+            0.2,
+        );
+    }
+}
+
+#[test]
 fn cuda_glm_shared_expert_q5k_q6k_batch_matches_cpu_reference() {
     let _guard = runtime_test_lock();
     let n_embd = 512usize;

@@ -1064,6 +1064,28 @@ pub fn dense_q4k_gelu_ffn_batch(
     .map_err(|err| format!("CUDA dense Q4_K GELU FFN batch failed: {err}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn dense_q4k_gelu_ffn_batch_fused_gate_up(
+    gate_up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    n_ff: usize,
+    n_embd: usize,
+    seq_len: usize,
+    input: &[f32],
+) -> Result<Vec<f32>> {
+    backend::dense_q4k_gelu_ffn_batch_fused_gate_up(
+        gate_up,
+        down,
+        down_quant as u32,
+        n_ff,
+        n_embd,
+        seq_len,
+        input,
+    )
+    .map_err(|err| format!("CUDA dense Q4_K fused gate/up GELU FFN batch failed: {err}"))
+}
+
 // cu46: drafter SwiGLU FFN port — silu_mul activation 의 batch variant.
 // drafter forward = single-token (seq_len=1) 라 batch=1 의 silu_ffn_batch.
 #[allow(clippy::too_many_arguments)]

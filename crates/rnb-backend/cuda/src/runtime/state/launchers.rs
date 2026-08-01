@@ -899,6 +899,40 @@ impl CudaState {
         )
     }
 
+    pub(in crate::runtime) fn launch_deinterleave_gate_up_f32(
+        &mut self,
+        fused_dev: u64,
+        gate_dev: u64,
+        up_dev: u64,
+        n_ff: usize,
+        seq_len: usize,
+    ) -> Result<(), String> {
+        let total = n_ff
+            .checked_mul(seq_len)
+            .ok_or_else(|| format!("gate/up deinterleave size overflow: {seq_len}x{n_ff}"))?;
+        let total_u32 = u32::try_from(total)
+            .map_err(|_| format!("gate/up deinterleave len exceeds u32: {total}"))?;
+        let mut fused_arg = fused_dev;
+        let mut gate_arg = gate_dev;
+        let mut up_arg = up_dev;
+        let mut n_ff_arg = u32::try_from(n_ff)
+            .map_err(|_| format!("gate/up deinterleave n_ff exceeds u32: {n_ff}"))?;
+        let mut seq_len_arg = u32::try_from(seq_len)
+            .map_err(|_| format!("gate/up deinterleave seq_len exceeds u32: {seq_len}"))?;
+        self.launch_cached_gemv(
+            "rnb_deinterleave_gate_up_f32",
+            &[
+                (&mut fused_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut gate_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut up_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut n_ff_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            ((total_u32.saturating_add(255)) / 256, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_split_gated_attention_q_f32(
         &mut self,
         q_full_dev: u64,

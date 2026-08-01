@@ -4,6 +4,8 @@ use super::moe_view::select_experts_from_logits;
 #[cfg(target_arch = "aarch64")]
 use super::prefill_moe_expert_group::compute_expert_groups;
 use super::select_ffn_pre_norm_weight;
+#[cfg(feature = "cuda")]
+use crate::engine::backend_runtime;
 use crate::engine::cpu_runtime::kernels;
 use crate::engine::dense_dispatch;
 use crate::engine::layer_weights::{AttentionLayerWeights, MoeLayerWeights};
@@ -377,13 +379,13 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     #[cfg(not(target_arch = "aarch64"))]
     let mut expert_input = vec![0.0f32; max_group * hidden_dim];
     #[cfg(not(target_arch = "aarch64"))]
-    let mut gate_up_output = vec![0.0f32; max_group * gate_up_rows];
+    let mut gate_up_output = Vec::<f32>::new();
     #[cfg(not(target_arch = "aarch64"))]
-    let mut expert_mid = vec![0.0f32; max_group * moe_w.n_ff];
+    let mut expert_mid = Vec::<f32>::new();
     #[cfg(not(target_arch = "aarch64"))]
-    let mut expert_up = vec![0.0f32; max_group * moe_w.n_ff];
+    let mut expert_up = Vec::<f32>::new();
     #[cfg(not(target_arch = "aarch64"))]
-    let mut expert_output = vec![0.0f32; max_group * hidden_dim];
+    let mut expert_output = Vec::<f32>::new();
     let mut ranked_output = vec![0.0f32; slots.len() * hidden_dim];
     finish_expert_major_stage(
         "gemma4:prefill:expert_major:scratch",
@@ -395,6 +397,7 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     let mut gate_up_elapsed = Duration::ZERO;
     let mut activation_elapsed = Duration::ZERO;
     let mut down_elapsed = Duration::ZERO;
+    let mut fused_ffn_elapsed = Duration::ZERO;
     let mut scatter_elapsed = Duration::ZERO;
 
     #[cfg(target_arch = "aarch64")]
@@ -460,9 +463,45 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             if let Some(gather_start) = gather_start {
                 gather_elapsed += gather_start.elapsed();
             }
-
-            let gate_up_start = profile_enabled.then(Instant::now);
             let gate_up_slice = &gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
+            let down_slice = &down_bytes[expert * per_down..(expert + 1) * per_down];
+            #[cfg(feature = "cuda")]
+            {
+                let fused_start = profile_enabled.then(Instant::now);
+                if let Some(fused_output) = backend_runtime::gemma4_moe_gelu_ffn_batch_if_supported(
+                    gate_up_slice,
+                    down_slice,
+                    moe_w.down_quant,
+                    moe_w.n_ff,
+                    hidden_dim,
+                    group_len,
+                    &expert_input[..group_len * hidden_dim],
+                )? {
+                    if let Some(fused_start) = fused_start {
+                        fused_ffn_elapsed += fused_start.elapsed();
+                    }
+                    let scatter_start = profile_enabled.then(Instant::now);
+                    scatter_weighted_expert_group(
+                        group_slots,
+                        &fused_output,
+                        down_scale[expert],
+                        moe_w.n_expert_used,
+                        hidden_dim,
+                        &mut ranked_output,
+                    );
+                    if let Some(scatter_start) = scatter_start {
+                        scatter_elapsed += scatter_start.elapsed();
+                    }
+                    start = end;
+                    continue;
+                }
+            }
+
+            gate_up_output.resize(group_len * gate_up_rows, 0.0);
+            expert_mid.resize(group_len * moe_w.n_ff, 0.0);
+            expert_up.resize(group_len * moe_w.n_ff, 0.0);
+            expert_output.resize(group_len * hidden_dim, 0.0);
+            let gate_up_start = profile_enabled.then(Instant::now);
             prefill_raw_quantized_batch(
                 gate_up_slice,
                 &expert_input[..group_len * hidden_dim],
@@ -500,7 +539,6 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             }
 
             let down_start = profile_enabled.then(Instant::now);
-            let down_slice = &down_bytes[expert * per_down..(expert + 1) * per_down];
             prefill_raw_quantized_batch(
                 down_slice,
                 &expert_mid[..group_len * moe_w.n_ff],
@@ -553,6 +591,12 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             layer_idx,
             "down",
             down_elapsed,
+        );
+        record_expert_major_duration(
+            "gemma4:prefill:expert_major:fused_ffn",
+            layer_idx,
+            "fused_ffn",
+            fused_ffn_elapsed,
         );
         record_expert_major_duration(
             "gemma4:prefill:expert_major:scatter",

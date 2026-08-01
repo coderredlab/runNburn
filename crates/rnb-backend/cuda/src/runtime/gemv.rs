@@ -690,6 +690,44 @@ impl CudaState {
         }
         self.gemv_batch(kernel, weights, rows, blocks_per_row, seq_len, input)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn quant_gemv_batch_dev_input_to_dev(
+        &mut self,
+        kernel: &'static str,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_arg = input_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        let grid = if kernel.ends_with("_warp8") {
+            (rows.div_ceil(8) as u32, seq_len as u32, 1)
+        } else {
+            (rows as u32, seq_len as u32, 1)
+        };
+        self.launch_cached_gemv(
+            kernel,
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            grid,
+            (256, 1, 1),
+        )
+    }
     fn q3k_mmq_batch(
         &mut self,
         weights: &[u8],

@@ -4620,6 +4620,52 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_batch_if_supported(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn gemma4_moe_gelu_ffn_batch_if_supported(
+    gate_up: &[u8],
+    down: &[u8],
+    down_quant: rnb_loader::GGMLType,
+    n_ff: usize,
+    n_embd: usize,
+    seq_len: usize,
+    input: &[f32],
+) -> crate::error::Result<Option<Vec<f32>>> {
+    if seq_len <= 1
+        || n_embd % 256 != 0
+        || n_ff % 32 != 0
+        || !matches!(
+            down_quant,
+            rnb_loader::GGMLType::Q5_1 | rnb_loader::GGMLType::Q8_0
+        )
+    {
+        return Ok(None);
+    }
+    let gate_bytes = n_ff
+        .checked_mul(n_embd / 256)
+        .and_then(|blocks| blocks.checked_mul(144))
+        .ok_or_else(|| {
+            crate::error::LlmError::Forward("Gemma4 MoE gate byte size overflow".into())
+        })?;
+    if gate_up.len() != gate_bytes.saturating_mul(2) {
+        return Err(crate::error::LlmError::Forward(format!(
+            "Gemma4 MoE gate/up byte mismatch: got {}, expected {}",
+            gate_up.len(),
+            gate_bytes.saturating_mul(2)
+        )));
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::dense_q4k_gelu_ffn_batch_fused_gate_up(
+            gate_up, down, down_quant, n_ff, n_embd, seq_len, input,
+        )
+        .map(Some)
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
     gate_weight: &QuantizedWeight,
     up_weight: &QuantizedWeight,

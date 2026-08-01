@@ -18,6 +18,24 @@ extern "C" __global__ void rnb_f16_to_f32(
     }
 }
 
+extern "C" __global__ void rnb_deinterleave_gate_up_f32(
+    const float* __restrict__ fused,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    unsigned n_ff,
+    unsigned seq_len) {
+    const unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned total = n_ff * seq_len;
+    if (idx >= total) {
+        return;
+    }
+    const unsigned seq = idx / n_ff;
+    const unsigned col = idx - seq * n_ff;
+    const unsigned fused_base = seq * n_ff * 2u;
+    gate[idx] = fused[fused_base + col];
+    up[idx] = fused[fused_base + n_ff + col];
+}
+
 extern "C" __global__ void rnb_q4k_gemv_batch(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
