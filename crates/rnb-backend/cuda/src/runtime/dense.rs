@@ -1090,8 +1090,8 @@ impl CudaState {
             ));
         }
         let (down_kernel, down_block_bytes) = match down_quant {
-            7 => ("rnb_q5_1_gemv_batch", 24usize),
-            8 => ("rnb_q8_0_gemv_batch", 34usize),
+            7 => ("rnb_q5_1_gemv_batch_seq4", 24usize),
+            8 => ("rnb_q8_0_gemv_batch_seq4", 34usize),
             other => {
                 return Err(format!(
                     "Gemma4 device FFN unsupported down quant code {other}"

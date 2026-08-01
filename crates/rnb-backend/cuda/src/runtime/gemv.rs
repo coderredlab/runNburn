@@ -709,10 +709,12 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let mut seq_len_arg = seq_len as u32;
-        let grid = if kernel.ends_with("_warp8") {
-            (rows.div_ceil(8) as u32, seq_len as u32, 1)
+        let (grid, block) = if kernel.ends_with("_warp8") {
+            ((rows.div_ceil(8) as u32, seq_len as u32, 1), (256, 1, 1))
+        } else if kernel.ends_with("_seq4") {
+            ((rows as u32, seq_len.div_ceil(4) as u32, 1), (256, 1, 1))
         } else {
-            (rows as u32, seq_len as u32, 1)
+            ((rows as u32, seq_len as u32, 1), (256, 1, 1))
         };
         self.launch_cached_gemv(
             kernel,
@@ -725,7 +727,7 @@ impl CudaState {
                 (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
             ],
             grid,
-            (256, 1, 1),
+            block,
         )
     }
     fn q3k_mmq_batch(

@@ -1582,6 +1582,83 @@ extern "C" __global__ void rnb_q5_1_gemv_batch(
     }
 }
 
+extern "C" __global__ void rnb_q5_1_gemv_batch_seq4(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ input,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned row = blockIdx.x;
+    const unsigned seq_base = blockIdx.y * 4u;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || seq_base >= seq_len || tid >= 256u) {
+        return;
+    }
+
+    __shared__ float partial[4][256];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 24u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned cols = blocks_per_row * 32u;
+
+    for (unsigned idx = tid; idx < cols; idx += 256u) {
+        const unsigned b = idx >> 5;
+        const unsigned lane = idx & 31u;
+        const unsigned char* block = row_ptr + b * 24u;
+        const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+        const unsigned raw_m = (unsigned)block[2] | ((unsigned)block[3] << 8);
+        const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+        const float m = __half2float(__ushort_as_half((unsigned short)raw_m));
+        const unsigned qh = (unsigned)block[4] | ((unsigned)block[5] << 8) |
+                            ((unsigned)block[6] << 16) | ((unsigned)block[7] << 24);
+        const unsigned byte = block[8u + (lane & 15u)];
+        const unsigned low = lane < 16u ? (byte & 0x0fu) : (byte >> 4);
+        const unsigned high = (qh >> lane) & 1u;
+        const float y = (float)(low | (high << 4)) * d + m;
+        acc0 += y * input[(unsigned long long)seq_base * cols + idx];
+        if (seq_base + 1u < seq_len) {
+            acc1 += y * input[(unsigned long long)(seq_base + 1u) * cols + idx];
+        }
+        if (seq_base + 2u < seq_len) {
+            acc2 += y * input[(unsigned long long)(seq_base + 2u) * cols + idx];
+        }
+        if (seq_base + 3u < seq_len) {
+            acc3 += y * input[(unsigned long long)(seq_base + 3u) * cols + idx];
+        }
+    }
+
+    partial[0][tid] = acc0;
+    partial[1][tid] = acc1;
+    partial[2][tid] = acc2;
+    partial[3][tid] = acc3;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[0][tid] += partial[0][tid + stride];
+            partial[1][tid] += partial[1][tid + stride];
+            partial[2][tid] += partial[2][tid + stride];
+            partial[3][tid] += partial[3][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        out[(unsigned long long)seq_base * rows + row] = partial[0][0];
+        if (seq_base + 1u < seq_len) {
+            out[(unsigned long long)(seq_base + 1u) * rows + row] = partial[1][0];
+        }
+        if (seq_base + 2u < seq_len) {
+            out[(unsigned long long)(seq_base + 2u) * rows + row] = partial[2][0];
+        }
+        if (seq_base + 3u < seq_len) {
+            out[(unsigned long long)(seq_base + 3u) * rows + row] = partial[3][0];
+        }
+    }
+}
+
 extern "C" __global__ void rnb_q8_0_gemv(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -2181,6 +2258,77 @@ extern "C" __global__ void rnb_q8_0_gemv_batch(
     }
     if (tid == 0) {
         out[seq * rows + row] = partial[0];
+    }
+}
+
+extern "C" __global__ void rnb_q8_0_gemv_batch_seq4(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ input,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned row = blockIdx.x;
+    const unsigned seq_base = blockIdx.y * 4u;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || seq_base >= seq_len || tid >= 256u) {
+        return;
+    }
+
+    __shared__ float partial[4][256];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 34u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned cols = blocks_per_row * 32u;
+
+    for (unsigned idx = tid; idx < cols; idx += 256u) {
+        const unsigned b = idx >> 5;
+        const unsigned lane = idx & 31u;
+        const unsigned char* block = row_ptr + b * 34u;
+        const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+        const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+        const signed char q = (signed char)block[2u + lane];
+        const float y = (float)q * d;
+        acc0 += y * input[(unsigned long long)seq_base * cols + idx];
+        if (seq_base + 1u < seq_len) {
+            acc1 += y * input[(unsigned long long)(seq_base + 1u) * cols + idx];
+        }
+        if (seq_base + 2u < seq_len) {
+            acc2 += y * input[(unsigned long long)(seq_base + 2u) * cols + idx];
+        }
+        if (seq_base + 3u < seq_len) {
+            acc3 += y * input[(unsigned long long)(seq_base + 3u) * cols + idx];
+        }
+    }
+
+    partial[0][tid] = acc0;
+    partial[1][tid] = acc1;
+    partial[2][tid] = acc2;
+    partial[3][tid] = acc3;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[0][tid] += partial[0][tid + stride];
+            partial[1][tid] += partial[1][tid + stride];
+            partial[2][tid] += partial[2][tid + stride];
+            partial[3][tid] += partial[3][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        out[(unsigned long long)seq_base * rows + row] = partial[0][0];
+        if (seq_base + 1u < seq_len) {
+            out[(unsigned long long)(seq_base + 1u) * rows + row] = partial[1][0];
+        }
+        if (seq_base + 2u < seq_len) {
+            out[(unsigned long long)(seq_base + 2u) * rows + row] = partial[2][0];
+        }
+        if (seq_base + 3u < seq_len) {
+            out[(unsigned long long)(seq_base + 3u) * rows + row] = partial[3][0];
+        }
     }
 }
 
