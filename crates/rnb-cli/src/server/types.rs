@@ -1,14 +1,12 @@
 use super::http::ApiError;
+use super::image_input::decode_data_image;
 use super::structured::{prepare_generation_constraint, prepare_tools};
-use base64::prelude::{Engine as _, BASE64_STANDARD};
-use image::{ImageFormat, ImageReader, Limits};
 use rnb_llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatTemplateOptions, Engine, GenerateParams,
     Qwen36RgbImage,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::Cursor;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatCompletionRequest {
@@ -90,8 +88,45 @@ pub(super) struct PreparedGenerationRequest {
     pub include_usage: bool,
     pub tool_names: Vec<String>,
     pub parallel_tool_calls: bool,
-    pub response_history_affixes: Option<(String, String)>,
+    pub response_history_context: Option<ResponseHistoryContext>,
     pub image: Option<Qwen36RgbImage>,
+}
+
+pub(super) struct ResponseHistoryContext {
+    messages: Vec<ChatMessage>,
+    prompt_definitions: Vec<Value>,
+    append_text: String,
+}
+
+impl ResponseHistoryContext {
+    pub fn prompt_alignment(
+        &self,
+        engine: &Engine,
+        assistant_content: &str,
+    ) -> Result<(String, String), String> {
+        let mut user_sentinel = "__RNB_RESPONSE_NEXT_USER_CONTENT_51D8E604__".to_string();
+        while assistant_content.contains(&user_sentinel) {
+            user_sentinel.push('_');
+        }
+        let mut messages = self.messages.clone();
+        messages.push(ChatMessage::new("assistant", assistant_content));
+        messages.push(ChatMessage::new("user", user_sentinel.clone()));
+        let rendered = engine
+            .tokenizer
+            .render_chat_prompt_with_tools(
+                &messages,
+                ChatTemplateOptions {
+                    add_generation_prompt: false,
+                    enable_thinking: false,
+                },
+                &self.prompt_definitions,
+            )
+            .map_err(|error| error.to_string())?;
+        let (prompt_prefix, _) = rendered
+            .split_once(&user_sentinel)
+            .ok_or_else(|| "chat template omitted the next user content".to_string())?;
+        Ok((prompt_prefix.to_string(), self.append_text.clone()))
+    }
 }
 
 pub(super) struct GenerationRequest {
@@ -283,7 +318,7 @@ impl GenerationRequest {
                 }
                 error => ApiError::internal(error.to_string()),
             })?;
-        let response_history_affixes = if self.capture_response_history {
+        let response_history_context = if self.capture_response_history {
             let mut assistant_sentinel = "__RNB_RESPONSE_ASSISTANT_CONTENT_7F43A9C2__".to_string();
             let mut user_sentinel = "__RNB_RESPONSE_NEXT_USER_CONTENT_51D8E604__".to_string();
             while prompt.contains(&assistant_sentinel) || prompt.contains(&user_sentinel) {
@@ -309,13 +344,17 @@ impl GenerationRequest {
                     }
                     error => ApiError::internal(error.to_string()),
                 })?;
-            let (prefix, tail) = rendered.split_once(&assistant_sentinel).ok_or_else(|| {
+            let (_, tail) = rendered.split_once(&assistant_sentinel).ok_or_else(|| {
                 ApiError::internal("chat template omitted the assistant response content")
             })?;
             let (bridge, _) = tail
                 .split_once(&user_sentinel)
                 .ok_or_else(|| ApiError::internal("chat template omitted the next user content"))?;
-            Some((prefix.to_string(), bridge.to_string()))
+            Some(ResponseHistoryContext {
+                messages: self.messages.clone(),
+                prompt_definitions: tools.prompt_definitions.clone(),
+                append_text: bridge.to_string(),
+            })
         } else {
             None
         };
@@ -406,7 +445,7 @@ impl GenerationRequest {
             include_usage: self.include_usage,
             tool_names: tools.names,
             parallel_tool_calls,
-            response_history_affixes,
+            response_history_context,
             image: self.image,
         })
     }
@@ -556,7 +595,14 @@ impl MessageContent {
                                     "invalid_value",
                                 )
                             })?;
-                            if image.replace(decode_data_image(&image_url.url)?).is_some() {
+                            if image
+                                .replace(decode_data_image(
+                                    &image_url.url,
+                                    "messages",
+                                    "image_url.url",
+                                )?)
+                                .is_some()
+                            {
                                 return Err(invalid_content_part(
                                     message_index,
                                     part_index,
@@ -592,89 +638,6 @@ fn invalid_content_part(
         format!("messages[{message_index}].content[{part_index}] {detail}"),
         Some("messages"),
         Some(code),
-    )
-}
-
-fn decode_data_image(url: &str) -> Result<Qwen36RgbImage, ApiError> {
-    const MAX_ENCODED_BYTES: usize = 28 * 1024 * 1024;
-    const MAX_DECODED_ALLOC: u64 = 256 * 1024 * 1024;
-    const MAX_DIMENSION: u32 = 8192;
-
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Err(unsupported(
-            "messages",
-            "remote image URLs are not supported; use a PNG or JPEG data URL",
-        ));
-    }
-    let (header, payload) = url.split_once(',').ok_or_else(|| {
-        ApiError::invalid(
-            "image_url.url must be a PNG or JPEG data URL",
-            Some("messages"),
-            Some("invalid_image"),
-        )
-    })?;
-    let claimed_format = match header {
-        "data:image/png;base64" => ImageFormat::Png,
-        "data:image/jpeg;base64" => ImageFormat::Jpeg,
-        _ => {
-            return Err(ApiError::invalid(
-                "image_url.url must use data:image/png;base64 or data:image/jpeg;base64",
-                Some("messages"),
-                Some("invalid_image"),
-            ));
-        }
-    };
-    if payload.len() > MAX_ENCODED_BYTES {
-        return Err(ApiError::invalid(
-            "image data URL exceeds the 28 MiB encoded limit",
-            Some("messages"),
-            Some("invalid_image"),
-        ));
-    }
-    let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
-        ApiError::invalid(
-            format!("image data URL contains invalid base64: {error}"),
-            Some("messages"),
-            Some("invalid_image"),
-        )
-    })?;
-    let mut reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| {
-            ApiError::invalid(
-                format!("could not identify image data: {error}"),
-                Some("messages"),
-                Some("invalid_image"),
-            )
-        })?;
-    if reader.format() != Some(claimed_format) {
-        return Err(ApiError::invalid(
-            "image MIME type does not match the encoded image",
-            Some("messages"),
-            Some("invalid_image"),
-        ));
-    }
-    let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_DIMENSION);
-    limits.max_image_height = Some(MAX_DIMENSION);
-    limits.max_alloc = Some(MAX_DECODED_ALLOC);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|error| {
-        ApiError::invalid(
-            format!("could not decode image: {error}"),
-            Some("messages"),
-            Some("invalid_image"),
-        )
-    })?;
-    let rgb = decoded.into_rgb8();
-    Qwen36RgbImage::new(rgb.width() as usize, rgb.height() as usize, rgb.into_raw()).map_err(
-        |error| {
-            ApiError::invalid(
-                format!("invalid image: {error}"),
-                Some("messages"),
-                Some("invalid_image"),
-            )
-        },
     )
 }
 

@@ -1601,6 +1601,11 @@ impl Engine {
                     "multimodal logical position overflows u32 during decode".into(),
                 )
             })?;
+            cursor.token_count = cursor.token_count.checked_add(1).ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "multimodal cached token count overflows usize during decode".into(),
+                )
+            })?;
         }
 
         // 5. Return logits when requested, then return scratch

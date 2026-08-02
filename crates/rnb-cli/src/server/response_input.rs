@@ -1,6 +1,7 @@
 use super::http::ApiError;
+use super::image_input::decode_data_image;
 use super::responses::{invalid, unsupported, validate_name};
-use rnb_llm::ChatMessage;
+use rnb_llm::{ChatContent, ChatContentPart, ChatMessage, Qwen36RgbImage};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -9,6 +10,12 @@ use serde_json::{json, Map, Value};
 pub(super) enum ResponseInput {
     Text(String),
     Items(Vec<Value>),
+}
+
+#[derive(Debug)]
+pub(super) struct NormalizedResponseInput {
+    pub messages: Vec<ChatMessage>,
+    pub image: Option<Qwen36RgbImage>,
 }
 
 impl ResponseInput {
@@ -27,8 +34,9 @@ impl ResponseInput {
 pub(super) fn normalize_input(
     input: ResponseInput,
     instructions: Option<&str>,
-) -> Result<Vec<ChatMessage>, ApiError> {
+) -> Result<NormalizedResponseInput, ApiError> {
     let mut messages = Vec::new();
+    let mut image = None;
     if let Some(instructions) = instructions {
         messages.push(ChatMessage::new("system", instructions));
     }
@@ -46,7 +54,16 @@ pub(super) fn normalize_input(
                 let kind = object.get("type").and_then(Value::as_str);
                 if kind.is_none() || kind == Some("message") {
                     flush_function_calls(&mut messages, &mut pending_calls);
-                    messages.push(normalize_message(object, index)?);
+                    let (message, message_image) = normalize_message(object, index)?;
+                    if let Some(message_image) = message_image {
+                        if image.replace(message_image).is_some() {
+                            return Err(unsupported(
+                                "input",
+                                "only one image is supported per response input",
+                            ));
+                        }
+                    }
+                    messages.push(message);
                 } else if kind == Some("function_call") {
                     pending_calls.push(normalize_function_call(object, index)?);
                 } else if kind == Some("function_call_output") {
@@ -65,10 +82,13 @@ pub(super) fn normalize_input(
             flush_function_calls(&mut messages, &mut pending_calls);
         }
     }
-    Ok(messages)
+    Ok(NormalizedResponseInput { messages, image })
 }
 
-fn normalize_message(object: &Map<String, Value>, index: usize) -> Result<ChatMessage, ApiError> {
+fn normalize_message(
+    object: &Map<String, Value>,
+    index: usize,
+) -> Result<(ChatMessage, Option<Qwen36RgbImage>), ApiError> {
     let role = object
         .get("role")
         .and_then(Value::as_str)
@@ -82,8 +102,92 @@ fn normalize_message(object: &Map<String, Value>, index: usize) -> Result<ChatMe
     let content = object
         .get("content")
         .ok_or_else(|| invalid("input", format!("input[{index}].content is required")))?;
-    let text = normalize_text_content(content, index, "content")?;
-    Ok(ChatMessage::new(role, text))
+    let (content, image) = normalize_message_content(content, index, role)?;
+    Ok((
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        },
+        image,
+    ))
+}
+
+fn normalize_message_content(
+    content: &Value,
+    item_index: usize,
+    role: &str,
+) -> Result<(ChatContent, Option<Qwen36RgbImage>), ApiError> {
+    if let Some(text) = content.as_str() {
+        return Ok((ChatContent::Text(text.to_string()), None));
+    }
+    let parts = content.as_array().ok_or_else(|| {
+        invalid(
+            "input",
+            format!("input[{item_index}].content must be text or an array"),
+        )
+    })?;
+    let mut normalized = Vec::with_capacity(parts.len());
+    let mut image = None;
+    for (part_index, part) in parts.iter().enumerate() {
+        let kind = part.get("type").and_then(Value::as_str);
+        match kind {
+            Some("input_text" | "output_text") => {
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    invalid(
+                        "input",
+                        format!("input[{item_index}].content[{part_index}].text is required"),
+                    )
+                })?;
+                normalized.push(ChatContentPart::Text {
+                    text: text.to_string(),
+                });
+            }
+            Some("input_image") => {
+                if role != "user" {
+                    return Err(invalid(
+                        "input",
+                        format!(
+                            "input[{item_index}].content[{part_index}] input_image is only valid for user messages"
+                        ),
+                    ));
+                }
+                let url = part
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        invalid(
+                            "input",
+                            format!(
+                                "input[{item_index}].content[{part_index}].image_url is required"
+                            ),
+                        )
+                    })?;
+                if image
+                    .replace(decode_data_image(url, "input", "input_image.image_url")?)
+                    .is_some()
+                {
+                    return Err(unsupported(
+                        "input",
+                        "only one image is supported per response message",
+                    ));
+                }
+                normalized.push(ChatContentPart::Image);
+            }
+            _ => {
+                return Err(unsupported(
+                    "input",
+                    format!(
+                        "input[{item_index}].content[{part_index}] type '{}' is not supported",
+                        kind.unwrap_or_default()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok((ChatContent::Parts(normalized), image))
 }
 
 fn normalize_function_call(object: &Map<String, Value>, index: usize) -> Result<Value, ApiError> {
@@ -214,12 +318,67 @@ mod tests {
                 "output": "sunny"
             }),
         ]);
-        let messages = normalize_input(input, Some("be concise")).unwrap();
+        let normalized = normalize_input(input, Some("be concise")).unwrap();
 
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[3].role, "tool");
-        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert!(normalized.image.is_none());
+        assert_eq!(normalized.messages.len(), 4);
+        assert_eq!(normalized.messages[0].role, "system");
+        assert_eq!(normalized.messages[2].role, "assistant");
+        assert_eq!(normalized.messages[3].role, "tool");
+        assert_eq!(
+            normalized.messages[3].tool_call_id.as_deref(),
+            Some("call_1")
+        );
+    }
+
+    #[test]
+    fn normalizes_input_image_data_url_and_rejects_remote_image() {
+        let data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let input = ResponseInput::Items(vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "input_image", "image_url": data_url},
+                {"type": "input_text", "text": "describe"}
+            ]
+        })]);
+        let normalized = normalize_input(input, None).unwrap();
+
+        let image = normalized.image.unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
+        assert_eq!(
+            normalized.messages[0].content,
+            Some(ChatContent::Parts(vec![
+                ChatContentPart::Image,
+                ChatContentPart::Text {
+                    text: "describe".to_string(),
+                },
+            ]))
+        );
+
+        let remote = ResponseInput::Items(vec![json!({
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "https://example.com/image.png"
+            }]
+        })]);
+        let error = normalize_input(remote, None).unwrap_err();
+        assert_eq!(error.param, Some("input"));
+        assert_eq!(error.code, Some("unsupported_value"));
+    }
+
+    #[test]
+    fn rejects_input_image_outside_user_messages() {
+        let input = ResponseInput::Items(vec![json!({
+            "role": "assistant",
+            "content": [{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA"
+            }]
+        })]);
+
+        let error = normalize_input(input, None).unwrap_err();
+        assert_eq!(error.param, Some("input"));
+        assert!(error.message.contains("only valid for user messages"));
     }
 }

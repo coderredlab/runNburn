@@ -24,8 +24,9 @@ pub use engine::{
     PrefillDriftTrace,
 };
 pub use generate::{
-    generate_stream_multimodal, generate_stream_multimodal_cancellable, GenerateParams,
-    GenerateResult, GenerationCancellation, MirostatParams, TextStopFilter,
+    generate_stream_multimodal, generate_stream_multimodal_cancellable,
+    generate_stream_multimodal_resuming, generate_stream_multimodal_resuming_cancellable,
+    GenerateParams, GenerateResult, GenerationCancellation, MirostatParams, TextStopFilter,
 };
 pub use kv_cache::{KVCache, KvCacheFormat, KvCacheMetrics};
 pub use multimodal::{CompiledPrompt, PromptSpan};

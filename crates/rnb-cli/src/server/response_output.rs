@@ -329,19 +329,21 @@ fn capture_sequence_state(
         result.prompt_token_ids.clone()
     };
     token_ids.extend_from_slice(&result.generated_token_ids);
-    let prompt_alignment = prepared
-        .generation
-        .response_history_affixes
-        .as_ref()
-        .filter(|_| result.output.tool_calls.is_empty() && !result.output.content.is_empty())
-        .map(|(prefix, suffix)| {
-            let mut prompt_prefix =
-                String::with_capacity(prefix.len() + result.output.content.len() + suffix.len());
-            prompt_prefix.push_str(prefix);
-            prompt_prefix.push_str(&result.output.content);
-            prompt_prefix.push_str(suffix);
-            (prompt_prefix, suffix.clone())
-        });
+    let prompt_alignment =
+        if result.output.tool_calls.is_empty() && !result.output.content.is_empty() {
+            match prepared.generation.response_history_context.as_ref() {
+                Some(context) => match context.prompt_alignment(engine, &result.output.content) {
+                    Ok(alignment) => Some(alignment),
+                    Err(error) => {
+                        eprintln!("[WARN] response KV snapshot skipped: {error}");
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
     let captured = match prompt_alignment {
         Some((prompt_prefix, append_text)) => engine.capture_sequence_state_with_prompt_alignment(
             token_ids,

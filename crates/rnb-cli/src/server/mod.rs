@@ -1,5 +1,6 @@
 mod generation;
 mod http;
+mod image_input;
 mod lifecycle;
 mod response_config;
 mod response_input;

@@ -72,7 +72,7 @@ impl ResponseRequest {
         context: ResolvedResponseContext,
     ) -> Result<PreparedResponseRequest, ApiError> {
         self.validate_supported_features()?;
-        let messages = normalize_input(
+        let normalized_input = normalize_input(
             ResponseInput::Items(context.history_items.clone()),
             self.instructions.as_deref(),
         )?;
@@ -93,8 +93,8 @@ impl ResponseRequest {
 
         let generation = GenerationRequest {
             model: self.model,
-            messages,
-            image: None,
+            messages: normalized_input.messages,
+            image: normalized_input.image,
             max_tokens: self.max_output_tokens,
             max_tokens_param: "max_output_tokens",
             input_param: "input",

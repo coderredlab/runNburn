@@ -481,6 +481,109 @@ fn generate_stream_impl_with_tokens(
     )
 }
 
+pub fn generate_stream_multimodal_resuming(
+    engine: &mut crate::engine::Engine,
+    rendered_prompt: &str,
+    image: &Qwen36RgbImage,
+    params: &GenerateParams,
+    state: &crate::engine::EngineSequenceState,
+    callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let start = Instant::now();
+    check_generation_cancellation()?;
+    if !state.is_multimodal() {
+        return Err(crate::error::LlmError::InvalidChatRequest(
+            "multimodal resume requires a multimodal sequence snapshot".into(),
+        ));
+    }
+    if !state.matches_multimodal_image(image) {
+        return Err(crate::error::LlmError::InvalidChatRequest(
+            "multimodal resume image does not match the cached sequence".into(),
+        ));
+    }
+    let prompt_tokens = resumed_prompt_tokens(engine, rendered_prompt, state).ok_or_else(|| {
+        let alignment = state.prompt_resume_alignment().map_or_else(
+            || "no prompt alignment".to_string(),
+            |(prefix, _)| {
+                let common_prefix_bytes = prefix
+                    .bytes()
+                    .zip(rendered_prompt.bytes())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                format!(
+                    "cached prefix bytes={}, rendered prompt bytes={}, common prefix bytes={common_prefix_bytes}",
+                    prefix.len(),
+                    rendered_prompt.len()
+                )
+            },
+        );
+        crate::error::LlmError::InvalidChatRequest(format!(
+            "multimodal resume requires prompt content appended to the cached sequence ({alignment})"
+        ))
+    })?;
+    let cached_tokens = state.token_len();
+    engine.restore_sequence_state(state)?;
+
+    let mut logits = Vec::new();
+    for &token in &prompt_tokens[cached_tokens..] {
+        check_generation_cancellation()?;
+        logits = engine.forward(&[token])?;
+    }
+    if logits.is_empty() {
+        return Err(crate::error::LlmError::Forward(
+            "multimodal resume produced no suffix logits".into(),
+        ));
+    }
+
+    let prompt_len = engine.kv_cache.current_len();
+    let total_rows = prompt_len.saturating_add(params.max_tokens);
+    if total_rows > engine.metadata.max_seq_len {
+        return Err(crate::error::LlmError::InvalidChatRequest(format!(
+            "resumed multimodal prompt executes {prompt_len} rows and allows {} completion rows, exceeding context limit {}",
+            params.max_tokens, engine.metadata.max_seq_len
+        )));
+    }
+    let mut rng = match params.seed {
+        Some(seed) => SmallRng::seed_from_u64(seed),
+        None => SmallRng::from_entropy(),
+    };
+    let sampler = SamplerChain::from_params(params);
+    let constraint = params
+        .constraint
+        .as_ref()
+        .map(|constraint| StructuredDecoder::new(&engine.tokenizer, constraint))
+        .transpose()?;
+    let mut result = finish_generation(
+        engine,
+        prompt_tokens,
+        prompt_len,
+        params,
+        start,
+        &mut rng,
+        sampler,
+        constraint,
+        logits,
+        None,
+        callback,
+    )?;
+    result.cached_prompt_tokens = cached_tokens;
+    Ok(result)
+}
+
+pub fn generate_stream_multimodal_resuming_cancellable(
+    engine: &mut crate::engine::Engine,
+    rendered_prompt: &str,
+    image: &Qwen36RgbImage,
+    params: &GenerateParams,
+    state: &crate::engine::EngineSequenceState,
+    cancellation: &GenerationCancellation,
+    callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let _scope = CancellationScope::enter(cancellation);
+    check_generation_cancellation()?;
+    generate_stream_multimodal_resuming(engine, rendered_prompt, image, params, state, callback)
+}
+
 pub fn generate_stream_multimodal(
     engine: &mut crate::engine::Engine,
     rendered_prompt: &str,

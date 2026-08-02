@@ -9,7 +9,8 @@ use super::prefill::run_prefill_layers_cpu_range_with_positions;
 use super::{finalize_prefill_logits, kernels, Engine};
 use crate::error::{LlmError, Result};
 use crate::multimodal::{
-    assemble_prompt_hidden, compile_qwen36_prompt, CompiledPrompt, SequenceCursor,
+    assemble_prompt_hidden, compile_qwen36_prompt, qwen36_image_fingerprint, CompiledPrompt,
+    SequenceCursor,
 };
 
 impl Engine {
@@ -46,7 +47,12 @@ impl Engine {
             token_ids.push(self.tokenizer.vocab.special.bos);
         }
         token_ids.extend(self.tokenizer.encode(rendered_prompt));
-        let compiled = compile_qwen36_prompt(token_ids, image_pad_token_id, vision)?;
+        let compiled = compile_qwen36_prompt(
+            token_ids,
+            image_pad_token_id,
+            vision,
+            qwen36_image_fingerprint(image),
+        )?;
         if compiled.executed_rows > self.metadata.max_seq_len {
             return Err(LlmError::InvalidChatRequest(format!(
                 "multimodal prompt executes {} rows, exceeding context limit {}",

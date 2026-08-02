@@ -3,9 +3,10 @@ use super::layer_weights::ModelWeights;
 use super::mtp::{EngineMtpRuntime, EngineMtpSequenceState, EngineMtpState};
 use super::types::{ModelMetadata, ScratchBuffers};
 use crate::kv_cache::{KVCache, KVCacheSnapshot, KvCacheMetrics};
-use crate::multimodal::SequenceCursor;
+use crate::multimodal::{qwen36_image_fingerprint, SequenceCursor};
 use crate::tokenizer::Tokenizer;
 use rnb_loader::Architecture as ModelArchitecture;
+use rnb_model_qwen::Qwen36RgbImage;
 
 #[derive(Clone)]
 struct PromptResumeAlignment {
@@ -20,11 +21,21 @@ pub struct EngineSequenceState {
     prompt_alignment: Option<PromptResumeAlignment>,
     kv_cache: KVCacheSnapshot,
     mtp: Option<EngineMtpSequenceState>,
+    sequence_cursor: Option<SequenceCursor>,
 }
 
 impl EngineSequenceState {
     pub fn token_len(&self) -> usize {
         self.cached_token_len
+    }
+
+    pub(crate) fn is_multimodal(&self) -> bool {
+        self.sequence_cursor.is_some()
+    }
+
+    pub(crate) fn matches_multimodal_image(&self, image: &Qwen36RgbImage) -> bool {
+        self.sequence_cursor
+            .is_some_and(|cursor| cursor.image_fingerprint == qwen36_image_fingerprint(image))
     }
 
     pub fn byte_size(&self) -> u64 {
@@ -188,13 +199,35 @@ impl Engine {
             ));
         }
         self.materialize_sequence_state()?;
-        let cached_len = self.kv_cache.current_len();
-        if cached_len == 0 || cached_len > token_ids.len() {
-            return Err(crate::error::LlmError::Forward(format!(
-                "cannot capture sequence state: {} tokens for KV length {cached_len}",
-                token_ids.len()
-            )));
+        let physical_cached_len = self.kv_cache.current_len();
+        if physical_cached_len == 0 {
+            return Err(crate::error::LlmError::Forward(
+                "cannot capture sequence state with an empty KV cache".to_string(),
+            ));
         }
+        let sequence_cursor = self.sequence_cursor;
+        let cached_token_len = if let Some(cursor) = sequence_cursor {
+            if cursor.physical_rows != physical_cached_len
+                || cursor.token_count == 0
+                || cursor.token_count > token_ids.len()
+            {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "cannot capture multimodal sequence state: {} tokens, cursor {} logical tokens / {} physical rows, KV length {physical_cached_len}",
+                    token_ids.len(),
+                    cursor.token_count,
+                    cursor.physical_rows
+                )));
+            }
+            cursor.token_count
+        } else {
+            if physical_cached_len > token_ids.len() {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "cannot capture sequence state: {} tokens for KV length {physical_cached_len}",
+                    token_ids.len()
+                )));
+            }
+            physical_cached_len
+        };
         let mtp = if self.mtp_spec_requested() {
             Some(
                 self.mtp_runtime
@@ -212,10 +245,11 @@ impl Engine {
         };
         Ok(EngineSequenceState {
             token_ids,
-            cached_token_len: cached_len,
+            cached_token_len,
             prompt_alignment,
             kv_cache: self.kv_cache.snapshot(),
             mtp,
+            sequence_cursor,
         })
     }
 
@@ -238,6 +272,16 @@ impl Engine {
         self.kv_cache
             .restore_snapshot(&state.kv_cache)
             .map_err(crate::error::LlmError::Forward)?;
+        if let Some(cursor) = state.sequence_cursor {
+            let restored_len = self.kv_cache.current_len();
+            if cursor.physical_rows != restored_len {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "multimodal sequence cursor has {} physical rows for restored KV length {restored_len}",
+                    cursor.physical_rows
+                )));
+            }
+            self.sequence_cursor = Some(cursor);
+        }
         if let Some(mtp_state) = state.mtp.as_ref() {
             self.mtp_runtime
                 .as_mut()
@@ -250,5 +294,105 @@ impl Engine {
         }
         self.last_layer_hidden_cached.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv_cache::KvCacheFormat;
+    use crate::tokenizer::{
+        bpe::Tokenizer as BpeTokenizer,
+        vocab::{SpecialTokens, Vocab},
+    };
+
+    fn mock_engine() -> Engine {
+        let tokenizer = BpeTokenizer::new(
+            Vocab::new(
+                (0..16).map(|index| format!("t{index}")).collect(),
+                SpecialTokens {
+                    bos: 1,
+                    eos: 2,
+                    pad: None,
+                },
+            ),
+            vec![],
+        );
+        Engine::mock(
+            tokenizer,
+            ModelMetadata {
+                num_layers: 1,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 128,
+                vocab_size: 16,
+                max_seq_len: 64,
+                hidden_dim: 128,
+                rope_theta: 10_000.0,
+                rope_theta_swa: 10_000.0,
+                rope_dim: 0,
+                rope_dim_swa: 0,
+                rope_sections: [0; 4],
+                norm_eps: 1e-5,
+                final_logit_softcapping: 0.0,
+                query_pre_attn_scalar: 256.0,
+                sliding_window: 0,
+                shared_kv_layers: 0,
+                sliding_window_pattern: vec![],
+                key_length_full: 0,
+                key_length_swa: 0,
+                value_length_swa: 0,
+                head_count_kv_per_layer: None,
+                embedding_length_per_layer_input: 0,
+                expert_used_count: 0,
+                expert_weights_scale: 1.0,
+                ssm_d_inner: 0,
+                ssm_d_state: 0,
+                ssm_n_group: 0,
+                ssm_dt_rank: 0,
+                ssm_conv_kernel: 0,
+                full_attention_interval: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn multimodal_snapshot_preserves_logical_tokens_cursor_and_image_identity() {
+        let mut engine = mock_engine();
+        engine.kv_cache =
+            KVCache::new_per_layer_with_format(64, &[1], &[128], KvCacheFormat::KvarnK4V4G128)
+                .unwrap();
+        let row = vec![0.0; 128];
+        for _ in 0..3 {
+            let pos = engine.kv_cache.current_len();
+            engine.kv_cache.append(0, pos, &row, &row);
+        }
+        let image = Qwen36RgbImage::new(1, 1, vec![10, 20, 30]).unwrap();
+        engine.sequence_cursor = Some(SequenceCursor {
+            physical_rows: 3,
+            logical_position: 7,
+            token_count: 2,
+            image_fingerprint: qwen36_image_fingerprint(&image),
+        });
+
+        let state = engine.capture_sequence_state(vec![3, 4, 5, 6]).unwrap();
+        assert_eq!(state.token_len(), 2);
+        assert!(state.is_multimodal());
+        assert!(state.matches_multimodal_image(&image));
+        let other_image = Qwen36RgbImage::new(1, 1, vec![10, 20, 31]).unwrap();
+        assert!(!state.matches_multimodal_image(&other_image));
+
+        engine.clear_sequence_state().unwrap();
+        engine.restore_sequence_state(&state).unwrap();
+        assert_eq!(engine.kv_cache.current_len(), 3);
+        assert_eq!(
+            engine.sequence_cursor,
+            Some(SequenceCursor {
+                physical_rows: 3,
+                logical_position: 7,
+                token_count: 2,
+                image_fingerprint: qwen36_image_fingerprint(&image),
+            })
+        );
     }
 }

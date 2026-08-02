@@ -163,17 +163,49 @@ impl Engine {
         #[cfg(feature = "cuda")]
         {
             let current_len = self.kv_cache.current_len();
+            let max_kv_dim = (0..self.kv_cache.num_layers())
+                .filter(|&layer_idx| self.kv_cache.layer_uses_kvarn(layer_idx))
+                .map(|layer_idx| self.kv_cache.layer_kv_dim(layer_idx))
+                .max()
+                .unwrap_or(0);
+            let mut materialized_key = vec![0u16; current_len.saturating_mul(max_kv_dim)];
+            let mut materialized_value = vec![0u16; current_len.saturating_mul(max_kv_dim)];
             for layer_idx in 0..self.kv_cache.num_layers() {
                 let kv_dim = self.kv_cache.layer_kv_dim(layer_idx);
-                let (key, value) = self.kv_cache.get_up_to_mut(layer_idx, current_len);
-                cuda_runtime::sync_device_kv_cache_f16_to_host(
-                    layer_idx,
-                    key,
-                    value,
-                    kv_dim,
-                    current_len,
-                )
-                .map_err(crate::error::LlmError::Forward)?;
+                if self.kv_cache.layer_uses_kvarn(layer_idx) {
+                    let count = current_len.saturating_mul(kv_dim);
+                    let key = &mut materialized_key[..count];
+                    let value = &mut materialized_value[..count];
+                    let synced = cuda_runtime::sync_device_kv_cache_f16_to_host(
+                        layer_idx,
+                        key,
+                        value,
+                        kv_dim,
+                        current_len,
+                    )
+                    .map_err(crate::error::LlmError::Forward)?;
+                    if synced {
+                        self.kv_cache
+                            .replace_layer_f16_range_compacted(
+                                layer_idx,
+                                0,
+                                current_len,
+                                key,
+                                value,
+                            )
+                            .map_err(crate::error::LlmError::Forward)?;
+                    }
+                } else {
+                    let (key, value) = self.kv_cache.get_up_to_mut(layer_idx, current_len);
+                    cuda_runtime::sync_device_kv_cache_f16_to_host(
+                        layer_idx,
+                        key,
+                        value,
+                        kv_dim,
+                        current_len,
+                    )
+                    .map_err(crate::error::LlmError::Forward)?;
+                }
             }
             for ssm in &mut self.kv_cache.ssm_states {
                 let Some(state) = ssm.as_mut() else {

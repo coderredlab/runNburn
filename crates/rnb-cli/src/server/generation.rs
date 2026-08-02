@@ -1,8 +1,10 @@
 use super::http::ApiError;
 use super::types::PreparedGenerationRequest;
 use rnb_llm::{
-    generate_stream_multimodal, generate_stream_multimodal_cancellable, parse_assistant_output,
-    Engine, EngineSequenceState, GenerationCancellation, ParsedAssistantOutput, TextStopFilter,
+    generate_stream_multimodal, generate_stream_multimodal_cancellable,
+    generate_stream_multimodal_resuming, generate_stream_multimodal_resuming_cancellable,
+    parse_assistant_output, Engine, EngineSequenceState, GenerationCancellation,
+    ParsedAssistantOutput, TextStopFilter,
 };
 
 pub(super) struct GeneratedCompletion {
@@ -53,13 +55,25 @@ pub(super) fn run_generation(
         })
     };
     let result = if let Some(image) = prepared.image.as_ref() {
-        if resume_state.is_some() {
-            return Err(ApiError::internal(
-                "multimodal generation cannot resume a cached sequence",
-            ));
-        }
-        match cancellation {
-            Some(cancellation) => generate_stream_multimodal_cancellable(
+        match (resume_state, cancellation) {
+            (Some(state), Some(cancellation)) => generate_stream_multimodal_resuming_cancellable(
+                engine,
+                &prepared.prompt,
+                image,
+                &prepared.params,
+                state,
+                cancellation,
+                &mut callback,
+            ),
+            (Some(state), None) => generate_stream_multimodal_resuming(
+                engine,
+                &prepared.prompt,
+                image,
+                &prepared.params,
+                state,
+                &mut callback,
+            ),
+            (None, Some(cancellation)) => generate_stream_multimodal_cancellable(
                 engine,
                 &prepared.prompt,
                 image,
@@ -67,7 +81,7 @@ pub(super) fn run_generation(
                 cancellation,
                 &mut callback,
             ),
-            None => generate_stream_multimodal(
+            (None, None) => generate_stream_multimodal(
                 engine,
                 &prepared.prompt,
                 image,

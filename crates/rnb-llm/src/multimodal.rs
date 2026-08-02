@@ -1,4 +1,7 @@
-use rnb_model_qwen::{plan_qwen36_multimodal_positions, Qwen36PositionSpan, Qwen36VisionOutput};
+use rnb_model_qwen::{
+    plan_qwen36_multimodal_positions, Qwen36PositionSpan, Qwen36RgbImage, Qwen36VisionOutput,
+};
+use sha2::{Digest, Sha256};
 
 use crate::error::{LlmError, Result};
 
@@ -23,12 +26,15 @@ pub struct CompiledPrompt {
     pub executed_rows: usize,
     pub logical_position_end: u32,
     pub sampler_token_ids: Vec<u32>,
+    pub(crate) image_fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SequenceCursor {
     pub physical_rows: usize,
     pub logical_position: u32,
+    pub token_count: usize,
+    pub image_fingerprint: [u8; 32],
 }
 
 impl SequenceCursor {
@@ -36,14 +42,25 @@ impl SequenceCursor {
         Self {
             physical_rows: prompt.executed_rows,
             logical_position: prompt.logical_position_end,
+            token_count: prompt.sampler_token_ids.len(),
+            image_fingerprint: prompt.image_fingerprint,
         }
     }
+}
+
+pub(crate) fn qwen36_image_fingerprint(image: &Qwen36RgbImage) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((image.width() as u64).to_le_bytes());
+    hasher.update((image.height() as u64).to_le_bytes());
+    hasher.update(image.pixels());
+    hasher.finalize().into()
 }
 
 pub(crate) fn compile_qwen36_prompt(
     token_ids: Vec<u32>,
     image_pad_token_id: u32,
     vision: Qwen36VisionOutput,
+    image_fingerprint: [u8; 32],
 ) -> Result<CompiledPrompt> {
     let placeholder_indices = token_ids
         .iter()
@@ -131,6 +148,7 @@ pub(crate) fn compile_qwen36_prompt(
         executed_rows: position_plan.physical_rows,
         logical_position_end: position_plan.logical_position_end,
         sampler_token_ids,
+        image_fingerprint,
     })
 }
 
@@ -227,7 +245,8 @@ mod tests {
     #[test]
     fn compile_replaces_only_image_placeholder_with_physical_rows() {
         let prompt =
-            compile_qwen36_prompt(vec![10, 99, 11], 99, vision_output(vec![0.1; 4])).unwrap();
+            compile_qwen36_prompt(vec![10, 99, 11], 99, vision_output(vec![0.1; 4]), [7; 32])
+                .unwrap();
 
         assert_eq!(prompt.executed_rows, 4);
         assert_eq!(prompt.logical_position_end, 4);
@@ -244,6 +263,7 @@ mod tests {
             vec![10, 99, 11],
             99,
             vision_output(vec![0.25, -0.5, 0.75, -1.0]),
+            [0; 32],
         )
         .unwrap();
         let hidden = assemble_prompt_hidden(
@@ -264,12 +284,13 @@ mod tests {
 
     #[test]
     fn compile_rejects_missing_or_duplicate_placeholders() {
-        let missing =
-            compile_qwen36_prompt(vec![1, 2], 99, vision_output(vec![0.0; 4])).unwrap_err();
+        let missing = compile_qwen36_prompt(vec![1, 2], 99, vision_output(vec![0.0; 4]), [0; 32])
+            .unwrap_err();
         assert!(missing.to_string().contains("got 0"));
 
         let duplicate =
-            compile_qwen36_prompt(vec![99, 99], 99, vision_output(vec![0.0; 4])).unwrap_err();
+            compile_qwen36_prompt(vec![99, 99], 99, vision_output(vec![0.0; 4]), [0; 32])
+                .unwrap_err();
         assert!(duplicate.to_string().contains("got 2"));
     }
 }
