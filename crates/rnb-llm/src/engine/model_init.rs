@@ -52,6 +52,7 @@ pub(super) fn build_tokenizer(tok_data: &TokenizerData) -> Result<(Tokenizer, us
     for (name, id) in [
         ("bos_token_id", Some(bos)),
         ("eos_token_id", Some(eos)),
+        ("eot_token_id", tok_data.eot_id),
         ("unknown_token_id", tok_data.unknown_id.or(default_unknown)),
         ("separator_token_id", tok_data.separator_id),
         ("padding_token_id", tok_data.padding_id),
@@ -179,6 +180,13 @@ pub(super) fn build_tokenizer(tok_data: &TokenizerData) -> Result<(Tokenizer, us
         }
     };
     tokenizer.set_chat_template(tok_data.chat_template.clone());
+    tokenizer.set_model_stop_tokens(
+        tok_data
+            .eot_id
+            .filter(|token| *token != eos)
+            .into_iter()
+            .collect(),
+    );
 
     Ok((tokenizer, tok_data.tokens.len()))
 }
@@ -284,6 +292,16 @@ mod tests {
         assert_eq!(tokenizer.vocab.special.pad, Some(4));
         assert_eq!(tokenizer.vocab.unknown_id(), Some(5));
         assert_eq!(tokenizer.encode("SPECIAL"), vec![3]);
+    }
+
+    #[test]
+    fn tokenizer_builder_preserves_distinct_eot_stop_token() {
+        let mut data = tokenizer_data("gpt2", &["x", "<bos>", "<eos>", "<eot>"]);
+        data.eot_id = Some(3);
+
+        let (tokenizer, _) = build_tokenizer(&data).unwrap();
+
+        assert_eq!(tokenizer.model_stop_tokens(), &[3]);
     }
 
     #[test]

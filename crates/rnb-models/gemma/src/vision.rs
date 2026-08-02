@@ -182,14 +182,25 @@ fn validate_tensors(
         &[2, position_table_size, embedding_length],
         GGMLType::F32,
     )?;
-    for name in ["v.std_bias", "v.std_scale"] {
-        require_tensor(projector, name, &[embedding_length], GGMLType::F32)?;
+    match (
+        projector.tensors.contains_key("v.std_bias"),
+        projector.tensors.contains_key("v.std_scale"),
+    ) {
+        (false, false) => {}
+        (true, true) => {
+            require_tensor(projector, "v.std_bias", &[embedding_length], GGMLType::F32)?;
+            require_tensor(projector, "v.std_scale", &[embedding_length], GGMLType::F32)?;
+        }
+        _ => {
+            return invalid(
+                "projector must contain both 'v.std_bias' and 'v.std_scale', or neither",
+            );
+        }
     }
-    require_tensor(
+    require_clippable_tensor(
         projector,
         "mm.input_projection.weight",
         &[projection_dim, embedding_length],
-        GGMLType::BF16,
     )?;
 
     for layer in 0..block_count {
@@ -221,32 +232,63 @@ fn validate_tensors(
             "attn_v.weight",
             "attn_out.weight",
         ] {
-            require_tensor(
+            require_clippable_tensor(
                 projector,
                 &format!("{prefix}.{suffix}"),
                 &[embedding_length, embedding_length],
-                GGMLType::BF16,
             )?;
         }
         for suffix in ["ffn_gate.weight", "ffn_up.weight"] {
-            require_tensor(
+            require_clippable_tensor(
                 projector,
                 &format!("{prefix}.{suffix}"),
                 &[feed_forward_length, embedding_length],
-                GGMLType::BF16,
             )?;
         }
-        require_tensor(
+        require_clippable_tensor(
             projector,
             &format!("{prefix}.ffn_down.weight"),
             &[embedding_length, feed_forward_length],
-            GGMLType::BF16,
         )?;
     }
     Ok(())
 }
 
-fn require_tensor(
+fn require_clippable_tensor(
+    projector: &VisionProjectorDescriptor,
+    weight_name: &str,
+    shape: &[usize],
+) -> Result<(), Gemma4VisionError> {
+    require_tensor(projector, weight_name, shape, GGMLType::BF16)?;
+
+    let prefix = weight_name
+        .strip_suffix(".weight")
+        .ok_or_else(|| Gemma4VisionError(format!("invalid weight tensor name '{weight_name}'")))?;
+    let clamp_names = [
+        format!("{prefix}.input_min"),
+        format!("{prefix}.input_max"),
+        format!("{prefix}.output_min"),
+        format!("{prefix}.output_max"),
+    ];
+    let clamp_count = clamp_names
+        .iter()
+        .filter(|name| projector.tensors.contains_key(name.as_str()))
+        .count();
+    if clamp_count == 0 {
+        return Ok(());
+    }
+    if clamp_count != clamp_names.len() {
+        return invalid(format!(
+            "tensor '{weight_name}' must contain all four input/output clamp scalars"
+        ));
+    }
+    for name in clamp_names {
+        require_tensor(projector, &name, &[1], GGMLType::F32)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn require_tensor(
     projector: &VisionProjectorDescriptor,
     name: &str,
     shape: &[usize],
@@ -271,7 +313,7 @@ fn require_tensor(
     Ok(())
 }
 
-fn metadata_usize(
+pub(crate) fn metadata_usize(
     projector: &VisionProjectorDescriptor,
     key: &str,
 ) -> Result<usize, Gemma4VisionError> {
@@ -280,7 +322,7 @@ fn metadata_usize(
         .map_err(metadata_error)
 }
 
-fn metadata_rgb(
+pub(crate) fn metadata_rgb(
     projector: &VisionProjectorDescriptor,
     key: &str,
 ) -> Result<[f32; 3], Gemma4VisionError> {
@@ -297,6 +339,6 @@ fn metadata_error(error: rnb_loader::LoaderError) -> Gemma4VisionError {
     Gemma4VisionError(error.to_string())
 }
 
-fn invalid<T>(message: impl Into<String>) -> Result<T, Gemma4VisionError> {
+pub(crate) fn invalid<T>(message: impl Into<String>) -> Result<T, Gemma4VisionError> {
     Err(Gemma4VisionError(message.into()))
 }

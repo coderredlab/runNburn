@@ -9,7 +9,7 @@ use crate::engine::moe_types::q4k_bytes_per_row;
 use crate::engine::norm::apply_model_gate_mul_inplace;
 use crate::engine::scalar_gemv::dot_k_block_row;
 
-use super::moe_types::{down_bytes_per_row, MoeLayerView};
+use super::moe_types::{down_bytes_per_row, gate_up_bytes_per_row, MoeLayerView};
 
 pub(super) fn select_experts_from_logits(
     logits: &[f32],
@@ -60,15 +60,14 @@ fn gemma4_moe_cuda_override(raw: Option<&str>) -> Option<bool> {
 }
 
 #[cfg(feature = "cuda")]
-fn gemma4_moe_cuda_quant_supported(quant: GGMLType) -> bool {
-    matches!(quant, GGMLType::Q5_1 | GGMLType::Q8_0)
+fn gemma4_moe_cuda_quant_supported(gate_up: GGMLType, down: GGMLType) -> bool {
+    gate_up == GGMLType::Q4_K && matches!(down, GGMLType::Q5_1 | GGMLType::Q8_0)
 }
 
 impl<'a> MoeLayerView<'a> {
     #[inline]
     pub fn per_expert_gate_up_bytes(&self) -> usize {
-        // rows = n_ff*2, cols = n_embd
-        (self.n_ff * 2) * q4k_bytes_per_row(self.n_embd)
+        (self.n_ff * 2) * gate_up_bytes_per_row(self.n_embd, self.gate_up_quant)
     }
 
     #[inline]
@@ -83,7 +82,7 @@ impl<'a> MoeLayerView<'a> {
         if let Some(enabled) = gemma4_moe_cuda_override(configured.as_deref()) {
             return enabled;
         }
-        if !gemma4_moe_cuda_quant_supported(self.down_quant) {
+        if !gemma4_moe_cuda_quant_supported(self.gate_up_quant, self.down_quant) {
             return false;
         }
         match backend_runtime::gemma4_moe_admitted(
@@ -136,13 +135,18 @@ impl<'a> MoeLayerView<'a> {
                 }
             }
         }
+        #[cfg(feature = "cuda")]
+        if self.gate_up_quant == GGMLType::Q4_0 && self.down_quant == GGMLType::Q4_0 {
+            self.forward_selected_q4_0(h, &idx, &exps, out);
+            return;
+        }
 
         #[cfg(target_arch = "aarch64")]
         let h_q8k = gemma4_moe_decode_q8k_enabled()
             .then(|| crate::engine::quantized_dispatch::quantize_raw_q8k(h));
 
         let gate_up_rows = self.n_ff * 2;
-        let gate_up_bpr = q4k_bytes_per_row(self.n_embd);
+        let gate_up_bpr = gate_up_bytes_per_row(self.n_embd, self.gate_up_quant);
         let down_bpr = down_bytes_per_row(self.n_ff, self.down_quant);
         let per_gu = self.per_expert_gate_up_bytes();
         let per_dn = self.per_expert_down_bytes();
@@ -185,29 +189,30 @@ impl<'a> MoeLayerView<'a> {
 
                 let mut gate_up_out = vec![0f32; gate_up_rows];
                 #[cfg(target_arch = "aarch64")]
-                let pair_done = h_q8k.as_deref().is_some_and(|q8k| {
-                    let projection_bytes = n_ff * gate_up_bpr;
-                    let (gate_out, up_out) = gate_up_out.split_at_mut(n_ff);
-                    crate::engine::quantized_dispatch::dispatch_q4k_pair_q8k_prequantized(
-                        &gu_slice[..projection_bytes],
-                        &gu_slice[projection_bytes..],
-                        q8k,
-                        gate_out,
-                        up_out,
-                        n_ff,
-                        n_embd,
-                        gate_up_bpr,
-                        gate_up_bpr,
-                        true,
-                    )
-                });
+                let pair_done = self.gate_up_quant == GGMLType::Q4_K
+                    && h_q8k.as_deref().is_some_and(|q8k| {
+                        let projection_bytes = n_ff * gate_up_bpr;
+                        let (gate_out, up_out) = gate_up_out.split_at_mut(n_ff);
+                        crate::engine::quantized_dispatch::dispatch_q4k_pair_q8k_prequantized(
+                            &gu_slice[..projection_bytes],
+                            &gu_slice[projection_bytes..],
+                            q8k,
+                            gate_out,
+                            up_out,
+                            n_ff,
+                            n_embd,
+                            gate_up_bpr,
+                            gate_up_bpr,
+                            true,
+                        )
+                    });
                 #[cfg(not(target_arch = "aarch64"))]
                 let pair_done = false;
                 if !pair_done {
                     for r in 0..gate_up_rows {
                         let rb = &gu_slice[r * gate_up_bpr..(r + 1) * gate_up_bpr];
                         gate_up_out[r] =
-                            dot_k_block_row(rb, h, n_embd, gate_up_bpr, GGMLType::Q4_K);
+                            dot_k_block_row(rb, h, n_embd, gate_up_bpr, self.gate_up_quant);
                     }
                 }
 
@@ -233,6 +238,59 @@ impl<'a> MoeLayerView<'a> {
         for expert_out in &per_expert {
             for i in 0..n_embd {
                 out[i] += expert_out[i];
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_selected_q4_0(
+        &self,
+        h: &[f32],
+        idx: &[usize],
+        expert_weights: &[f32],
+        out: &mut [f32],
+    ) {
+        use crate::engine::quantized_dispatch::prefill_raw_quantized_batch;
+
+        let gate_up_rows = self.n_ff * 2;
+        let gate_up_bpr = gate_up_bytes_per_row(self.n_embd, self.gate_up_quant);
+        let down_bpr = down_bytes_per_row(self.n_ff, self.down_quant);
+        let per_gate_up = self.per_expert_gate_up_bytes();
+        let per_down = self.per_expert_down_bytes();
+        let mut gate_up = vec![0.0f32; gate_up_rows];
+        let mut expert_out = vec![0.0f32; self.n_embd];
+        out.fill(0.0);
+
+        for (slot, &expert) in idx.iter().enumerate() {
+            let gate_up_bytes =
+                &self.gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
+            prefill_raw_quantized_batch(
+                gate_up_bytes,
+                h,
+                &mut gate_up,
+                gate_up_rows,
+                self.n_embd,
+                1,
+                gate_up_bpr,
+                self.gate_up_quant,
+            );
+            let (gate, up) = gate_up.split_at_mut(self.n_ff);
+            apply_model_gate_mul_inplace(gate, up, ModelArchitecture::Gemma4);
+
+            let down_bytes = &self.down_bytes[expert * per_down..(expert + 1) * per_down];
+            prefill_raw_quantized_batch(
+                down_bytes,
+                gate,
+                &mut expert_out,
+                self.n_embd,
+                self.n_ff,
+                1,
+                down_bpr,
+                self.down_quant,
+            );
+            let scale = expert_weights[slot] * self.down_scale[expert];
+            for (dst, value) in out.iter_mut().zip(&expert_out) {
+                *dst += *value * scale;
             }
         }
     }
@@ -302,9 +360,25 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn gemma4_cuda_moe_auto_accepts_only_implemented_down_quants() {
-        assert!(gemma4_moe_cuda_quant_supported(GGMLType::Q5_1));
-        assert!(gemma4_moe_cuda_quant_supported(GGMLType::Q8_0));
-        assert!(!gemma4_moe_cuda_quant_supported(GGMLType::Q5_0));
-        assert!(!gemma4_moe_cuda_quant_supported(GGMLType::Q4_K));
+        assert!(gemma4_moe_cuda_quant_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q5_1
+        ));
+        assert!(gemma4_moe_cuda_quant_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q8_0
+        ));
+        assert!(!gemma4_moe_cuda_quant_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q5_0
+        ));
+        assert!(!gemma4_moe_cuda_quant_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q4_K
+        ));
+        assert!(!gemma4_moe_cuda_quant_supported(
+            GGMLType::Q4_0,
+            GGMLType::Q4_0
+        ));
     }
 }

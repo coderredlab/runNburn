@@ -42,7 +42,10 @@ fn multimodal_decode_position(
     }
     Ok((
         cursor.logical_position as usize,
-        matches!(architecture, ModelArchitecture::Qwen35MoE),
+        matches!(
+            architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ),
     ))
 }
 
@@ -791,8 +794,7 @@ impl Engine {
                     && metadata.head_dim == 512
                     && metadata.num_heads == 8
                     && metadata.num_kv_heads == 1;
-                eprintln!("[cu63-gate] enabled={cu63_enabled} is_e2b={is_gemma4_e2b}");
-                if is_gemma4_e2b && cuda_runtime::cu63_device_decode_enabled() {
+                if is_gemma4_e2b && cu63_enabled {
                     let hidden_bytes = hidden_dim * std::mem::size_of::<f32>();
                     let hidden_dev = cuda_runtime::acquire_decode_hidden_carrier(hidden_bytes)
                         .map_err(crate::error::LlmError::Forward)?;
@@ -2043,6 +2045,11 @@ mod tests {
                 10,
             )
             .unwrap(),
+            (7, true)
+        );
+        assert_eq!(
+            super::multimodal_decode_position(Some(cursor), super::ModelArchitecture::Qwen35, 10,)
+                .unwrap(),
             (7, true)
         );
         assert_eq!(

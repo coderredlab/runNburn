@@ -84,7 +84,7 @@ pub(super) fn gemv_host_quantized_batch(
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_gemv_or_panic(
+pub(in crate::engine) fn cuda_gemv_or_panic(
     bytes: &[u8],
     input: &[f32],
     output: &mut [f32],

@@ -122,6 +122,7 @@ pub struct Tokenizer {
     sentencepiece_scores: Vec<f32>,
     add_bos_token: bool,
     chat_template: Option<String>,
+    model_stop_tokens: Vec<u32>,
     max_token_chars: usize,
     structured_decoder_factory: OnceLock<std::result::Result<llguidance::ParserFactory, String>>,
 }
@@ -226,6 +227,7 @@ impl Tokenizer {
             sentencepiece_scores: scores,
             add_bos_token,
             chat_template: None,
+            model_stop_tokens: Vec::new(),
             max_token_chars,
             structured_decoder_factory: OnceLock::new(),
         }
@@ -256,6 +258,7 @@ impl Tokenizer {
             sentencepiece_scores: scores,
             add_bos_token,
             chat_template: None,
+            model_stop_tokens: Vec::new(),
             max_token_chars,
             structured_decoder_factory: OnceLock::new(),
         }
@@ -286,6 +289,7 @@ impl Tokenizer {
             sentencepiece_scores: vec![],
             add_bos_token: true,
             chat_template: None,
+            model_stop_tokens: Vec::new(),
             max_token_chars,
             structured_decoder_factory: OnceLock::new(),
         }
@@ -305,6 +309,14 @@ impl Tokenizer {
 
     pub fn set_chat_template(&mut self, chat_template: Option<String>) {
         self.chat_template = chat_template;
+    }
+
+    pub(crate) fn set_model_stop_tokens(&mut self, stop_tokens: Vec<u32>) {
+        self.model_stop_tokens = stop_tokens;
+    }
+
+    pub(crate) fn model_stop_tokens(&self) -> &[u32] {
+        &self.model_stop_tokens
     }
 
     pub fn chat_template(&self) -> Option<&str> {

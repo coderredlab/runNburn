@@ -563,6 +563,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             .unwrap_or_default();
     let bos_id = get_u32_opt(metadata, "tokenizer.ggml.bos_token_id")?;
     let eos_id = get_u32_opt(metadata, "tokenizer.ggml.eos_token_id")?;
+    let eot_id = get_u32_opt(metadata, "tokenizer.ggml.eot_token_id")?;
     let unknown_id = get_u32_opt(metadata, "tokenizer.ggml.unknown_token_id")?;
     let padding_id = get_u32_opt(metadata, "tokenizer.ggml.padding_token_id")?;
     let separator_id = match (
@@ -622,6 +623,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     for (key, id) in [
         ("tokenizer.ggml.bos_token_id", bos_id),
         ("tokenizer.ggml.eos_token_id", eos_id),
+        ("tokenizer.ggml.eot_token_id", eot_id),
         ("tokenizer.ggml.unknown_token_id", unknown_id),
         ("tokenizer.ggml.separator_token_id", separator_id),
         ("tokenizer.ggml.padding_token_id", padding_id),
@@ -718,6 +720,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             added_tokens,
             bos_id,
             eos_id,
+            eot_id,
             unknown_id,
             separator_id,
             padding_id,

@@ -11,6 +11,7 @@ fn per_expert_byte_counts_match_gemma4_26b_a4b() {
     let view = MoeLayerView {
         router_w: &[],
         gate_up_bytes: &[],
+        gate_up_quant: GGMLType::Q4_K,
         down_bytes: &[],
         down_scale: &[],
         down_quant: GGMLType::Q5_1,
@@ -27,6 +28,7 @@ fn per_expert_byte_counts_match_gemma4_26b_a4b() {
 #[test]
 fn gemma_moe_down_byte_count_uses_tensor_quant_type() {
     assert_eq!(gemma_down_bytes_per_row(704, GGMLType::Q5_0), 484);
+    assert_eq!(gemma_down_bytes_per_row(704, GGMLType::Q4_0), 396);
     assert_eq!(gemma_down_bytes_per_row(704, GGMLType::Q8_0), 748);
     assert_eq!(
         per_expert_down_bytes(2816, 704, GGMLType::Q5_0),
@@ -59,6 +61,7 @@ fn zero_weights_produce_zero_output() {
     let view = MoeLayerView {
         router_w: &router_w,
         gate_up_bytes: &gate_up_bytes,
+        gate_up_quant: GGMLType::Q4_K,
         down_bytes: &down_bytes,
         down_scale: &down_scale,
         down_quant: GGMLType::Q5_1,

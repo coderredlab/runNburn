@@ -1,11 +1,21 @@
-use crate::engine::moe_types::{q4k_bytes_per_row, q5_1_bytes_per_row, q8_0_bytes_per_row};
+use crate::engine::moe_types::{
+    q4_0_bytes_per_row, q4k_bytes_per_row, q5_1_bytes_per_row, q8_0_bytes_per_row,
+};
 use rnb_loader::GGMLType;
 
-/// Bytes per expert for the `gate_up_exps` Q4_K tensor (shape
-/// `[n_expert, n_ff*2, n_embd]`).
+/// Bytes per row for the fused `gate_up_exps` tensor.
+#[inline]
+pub fn gate_up_bytes_per_row(cols: usize, quant: GGMLType) -> usize {
+    match quant {
+        GGMLType::Q4_0 => q4_0_bytes_per_row(cols),
+        GGMLType::Q4_K => q4k_bytes_per_row(cols),
+        other => panic!("unsupported Gemma MoE gate/up quant {other:?}"),
+    }
+}
+
 #[inline]
 pub fn per_expert_gate_up_bytes(n_embd: usize, n_ff: usize) -> usize {
-    (n_ff * 2) * q4k_bytes_per_row(n_embd)
+    (n_ff * 2) * gate_up_bytes_per_row(n_embd, GGMLType::Q4_K)
 }
 
 /// Bytes per row for the `down_exps` tensor. Gemma4 MoE GGUFs can mix
@@ -14,6 +24,7 @@ pub fn per_expert_gate_up_bytes(n_embd: usize, n_ff: usize) -> usize {
 #[inline]
 pub fn down_bytes_per_row(cols: usize, quant: GGMLType) -> usize {
     match quant {
+        GGMLType::Q4_0 => q4_0_bytes_per_row(cols),
         GGMLType::Q5_0 => {
             debug_assert!(cols % 32 == 0, "Q5_0 requires cols divisible by 32");
             (cols / 32) * 22
@@ -24,7 +35,6 @@ pub fn down_bytes_per_row(cols: usize, quant: GGMLType) -> usize {
     }
 }
 
-#[inline]
 pub fn per_expert_down_bytes(n_embd: usize, n_ff: usize, quant: GGMLType) -> usize {
     n_embd * down_bytes_per_row(n_ff, quant)
 }
@@ -35,6 +45,7 @@ pub struct MoeLayerView<'a> {
     pub router_w: &'a [f32],
     /// Flat Q4_K bytes for the full `gate_up_exps` expert range.
     pub gate_up_bytes: &'a [u8],
+    pub gate_up_quant: GGMLType,
     pub down_bytes: &'a [u8],
     pub down_scale: &'a [f32],
     pub down_quant: GGMLType,

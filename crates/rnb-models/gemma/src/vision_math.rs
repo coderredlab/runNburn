@@ -3,6 +3,38 @@ use rnb_cpu::gemm::f32_gemv::dot_f32_row;
 
 use super::vision::{Gemma4VisionError, GEMMA4_VISION_ROPE_THETA};
 
+pub(crate) fn layer_norm_affine(
+    input: &[f32],
+    width: usize,
+    epsilon: f32,
+    weight: &[f32],
+    bias: &[f32],
+) -> Result<Vec<f32>, Gemma4VisionError> {
+    if width == 0 || input.len() % width != 0 || weight.len() != width || bias.len() != width {
+        return Err(error("LayerNorm input, weight, or bias shape is invalid"));
+    }
+    let mut output = vec![0.0f32; input.len()];
+    input
+        .par_chunks(width)
+        .zip(output.par_chunks_mut(width))
+        .for_each(|(source, target)| {
+            let mean = source.iter().map(|value| *value as f64).sum::<f64>() / width as f64;
+            let variance = source
+                .iter()
+                .map(|value| {
+                    let delta = *value as f64 - mean;
+                    delta * delta
+                })
+                .sum::<f64>()
+                / width as f64;
+            let scale = 1.0 / (variance as f32 + epsilon).sqrt();
+            for index in 0..width {
+                target[index] = (source[index] - mean as f32) * scale * weight[index] + bias[index];
+            }
+        });
+    Ok(output)
+}
+
 pub(crate) fn rms_norm_affine(
     input: &[f32],
     width: usize,

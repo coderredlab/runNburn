@@ -25,7 +25,7 @@ use super::super::models::gemma::{
 };
 use super::super::quantized_weight_types::QuantizedWeight;
 use super::super::types::ModelMetadata;
-use rnb_loader::Architecture as ModelArchitecture;
+use rnb_loader::{Architecture as ModelArchitecture, GGMLType};
 
 /// Resolved arguments needed by
 /// `dense_q4k_attention_output_gelu_ffn_norm_residual_if_supported`.
@@ -96,6 +96,36 @@ pub(in crate::engine) struct ChainCallerCtx<'a> {
     pub long_kv_split_preferred: bool,
 }
 
+fn dense_chain_projection_types_supported(output: GGMLType, gate: GGMLType, up: GGMLType) -> bool {
+    matches!(
+        (output, gate, up),
+        (GGMLType::Q4_K, GGMLType::Q4_K, GGMLType::Q4_K)
+    )
+}
+
+fn dense_chain_weights_supported(ctx: &ChainCallerCtx<'_>) -> bool {
+    dense_chain_projection_types_supported(
+        ctx.w.o_weight.ggml_type,
+        ctx.w.ffn_gate_weight.ggml_type,
+        ctx.w.ffn_up_weight.ggml_type,
+    )
+}
+
+fn ple_dense_chain_types_supported(gate: GGMLType, proj: GGMLType) -> bool {
+    matches!(
+        (gate, proj),
+        (GGMLType::Q4_K, GGMLType::Q4_K) | (GGMLType::F32, GGMLType::F32)
+    )
+}
+
+fn ple_dense_chain_supported(ctx: &ChainCallerCtx<'_>) -> bool {
+    ctx.ple_fusion.is_none_or(|(_, gemma)| {
+        gemma.layers.get(ctx.layer_idx).is_some_and(|layer| {
+            ple_dense_chain_types_supported(layer.inp_gate.ggml_type, layer.proj.ggml_type)
+        })
+    })
+}
+
 /// `true` iff `compute_chain_function_args` would return `Some` — i.e. the
 /// chain function will be called for this `(arch, layer)` and the resulting
 /// `hidden_carrier_dev` will be written. cu57 `chain_emits_hidden_carrier`
@@ -120,6 +150,12 @@ pub(in crate::engine) fn chain_function_active(ctx: &ChainCallerCtx<'_>) -> bool
             return false;
         }
         if matches!(ctx.architecture, ModelArchitecture::NemotronHMoE) {
+            return false;
+        }
+        if !dense_chain_weights_supported(ctx) {
+            return false;
+        }
+        if !ple_dense_chain_supported(ctx) {
             return false;
         }
         let chain_env_on = crate::engine::policy::cuda_decode_device_chain_enabled()
@@ -189,6 +225,12 @@ pub(in crate::engine) fn compute_chain_function_args<'a>(
             return None;
         }
         if matches!(ctx.architecture, ModelArchitecture::NemotronHMoE) {
+            return None;
+        }
+        if !dense_chain_weights_supported(ctx) {
+            return None;
+        }
+        if !ple_dense_chain_supported(ctx) {
             return None;
         }
         let chain_env_on = crate::engine::policy::cuda_decode_device_chain_enabled()
@@ -517,4 +559,35 @@ fn build_gemma_args<'a>(ctx: &ChainCallerCtx<'a>) -> Option<ChainArgs<'a>> {
         layer_segment_graph_request: Some(layer_segment_graph_request),
         ffn_uses_gelu: true, // Gemma FFN = gelu
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_chain_rejects_q4_0_weights() {
+        assert!(dense_chain_projection_types_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q4_K,
+            GGMLType::Q4_K
+        ));
+        assert!(!dense_chain_projection_types_supported(
+            GGMLType::Q4_0,
+            GGMLType::Q4_0,
+            GGMLType::Q4_0
+        ));
+        assert!(ple_dense_chain_types_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q4_K
+        ));
+        assert!(ple_dense_chain_types_supported(
+            GGMLType::F32,
+            GGMLType::F32
+        ));
+        assert!(!ple_dense_chain_types_supported(
+            GGMLType::Q4_0,
+            GGMLType::Q4_0
+        ));
+    }
 }

@@ -275,7 +275,7 @@ impl Engine {
             })
             .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
             let (projection_dim, model_name) = match model.metadata.architecture {
-                ModelArchitecture::Qwen35MoE => {
+                ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE => {
                     let capability =
                         rnb_model_qwen::inspect_qwen36_vision_projector(&projector.descriptor)
                             .map_err(|error| {
@@ -289,11 +289,20 @@ impl Engine {
                     (capability.projection_dim, "Qwen3.6")
                 }
                 ModelArchitecture::Gemma4 => {
-                    let capability =
-                        rnb_model_gemma::inspect_gemma4_vision_projector(&projector.descriptor)
-                            .map_err(|error| {
-                                crate::error::LlmError::ModelLoad(error.to_string())
-                            })?;
+                    let projection_dim =
+                        match projector.descriptor.envelope.projector_type.as_str() {
+                            rnb_model_gemma::GEMMA4_UNIFIED_PROJECTOR_TYPE => {
+                                rnb_model_gemma::inspect_gemma4_unified_vision_projector(
+                                    &projector.descriptor,
+                                )
+                                .map(|capability| capability.projection_dim)
+                            }
+                            _ => rnb_model_gemma::inspect_gemma4_vision_projector(
+                                &projector.descriptor,
+                            )
+                            .map(|capability| capability.projection_dim),
+                        }
+                        .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
                     for token in ["<|image|>", "<|image>", "<image|>"] {
                         if tokenizer.token_id(token).is_none() {
                             return Err(crate::error::LlmError::ModelLoad(format!(
@@ -301,11 +310,11 @@ impl Engine {
                             )));
                         }
                     }
-                    (capability.projection_dim, "Gemma 4")
+                    (projection_dim, "Gemma 4")
                 }
                 architecture => {
                     return Err(crate::error::LlmError::ModelLoad(format!(
-                        "vision projector requires Qwen35MoE or Gemma4, got {architecture:?}"
+                        "vision projector requires Qwen35, Qwen35MoE, or Gemma4, got {architecture:?}"
                     )));
                 }
             };

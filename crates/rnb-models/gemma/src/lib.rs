@@ -2,6 +2,7 @@ mod vision;
 mod vision_encoder;
 mod vision_math;
 mod vision_preprocess;
+mod vision_unified;
 
 pub use rnb_core::image::RgbImage;
 pub use vision::{
@@ -14,6 +15,10 @@ pub use vision_encoder::{
 pub use vision_preprocess::{
     gemma4_smart_resize, prepare_gemma4_vision_intermediate, Gemma4TensorStats,
     Gemma4VisionIntermediate, GEMMA4_MAX_IMAGE_TOKENS, GEMMA4_MIN_IMAGE_TOKENS,
+};
+pub use vision_unified::{
+    encode_gemma4_unified_vision, inspect_gemma4_unified_vision_projector,
+    Gemma4UnifiedVisionCapability, GEMMA4_UNIFIED_PROJECTOR_TYPE,
 };
 
 pub fn gelu_tanh(x: f32) -> f32 {

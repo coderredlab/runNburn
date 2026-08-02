@@ -34,6 +34,10 @@ pub(in crate::engine) fn load_gemma_moe_layer(
         Tensor::from_slice(&vec![1.0f32; n_embd], &[n_embd])
     };
     let gate_up_exps = model.weights.get(&exps_key).unwrap().clone();
+    let gate_up_quant = *model
+        .tensor_ggml_types
+        .get(&exps_key)
+        .unwrap_or(&rnb_loader::GGMLType::Q4_K);
     let down_exps = model.weights.get(&down_exps_key).unwrap().clone();
     let down_scale_key = format!("blk.{i}.ffn_down_exps.scale");
     let down_scale = if model.weights.contains_key(&down_scale_key) {
@@ -74,6 +78,7 @@ pub(in crate::engine) fn load_gemma_moe_layer(
         router_w,
         router_scale,
         gate_up_exps,
+        gate_up_quant,
         down_exps,
         down_scale,
         down_quant,

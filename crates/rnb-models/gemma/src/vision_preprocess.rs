@@ -171,7 +171,7 @@ fn smart_resize_with_limits(
     Ok((target_width, target_height))
 }
 
-fn resize_bilinear_align_corners(
+pub(crate) fn resize_bilinear_align_corners(
     image: &RgbImage,
     target_width: usize,
     target_height: usize,
@@ -216,7 +216,7 @@ fn resize_bilinear_align_corners(
         .map_err(|error| self::error(error.to_string()))
 }
 
-fn normalize_rgb(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
+pub(crate) fn normalize_rgb(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
     image
         .pixels()
         .chunks_exact(3)
@@ -230,7 +230,7 @@ fn normalize_rgb(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
         .collect()
 }
 
-fn collect_patch_rows(
+pub(crate) fn collect_patch_rows(
     pixels: &[f32],
     width: usize,
     height: usize,
@@ -263,7 +263,7 @@ fn collect_patch_rows(
     Ok(rows)
 }
 
-fn add_learned_positions(
+pub(crate) fn add_learned_positions(
     hidden: &mut [f32],
     positions: &[f32],
     grid_width: usize,

@@ -72,6 +72,7 @@ pub(in crate::engine) fn forward_ffn_gemma4_moe_hybrid(
     let view = crate::engine::moe::MoeLayerView {
         router_w: router_w_data, // unused by forward_with_logits
         gate_up_bytes,
+        gate_up_quant: moe_w.gate_up_quant,
         down_bytes,
         down_scale: kernels::tensor_as_f32_slice(&moe_w.down_scale),
         down_quant: moe_w.down_quant,

@@ -89,9 +89,12 @@ pub(super) fn apply_prefill_rope(
     let (rope_dim, rope_theta, proportional_rope) =
         resolve_rope_params(metadata, architecture, layer_idx, head_dim);
     if let Some((positions, sections)) = imrope_positions {
-        if architecture != ModelArchitecture::Qwen35MoE {
+        if !matches!(
+            architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ) {
             return Err(crate::error::LlmError::Forward(format!(
-                "explicit IMRoPE positions require Qwen35MoE, got {architecture:?}"
+                "explicit IMRoPE positions require Qwen35 or Qwen35MoE, got {architecture:?}"
             )));
         }
         let q = kernels::rope::rope_imrope(&q, positions, head_dim, rope_dim, sections, rope_theta)

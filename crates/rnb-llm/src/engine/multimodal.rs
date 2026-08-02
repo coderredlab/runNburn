@@ -1,7 +1,10 @@
 use rnb_core::image::RgbImage;
 use rnb_core::tensor::Tensor;
 use rnb_loader::Architecture as ModelArchitecture;
-use rnb_model_gemma::{encode_gemma4_vision_intermediate, prepare_gemma4_vision_intermediate};
+use rnb_model_gemma::{
+    encode_gemma4_unified_vision, encode_gemma4_vision_intermediate,
+    prepare_gemma4_vision_intermediate, GEMMA4_UNIFIED_PROJECTOR_TYPE,
+};
 #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
 use rnb_model_qwen::encode_qwen36_vision_intermediate;
 use rnb_model_qwen::prepare_qwen36_vision_intermediate;
@@ -108,7 +111,7 @@ impl Engine {
         token_ids.extend(self.tokenizer.encode(rendered_prompt));
 
         let compiled = match self.architecture {
-            ModelArchitecture::Qwen35MoE => {
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE => {
                 let image_pad_token_id =
                     self.tokenizer.token_id("<|image_pad|>").ok_or_else(|| {
                         LlmError::Tokenizer("Qwen3.6 tokenizer is missing <|image_pad|>".into())
@@ -148,10 +151,16 @@ impl Engine {
                 let image_end_id = self.tokenizer.token_id("<image|>").ok_or_else(|| {
                     LlmError::Tokenizer("Gemma 4 tokenizer is missing <image|>".into())
                 })?;
-                let intermediate = prepare_gemma4_vision_intermediate(projector, image)
-                    .map_err(|error| LlmError::Forward(error.to_string()))?;
-                let vision = encode_gemma4_vision_intermediate(projector, intermediate)
-                    .map_err(|error| LlmError::Forward(error.to_string()))?;
+                let vision = if projector.descriptor.envelope.projector_type
+                    == GEMMA4_UNIFIED_PROJECTOR_TYPE
+                {
+                    encode_gemma4_unified_vision(projector, image)
+                } else {
+                    prepare_gemma4_vision_intermediate(projector, image).and_then(|intermediate| {
+                        encode_gemma4_vision_intermediate(projector, intermediate)
+                    })
+                }
+                .map_err(|error| LlmError::Forward(error.to_string()))?;
                 compile_gemma4_prompt(
                     token_ids,
                     image_placeholder_id,
@@ -181,9 +190,12 @@ impl Engine {
         rendered_prompt: &str,
         image: &RgbImage,
     ) -> Result<CompiledPrompt> {
-        if self.architecture != ModelArchitecture::Qwen35MoE {
+        if !matches!(
+            self.architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ) {
             return Err(LlmError::InvalidChatRequest(format!(
-                "Qwen3.6 image input requires Qwen35MoE, got {:?}",
+                "Qwen3.6 image input requires Qwen35 or Qwen35MoE, got {:?}",
                 self.architecture
             )));
         }
@@ -198,9 +210,12 @@ impl Engine {
         rendered_prompt: &str,
         image: &RgbImage,
     ) -> Result<Vec<f32>> {
-        if self.architecture != ModelArchitecture::Qwen35MoE {
+        if !matches!(
+            self.architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ) {
             return Err(LlmError::InvalidChatRequest(format!(
-                "Qwen3.6 image input requires Qwen35MoE, got {:?}",
+                "Qwen3.6 image input requires Qwen35 or Qwen35MoE, got {:?}",
                 self.architecture
             )));
         }
@@ -248,7 +263,9 @@ impl Engine {
         }
 
         match self.architecture {
-            ModelArchitecture::Qwen35MoE => self.forward_qwen36_compiled_prompt(prompt),
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE => {
+                self.forward_qwen36_compiled_prompt(prompt)
+            }
             ModelArchitecture::Gemma4 => self.forward_gemma4_compiled_prompt(prompt),
             architecture => Err(LlmError::Forward(format!(
                 "compiled multimodal prompt cannot run on {architecture:?}"
@@ -429,6 +446,7 @@ impl Engine {
                     self.metadata.norm_eps,
                 )?
             };
+            self.kv_cache.set_len(pos_start + seq_len);
             last_output = Some((output, seq_len, pos_start));
         }
 

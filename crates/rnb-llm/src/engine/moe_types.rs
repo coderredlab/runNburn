@@ -6,6 +6,12 @@ pub fn q4k_bytes_per_row(cols: usize) -> usize {
 }
 
 #[inline]
+pub fn q4_0_bytes_per_row(cols: usize) -> usize {
+    debug_assert!(cols % 32 == 0, "Q4_0 requires cols divisible by 32");
+    (cols / 32) * 18
+}
+
+#[inline]
 pub fn q5_1_bytes_per_row(cols: usize) -> usize {
     debug_assert!(cols % 32 == 0, "Q5_1 requires cols divisible by 32");
     (cols / 32) * 24

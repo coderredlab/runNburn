@@ -5,6 +5,7 @@ use crate::tokenizer::{TokenStreamDecoder, Tokenizer};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rnb_core::image::RgbImage;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -179,6 +180,25 @@ impl Default for GenerateParams {
     }
 }
 
+fn params_with_model_stop_tokens<'a>(
+    tokenizer: &Tokenizer,
+    params: &'a GenerateParams,
+) -> Cow<'a, GenerateParams> {
+    let missing = tokenizer
+        .model_stop_tokens()
+        .iter()
+        .copied()
+        .filter(|token| !params.stop_tokens.contains(token))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Cow::Borrowed(params)
+    } else {
+        let mut params = params.clone();
+        params.stop_tokens.extend(missing);
+        Cow::Owned(params)
+    }
+}
+
 /// 텍스트 생성 결과
 #[derive(Debug, Clone)]
 pub struct GenerateResult {
@@ -228,6 +248,8 @@ pub fn generate_stream(
     params: &GenerateParams,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    let params = params_with_model_stop_tokens(&engine.tokenizer, params);
+    let params = params.as_ref();
     engine.set_backend_argmax_excluded_token(
         params
             .ignore_eos
@@ -318,6 +340,8 @@ pub(crate) fn generate_stream_resuming(
     state: &crate::engine::EngineSequenceState,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    let params = params_with_model_stop_tokens(&engine.tokenizer, params);
+    let params = params.as_ref();
     engine.set_backend_argmax_excluded_token(
         params
             .ignore_eos
@@ -489,6 +513,8 @@ pub fn generate_stream_multimodal_resuming(
     state: &crate::engine::EngineSequenceState,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    let params = params_with_model_stop_tokens(&engine.tokenizer, params);
+    let params = params.as_ref();
     let start = Instant::now();
     check_generation_cancellation()?;
     if !state.is_multimodal() {
@@ -591,6 +617,8 @@ pub fn generate_stream_multimodal(
     params: &GenerateParams,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
+    let params = params_with_model_stop_tokens(&engine.tokenizer, params);
+    let params = params.as_ref();
     let start = Instant::now();
     check_generation_cancellation()?;
     let compiled = engine.compile_multimodal_prompt(rendered_prompt, image)?;
@@ -967,6 +995,22 @@ mod tests {
             ..GenerateParams::default()
         };
         let result = engine.generate("x", &params).expect("ok");
+        assert_eq!(result.tokens_generated, 0);
+    }
+
+    #[test]
+    fn test_generate_stops_at_model_eot_token() {
+        let mut engine = make_engine_non_eos_greedy(9);
+        engine.tokenizer.set_model_stop_tokens(vec![15]);
+        let params = GenerateParams {
+            max_tokens: 100,
+            temperature: 0.0,
+            seed: Some(0),
+            ..GenerateParams::default()
+        };
+
+        let result = engine.generate("x", &params).expect("ok");
+
         assert_eq!(result.tokens_generated, 0);
     }
 

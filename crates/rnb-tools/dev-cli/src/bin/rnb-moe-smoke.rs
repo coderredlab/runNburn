@@ -329,6 +329,10 @@ fn main() -> ExitCode {
                 unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
             })
             .unwrap_or_else(|| vec![1.0f32; n_expert]);
+        let gate_up_quant = *model
+            .tensor_ggml_types
+            .get("blk.0.ffn_gate_up_exps.weight")
+            .unwrap_or(&rnb_loader::GGMLType::Q4_K);
         let down_quant = *model
             .tensor_ggml_types
             .get("blk.0.ffn_down_exps.weight")
@@ -339,6 +343,7 @@ fn main() -> ExitCode {
             gate_up_bytes,
             down_bytes,
             down_scale: &down_scale,
+            gate_up_quant,
             down_quant,
             n_embd,
             n_ff,

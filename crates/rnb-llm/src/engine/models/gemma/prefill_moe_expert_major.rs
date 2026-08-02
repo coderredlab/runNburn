@@ -29,8 +29,23 @@ pub(super) struct GemmaRouteSlot {
     pub(super) weight: f32,
 }
 
-pub(super) fn gemma4_moe_expert_major_enabled(_moe_w: &MoeLayerWeights, seq_len: usize) -> bool {
-    policy::gemma4_moe_expert_major_enabled() && seq_len > 1
+pub(super) fn gemma4_moe_expert_major_enabled(moe_w: &MoeLayerWeights, seq_len: usize) -> bool {
+    let gate_up_supported = matches!(moe_w.gate_up_quant, GGMLType::Q4_0 | GGMLType::Q4_K);
+    let down_supported = matches!(
+        moe_w.down_quant,
+        GGMLType::Q4_0 | GGMLType::Q5_0 | GGMLType::Q5_1 | GGMLType::Q8_0
+    );
+    let arm_group_supported = !cfg!(target_arch = "aarch64")
+        || (moe_w.gate_up_quant == GGMLType::Q4_K
+            && matches!(
+                moe_w.down_quant,
+                GGMLType::Q5_0 | GGMLType::Q5_1 | GGMLType::Q8_0
+            ));
+    policy::gemma4_moe_expert_major_enabled()
+        && seq_len > 1
+        && gate_up_supported
+        && down_supported
+        && arm_group_supported
 }
 
 fn gemma_expert_major_slots(
@@ -389,19 +404,25 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             .iter()
             .map(|slot| slot.weight * down_scale[slot.expert])
             .collect::<Vec<_>>();
-        let output = backend_runtime::gemma4_moe_gelu_selected_if_supported(
-            gate_up_bytes,
-            down_bytes,
-            moe_w.down_quant,
-            moe_w.n_expert,
-            moe_w.n_ff,
-            hidden_dim,
-            seq_len,
-            &expert_ids,
-            &token_ids,
-            &route_weights,
-            &moe_input,
-        )?;
+        let output = if moe_w.gate_up_quant == GGMLType::Q4_K
+            && matches!(moe_w.down_quant, GGMLType::Q5_1 | GGMLType::Q8_0)
+        {
+            backend_runtime::gemma4_moe_gelu_selected_if_supported(
+                gate_up_bytes,
+                down_bytes,
+                moe_w.down_quant,
+                moe_w.n_expert,
+                moe_w.n_ff,
+                hidden_dim,
+                seq_len,
+                &expert_ids,
+                &token_ids,
+                &route_weights,
+                &moe_input,
+            )?
+        } else {
+            None
+        };
         (
             output,
             selected_start.map_or(Duration::ZERO, |start| start.elapsed()),
@@ -524,7 +545,7 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
                     hidden_dim,
                     group_len,
                     gate_up_bytes_per_row,
-                    GGMLType::Q4_K,
+                    moe_w.gate_up_quant,
                 );
                 if let Some(gate_up_start) = gate_up_start {
                     gate_up_elapsed += gate_up_start.elapsed();

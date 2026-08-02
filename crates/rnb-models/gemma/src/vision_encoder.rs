@@ -176,11 +176,13 @@ pub fn encode_gemma4_vision_intermediate(
     )?;
     let pool_scale = (capability.embedding_length as f32).sqrt();
     pooled.iter_mut().for_each(|value| *value *= pool_scale);
-    let std_bias = tensor_f32(projector, "v.std_bias")?;
-    let std_scale = tensor_f32(projector, "v.std_scale")?;
-    for row in pooled.chunks_mut(capability.embedding_length) {
-        for index in 0..capability.embedding_length {
-            row[index] = (row[index] - std_bias[index]) * std_scale[index];
+    if projector.descriptor.tensors.contains_key("v.std_bias") {
+        let std_bias = tensor_f32(projector, "v.std_bias")?;
+        let std_scale = tensor_f32(projector, "v.std_scale")?;
+        for row in pooled.chunks_mut(capability.embedding_length) {
+            for index in 0..capability.embedding_length {
+                row[index] = (row[index] - std_bias[index]) * std_scale[index];
+            }
         }
     }
     let pooled = rms_norm(
@@ -283,7 +285,7 @@ fn average_pool_2d(
     Ok(output)
 }
 
-fn linear_bf16(
+pub(crate) fn linear_bf16(
     projector: &LoadedVisionProjector,
     weight_name: &str,
     input: &[f32],
@@ -296,10 +298,54 @@ fn linear_bf16(
             "tensor '{weight_name}' input shape mismatch"
         )));
     }
+    let clamp = clippable_bounds(projector, weight_name)?;
+    let clamped_input = clamp.map(|(input_min, input_max, _, _)| {
+        input
+            .iter()
+            .map(|value| value.clamp(input_min, input_max))
+            .collect::<Vec<_>>()
+    });
+    let gemv_input = clamped_input.as_deref().unwrap_or(input);
     let weight = tensor_bf16_words(projector, weight_name, rows, cols)?;
     let mut output = vec![0.0f32; rows * sequence_length];
-    gemv_bf16(weight, input, &mut output, rows, cols, sequence_length);
+    gemv_bf16(weight, gemv_input, &mut output, rows, cols, sequence_length);
+    if let Some((_, _, output_min, output_max)) = clamp {
+        output
+            .iter_mut()
+            .for_each(|value| *value = value.clamp(output_min, output_max));
+    }
     Ok(output)
+}
+
+fn clippable_bounds(
+    projector: &LoadedVisionProjector,
+    weight_name: &str,
+) -> Result<Option<(f32, f32, f32, f32)>, Gemma4VisionError> {
+    let prefix = weight_name
+        .strip_suffix(".weight")
+        .ok_or_else(|| error(format!("invalid weight tensor name '{weight_name}'")))?;
+    let input_min_name = format!("{prefix}.input_min");
+    if !projector.descriptor.tensors.contains_key(&input_min_name) {
+        return Ok(None);
+    }
+    let input_max_name = format!("{prefix}.input_max");
+    let output_min_name = format!("{prefix}.output_min");
+    let output_max_name = format!("{prefix}.output_max");
+    let input_min = tensor_f32(projector, &input_min_name)?[0];
+    let input_max = tensor_f32(projector, &input_max_name)?[0];
+    let output_min = tensor_f32(projector, &output_min_name)?[0];
+    let output_max = tensor_f32(projector, &output_max_name)?[0];
+    if [input_min, input_max, output_min, output_max]
+        .iter()
+        .any(|value| !value.is_finite())
+        || input_min > input_max
+        || output_min > output_max
+    {
+        return Err(error(format!(
+            "tensor '{weight_name}' clamp bounds must be finite and ordered"
+        )));
+    }
+    Ok(Some((input_min, input_max, output_min, output_max)))
 }
 
 fn tensor_bf16_words<'a>(

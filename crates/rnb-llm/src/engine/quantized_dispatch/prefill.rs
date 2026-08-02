@@ -207,6 +207,14 @@ pub(in crate::engine) fn prefill_raw_quantized_batch(
     bytes_per_row: usize,
     ggml_type: GGMLType,
 ) {
+    #[cfg(feature = "cuda")]
+    if ggml_type == GGMLType::Q4_0 {
+        crate::engine::scalar_gemv::cuda_gemv_or_panic(
+            bytes, input, output, rows, cols, seq_len, ggml_type,
+        );
+        return;
+    }
+
     #[cfg(target_arch = "aarch64")]
     if seq_len > 1
         && cols % 256 == 0

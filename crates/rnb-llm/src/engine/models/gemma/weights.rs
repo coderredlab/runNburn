@@ -13,8 +13,9 @@ pub(in crate::engine) struct MoeLayerWeights {
     pub(in crate::engine) router_w: Tensor,
     /// F32 `[n_embd]` — `ffn_gate_inp.scale` (learned router pre-projection scale).
     pub(in crate::engine) router_scale: Tensor,
-    /// Q4_K bytes `[n_expert, n_ff*2, n_embd]` — `ffn_gate_up_exps.weight`.
+    /// Quantized bytes `[n_expert, n_ff*2, n_embd]` — `ffn_gate_up_exps.weight`.
     pub(in crate::engine) gate_up_exps: Tensor,
+    pub(in crate::engine) gate_up_quant: GGMLType,
     /// Quantized bytes `[n_expert, n_embd, n_ff]` — `ffn_down_exps.weight`.
     pub(in crate::engine) down_exps: Tensor,
     /// F32 `[n_expert]` — per-expert scale applied to `down_exps`.

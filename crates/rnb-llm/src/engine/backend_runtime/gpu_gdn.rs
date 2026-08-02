@@ -144,6 +144,19 @@ pub(in crate::engine) fn try_gdn_prefill_chain_if_supported(
 }
 
 #[cfg(feature = "cuda")]
+fn chain_k_quant_weight_supported(weight: &QuantizedWeight) -> bool {
+    matches!(
+        weight.ggml_type,
+        GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::Q8_0
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn chain_q4k_or_f32_weight_supported(weight: &QuantizedWeight) -> bool {
+    matches!(weight.ggml_type, GGMLType::F32 | GGMLType::Q4_K)
+}
+
+#[cfg(feature = "cuda")]
 fn chain_k_quant_weight_raw<'a>(
     weight: &'a QuantizedWeight,
     label: &'static str,
@@ -242,6 +255,14 @@ pub(in crate::engine) fn gdn_prefill_chain_q4k(
     #[cfg(feature = "cuda")]
     {
         if !try_gdn_prefill_chain_if_supported(shape)? {
+            return Ok(None);
+        }
+        if !chain_k_quant_weight_supported(qkv_weight)
+            || !chain_k_quant_weight_supported(gate_weight)
+            || !chain_q4k_or_f32_weight_supported(alpha_weight)
+            || !chain_q4k_or_f32_weight_supported(beta_weight)
+            || !chain_k_quant_weight_supported(ssm_out)
+        {
             return Ok(None);
         }
         let (qkv_q4k, qkv_quant) = chain_k_quant_weight_raw(qkv_weight, "qkv")?;
@@ -861,6 +882,58 @@ mod tests {
             1e-6,
         )
         .expect("disabled chain should not validate weight formats");
+
+        unsafe {
+            std::env::remove_var("RNB_CUDA_GDN_PREFILL_CHAIN");
+        }
+
+        assert!(output.is_none());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gdn_prefill_chain_q4k_falls_back_for_unsupported_weight_quant() {
+        let _guard = GDN_CHAIN_ENV_LOCK.lock().expect("GDN chain env lock");
+        let shape = qwen35_chain_shape(32);
+        let q4k_weight = QuantizedWeight::new(
+            rnb_core::tensor::Tensor::zeros(&[1], rnb_core::tensor::DType::U8),
+            GGMLType::Q4_K,
+            1,
+            1,
+        );
+        let q5k_weight = QuantizedWeight::new(
+            rnb_core::tensor::Tensor::zeros(&[1], rnb_core::tensor::DType::U8),
+            GGMLType::Q5_K,
+            1,
+            1,
+        );
+        let mut conv_state = Vec::new();
+        let mut delta_state = Vec::new();
+        unsafe {
+            std::env::set_var("RNB_CUDA_GDN_PREFILL_CHAIN", "1");
+        }
+
+        let output = gdn_prefill_chain_q4k(
+            &shape,
+            &[],
+            None,
+            &[],
+            &q4k_weight,
+            &q4k_weight,
+            &q4k_weight,
+            &q4k_weight,
+            &mut conv_state,
+            &[],
+            &[],
+            &[],
+            &mut delta_state,
+            &[],
+            &q5k_weight,
+            &[],
+            true,
+            1e-6,
+        )
+        .expect("unsupported chain weight should use the existing fallback");
 
         unsafe {
             std::env::remove_var("RNB_CUDA_GDN_PREFILL_CHAIN");
