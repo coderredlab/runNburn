@@ -144,7 +144,7 @@ pub(super) fn hyper_post(
         for feature in 0..dim {
             let mut value = mix.post[row] * branch_output[feature];
             for col in 0..hc {
-                value += mix.comb[row * hc + col] * residual[col * dim + feature];
+                value += mix.comb[col * hc + row] * residual[col * dim + feature];
             }
             output[row * dim + feature] = value;
         }
@@ -325,5 +325,51 @@ pub(super) fn fp4_quantize_inplace(values: &mut [f32], block_size: usize) {
                 .unwrap();
             *value = sign * nearest * scale;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hyper_post, DeepSeek4Config, HyperConnectionMix};
+
+    #[test]
+    fn hyper_post_reads_comb_as_source_by_destination() {
+        let config = DeepSeek4Config {
+            hidden_dim: 1,
+            num_heads: 1,
+            head_dim: 1,
+            rope_dim: 0,
+            output_groups: 1,
+            output_lora_rank: 1,
+            window_size: 1,
+            index_heads: 1,
+            index_head_dim: 1,
+            index_topk: 1,
+            hc_count: 2,
+            sinkhorn_iterations: 1,
+            hc_eps: 0.0,
+            norm_eps: 0.0,
+            expert_count: 1,
+            expert_used_count: 1,
+            expert_ffn_dim: 1,
+            expert_scale: 1.0,
+            rope_theta: 1.0,
+            compress_rope_theta: 1.0,
+            rope_factor: 1.0,
+            rope_original_context_length: 0,
+            rope_yarn_beta_fast: 1.0,
+            rope_yarn_beta_slow: 1.0,
+        };
+        let mix = HyperConnectionMix {
+            branch: Vec::new(),
+            post: vec![0.0, 0.0],
+            // Flattened as comb[source * hc + destination].
+            comb: vec![1.0, 2.0, 3.0, 4.0],
+        };
+
+        assert_eq!(
+            hyper_post(&[0.0], &[10.0, 20.0], mix, &config),
+            vec![70.0, 100.0]
+        );
     }
 }

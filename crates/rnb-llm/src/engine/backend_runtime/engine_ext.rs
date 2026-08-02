@@ -135,6 +135,9 @@ impl Engine {
     }
 
     pub fn backend_output_argmax_supported_for_runtime(&self) -> bool {
+        if !backend_output_argmax_architecture_supported(self.architecture) {
+            return false;
+        }
         let Some(weights) = self.weights.as_ref() else {
             return false;
         };
@@ -266,6 +269,10 @@ impl Engine {
     }
 }
 
+fn backend_output_argmax_architecture_supported(architecture: rnb_loader::Architecture) -> bool {
+    architecture != rnb_loader::Architecture::DeepSeek4
+}
+
 #[cfg(any(feature = "cuda", test))]
 pub(crate) fn should_invalidate_resident_sequence_state_after_restore(
     restored_resident: bool,
@@ -275,6 +282,17 @@ pub(crate) fn should_invalidate_resident_sequence_state_after_restore(
 
 #[cfg(test)]
 mod tests {
+    use rnb_loader::Architecture;
+
+    #[test]
+    fn deepseek4_disables_generic_backend_argmax_decode() {
+        assert!(!super::backend_output_argmax_architecture_supported(
+            Architecture::DeepSeek4
+        ));
+        assert!(super::backend_output_argmax_architecture_supported(
+            Architecture::LLaMA
+        ));
+    }
     #[test]
     fn resident_delta_restore_keeps_weight_cache_policy() {
         assert!(!super::should_invalidate_resident_sequence_state_after_restore(true));

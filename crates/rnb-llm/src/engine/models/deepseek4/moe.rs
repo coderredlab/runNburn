@@ -199,11 +199,31 @@ fn softplus(value: f32) -> f32 {
 #[cfg(feature = "cuda")]
 fn routed_cuda_supported(weights: &DeepSeek4MoeWeights, config: &DeepSeek4Config) -> bool {
     let moe = &weights.weights;
-    moe.gate_quant == GGMLType::IQ2_XXS
-        && moe.up_quant == GGMLType::IQ2_XXS
-        && moe.down_quant == GGMLType::IQ3_XXS
-        && config.hidden_dim % 256 == 0
-        && config.expert_ffn_dim % 256 == 0
+    routed_cuda_layout_supported(
+        weights.prefer_sparse_moe_cuda,
+        moe.gate_quant,
+        moe.up_quant,
+        moe.down_quant,
+        config.hidden_dim,
+        config.expert_ffn_dim,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn routed_cuda_layout_supported(
+    prefer_sparse_moe_cuda: bool,
+    gate_quant: GGMLType,
+    up_quant: GGMLType,
+    down_quant: GGMLType,
+    hidden_dim: usize,
+    expert_ffn_dim: usize,
+) -> bool {
+    prefer_sparse_moe_cuda
+        && gate_quant == GGMLType::IQ2_XXS
+        && up_quant == GGMLType::IQ2_XXS
+        && down_quant == GGMLType::IQ3_XXS
+        && hidden_dim % 256 == 0
+        && expert_ffn_dim % 256 == 0
 }
 
 #[cfg(feature = "cuda")]
@@ -452,4 +472,30 @@ fn swiglu_clamped(gate: &mut [f32], up: &mut [f32], limit: f32) {
 fn bytes_per_row(cols: usize, quant: GGMLType) -> usize {
     let (block_elements, block_bytes) = ggml_quant_params(quant);
     cols.div_ceil(block_elements) * block_bytes
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::routed_cuda_layout_supported;
+    use rnb_loader::GGMLType;
+
+    #[test]
+    fn routed_cuda_layout_respects_sparse_moe_policy() {
+        assert!(!routed_cuda_layout_supported(
+            false,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ3_XXS,
+            7_168,
+            2_048,
+        ));
+        assert!(routed_cuda_layout_supported(
+            true,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ3_XXS,
+            7_168,
+            2_048,
+        ));
+    }
 }

@@ -1,6 +1,6 @@
 use crate::engine::cpu_runtime::kernels;
 use crate::engine::quantized_weight_types::QuantizedWeight;
-use crate::error::Result;
+use crate::error::{LlmError, Result};
 use rnb_core::tensor::Tensor;
 
 use super::attention::forward_attention;
@@ -16,9 +16,7 @@ pub(in crate::engine) fn forward_tokens(
     tokens: &[u32],
     expected_position: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    if model.state.position != expected_position {
-        model.state.clear();
-    }
+    ensure_state_position(model.state.position, expected_position)?;
     if tokens.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -134,4 +132,25 @@ fn forward_single_token(
     let logits = output.gemv_vec(&final_hidden)?;
     model.state.position += 1;
     Ok((logits, final_hidden))
+}
+
+fn ensure_state_position(actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(LlmError::Forward(format!(
+        "DeepSeek4 sequence state position {actual} does not match engine position {expected}"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_state_position;
+
+    #[test]
+    fn rejects_desynchronized_sequence_position() {
+        assert!(ensure_state_position(7, 7).is_ok());
+        assert!(ensure_state_position(0, 7).is_err());
+        assert!(ensure_state_position(7, 0).is_err());
+    }
 }

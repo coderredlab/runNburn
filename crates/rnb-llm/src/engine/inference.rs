@@ -1797,10 +1797,19 @@ impl Engine {
             )
         };
         self.weights = Some(weights);
-        let (logits, final_hidden) = result?;
-        self.kv_cache.set_len(expected_position + tokens.len());
-        self.last_layer_hidden_cached = final_hidden;
-        Ok(logits)
+        match result {
+            Ok((logits, final_hidden)) => {
+                self.kv_cache.set_len(expected_position + tokens.len());
+                self.last_layer_hidden_cached = final_hidden;
+                Ok(logits)
+            }
+            Err(error) => match self.clear_sequence_state() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(crate::error::LlmError::Forward(format!(
+                    "{error}; DeepSeek4 sequence-state cleanup failed: {cleanup_error}"
+                ))),
+            },
+        }
     }
 
     pub fn forward(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {

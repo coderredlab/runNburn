@@ -103,6 +103,9 @@ fn apply_host_memory_plan(
             moe.decode_expert_host = decode_expert_host;
         }
     }
+    if let Some(deepseek4) = weights.deepseek4.as_mut() {
+        deepseek4.set_sparse_moe_cuda_enabled(sparse_moe_cuda_enabled);
+    }
 }
 
 /// Registers the per-layer sparse expert file regions with the CUDA backend

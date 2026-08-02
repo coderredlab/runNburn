@@ -1,3 +1,4 @@
+pub mod deepseek4;
 pub mod gemma;
 pub mod llama;
 pub mod phi;
@@ -192,6 +193,57 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
     }
 }
 
+fn deepseek4_layer_f32(
+    metadata: &[(String, GGUFValue)],
+    key: &str,
+    num_layers: usize,
+) -> Result<Vec<f32>, LoaderError> {
+    let mut values = match get_f32_array(metadata, key) {
+        Ok(values) => values,
+        Err(LoaderError::TypeMismatch { .. }) => vec![get_f32(metadata, key)?; num_layers],
+        Err(error) => return Err(error),
+    };
+    if values.len() < num_layers {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!(
+                "{key} has {} entries, expected at least {num_layers}",
+                values.len()
+            ),
+        });
+    }
+    values.truncate(num_layers);
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!("{key} values must be finite and positive"),
+        });
+    }
+    Ok(values)
+}
+
+fn validate_deepseek4_compression_ratios(
+    prefix: &str,
+    ratios: &[usize],
+) -> Result<(), LoaderError> {
+    if let Some(ratio) = ratios
+        .iter()
+        .copied()
+        .find(|ratio| !matches!(ratio, 0 | 4 | 128))
+    {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!(
+                "{prefix}.attention.compress_ratios contains unsupported ratio {ratio}; expected 0, 4, or 128"
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadata, LoaderError> {
     let arch = detect_architecture(metadata)?;
 
@@ -322,6 +374,18 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
                 ),
             });
         }
+        validate_deepseek4_compression_ratios(prefix, &compress_ratios)?;
+        let swiglu_clamp_exp =
+            deepseek4_layer_f32(metadata, &format!("{prefix}.swiglu_clamp_exp"), num_layers)?;
+        let swiglu_clamp_shared = match deepseek4_layer_f32(
+            metadata,
+            &format!("{prefix}.swiglu_clamp_shexp"),
+            num_layers,
+        ) {
+            Ok(values) => values,
+            Err(LoaderError::MissingKey(_)) => swiglu_clamp_exp.clone(),
+            Err(error) => return Err(error),
+        };
         Some(DeepSeek4Metadata {
             q_lora_rank: get_u32(metadata, &format!("{prefix}.attention.q_lora_rank"))? as usize,
             indexer: GlmIndexerMetadata {
@@ -350,8 +414,8 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             )? as usize,
             hyper_connection_eps: get_f32(metadata, &format!("{prefix}.hyper_connection.epsilon"))?,
             hash_layer_count: get_u32(metadata, &format!("{prefix}.hash_layer_count"))? as usize,
-            swiglu_clamp_exp: get_f32_array(metadata, &format!("{prefix}.swiglu_clamp_exp"))?,
-            swiglu_clamp_shared: get_f32_array(metadata, &format!("{prefix}.swiglu_clamp_shexp"))?,
+            swiglu_clamp_exp,
+            swiglu_clamp_shared,
             rope_scaling_factor: get_f32(metadata, &format!("{prefix}.rope.scaling.factor"))?,
             rope_original_context_length: get_u32(
                 metadata,
@@ -445,6 +509,14 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         get_u32_opt(metadata, &format!("{prefix}.expert_gating_func")).unwrap_or(0);
     let expert_weights_norm =
         get_bool_opt(metadata, &format!("{prefix}.expert_weights_norm")).unwrap_or(false);
+    if arch == Architecture::DeepSeek4 && expert_gating_func != 4 {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!(
+                "{prefix}.expert_gating_func must be 4 (sqrt-softplus) for DeepSeek4, got {expert_gating_func}"
+            ),
+        });
+    }
 
     // SSM/Delta Net parameters (Qwen3.5 etc.)
     let ssm_d_inner =
@@ -692,8 +764,8 @@ pub fn build_graph(meta: &ModelMetadata) -> Result<Graph, LoaderError> {
         | Architecture::Qwen35MoE
         | Architecture::NemotronHMoE
         | Architecture::Hy3
-        | Architecture::GlmDsa
-        | Architecture::DeepSeek4 => Ok(llama::build_llama_graph(meta)),
+        | Architecture::GlmDsa => Ok(llama::build_llama_graph(meta)),
+        Architecture::DeepSeek4 => Ok(deepseek4::build_deepseek4_graph(meta)),
         // Gemma4 shares the structural graph builder with Gemma for now; the actual Gemma4-specific
         // forward semantics (ISWA, PLE, KV sharing, f_attention_scale=1.0) live in the engine path
         // and are layered on top. Graph-level split will come if/when builder-level differences
@@ -1305,6 +1377,10 @@ mod tests {
             ("deepseek4.expert_count".to_string(), GGUFValue::U32(256)),
             ("deepseek4.expert_used_count".to_string(), GGUFValue::U32(6)),
             (
+                "deepseek4.expert_gating_func".to_string(),
+                GGUFValue::U32(4),
+            ),
+            (
                 "deepseek4.attention.q_lora_rank".to_string(),
                 GGUFValue::U32(1024),
             ),
@@ -1383,5 +1459,16 @@ mod tests {
         assert_eq!(deepseek4.indexer.top_k, 512);
         assert_eq!(deepseek4.hyper_connection_count, 4);
         assert_eq!(deepseek4.hash_layer_count, 1);
+    }
+
+    #[test]
+    fn test_deepseek4_layer_f32_accepts_scalar_and_validates_ratios() {
+        let metadata = vec![("deepseek4.clamp".to_string(), GGUFValue::F32(10.0))];
+        assert_eq!(
+            deepseek4_layer_f32(&metadata, "deepseek4.clamp", 3).unwrap(),
+            vec![10.0; 3]
+        );
+        assert!(validate_deepseek4_compression_ratios("deepseek4", &[0, 4, 128]).is_ok());
+        assert!(validate_deepseek4_compression_ratios("deepseek4", &[8]).is_err());
     }
 }

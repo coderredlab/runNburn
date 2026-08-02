@@ -23,6 +23,11 @@ impl DeepSeek4Weights {
     pub(in crate::engine) fn clear_state(&mut self) {
         self.state.clear();
     }
+    pub(in crate::engine) fn set_sparse_moe_cuda_enabled(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            layer.moe.prefer_sparse_moe_cuda = enabled;
+        }
+    }
 }
 
 pub(super) struct DeepSeek4Config {
@@ -100,6 +105,7 @@ pub(super) struct DeepSeek4MoeWeights {
     pub(super) hash_routes: Option<Vec<i32>>,
     pub(super) routed_clamp: f32,
     pub(super) shared_clamp: f32,
+    pub(super) prefer_sparse_moe_cuda: bool,
 }
 
 pub(in crate::engine) fn load_deepseek4_weights(
@@ -165,6 +171,7 @@ pub(in crate::engine) fn load_deepseek4_weights(
                 hash_routes,
                 routed_clamp: metadata.swiglu_clamp_exp[layer_index],
                 shared_clamp: metadata.swiglu_clamp_shared[layer_index],
+                prefer_sparse_moe_cuda: false,
             },
             ffn_hc: load_hc(model, &prefix, "ffn", load_f32),
         });
