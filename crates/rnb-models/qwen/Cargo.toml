@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 rayon = "1"
+rnb-core = { path = "../../rnb-core" }
 rnb-cpu = { path = "../../rnb-cpu" }
 rnb-loader = { path = "../../rnb-loader" }

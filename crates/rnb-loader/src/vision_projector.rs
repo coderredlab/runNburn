@@ -101,10 +101,15 @@ fn parse_envelope(
         ));
     }
 
+    let projector_type = match get_string(metadata, "clip.projector_type") {
+        Ok(value) => value,
+        Err(LoaderError::MissingKey(_)) => get_string(metadata, "clip.vision.projector_type")?,
+        Err(error) => return Err(error),
+    };
     Ok(VisionProjectorEnvelope {
         architecture: architecture.to_string(),
         kind: kind.to_string(),
-        projector_type: get_string(metadata, "clip.projector_type")?.to_string(),
+        projector_type: projector_type.to_string(),
         has_vision_encoder,
     })
 }
@@ -146,6 +151,20 @@ mod tests {
         assert_eq!(envelope.kind, "mmproj");
         assert_eq!(envelope.projector_type, "qwen3vl_merger");
         assert!(envelope.has_vision_encoder);
+    }
+
+    #[test]
+    fn accepts_gemma_projector_type_from_vision_namespace() {
+        let mut metadata = metadata("clip", "mmproj", true);
+        metadata.retain(|(key, _)| key != "clip.projector_type");
+        metadata.push((
+            "clip.vision.projector_type".to_string(),
+            GGUFValue::String("gemma4v".to_string()),
+        ));
+
+        let envelope = parse_envelope(&metadata).unwrap();
+
+        assert_eq!(envelope.projector_type, "gemma4v");
     }
 
     #[test]

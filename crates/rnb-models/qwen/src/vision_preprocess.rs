@@ -1,3 +1,4 @@
+use rnb_core::image::RgbImage;
 use rnb_cpu::gemm::f32_gemv::gemv_f32;
 use rnb_loader::{GGMLType, LoadedVisionProjector};
 
@@ -5,51 +6,6 @@ use super::vision::{inspect_qwen36_vision_projector, Qwen36VisionError};
 
 pub const QWEN36_MIN_IMAGE_TOKENS: usize = 8;
 pub const QWEN36_MAX_IMAGE_TOKENS: usize = 4096;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Qwen36RgbImage {
-    width: usize,
-    height: usize,
-    pixels: Vec<u8>,
-}
-
-impl Qwen36RgbImage {
-    pub fn new(width: usize, height: usize, pixels: Vec<u8>) -> Result<Self, Qwen36VisionError> {
-        if width == 0 || height == 0 {
-            return Err(error("image dimensions must be positive"));
-        }
-        if width > u32::MAX as usize || height > u32::MAX as usize {
-            return Err(error("image dimensions must fit u32"));
-        }
-        let expected = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or_else(|| error("RGB image byte count overflows usize"))?;
-        if pixels.len() != expected {
-            return Err(error(format!(
-                "RGB image has {} bytes, expected {expected} for {width}x{height}",
-                pixels.len()
-            )));
-        }
-        Ok(Self {
-            width,
-            height,
-            pixels,
-        })
-    }
-
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
-    pub fn height(&self) -> usize {
-        self.height
-    }
-
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Qwen36TensorStats {
@@ -94,12 +50,12 @@ pub fn qwen36_smart_resize(
 
 pub fn prepare_qwen36_vision_intermediate(
     projector: &LoadedVisionProjector,
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
 ) -> Result<Qwen36VisionIntermediate, Qwen36VisionError> {
     let capability = inspect_qwen36_vision_projector(&projector.descriptor)?;
     let (target_width, target_height) = qwen36_smart_resize(
-        image.width,
-        image.height,
+        image.width(),
+        image.height(),
         capability.patch_size,
         capability.spatial_merge_size,
     )?;
@@ -241,11 +197,11 @@ fn smart_resize_with_limits(
 }
 
 fn resize_bilinear_align_corners(
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
     target_width: usize,
     target_height: usize,
-) -> Result<Qwen36RgbImage, Qwen36VisionError> {
-    if image.width == target_width && image.height == target_height {
+) -> Result<RgbImage, Qwen36VisionError> {
+    if image.width() == target_width && image.height() == target_height {
         return Ok(image.clone());
     }
     let byte_count = target_width
@@ -254,31 +210,31 @@ fn resize_bilinear_align_corners(
         .ok_or_else(|| error("resized RGB byte count overflows usize"))?;
     let mut output = vec![0u8; byte_count];
     let x_ratio = if target_width > 1 {
-        (image.width - 1) as f32 / (target_width - 1) as f32
+        (image.width() - 1) as f32 / (target_width - 1) as f32
     } else {
         0.0
     };
     let y_ratio = if target_height > 1 {
-        (image.height - 1) as f32 / (target_height - 1) as f32
+        (image.height() - 1) as f32 / (target_height - 1) as f32
     } else {
         0.0
     };
 
     for y in 0..target_height {
         let source_y = y as f32 * y_ratio;
-        let y0 = (source_y as usize).min(image.height - 1);
-        let y1 = (y0 + 1).min(image.height - 1);
+        let y0 = (source_y as usize).min(image.height() - 1);
+        let y1 = (y0 + 1).min(image.height() - 1);
         let y_fraction = source_y - y0 as f32;
         for x in 0..target_width {
             let source_x = x as f32 * x_ratio;
-            let x0 = (source_x as usize).min(image.width - 1);
-            let x1 = (x0 + 1).min(image.width - 1);
+            let x0 = (source_x as usize).min(image.width() - 1);
+            let x1 = (x0 + 1).min(image.width() - 1);
             let x_fraction = source_x - x0 as f32;
             for channel in 0..3 {
-                let p00 = image.pixels[(y0 * image.width + x0) * 3 + channel] as f32;
-                let p10 = image.pixels[(y0 * image.width + x1) * 3 + channel] as f32;
-                let p01 = image.pixels[(y1 * image.width + x0) * 3 + channel] as f32;
-                let p11 = image.pixels[(y1 * image.width + x1) * 3 + channel] as f32;
+                let p00 = image.pixels()[(y0 * image.width() + x0) * 3 + channel] as f32;
+                let p10 = image.pixels()[(y0 * image.width() + x1) * 3 + channel] as f32;
+                let p01 = image.pixels()[(y1 * image.width() + x0) * 3 + channel] as f32;
+                let p11 = image.pixels()[(y1 * image.width() + x1) * 3 + channel] as f32;
                 let top = p00 + (p10 - p00) * x_fraction;
                 let bottom = p01 + (p11 - p01) * x_fraction;
                 let value = top + (bottom - top) * y_fraction;
@@ -287,12 +243,13 @@ fn resize_bilinear_align_corners(
         }
     }
 
-    Qwen36RgbImage::new(target_width, target_height, output)
+    RgbImage::new(target_width, target_height, output)
+        .map_err(|image_error| error(image_error.to_string()))
 }
 
-fn normalize_rgb(image: &Qwen36RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
+fn normalize_rgb(image: &RgbImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
     image
-        .pixels
+        .pixels()
         .chunks_exact(3)
         .flat_map(|pixel| {
             [
@@ -588,10 +545,9 @@ mod tests {
     #[test]
     fn bilinear_resize_uses_align_corners_then_normalizes_rgb() {
         let image =
-            Qwen36RgbImage::new(2, 2, vec![0, 10, 20, 100, 10, 20, 200, 10, 20, 255, 10, 20])
-                .unwrap();
+            RgbImage::new(2, 2, vec![0, 10, 20, 100, 10, 20, 200, 10, 20, 255, 10, 20]).unwrap();
         let resized = resize_bilinear_align_corners(&image, 3, 3).unwrap();
-        assert_eq!(resized.pixels[(1 * 3 + 1) * 3], 138);
+        assert_eq!(resized.pixels()[(1 * 3 + 1) * 3], 138);
 
         let normalized = normalize_rgb(&resized, [0.5; 3], [0.5; 3]);
         let center = normalized[(1 * 3 + 1) * 3];
@@ -639,7 +595,7 @@ mod tests {
 
     #[test]
     fn rgb_constructor_rejects_dimension_and_byte_count_errors() {
-        assert!(Qwen36RgbImage::new(0, 1, Vec::new()).is_err());
-        assert!(Qwen36RgbImage::new(2, 2, vec![0; 11]).is_err());
+        assert!(RgbImage::new(0, 1, Vec::new()).is_err());
+        assert!(RgbImage::new(2, 2, vec![0; 11]).is_err());
     }
 }

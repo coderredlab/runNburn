@@ -1194,6 +1194,7 @@ dependencies = [
  "rayon",
  "rnb-core",
  "rnb-loader",
+ "rnb-model-gemma",
  "rnb-model-nemotron",
  "rnb-model-qwen",
  "rnb-mtp",
@@ -1232,6 +1233,12 @@ dependencies = [
 [[package]]
 name = "rnb-model-gemma"
 version = "0.7.0"
+dependencies = [
+ "rayon",
+ "rnb-core",
+ "rnb-cpu",
+ "rnb-loader",
+]
 
 [[package]]
 name = "rnb-model-ir"
@@ -1246,6 +1253,7 @@ name = "rnb-model-qwen"
 version = "0.7.0"
 dependencies = [
  "rayon",
+ "rnb-core",
  "rnb-cpu",
  "rnb-loader",
 ]

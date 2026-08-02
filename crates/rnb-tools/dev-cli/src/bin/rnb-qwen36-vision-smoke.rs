@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use rnb_loader::load_vision_projector;
 use rnb_model_qwen::{
     encode_qwen36_vision_intermediate, inspect_qwen36_vision_projector,
-    prepare_qwen36_vision_intermediate, Qwen36RgbImage, Qwen36TensorStats,
+    prepare_qwen36_vision_intermediate, Qwen36TensorStats, RgbImage,
 };
 use sha2::{Digest, Sha256};
 
@@ -215,11 +215,11 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn fixed_image(white_reference: bool) -> Result<Qwen36RgbImage, rnb_model_qwen::Qwen36VisionError> {
+fn fixed_image(white_reference: bool) -> Result<RgbImage, rnb_core::image::ImageError> {
     const WIDTH: usize = 768;
     const HEIGHT: usize = 768;
     if white_reference {
-        return Qwen36RgbImage::new(WIDTH, HEIGHT, vec![255; WIDTH * HEIGHT * 3]);
+        return RgbImage::new(WIDTH, HEIGHT, vec![255; WIDTH * HEIGHT * 3]);
     }
     let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
     for y in 0..HEIGHT {
@@ -229,10 +229,10 @@ fn fixed_image(white_reference: bool) -> Result<Qwen36RgbImage, rnb_model_qwen::
             pixels.push(((x + y) * 255 / (WIDTH + HEIGHT - 2)) as u8);
         }
     }
-    Qwen36RgbImage::new(WIDTH, HEIGHT, pixels)
+    RgbImage::new(WIDTH, HEIGHT, pixels)
 }
 
-fn write_ppm(path: &std::path::Path, image: &Qwen36RgbImage) -> std::io::Result<()> {
+fn write_ppm(path: &std::path::Path, image: &RgbImage) -> std::io::Result<()> {
     let header = format!("P6\n{} {}\n255\n", image.width(), image.height());
     let mut bytes = Vec::with_capacity(header.len() + image.pixels().len());
     bytes.extend_from_slice(header.as_bytes());

@@ -16,6 +16,7 @@ mediatek = ["rnb-runtime/mediatek"]
 rnb-core = { path = "../rnb-core" }
 rnb-loader = { path = "../rnb-loader" }
 rnb-model-nemotron = { path = "../rnb-models/nemotron" }
+rnb-model-gemma = { path = "../rnb-models/gemma" }
 rnb-model-qwen = { path = "../rnb-models/qwen" }
 rnb-mtp = { path = "../rnb-mtp" }
 rnb-runtime = { path = "../rnb-runtime", default-features = false }
