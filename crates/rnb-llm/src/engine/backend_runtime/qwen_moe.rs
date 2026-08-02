@@ -2134,7 +2134,9 @@ pub(in crate::engine) fn glm_moe_decode_iq2xxs_iq3xxs_into(
     shared_down_q8_0: bool,
     gate_up_iq3xxs: bool,
     shared_gate_up_q8_0: bool,
-) -> std::result::Result<(), String> {
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
+) -> std::result::Result<bool, String> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
         let used = metal_runtime::metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
@@ -2156,13 +2158,15 @@ pub(in crate::engine) fn glm_moe_decode_iq2xxs_iq3xxs_into(
             shared_down_q8_0,
             gate_up_iq3xxs,
             shared_gate_up_q8_0,
+            activation_limits,
+            shared_first,
         )
         .map_err(|err| err.to_string())?;
         if used {
-            return Ok(());
+            return Ok(true);
         }
     }
-    Err("Metal GLM MoE IQ decode batch is not available".to_string())
+    Ok(false)
 }
 
 /// pm112: GLM MLA decode dense GEMV (q_a/q_b/kv_a/o) Metal 라우팅 glue.
@@ -2317,6 +2321,8 @@ pub(in crate::engine) fn glm_moe_prefill_iq_batch_into(
     shared_down_q8_0: bool,
     gate_up_iq3xxs: bool,
     shared_gate_up_q8_0: bool,
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
     file_regions: Option<&[rnb_core::tensor::FileBackedRegion; 3]>,
 ) -> std::result::Result<bool, String> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -2338,6 +2344,8 @@ pub(in crate::engine) fn glm_moe_prefill_iq_batch_into(
             shared_down_q8_0,
             gate_up_iq3xxs,
             shared_gate_up_q8_0,
+            activation_limits,
+            shared_first,
             file_regions,
         )
         .map_err(|err| err.to_string());

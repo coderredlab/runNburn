@@ -12,6 +12,9 @@ use rnb_loader::GGMLType;
 
 use super::math::tensor_f32;
 use super::weights::{DeepSeek4Config, DeepSeek4MoeWeights};
+fn metal_decode_route_supported(expert_slots: usize, route_weight_slots: usize) -> bool {
+    (1..=8).contains(&expert_slots) && expert_slots == route_weight_slots
+}
 
 pub(super) fn forward_moe(
     input: &[f32],
@@ -20,6 +23,11 @@ pub(super) fn forward_moe(
     config: &DeepSeek4Config,
 ) -> Result<Vec<f32>> {
     let (experts, route_weights) = route(input, token_id, weights, config);
+    if let Some(output) =
+        forward_moe_metal_decode(input, &experts, &route_weights, weights, config)?
+    {
+        return Ok(output);
+    }
     let sparse_outputs: Vec<Vec<f32>> = experts
         .par_iter()
         .zip(route_weights.par_iter())
@@ -41,6 +49,106 @@ pub(super) fn forward_moe(
         }
     }
     Ok(output)
+}
+
+fn forward_moe_metal_decode(
+    input: &[f32],
+    experts: &[usize],
+    route_weights: &[f32],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Option<Vec<f32>>> {
+    if !crate::engine::backend_runtime::metal_deepseek4_moe_decode_requested() {
+        return Ok(None);
+    }
+
+    let moe = &weights.weights;
+    let supported = metal_decode_route_supported(experts.len(), route_weights.len())
+        && moe.gate_quant == moe.up_quant
+        && matches!(
+            moe.gate_quant,
+            GGMLType::IQ2_XXS | GGMLType::IQ2_S | GGMLType::IQ3_XXS
+        )
+        && matches!(moe.down_quant, GGMLType::IQ3_XXS | GGMLType::IQ4_XS)
+        && moe.shared_gate.ggml_type == moe.shared_up.ggml_type
+        && matches!(
+            moe.shared_gate.ggml_type,
+            GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
+        )
+        && matches!(moe.shared_down.ggml_type, GGMLType::Q6_K | GGMLType::Q8_0)
+        && moe.shared_gate.rows == config.expert_ffn_dim
+        && moe.shared_up.rows == config.expert_ffn_dim
+        && moe.shared_down.rows == config.hidden_dim
+        && moe.shared_gate.cols == config.hidden_dim
+        && moe.shared_up.cols == config.hidden_dim
+        && moe.shared_down.cols == config.expert_ffn_dim
+        && config.hidden_dim % 256 == 0
+        && config.expert_ffn_dim % 256 == 0;
+    if !supported {
+        return Ok(None);
+    }
+
+    let Some(gate_bytes) = moe.gate_exps_bytes() else {
+        return Ok(None);
+    };
+    let Some(up_bytes) = moe.up_exps_bytes() else {
+        return Ok(None);
+    };
+    let Some(down_bytes) = moe.down_exps_bytes() else {
+        return Ok(None);
+    };
+    let (Some(shared_gate), Some(shared_up), Some(shared_down)) = (
+        moe.shared_gate.data.as_bytes(),
+        moe.shared_up.data.as_bytes(),
+        moe.shared_down.data.as_bytes(),
+    ) else {
+        return Ok(None);
+    };
+
+    let gate_expert_bytes =
+        config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.gate_quant);
+    let up_expert_bytes = config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.up_quant);
+    let down_expert_bytes =
+        config.hidden_dim * bytes_per_row(config.expert_ffn_dim, moe.down_quant);
+    let mut gate_slots = Vec::with_capacity(experts.len());
+    let mut up_slots = Vec::with_capacity(experts.len());
+    let mut down_slots = Vec::with_capacity(experts.len());
+    for &expert in experts {
+        let gate_start = expert * gate_expert_bytes;
+        let up_start = expert * up_expert_bytes;
+        let down_start = expert * down_expert_bytes;
+        gate_slots.push(&gate_bytes[gate_start..gate_start + gate_expert_bytes]);
+        up_slots.push(&up_bytes[up_start..up_start + up_expert_bytes]);
+        down_slots.push(&down_bytes[down_start..down_start + down_expert_bytes]);
+    }
+
+    let mut activation_limits = vec![weights.routed_clamp; experts.len()];
+    activation_limits.push(weights.shared_clamp);
+    let mut output = vec![0.0f32; config.hidden_dim];
+    let used = crate::engine::backend_runtime::glm_moe_decode_iq2xxs_iq3xxs_into(
+        &gate_slots,
+        &up_slots,
+        &down_slots,
+        route_weights,
+        shared_gate,
+        shared_up,
+        shared_down,
+        1.0,
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        input,
+        &mut output,
+        moe.gate_quant == GGMLType::IQ2_S,
+        moe.down_quant == GGMLType::IQ4_XS,
+        moe.shared_gate.ggml_type == GGMLType::Q6_K,
+        moe.shared_down.ggml_type == GGMLType::Q8_0,
+        moe.gate_quant == GGMLType::IQ3_XXS,
+        moe.shared_gate.ggml_type == GGMLType::Q8_0,
+        Some(&activation_limits),
+        true,
+    )
+    .map_err(crate::error::LlmError::Forward)?;
+    Ok(used.then_some(output))
 }
 pub(super) fn forward_moe_batch(
     inputs: &[f32],
@@ -67,6 +175,10 @@ pub(super) fn forward_moe_batch(
         for (dst, sparse) in output.iter_mut().zip(sparse) {
             *dst += sparse;
         }
+        return Ok(output);
+    }
+
+    if let Some(output) = forward_moe_metal_batch(inputs, &routes, weights, config)? {
         return Ok(output);
     }
 
@@ -127,6 +239,120 @@ pub(super) fn forward_moe_batch(
         }
     }
     Ok(output)
+}
+
+fn forward_moe_metal_batch(
+    inputs: &[f32],
+    routes: &[(Vec<usize>, Vec<f32>)],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Option<Vec<f32>>> {
+    if !crate::engine::backend_runtime::metal_deepseek4_moe_prefill_batch_requested() {
+        return Ok(None);
+    }
+
+    let moe = &weights.weights;
+    let sparse_gate_up_supported = moe.gate_quant == moe.up_quant
+        && matches!(
+            moe.gate_quant,
+            GGMLType::IQ2_XXS | GGMLType::IQ2_S | GGMLType::IQ3_XXS
+        );
+    let sparse_down_supported = matches!(moe.down_quant, GGMLType::IQ3_XXS | GGMLType::IQ4_XS);
+    let shared_gate_up_supported = moe.shared_gate.ggml_type == moe.shared_up.ggml_type
+        && matches!(
+            moe.shared_gate.ggml_type,
+            GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
+        );
+    let shared_down_supported =
+        matches!(moe.shared_down.ggml_type, GGMLType::Q6_K | GGMLType::Q8_0);
+    let shared_shape_matches = moe.shared_gate.rows == config.expert_ffn_dim
+        && moe.shared_up.rows == config.expert_ffn_dim
+        && moe.shared_down.rows == config.hidden_dim
+        && moe.shared_gate.cols == config.hidden_dim
+        && moe.shared_up.cols == config.hidden_dim
+        && moe.shared_down.cols == config.expert_ffn_dim;
+    if !sparse_gate_up_supported
+        || !sparse_down_supported
+        || !shared_gate_up_supported
+        || !shared_down_supported
+        || !shared_shape_matches
+        || config.hidden_dim % 256 != 0
+        || config.expert_ffn_dim % 256 != 0
+    {
+        return Ok(None);
+    }
+
+    let Some(gate_bytes) = moe.gate_exps_bytes() else {
+        return Ok(None);
+    };
+    let Some(up_bytes) = moe.up_exps_bytes() else {
+        return Ok(None);
+    };
+    let Some(down_bytes) = moe.down_exps_bytes() else {
+        return Ok(None);
+    };
+    let (Some(shared_gate), Some(shared_up), Some(shared_down)) = (
+        moe.shared_gate.data.as_bytes(),
+        moe.shared_up.data.as_bytes(),
+        moe.shared_down.data.as_bytes(),
+    ) else {
+        return Ok(None);
+    };
+
+    let sparse_slots = config.expert_used_count;
+    let slots = sparse_slots + 1;
+    let gate_expert_bytes =
+        config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.gate_quant);
+    let up_expert_bytes = config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.up_quant);
+    let down_expert_bytes =
+        config.hidden_dim * bytes_per_row(config.expert_ffn_dim, moe.down_quant);
+    let mut gate_slots = Vec::with_capacity(routes.len() * slots);
+    let mut up_slots = Vec::with_capacity(routes.len() * slots);
+    let mut down_slots = Vec::with_capacity(routes.len() * slots);
+    let mut route_weights = Vec::with_capacity(routes.len() * slots);
+    for (experts, weights) in routes {
+        for (&expert, &route_weight) in experts.iter().zip(weights) {
+            let gate_start = expert * gate_expert_bytes;
+            let up_start = expert * up_expert_bytes;
+            let down_start = expert * down_expert_bytes;
+            gate_slots.push(&gate_bytes[gate_start..gate_start + gate_expert_bytes]);
+            up_slots.push(&up_bytes[up_start..up_start + up_expert_bytes]);
+            down_slots.push(&down_bytes[down_start..down_start + down_expert_bytes]);
+            route_weights.push(route_weight);
+        }
+        gate_slots.push(shared_gate);
+        up_slots.push(shared_up);
+        down_slots.push(shared_down);
+        route_weights.push(1.0);
+    }
+
+    let mut activation_limits = vec![weights.routed_clamp; sparse_slots];
+    activation_limits.push(weights.shared_clamp);
+    let mut output = vec![0.0f32; routes.len() * config.hidden_dim];
+    let file_regions = moe.sparse_expert_file_regions();
+    let used = crate::engine::backend_runtime::glm_moe_prefill_iq_batch_into(
+        &gate_slots,
+        &up_slots,
+        &down_slots,
+        &route_weights,
+        routes.len(),
+        sparse_slots,
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        inputs,
+        &mut output,
+        moe.gate_quant == GGMLType::IQ2_S,
+        moe.down_quant == GGMLType::IQ4_XS,
+        moe.shared_gate.ggml_type == GGMLType::Q6_K,
+        moe.shared_down.ggml_type == GGMLType::Q8_0,
+        moe.gate_quant == GGMLType::IQ3_XXS,
+        moe.shared_gate.ggml_type == GGMLType::Q8_0,
+        Some(&activation_limits),
+        true,
+        file_regions.as_ref(),
+    )
+    .map_err(crate::error::LlmError::Forward)?;
+    Ok(used.then_some(output))
 }
 
 fn route(
@@ -474,13 +700,25 @@ fn bytes_per_row(cols: usize, quant: GGMLType) -> usize {
     cols.div_ceil(block_elements) * block_bytes
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
-    use super::routed_cuda_layout_supported;
-    use rnb_loader::GGMLType;
+    use super::metal_decode_route_supported;
 
     #[test]
+    fn metal_decode_route_admission_matches_backend_slot_limit() {
+        assert!(metal_decode_route_supported(1, 1));
+        assert!(metal_decode_route_supported(8, 8));
+        assert!(!metal_decode_route_supported(0, 0));
+        assert!(!metal_decode_route_supported(9, 9));
+        assert!(!metal_decode_route_supported(8, 7));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn routed_cuda_layout_respects_sparse_moe_policy() {
+        use super::routed_cuda_layout_supported;
+        use rnb_loader::GGMLType;
+
         assert!(!routed_cuda_layout_supported(
             false,
             GGMLType::IQ2_XXS,

@@ -3050,6 +3050,28 @@ pub(in crate::engine) fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
     }
 }
 
+pub(in crate::engine) fn metal_deepseek4_moe_prefill_batch_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_moe_prefill_batch_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_moe_decode_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_moe_decode_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
 pub(in crate::engine) fn metal_deepseek4_attention_prefill_batch_tokens(
     seq_len: usize,
     scratch_bytes_per_token: usize,

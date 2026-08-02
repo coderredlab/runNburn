@@ -338,6 +338,41 @@ pub(crate) fn encode_silu_mul(
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+pub(crate) fn encode_silu_mul_clamped_slots(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
+    slot_limits_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_ff_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim: usize,
+) {
+    enc.setComputePipelineState(&ctx.silu_mul_clamped_slots_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(up_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(slot_limits_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(n_ff_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 4);
+    }
+    let tg_width = ctx
+        .silu_mul_clamped_slots_pipeline
+        .threadExecutionWidth()
+        .max(1);
+    let grid = MTLSize {
+        width: dim.div_ceil(tg_width),
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_width,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
 /// residual in-place(hidden += down) 를 encoder 에 encode.
 pub(crate) fn encode_residual_add(
     ctx: &MetalContext,
@@ -8994,6 +9029,33 @@ pub(crate) fn qwen_moe_decode_dispatch(
     readback(&carrier.out_dev, carrier.n_embd)
 }
 
+fn glm_moe_reduce_route_weights<'a>(
+    route_weights: &'a [f32],
+    seq_len: usize,
+    sparse_slots: usize,
+    shared_first: bool,
+) -> std::borrow::Cow<'a, [f32]> {
+    let slots = sparse_slots + 1;
+    assert_eq!(route_weights.len(), seq_len * slots);
+    if !shared_first {
+        return std::borrow::Cow::Borrowed(route_weights);
+    }
+    let mut ordered = Vec::with_capacity(route_weights.len());
+    for weights in route_weights.chunks_exact(slots) {
+        ordered.push(weights[sparse_slots]);
+        ordered.extend_from_slice(&weights[..sparse_slots]);
+    }
+    std::borrow::Cow::Owned(ordered)
+}
+
+fn glm_moe_down_slot_bases(shared_first: bool, sparse_slots: usize) -> (usize, usize) {
+    if shared_first {
+        (1, 0)
+    } else {
+        (0, sparse_slots)
+    }
+}
+
 /// pm113: GLM MoE prefill token-batch. 토큰별 stage 시퀀스(gate/up sparse+shared →
 /// silu → down sparse+shared → reduce)를 **단일 command buffer** 에 encode 해
 /// per-token commit/wait/wiring 오버헤드를 없앤다. carrier scratch 는 토큰 간
@@ -9015,6 +9077,8 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
     down_w: &[Retained<ProtocolObject<dyn MTLBuffer>>],
     down_off: &[u32],
     route_weights_all: &[f32],
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
     select: crate::GlmMoeQuantSelect,
 ) -> Vec<f32> {
     let slots = sparse_slots + 1;
@@ -9027,7 +9091,10 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
     assert_eq!(down_w.len(), seq_len * slots);
     assert_eq!(down_off.len(), seq_len * slots);
     assert_eq!(route_weights_all.len(), seq_len * slots);
+    assert!(activation_limits.is_none_or(|limits| limits.len() == slots));
     assert_eq!(input_all.len(), seq_len * carrier.n_embd);
+    let reduce_route_weights =
+        glm_moe_reduce_route_weights(route_weights_all, seq_len, sparse_slots, shared_first);
 
     // pm116: encode/gpu/readback 분해 — lib.rs 의 pread/wrap 줄과 같은 게이트.
     let profiling = std::env::var("RNB_METAL_GLM_MOE_PREFILL_PROFILE").as_deref() == Ok("1");
@@ -9045,16 +9112,14 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
             .expect("Metal: GLM prefill input buffer")
     };
     let route_buf: Retained<ProtocolObject<dyn MTLBuffer>> = unsafe {
-        let ptr = NonNull::new(route_weights_all.as_ptr() as *mut std::ffi::c_void)
+        let route_weights = reduce_route_weights.as_ref();
+        let ptr = NonNull::new(route_weights.as_ptr() as *mut std::ffi::c_void)
             .expect("prefill route ptr is null");
         ctx.device
-            .newBufferWithBytes_length_options(
-                ptr,
-                std::mem::size_of_val(route_weights_all),
-                shared,
-            )
+            .newBufferWithBytes_length_options(ptr, std::mem::size_of_val(route_weights), shared)
             .expect("Metal: GLM prefill route buffer")
     };
+    let activation_limits_buf = activation_limits.map(|limits| shared_f32_buf(ctx, limits));
     let out_buf: Retained<ProtocolObject<dyn MTLBuffer>> = ctx
         .device
         .newBufferWithLength_options(seq_len * n_embd * f32_bytes, shared)
@@ -9086,7 +9151,9 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
     };
     let shared_slot = sparse_slots;
     let shared_ff_offset = shared_slot * n_ff * f32_bytes;
-    let shared_embd_offset = shared_slot * n_embd * f32_bytes;
+    let (sparse_down_slot, shared_down_slot) = glm_moe_down_slot_bases(shared_first, sparse_slots);
+    let sparse_down_byte_offset = sparse_down_slot * n_embd * f32_bytes;
+    let shared_down_byte_offset = shared_down_slot * n_embd * f32_bytes;
     let zero_off_buf = u32_buf(ctx, 0);
 
     for token in 0..seq_len {
@@ -9148,14 +9215,27 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
             shared_ff_offset,
             n_ff,
         );
-        encode_silu_mul(
-            ctx,
-            &enc,
-            &carrier.gate_dev,
-            &carrier.up_dev,
-            &carrier.total_ff_buf,
-            carrier.slots * n_ff,
-        );
+        if let Some(limits) = &activation_limits_buf {
+            encode_silu_mul_clamped_slots(
+                ctx,
+                &enc,
+                &carrier.gate_dev,
+                &carrier.up_dev,
+                limits,
+                &carrier.n_ff_buf,
+                &carrier.total_ff_buf,
+                carrier.slots * n_ff,
+            );
+        } else {
+            encode_silu_mul(
+                ctx,
+                &enc,
+                &carrier.gate_dev,
+                &carrier.up_dev,
+                &carrier.total_ff_buf,
+                carrier.slots * n_ff,
+            );
+        }
         encode_glm_moe_decode_iq_selected_slots_at(
             down_pipeline,
             &enc,
@@ -9164,7 +9244,7 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
             &carrier.gate_dev,
             0,
             &carrier.down_dev,
-            0,
+            sparse_down_byte_offset,
             &carrier.n_embd_buf,
             &carrier.n_ff_buf,
             &carrier.slots_buf,
@@ -9180,7 +9260,7 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
                 &carrier.gate_dev,
                 shared_ff_offset,
                 &carrier.down_dev,
-                shared_embd_offset,
+                shared_down_byte_offset,
                 &carrier.n_embd_buf,
                 &carrier.n_ff_buf,
                 &zero_off_buf,
@@ -9197,7 +9277,7 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
                 &carrier.n_ff_buf,
                 &carrier.down_off_buf[shared_slot],
                 shared_ff_offset,
-                shared_embd_offset,
+                shared_down_byte_offset,
                 n_embd,
             );
         }
@@ -9246,6 +9326,8 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     down_w: &[Retained<ProtocolObject<dyn MTLBuffer>>],
     down_off: &[u32],
     route_weights: &[f32],
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
     select: crate::GlmMoeQuantSelect,
 ) -> Vec<f32> {
     let slots = route_weights.len();
@@ -9258,13 +9340,17 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     assert_eq!(up_off.len(), slots);
     assert_eq!(down_w.len(), slots);
     assert_eq!(down_off.len(), slots);
+    assert!(activation_limits.is_none_or(|limits| limits.len() == slots));
+    let reduce_route_weights =
+        glm_moe_reduce_route_weights(route_weights, 1, sparse_slots, shared_first);
     let profile_start = (std::env::var("RNB_METAL_GLM_MOE_PROFILE").as_deref() == Ok("1"))
         .then(std::time::Instant::now);
 
     carrier.upload_input(input);
     carrier.upload_offsets(gate_off, up_off, down_off);
-    carrier.upload_route_weights(route_weights);
+    carrier.upload_route_weights(reduce_route_weights.as_ref());
     let t_upload = profile_start.map(|s| s.elapsed().as_secs_f64() * 1000.0);
+    let activation_limits_buf = activation_limits.map(|limits| shared_f32_buf(ctx, limits));
     let stage_profile = std::env::var("RNB_METAL_GLM_MOE_STAGE_PROFILE").as_deref() == Ok("1");
     let mut cmd = ctx.queue.commandBuffer().expect("command buffer");
     let mut enc = cmd.computeCommandEncoder().expect("compute encoder");
@@ -9306,6 +9392,8 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     let shared_slot = sparse_slots;
     let f32_bytes = std::mem::size_of::<f32>();
     let shared_ff_offset = shared_slot * carrier.n_ff * f32_bytes;
+    let (sparse_down_slot, shared_down_slot) = glm_moe_down_slot_bases(shared_first, sparse_slots);
+    let sparse_down_byte_offset = sparse_down_slot * carrier.n_embd * f32_bytes;
     if stage_profile {
         glm_moe_stage_cut(ctx, &mut cmd, &mut enc, 0);
     }
@@ -9345,14 +9433,27 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     if stage_profile {
         glm_moe_stage_cut(ctx, &mut cmd, &mut enc, 1);
     }
-    encode_silu_mul(
-        ctx,
-        &enc,
-        &carrier.gate_dev,
-        &carrier.up_dev,
-        &carrier.total_ff_buf,
-        carrier.slots * carrier.n_ff,
-    );
+    if let Some(limits) = &activation_limits_buf {
+        encode_silu_mul_clamped_slots(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            limits,
+            &carrier.n_ff_buf,
+            &carrier.total_ff_buf,
+            carrier.slots * carrier.n_ff,
+        );
+    } else {
+        encode_silu_mul(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            &carrier.total_ff_buf,
+            carrier.slots * carrier.n_ff,
+        );
+    }
     if stage_profile {
         glm_moe_stage_cut(ctx, &mut cmd, &mut enc, 2);
     }
@@ -9362,13 +9463,15 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     } else {
         ctx.glm_moe_decode_iq3xxs_selected_slots_pipeline()
     };
-    encode_glm_moe_decode_iq_selected_slots(
+    encode_glm_moe_decode_iq_selected_slots_at(
         down_pipeline,
         &enc,
         &down_w[..sparse_slots],
         &down_off[..sparse_slots],
         &carrier.gate_dev,
+        0,
         &carrier.down_dev,
+        sparse_down_byte_offset,
         &carrier.n_embd_buf,
         &carrier.n_ff_buf,
         &carrier.slots_buf,
@@ -9378,7 +9481,7 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
     if stage_profile {
         glm_moe_stage_cut(ctx, &mut cmd, &mut enc, 3);
     }
-    let shared_embd_offset = shared_slot * carrier.n_embd * f32_bytes;
+    let shared_embd_offset = shared_down_slot * carrier.n_embd * f32_bytes;
     if select.shared_down_q8_0 {
         let zero_off_buf = u32_buf(ctx, 0);
         crate::compute::encode_gemv_q8_0_at(
@@ -12802,6 +12905,31 @@ mod qwen_moe_id_plan_tests {
             long.total_bytes,
             generic_long.total_bytes - generic_long.q8_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod glm_moe_reduce_order_tests {
+    use super::{glm_moe_down_slot_bases, glm_moe_reduce_route_weights};
+
+    #[test]
+    fn shared_first_reorders_each_token_and_output_slots() {
+        let weights = [0.25, 0.5, 1.0, 0.75, 0.125, 1.0];
+        assert_eq!(
+            glm_moe_reduce_route_weights(&weights, 2, 2, true).as_ref(),
+            &[1.0, 0.25, 0.5, 1.0, 0.75, 0.125]
+        );
+        assert_eq!(glm_moe_down_slot_bases(true, 2), (1, 0));
+    }
+
+    #[test]
+    fn sparse_first_preserves_existing_layout() {
+        let weights = [0.25, 0.5, 1.0];
+        assert_eq!(
+            glm_moe_reduce_route_weights(&weights, 1, 2, false).as_ref(),
+            &weights
+        );
+        assert_eq!(glm_moe_down_slot_bases(false, 2), (0, 2));
     }
 }
 

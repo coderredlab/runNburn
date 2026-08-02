@@ -14,6 +14,22 @@ kernel void silu_mul(
     gate[gid] = (g / (1.0f + exp(-g))) * up[gid];
 }
 
+// DeepSeek4 SwiGLU: routed/shared slots may use different clamp limits.
+kernel void silu_mul_clamped_slots(
+    device float*       gate        [[buffer(0)]],
+    device const float* up          [[buffer(1)]],
+    device const float* slot_limits [[buffer(2)]],
+    constant uint&      n_ff        [[buffer(3)]],
+    constant uint&      dim         [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float limit = slot_limits[gid / n_ff];
+    float g = min(gate[gid], limit);
+    float u = clamp(up[gid], -limit, limit);
+    gate[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
 // Prefill tensorops down GEMM consumes half activation. This is bit-equivalent to
 // silu_mul(gate, up) followed by cast_f32_to_f16, but avoids the intermediate f32
 // activation write/read.

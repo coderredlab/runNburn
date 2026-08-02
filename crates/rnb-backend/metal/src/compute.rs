@@ -508,6 +508,7 @@ pub struct MetalContext {
     /// pm43: GDN prefill gated RMSNorm+SiLU(batch, rows>1). rmsnorm(out)*silu(z) fused per-row.
     pub gated_rmsnorm_silu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub silu_mul_clamped_slots_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_half_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub residual_add_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2038,6 +2039,8 @@ pub fn build_metal_context_with_opts(
     let gated_rmsnorm_silu_pipeline =
         build_pipeline(&device, RMS_NORM_SRC, "gated_rmsnorm_silu_batch");
     let silu_mul_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul");
+    let silu_mul_clamped_slots_pipeline =
+        build_pipeline(&device, SILU_MUL_SRC, "silu_mul_clamped_slots");
     let silu_mul_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul_to_f16");
     let silu_mul_half_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul_half_to_f16");
     let residual_add_pipeline = build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add");
@@ -2357,6 +2360,7 @@ pub fn build_metal_context_with_opts(
         rms_norm_batch_pipeline,
         gated_rmsnorm_silu_pipeline,
         silu_mul_pipeline,
+        silu_mul_clamped_slots_pipeline,
         silu_mul_f16_pipeline,
         silu_mul_half_f16_pipeline,
         residual_add_pipeline,

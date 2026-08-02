@@ -726,28 +726,31 @@ pub(super) fn compute_sparse_fanout(
             up_slices[slot] = &view.up_exps_bytes[expert * per_up..(expert + 1) * per_up];
             down_slices[slot] = &view.down_exps_bytes[expert * per_down..(expert + 1) * per_down];
         }
-        if qwen_moe_backend::glm_moe_decode_iq2xxs_iq3xxs_into(
-            &gate_slices[..idx.len()],
-            &up_slices[..idx.len()],
-            &down_slices[..idx.len()],
-            exps,
-            view.shared_gate_bytes,
-            view.shared_up_bytes,
-            view.shared_down_bytes,
-            gate_scalar,
-            n_ff,
-            n_embd,
-            h,
-            out,
-            view.gate_quant == GGMLType::IQ2_S,
-            view.down_quant == GGMLType::IQ4_XS,
-            view.shared_gate_quant == GGMLType::Q6_K,
-            view.shared_down_quant == GGMLType::Q8_0,
-            view.gate_quant == GGMLType::IQ3_XXS,
-            view.shared_gate_quant == GGMLType::Q8_0,
-        )
-        .is_ok()
-        {
+        if matches!(
+            qwen_moe_backend::glm_moe_decode_iq2xxs_iq3xxs_into(
+                &gate_slices[..idx.len()],
+                &up_slices[..idx.len()],
+                &down_slices[..idx.len()],
+                exps,
+                view.shared_gate_bytes,
+                view.shared_up_bytes,
+                view.shared_down_bytes,
+                gate_scalar,
+                n_ff,
+                n_embd,
+                h,
+                out,
+                view.gate_quant == GGMLType::IQ2_S,
+                view.down_quant == GGMLType::IQ4_XS,
+                view.shared_gate_quant == GGMLType::Q6_K,
+                view.shared_down_quant == GGMLType::Q8_0,
+                view.gate_quant == GGMLType::IQ3_XXS,
+                view.shared_gate_quant == GGMLType::Q8_0,
+                None,
+                false,
+            ),
+            Ok(true)
+        ) {
             let fanout_us = fanout_start.elapsed().as_micros();
             if profile_enabled {
                 record_moe_profile(

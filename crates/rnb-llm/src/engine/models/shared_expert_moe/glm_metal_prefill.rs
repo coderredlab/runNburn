@@ -174,6 +174,8 @@ pub(super) fn forward(
         shared_down_q8_0,
         false,
         false,
+        None,
+        false,
         file_regions,
     )
     .map_err(crate::error::LlmError::Forward)?;

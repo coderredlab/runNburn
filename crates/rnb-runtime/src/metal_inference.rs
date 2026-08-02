@@ -1166,6 +1166,14 @@ pub fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
         .with(|backend| backend.deepseek4_prefill_q8_multi_gemm(weights, input, seq_len, layout)))
 }
 
+pub fn metal_deepseek4_moe_prefill_batch_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_MOE_PREFILL_BATCH")
+}
+
+pub fn metal_deepseek4_moe_decode_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_MOE_DECODE") && !env_falsey("RNB_METAL_GLM_MOE_DECODE")
+}
+
 // Temporary projection buffers must stay small beside file-backed weights on unified memory.
 // The capacity fraction bounds cold allocations; the available-memory fraction shrinks first
 // under pressure from the mapped model or other applications.
@@ -4220,6 +4228,8 @@ pub fn metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
     shared_down_q8_0: bool,
     gate_up_iq3xxs: bool,
     shared_gate_up_q8_0: bool,
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
 ) -> Result<bool> {
     if env_falsey("RNB_METAL_GLM_MOE_DECODE") {
         return Ok(false);
@@ -4238,6 +4248,7 @@ pub fn metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
         || n_embd % 256 != 0
         || input.len() != n_embd
         || out.len() != n_embd
+        || activation_limits.is_some_and(|limits| limits.len() != gate.len() + 1)
     {
         return Ok(false);
     }
@@ -4254,6 +4265,8 @@ pub fn metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
             n_ff,
             n_embd,
             input,
+            activation_limits,
+            shared_first,
             rnb_backend_metal::GlmMoeQuantSelect {
                 gate_up_iq2s,
                 down_iq4xs: down_is_iq4xs,
@@ -4289,6 +4302,8 @@ pub fn metal_glm_moe_prefill_iq_batch_into_if_supported(
     shared_down_q8_0: bool,
     gate_up_iq3xxs: bool,
     shared_gate_up_q8_0: bool,
+    activation_limits: Option<&[f32]>,
+    shared_first: bool,
     file_regions: Option<&[rnb_core::tensor::FileBackedRegion; 3]>,
 ) -> Result<bool> {
     if env_falsey("RNB_METAL_GLM_MOE_PREFILL_BATCH") || env_falsey("RNB_METAL_GLM_MOE_DECODE") {
@@ -4308,6 +4323,7 @@ pub fn metal_glm_moe_prefill_iq_batch_into_if_supported(
         || n_embd % 256 != 0
         || input_all.len() != seq_len * n_embd
         || out.len() != seq_len * n_embd
+        || activation_limits.is_some_and(|limits| limits.len() != slots)
     {
         return Ok(false);
     }
@@ -4344,6 +4360,8 @@ pub fn metal_glm_moe_prefill_iq_batch_into_if_supported(
                 gate_up_iq3xxs,
                 shared_gate_up_q8_0,
             },
+            activation_limits,
+            shared_first,
             direct_file.as_ref(),
         )
     });
@@ -5958,25 +5976,70 @@ mod deepseek4_attention_prefill_batch_policy_tests {
     }
 
     #[test]
-    fn deepseek4_attention_decode_defaults_on_with_falsey_opt_out() {
+    fn deepseek4_moe_prefill_batch_defaults_on_with_falsey_opt_out() {
         let _guard = metal_inference_env_lock().lock().expect("env lock");
-        let key = "RNB_METAL_DEEPSEEK4_ATTN_DECODE";
+        let key = "RNB_METAL_DEEPSEEK4_MOE_PREFILL_BATCH";
         let previous = std::env::var(key).ok();
 
         std::env::remove_var(key);
-        assert!(metal_deepseek4_attention_decode_requested());
+        assert!(metal_deepseek4_moe_prefill_batch_requested());
         for value in ["0", "false", "off", "no"] {
             std::env::set_var(key, value);
-            assert!(!metal_deepseek4_attention_decode_requested());
+            assert!(
+                !metal_deepseek4_moe_prefill_batch_requested(),
+                "{value} should opt out"
+            );
         }
         for value in ["1", "true", "on", "yes"] {
             std::env::set_var(key, value);
-            assert!(metal_deepseek4_attention_decode_requested());
+            assert!(
+                metal_deepseek4_moe_prefill_batch_requested(),
+                "{value} should keep the default enabled"
+            );
         }
 
         match previous {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_decode_paths_default_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let global_key = "RNB_METAL_GLM_MOE_DECODE";
+        let global_previous = std::env::var(global_key).ok();
+        std::env::remove_var(global_key);
+        let policies: [(&str, fn() -> bool); 2] = [
+            (
+                "RNB_METAL_DEEPSEEK4_ATTN_DECODE",
+                metal_deepseek4_attention_decode_requested,
+            ),
+            (
+                "RNB_METAL_DEEPSEEK4_MOE_DECODE",
+                metal_deepseek4_moe_decode_requested,
+            ),
+        ];
+        for (key, requested) in policies {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            assert!(requested());
+            for value in ["0", "false", "off", "no"] {
+                std::env::set_var(key, value);
+                assert!(!requested(), "{key}={value} should opt out");
+            }
+            for value in ["1", "true", "on", "yes"] {
+                std::env::set_var(key, value);
+                assert!(requested(), "{key}={value} should keep the default enabled");
+            }
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        match global_previous {
+            Some(value) => std::env::set_var(global_key, value),
+            None => std::env::remove_var(global_key),
         }
     }
 

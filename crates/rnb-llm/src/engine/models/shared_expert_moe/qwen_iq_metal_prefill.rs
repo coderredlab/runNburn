@@ -154,6 +154,8 @@ pub(super) fn forward(
         shared_q8_0, // shared_down_q8_0
         true,        // gate_up_iq3xxs
         shared_q8_0, // shared_gate_up_q8_0
+        None,        // activation_limits
+        false,       // shared_first
         None,        // file_regions (mmap direct 미사용)
     )
     .map_err(crate::error::LlmError::Forward)?;

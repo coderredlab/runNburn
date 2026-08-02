@@ -6879,6 +6879,8 @@ impl MetalBackend {
         n_ff: usize,
         n_embd: usize,
         input: &[f32],
+        activation_limits: Option<&[f32]>,
+        shared_first: bool,
         select: GlmMoeQuantSelect,
     ) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
@@ -6894,6 +6896,7 @@ impl MetalBackend {
         assert!(!shared_gate.is_empty(), "GLM MoE shared gate is empty");
         assert!(!shared_up.is_empty(), "GLM MoE shared up is empty");
         assert!(!shared_down.is_empty(), "GLM MoE shared down is empty");
+        assert!(activation_limits.is_none_or(|limits| limits.len() == sparse_slots + 1));
 
         self.ensure_weight_residency(ctx);
         let residency_enabled = self.weight_residency_enabled();
@@ -6962,6 +6965,8 @@ impl MetalBackend {
             &down_w,
             &down_off,
             &all_route_weights,
+            activation_limits,
+            shared_first,
             select,
         )
     }
@@ -7126,6 +7131,8 @@ impl MetalBackend {
         n_embd: usize,
         input_all: &[f32],
         select: GlmMoeQuantSelect,
+        activation_limits: Option<&[f32]>,
+        shared_first: bool,
         direct_file: Option<&GlmPrefillDirectFile<'_>>,
     ) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
@@ -7135,6 +7142,7 @@ impl MetalBackend {
         assert_eq!(up.len(), seq_len * slots, "GLM MoE prefill up slots");
         assert_eq!(down.len(), seq_len * slots, "GLM MoE prefill down slots");
         assert_eq!(route_weights.len(), seq_len * slots);
+        assert!(activation_limits.is_none_or(|limits| limits.len() == slots));
         assert_eq!(input_all.len(), seq_len * n_embd);
 
         self.ensure_weight_residency(ctx);
@@ -7146,7 +7154,9 @@ impl MetalBackend {
         // direct-file 경로에서만 의미 (pread 가 없으면 겹칠 것도 없음).
         // 537tok ABAB 7페어 same-index 전승/-3.2% 로 채택, 기본 ON
         // (`RNB_METAL_GLM_PREFILL_STAGE_OVERLAP=0` opt-out).
-        if direct_file.is_some()
+        if activation_limits.is_none()
+            && !shared_first
+            && direct_file.is_some()
             && glm_prefill_direct_file_enabled()
             && std::env::var("RNB_METAL_GLM_PREFILL_STAGE_OVERLAP").as_deref() != Ok("0")
             && seq_len >= glm_stage_overlap_min_seq()
@@ -7258,6 +7268,8 @@ impl MetalBackend {
             &down_w,
             &down_off,
             route_weights,
+            activation_limits,
+            shared_first,
             select,
         )
     }
