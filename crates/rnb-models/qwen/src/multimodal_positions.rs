@@ -2,8 +2,13 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen36PositionSpan {
-    Text { rows: usize },
-    Image { grid_width: usize, grid_height: usize },
+    Text {
+        rows: usize,
+    },
+    Image {
+        grid_width: usize,
+        grid_height: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,11 +180,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_or_multiple_images() {
-        let missing = plan_qwen36_multimodal_positions(
-            &[Qwen36PositionSpan::Text { rows: 1 }],
-            0,
-        )
-        .unwrap_err();
+        let missing = plan_qwen36_multimodal_positions(&[Qwen36PositionSpan::Text { rows: 1 }], 0)
+            .unwrap_err();
         assert!(missing.to_string().contains("exactly one image span"));
 
         let multiple = plan_qwen36_multimodal_positions(

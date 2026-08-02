@@ -311,6 +311,10 @@ impl Tokenizer {
         self.chat_template.as_deref()
     }
 
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.vocab.token_id(token)
+    }
+
     pub(crate) fn structured_decoder_factory(
         &self,
     ) -> crate::error::Result<&llguidance::ParserFactory> {

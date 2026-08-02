@@ -1197,6 +1197,8 @@ fn make_decode_test_engine(vocab_size: usize) -> Engine {
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -1388,6 +1390,8 @@ fn make_multi_layer_attention_engine(
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -1558,6 +1562,8 @@ fn make_hybrid_slice1_engine(vocab_size: usize) -> Engine {
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -1819,6 +1825,8 @@ fn make_hybrid_slice1_gqa_engine_with_suffix(vocab_size: usize) -> Engine {
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -1989,6 +1997,8 @@ fn make_real_gpu_multi_layer_attention_engine(
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -2190,6 +2200,8 @@ fn make_real_gpu_hybrid_slice1_engine(vocab_size: usize, with_suffix: bool) -> E
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]
@@ -2389,6 +2401,8 @@ fn make_real_gpu_hybrid_slice1_gqa_engine_with_suffix(vocab_size: usize) -> Engi
         scratch: Some(scratch),
         mtp: None,
         mtp_runtime: None,
+        vision_projector: None,
+        sequence_cursor: None,
         backend_runtime: backend_runtime::EngineBackendRuntime::new(),
         memtrace_step: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "vulkan")]

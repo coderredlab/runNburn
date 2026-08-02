@@ -692,6 +692,18 @@ impl Engine {
         emit_layer_trace("decode-input", usize::MAX, &scratch.hidden[..hidden_dim]);
 
         let pos = self.kv_cache.current_len();
+        let (rope_pos, force_qwen_imrope) = match self.sequence_cursor {
+            Some(cursor) => {
+                if cursor.physical_rows != pos {
+                    return Err(crate::error::LlmError::Forward(format!(
+                        "multimodal physical cursor {} does not match KV length {pos}",
+                        cursor.physical_rows
+                    )));
+                }
+                (cursor.logical_position as usize, true)
+            }
+            None => (pos, false),
+        };
 
         // 2. Transformer layers — with per-layer timing for verbose mode
         let t_layers = std::time::Instant::now();
@@ -716,7 +728,7 @@ impl Engine {
         #[cfg(feature = "vulkan")]
         let backend_max_layer = self.decode_backend_max_layer();
         let use_backend_output_logits = backend_runtime::output_logits_enabled_for_runtime();
-        let mtp_collect_hidden = self.mtp_spec_requested();
+        let mtp_collect_hidden = self.mtp_spec_requested() && !force_qwen_imrope;
         let kv_cache = &mut self.kv_cache;
 
         let decode_result: crate::error::Result<Option<Vec<f32>>> = (|| {
@@ -907,7 +919,7 @@ impl Engine {
             #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
             let backend_output_done = false;
             #[cfg(feature = "cuda")]
-            if !cu63_device_decode_done && !mtp_collect_hidden {
+            if !force_qwen_imrope && !cu63_device_decode_done && !mtp_collect_hidden {
                 // cu94 Milestone 0: pass scratch.logits as out buffer so the
                 // dispatch path writes full vocab logits back, not just the
                 // argmax token. Required for sampler-chain callers and the
@@ -973,12 +985,12 @@ impl Engine {
                 // carrier-ineligible(gemma/non-Q4K)은 try_run_decode_chain 의 layer 별
                 // eligible 검사(attn_carrier_eligible/gdn_carrier_eligible)가 걸러 host fallback.
                 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-                let decode_chain_enabled =
-                    backend_runtime::metal_decode_legacy_carrier_enabled_by_policy()
-                        && eager_layer_cap.is_none()
-                        && !gemma_ple_active
-                        && !keep_layer_hidden_snapshots
-                        && architecture != ModelArchitecture::GlmDsa;
+                let decode_chain_enabled = !force_qwen_imrope
+                    && backend_runtime::metal_decode_legacy_carrier_enabled_by_policy()
+                    && eager_layer_cap.is_none()
+                    && !gemma_ple_active
+                    && !keep_layer_hidden_snapshots
+                    && architecture != ModelArchitecture::GlmDsa;
                 #[cfg(all(feature = "metal", not(feature = "cuda")))]
                 let decode_chain_trace =
                     crate::engine::policy::env_string("RNB_METAL_DECODE_CHAIN_TRACE").as_deref()
@@ -997,11 +1009,11 @@ impl Engine {
                 // Dense attention은 기존 attn carrier policy, Qwen Attention+MoE는
                 // qwen_moe_decode_chain policy가 켜져야 chain에 합류한다.
                 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-                let attn_layer_env =
-                    backend_runtime::metal_decode_legacy_attn_layer_enabled_by_policy();
+                let attn_layer_env = !force_qwen_imrope
+                    && backend_runtime::metal_decode_legacy_attn_layer_enabled_by_policy();
                 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-                let qwen_moe_decode_chain_env =
-                    backend_runtime::metal_qwen_moe_decode_chain_enabled_by_policy();
+                let qwen_moe_decode_chain_env = !force_qwen_imrope
+                    && backend_runtime::metal_qwen_moe_decode_chain_enabled_by_policy();
                 // footgun 가드: int8 KV 는 carrier(attn) 경로 전용이다. 사용자가 명시적으로
                 // RNB_METAL_KV_INT8=1 을 켜고 carrier(chain/attn) 를 끈(=0) 모순만 startup 에서
                 // 죽인다. default(미설정) int8 은 carrier 종속(compute.rs build_metal_context)이라
@@ -1324,7 +1336,7 @@ impl Engine {
                                 } else {
                                     None
                                 };
-                                ple_fused_in_attention = decode_attention_layer(
+                                ple_fused_in_attention = decode_attention_layer_with_rope_pos(
                                     kv_cache,
                                     metadata,
                                     architecture,
@@ -1333,6 +1345,8 @@ impl Engine {
                                     weights.rope_freqs.as_ref(),
                                     layer_idx,
                                     pos,
+                                    rope_pos,
+                                    force_qwen_imrope,
                                     src_hidden_slice,
                                     prev_hidden_slice,
                                     ple_fusion_for_attention,
@@ -1580,6 +1594,14 @@ impl Engine {
 
         // 4. KV cache update
         kv_cache.set_len(pos + 1);
+        if let Some(cursor) = self.sequence_cursor.as_mut() {
+            cursor.physical_rows = pos + 1;
+            cursor.logical_position = cursor.logical_position.checked_add(1).ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "multimodal logical position overflows u32 during decode".into(),
+                )
+            })?;
+        }
 
         // 5. Return logits when requested, then return scratch
         let backend_argmax_token = scratch.backend_argmax_token;

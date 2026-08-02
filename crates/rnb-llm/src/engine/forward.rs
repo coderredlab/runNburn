@@ -100,6 +100,7 @@ pub(super) fn forward_attention_layer(
         _rope_theta,
         norm_eps,
         None,
+        None,
     )?
     .hidden)
 }
@@ -141,8 +142,51 @@ pub(super) fn forward_attention_layer_with_rope_pos(
         rope_theta,
         norm_eps,
         None,
+        None,
     )?
     .hidden)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_attention_layer_with_positions(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    hidden: Tensor,
+    w: &AttentionLayerWeights,
+    rope_freqs: Option<&Tensor>,
+    layer_idx: usize,
+    seq_len: usize,
+    pos_start: usize,
+    positions: &[[u32; 4]],
+    rope_sections: [usize; 4],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+) -> crate::error::Result<PrefillAttentionLayerOutput> {
+    forward_attention_layer_impl(
+        kv_cache,
+        metadata,
+        architecture,
+        hidden,
+        w,
+        rope_freqs,
+        layer_idx,
+        seq_len,
+        pos_start,
+        pos_start,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rope_theta,
+        norm_eps,
+        Some((positions, rope_sections)),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -181,6 +225,7 @@ pub(super) fn forward_attention_layer_with_gemma4_ple_fusion(
         kv_dim,
         rope_theta,
         norm_eps,
+        None,
         ple_fusion,
     )
 }
@@ -203,12 +248,15 @@ fn forward_attention_layer_impl(
     _kv_dim: usize,
     _rope_theta: f32,
     norm_eps: f32,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     ple_fusion: Option<&Gemma4PrefillPleFusion<'_>>,
 ) -> crate::error::Result<PrefillAttentionLayerOutput> {
-    if super::models::shared_expert_moe::qwen35_verify_tokens2_decode_equivalent_enabled(
-        architecture,
-        seq_len,
-    ) {
+    if imrope_positions.is_none()
+        && super::models::shared_expert_moe::qwen35_verify_tokens2_decode_equivalent_enabled(
+            architecture,
+            seq_len,
+        )
+    {
         let hidden_dim = metadata.hidden_dim;
         let ffn_inner_dim = w
             .shared_expert_moe
@@ -231,6 +279,7 @@ fn forward_attention_layer_impl(
                 layer_idx,
                 pos_start + token_idx,
                 rope_pos_start + token_idx,
+                false,
                 None,
                 None,
                 None,
@@ -249,7 +298,7 @@ fn forward_attention_layer_impl(
     }
 
     let profiling = super::policy::profiling_enabled();
-    let positions_aligned = pos_start == rope_pos_start;
+    let positions_aligned = pos_start == rope_pos_start && imrope_positions.is_none();
     let gemma_runtime_flavor = if matches!(architecture, ModelArchitecture::Gemma4)
         && metadata.num_layers == 35
         && metadata.hidden_dim == 1536
@@ -612,6 +661,7 @@ fn forward_attention_layer_impl(
                 head_dim,
                 kv_dim,
                 norm_eps,
+                imrope_positions,
                 projection,
                 &prof,
                 t0,
@@ -651,6 +701,7 @@ fn forward_attention_layer_impl(
             head_dim,
             kv_dim,
             norm_eps,
+            imrope_positions,
             projection,
             &prof,
             t0,
@@ -831,6 +882,7 @@ fn compute_prefill_attention_from_projection<F>(
     head_dim: usize,
     kv_dim: usize,
     norm_eps: f32,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     projection: projection::PrefillAttentionProjection,
     prof: &F,
     t_projection: std::time::Instant,
@@ -923,6 +975,7 @@ where
             rope_pos_start,
             head_dim,
             kv_dim,
+            imrope_positions,
         )?;
 
         let k_data = k_rope.as_ref().map(|t| kernels::tensor_as_f32_slice(t));

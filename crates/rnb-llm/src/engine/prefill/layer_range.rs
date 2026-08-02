@@ -33,6 +33,55 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range(
         layer_range,
         seq_len,
         pos_start,
+        None,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rope_theta,
+        norm_eps,
+        true,
+        None,
+    )
+    .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn run_prefill_layers_cpu_range_with_positions(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    hidden: Tensor,
+    layer_range: Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    positions: &[[u32; 4]],
+    rope_sections: [usize; 4],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+) -> crate::error::Result<Tensor> {
+    if positions.len() != seq_len {
+        return Err(crate::error::LlmError::Forward(format!(
+            "Qwen IMRoPE position rows {} do not match prefill sequence length {seq_len}",
+            positions.len()
+        )));
+    }
+    run_prefill_layers_cpu_range_impl(
+        kv_cache,
+        metadata,
+        architecture,
+        weights,
+        None,
+        hidden,
+        layer_range,
+        seq_len,
+        pos_start,
+        Some((positions, rope_sections)),
         num_heads,
         num_kv_heads,
         head_dim,
@@ -74,6 +123,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_mtp_resident_kv(
         layer_range,
         seq_len,
         pos_start,
+        None,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -115,6 +165,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_carrier(
         layer_range,
         seq_len,
         pos_start,
+        None,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -154,6 +205,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_prefix_state(
         layer_range,
         seq_len,
         pos_start,
+        None,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -1531,6 +1583,7 @@ fn run_prefill_layers_cpu_range_impl(
     layer_range: Range<usize>,
     seq_len: usize,
     pos_start: usize,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -1579,9 +1632,9 @@ fn run_prefill_layers_cpu_range_impl(
     };
 
     #[cfg(feature = "cuda")]
-    let qwen_attention_device_chain = if prefix_collector.is_none()
+    let qwen_attention_device_chain = if imrope_positions.is_none()
+        && prefix_collector.is_none()
         && architecture == ModelArchitecture::Qwen35MoE
-        && qwen_gdn_moe_output_device_enabled()
         && crate::engine::inference::qwen35_prefill_attention_moe_device_layers_supported(
             weights, seq_len,
         ) {
@@ -1612,7 +1665,7 @@ fn run_prefill_layers_cpu_range_impl(
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
+    if imrope_positions.is_none() && prefix_collector.is_none() && gemma_per_layer_base.is_none() {
         let chain_end = match metal_qwen_prefill_chain_diag_layers() {
             Some(0) => layer_range.start,
             Some(prefix_layers) => layer_range
@@ -2377,24 +2430,46 @@ fn run_prefill_layers_cpu_range_impl(
                     };
                     #[cfg(not(feature = "cuda"))]
                     let ple_fusion: Option<Gemma4PrefillPleFusion<'_>> = None;
-                    let attention_output = forward_attention_layer_with_gemma4_ple_fusion(
-                        kv_cache,
-                        metadata,
-                        architecture,
-                        hidden_tensor,
-                        w,
-                        weights.rope_freqs.as_ref(),
-                        layer_idx,
-                        seq_len,
-                        pos_start,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        kv_dim,
-                        rope_theta,
-                        norm_eps,
-                        ple_fusion.as_ref(),
-                    )?;
+                    let attention_output = if let Some((positions, sections)) = imrope_positions {
+                        forward_attention_layer_with_positions(
+                            kv_cache,
+                            metadata,
+                            architecture,
+                            hidden_tensor,
+                            w,
+                            weights.rope_freqs.as_ref(),
+                            layer_idx,
+                            seq_len,
+                            pos_start,
+                            positions,
+                            sections,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_dim,
+                            rope_theta,
+                            norm_eps,
+                        )?
+                    } else {
+                        forward_attention_layer_with_gemma4_ple_fusion(
+                            kv_cache,
+                            metadata,
+                            architecture,
+                            hidden_tensor,
+                            w,
+                            weights.rope_freqs.as_ref(),
+                            layer_idx,
+                            seq_len,
+                            pos_start,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            kv_dim,
+                            rope_theta,
+                            norm_eps,
+                            ple_fusion.as_ref(),
+                        )?
+                    };
                     let attention_gemma4_ple_fused = attention_output.gemma4_ple_fused;
                     let attention_gemma4_output_scale_fused =
                         attention_output.gemma4_output_scale_fused;

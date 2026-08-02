@@ -12,6 +12,7 @@ pub(in crate::engine) fn apply_decode_rope(
     q_dim: usize,
     kv_dim: usize,
     gemma4_reuse_q_only: bool,
+    force_qwen_imrope: bool,
     q_slice: &mut [f32],
     k_slice: &mut [f32],
 ) {
@@ -26,6 +27,23 @@ pub(in crate::engine) fn apply_decode_rope(
     let qwen_mrope_dim = qwen_text_mrope_dim(metadata, architecture, rope_dim, head_dim);
     let trace_k_pre_rope = should_capture_decode_k_pre_rope(layer_idx, attn_trace_enabled());
     let k_pre_rope = trace_k_pre_rope.then(|| k_slice.to_vec());
+    if force_qwen_imrope {
+        let sections: [usize; 4] = metadata
+            .rope_sections
+            .as_slice()
+            .try_into()
+            .expect("Qwen IMRoPE requires four rope sections");
+        let positions = [[pos as u32; 4]];
+        kernels::rope::rope_imrope_inplace(
+            q_slice, &positions, head_dim, q_dim, rope_dim, sections, rope_theta,
+        );
+        if !gemma4_reuse_q_only {
+            kernels::rope::rope_imrope_inplace(
+                k_slice, &positions, head_dim, kv_dim, rope_dim, sections, rope_theta,
+            );
+        }
+        return;
+    }
     let use_neox_rope = uses_neox_rope(architecture);
     #[cfg(feature = "cuda")]
     {

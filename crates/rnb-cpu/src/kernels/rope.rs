@@ -351,9 +351,7 @@ pub fn rope_imrope(
     } else {
         out.len()
     };
-    rope_imrope_inplace(
-        &mut out, positions, head_dim, dim, n_rot, sections, theta,
-    );
+    rope_imrope_inplace(&mut out, positions, head_dim, dim, n_rot, sections, theta);
     Ok(Tensor::from_vec(out, input.shape()))
 }
 
@@ -827,12 +825,8 @@ mod tests {
 
     #[test]
     fn test_imrope_selects_interleaved_position_axes() {
-        let input = Tensor::from_slice(
-            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[1, 8],
-        );
-        let output =
-            rope_imrope(&input, &[[1, 2, 3, 4]], 8, 8, [1, 1, 1, 1], 10000.0).unwrap();
+        let input = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 8]);
+        let output = rope_imrope(&input, &[[1, 2, 3, 4]], 8, 8, [1, 1, 1, 1], 10000.0).unwrap();
         let data = tensor_to_f32_vec(&output);
         let angles = [1.0f32, 0.2, 0.03, 0.004];
 

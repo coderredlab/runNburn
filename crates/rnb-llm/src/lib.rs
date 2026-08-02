@@ -8,6 +8,7 @@ pub mod external_drafter;
 pub mod generate;
 pub mod kv_cache;
 mod mtp_generate;
+pub mod multimodal;
 mod runtime;
 pub mod sampler;
 pub mod speculative;
@@ -23,9 +24,11 @@ pub use engine::{
     PrefillDriftTrace,
 };
 pub use generate::{
-    GenerateParams, GenerateResult, GenerationCancellation, MirostatParams, TextStopFilter,
+    generate_stream_multimodal, generate_stream_multimodal_cancellable, GenerateParams,
+    GenerateResult, GenerationCancellation, MirostatParams, TextStopFilter,
 };
 pub use kv_cache::{KVCache, KvCacheFormat, KvCacheMetrics};
+pub use multimodal::{CompiledPrompt, PromptSpan};
 pub use sampler::SamplerChain;
 pub use tokenizer::Tokenizer;
 pub use tool_call::{
@@ -34,6 +37,7 @@ pub use tool_call::{
 
 // SharedKvStates / SharedKvLayer 는 rnb-mtp 에 정의된다.
 // rnb-llm 은 rnb-mtp 에 의존 (helper direction). 편의를 위해 re-export.
+pub use rnb_model_qwen::Qwen36RgbImage;
 pub use rnb_mtp::{SharedKvLayer, SharedKvStates};
 
 pub fn reset_metal_prefill_atn_full_counters() {

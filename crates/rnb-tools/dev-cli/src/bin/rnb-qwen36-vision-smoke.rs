@@ -19,7 +19,7 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| "rnb-qwen36-vision-smoke".into());
     let usage = || {
         eprintln!(
-            "usage: {} <path-to-mmproj.gguf> [--white-reference]",
+            "usage: {} <path-to-mmproj.gguf> [--white-reference] [--model <path-to-model.gguf>] [--write-image <path.ppm>]",
             program.to_string_lossy()
         );
     };
@@ -27,17 +27,28 @@ fn main() -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
-    let white_reference = match args.next() {
-        None => false,
-        Some(value) if value == OsStr::new("--white-reference") => true,
-        Some(_) => {
+    let mut white_reference = false;
+    let mut model_path = None;
+    let mut reference_image_path = None;
+    while let Some(value) = args.next() {
+        if value == OsStr::new("--white-reference") {
+            white_reference = true;
+        } else if value == OsStr::new("--model") {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            model_path = Some(PathBuf::from(value));
+        } else if value == OsStr::new("--write-image") {
+            let Some(value) = args.next() else {
+                usage();
+                return ExitCode::from(2);
+            };
+            reference_image_path = Some(PathBuf::from(value));
+        } else {
             usage();
             return ExitCode::from(2);
         }
-    };
-    if args.next().is_some() {
-        usage();
-        return ExitCode::from(2);
     }
 
     let projector = match load_vision_projector(&path) {
@@ -61,6 +72,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(reference_image_path) = reference_image_path.as_ref() {
+        if let Err(error) = write_ppm(reference_image_path, &image) {
+            eprintln!(
+                "reference image write failed ({}): {error}",
+                reference_image_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let intermediate = match prepare_qwen36_vision_intermediate(&projector, &image) {
         Ok(intermediate) => intermediate,
         Err(error) => {
@@ -159,6 +179,39 @@ fn main() -> ExitCode {
     println!("embedding_sha256 = {}", hash_f32(&output.embeddings));
     println!("embedding_first8 = {:?}", &output.embeddings[..8]);
 
+    if let Some(model_path) = model_path {
+        const PROMPT: &str = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What are the dominant colors in this image?<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        let config = rnb_llm::EngineLoadConfig::default().with_vision_projector(path.as_path());
+        let mut engine = match rnb_llm::Engine::from_gguf_with_config(&model_path, config) {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("base model load failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let logits = match engine.debug_qwen36_multimodal_prefill_logits(PROMPT, &image) {
+            Ok(logits) => logits,
+            Err(error) => {
+                eprintln!("multimodal prefill failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+        println!("base_model = {}", model_path.display());
+        println!("mixed_prompt = {:?}", PROMPT);
+        println!("first_logits_sha256 = {}", hash_f32(&logits));
+        for (rank, (token_id, logit)) in ranked.iter().take(20).enumerate() {
+            println!(
+                "first_logit_top{:02} = id={} logit={:.9} piece={:?}",
+                rank + 1,
+                token_id,
+                logit,
+                engine.tokenizer.decode_token(*token_id as u32)
+            );
+        }
+    }
+
     ExitCode::SUCCESS
 }
 
@@ -177,6 +230,14 @@ fn fixed_image(white_reference: bool) -> Result<Qwen36RgbImage, rnb_model_qwen::
         }
     }
     Qwen36RgbImage::new(WIDTH, HEIGHT, pixels)
+}
+
+fn write_ppm(path: &std::path::Path, image: &Qwen36RgbImage) -> std::io::Result<()> {
+    let header = format!("P6\n{} {}\n255\n", image.width(), image.height());
+    let mut bytes = Vec::with_capacity(header.len() + image.pixels().len());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(image.pixels());
+    std::fs::write(path, bytes)
 }
 
 fn print_stats(name: &str, stats: Qwen36TensorStats) {

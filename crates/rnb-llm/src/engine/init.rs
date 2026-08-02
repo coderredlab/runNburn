@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::backend_runtime::{
     init_engine_backend_runtime, reset_backend_state_for_engine_init, EngineBackendRuntime,
@@ -134,6 +134,7 @@ fn register_sparse_stream_regions(weights: &super::layer_weights::ModelWeights) 
 pub struct EngineLoadConfig {
     pub host_memory_budget: Option<crate::engine::memory_runtime::MemoryBudget>,
     pub kv_cache_format: Option<KvCacheFormat>,
+    pub vision_projector_path: Option<PathBuf>,
 }
 
 impl EngineLoadConfig {
@@ -150,6 +151,11 @@ impl EngineLoadConfig {
 
     pub fn with_kv_cache_format(mut self, format: KvCacheFormat) -> Self {
         self.kv_cache_format = Some(format);
+        self
+    }
+
+    pub fn with_vision_projector(mut self, path: impl Into<PathBuf>) -> Self {
+        self.vision_projector_path = Some(path.into());
         self
     }
 }
@@ -192,6 +198,7 @@ impl Engine {
         let EngineLoadConfig {
             host_memory_budget,
             kv_cache_format,
+            vision_projector_path,
         } = config;
 
         if path
@@ -262,6 +269,34 @@ impl Engine {
         let metadata = load_stage!("build_metadata", {
             build_model_metadata(&model, vocab_size)
         });
+        let vision_projector = if let Some(projector_path) = vision_projector_path {
+            if model.metadata.architecture != ModelArchitecture::Qwen35MoE {
+                return Err(crate::error::LlmError::ModelLoad(format!(
+                    "Qwen3.6 mmproj requires base architecture qwen35moe, got {:?}",
+                    model.metadata.architecture
+                )));
+            }
+            let projector = load_stage!("load_vision_projector", {
+                rnb_loader::load_vision_projector(&projector_path)
+            })
+            .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
+            let capability = rnb_model_qwen::inspect_qwen36_vision_projector(&projector.descriptor)
+                .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
+            if capability.projection_dim != metadata.hidden_dim {
+                return Err(crate::error::LlmError::ModelLoad(format!(
+                    "Qwen3.6 mmproj projection width {} does not match base model hidden width {}",
+                    capability.projection_dim, metadata.hidden_dim
+                )));
+            }
+            if tokenizer.token_id("<|image_pad|>").is_none() {
+                return Err(crate::error::LlmError::ModelLoad(
+                    "Qwen3.6 tokenizer is missing required <|image_pad|> token".into(),
+                ));
+            }
+            Some(projector)
+        } else {
+            None
+        };
         let mtp = load_stage!("build_mtp_state", {
             EngineMtpState::from_loader_parts(model.metadata.mtp.as_ref(), &model.mtp_tensors)
         })?;
@@ -586,6 +621,8 @@ impl Engine {
                 scratch: Some(scratch),
                 mtp,
                 mtp_runtime,
+                vision_projector,
+                sequence_cursor: None,
                 backend_runtime,
                 memtrace_step: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "vulkan")]
@@ -699,6 +736,8 @@ impl Engine {
             scratch: None,
             mtp: None,
             mtp_runtime: None,
+            vision_projector: None,
+            sequence_cursor: None,
             backend_runtime: EngineBackendRuntime::new(),
             memtrace_step: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "vulkan")]

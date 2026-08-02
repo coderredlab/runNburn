@@ -60,6 +60,7 @@ pub(super) fn decode_attention_layer(
         layer_idx,
         pos,
         pos,
+        false,
         source_hidden,
         prev_layer_hidden,
         ple_fusion,
@@ -155,6 +156,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     layer_idx: usize,
     cache_pos: usize,
     rope_pos: usize,
+    force_qwen_imrope: bool,
     source_hidden: Option<&[f32]>,
     prev_layer_hidden: Option<&[f32]>,
     ple_fusion: Option<(&GemmaPerLayerBase, &GemmaPerLayerWeights)>,
@@ -225,7 +227,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         // n_rot 으로 전달. has_gated_attn 요구(non-gated 는 split 미지원이라 host fallback).
         let (carrier_rope_dim, carrier_rope_theta, _) =
             resolve_rope_params(metadata, architecture, layer_idx, head_dim);
-        if !kv_cache.layer_uses_kvarn(kv_cache_layer)
+        if !force_qwen_imrope
+            && !kv_cache.layer_uses_kvarn(kv_cache_layer)
             && attn_carrier_eligible(
                 w,
                 has_gated_attn,
@@ -326,7 +329,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         None
     };
     #[cfg(feature = "cuda")]
-    let chain_emits_hidden_carrier: bool = {
+    let chain_emits_hidden_carrier: bool = !force_qwen_imrope && {
         let signal_ctx = super::forward::chain_args::ChainCallerCtx {
             architecture,
             layer_idx,
@@ -451,6 +454,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         let (rope_dim, rope_theta, proportional_rope) =
             resolve_rope_params(metadata, architecture, layer_idx, head_dim);
         if !rms_used_cuda
+            && !force_qwen_imrope
             && head_dim == 128
             && !has_gated_attn
             && !gemma4_reuse_q_only
@@ -669,6 +673,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             q_dim,
             kv_dim,
             gemma4_reuse_q_only,
+            force_qwen_imrope,
             q_slice,
             &mut scratch.k_buf[..kv_dim],
         );

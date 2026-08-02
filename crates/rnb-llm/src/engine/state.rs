@@ -3,6 +3,7 @@ use super::layer_weights::ModelWeights;
 use super::mtp::{EngineMtpRuntime, EngineMtpSequenceState, EngineMtpState};
 use super::types::{ModelMetadata, ScratchBuffers};
 use crate::kv_cache::{KVCache, KVCacheSnapshot, KvCacheMetrics};
+use crate::multimodal::SequenceCursor;
 use crate::tokenizer::Tokenizer;
 use rnb_loader::Architecture as ModelArchitecture;
 
@@ -72,6 +73,8 @@ pub struct Engine {
     pub(super) scratch: Option<ScratchBuffers>,
     pub(super) mtp: Option<EngineMtpState>,
     pub(super) mtp_runtime: Option<EngineMtpRuntime>,
+    pub(super) vision_projector: Option<rnb_loader::LoadedVisionProjector>,
+    pub(super) sequence_cursor: Option<SequenceCursor>,
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(super) backend_runtime: backend_runtime::EngineBackendRuntime,
     /// Per-token monotonic counter used to tag `memtrace` step rows. Only

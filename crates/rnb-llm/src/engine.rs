@@ -41,6 +41,7 @@ mod model_init;
 mod models;
 pub mod moe;
 pub mod moe_jit;
+mod multimodal;
 #[cfg(feature = "cuda")]
 mod persistent_decode_dispatch;
 pub use mtp::{MtpAutoPolicy, MtpAutoResourceHint};

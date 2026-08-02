@@ -4,6 +4,7 @@ use crate::sampler::SamplerChain;
 use crate::tokenizer::{TokenStreamDecoder, Tokenizer};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use rnb_model_qwen::Qwen36RgbImage;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -437,19 +438,17 @@ fn generate_stream_impl_with_tokens(
     prompt_tokens: Vec<u32>,
     params: &GenerateParams,
     resume_from: Option<usize>,
-    mut callback: impl FnMut(&str) -> bool,
+    callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
     let start = Instant::now();
     check_generation_cancellation()?;
     let prompt_len = prompt_tokens.len();
-
     let mut rng = match params.seed {
         Some(seed) => SmallRng::seed_from_u64(seed),
         None => SmallRng::from_entropy(),
     };
-
-    let mut sampler = SamplerChain::from_params(params);
-    let mut constraint = params
+    let sampler = SamplerChain::from_params(params);
+    let constraint = params
         .constraint
         .as_ref()
         .map(|constraint| StructuredDecoder::new(&engine.tokenizer, constraint))
@@ -461,12 +460,104 @@ fn generate_stream_impl_with_tokens(
         engine.clear_sequence_state()?;
         prompt_tokens.as_slice()
     };
-    let mut logits = if constraint.is_some() {
+    let logits = if constraint.is_some() {
         engine.forward_prompt_with_logits(forward_tokens)?
     } else {
         engine.forward_prompt(forward_tokens)?
     };
-    let mut backend_argmax = engine.last_backend_argmax_token();
+    let backend_argmax = engine.last_backend_argmax_token();
+    finish_generation(
+        engine,
+        prompt_tokens,
+        prompt_len,
+        params,
+        start,
+        &mut rng,
+        sampler,
+        constraint,
+        logits,
+        backend_argmax,
+        callback,
+    )
+}
+
+pub fn generate_stream_multimodal(
+    engine: &mut crate::engine::Engine,
+    rendered_prompt: &str,
+    image: &Qwen36RgbImage,
+    params: &GenerateParams,
+    callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let start = Instant::now();
+    check_generation_cancellation()?;
+    let compiled = engine.compile_qwen36_multimodal_prompt(rendered_prompt, image)?;
+    let prompt_len = compiled.executed_rows;
+    let prompt_tokens = compiled.sampler_token_ids.clone();
+    let mut rng = match params.seed {
+        Some(seed) => SmallRng::seed_from_u64(seed),
+        None => SmallRng::from_entropy(),
+    };
+    let sampler = SamplerChain::from_params(params);
+    let constraint = params
+        .constraint
+        .as_ref()
+        .map(|constraint| StructuredDecoder::new(&engine.tokenizer, constraint))
+        .transpose()?;
+
+    engine.clear_sequence_state()?;
+    let logits = match engine.forward_compiled_prompt(&compiled) {
+        Ok(logits) => logits,
+        Err(error) => {
+            return match engine.clear_sequence_state() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(crate::error::LlmError::Forward(format!(
+                    "{error}; multimodal sequence cleanup failed: {cleanup}"
+                ))),
+            };
+        }
+    };
+    finish_generation(
+        engine,
+        prompt_tokens,
+        prompt_len,
+        params,
+        start,
+        &mut rng,
+        sampler,
+        constraint,
+        logits,
+        None,
+        callback,
+    )
+}
+
+pub fn generate_stream_multimodal_cancellable(
+    engine: &mut crate::engine::Engine,
+    rendered_prompt: &str,
+    image: &Qwen36RgbImage,
+    params: &GenerateParams,
+    cancellation: &GenerationCancellation,
+    callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let _scope = CancellationScope::enter(cancellation);
+    check_generation_cancellation()?;
+    generate_stream_multimodal(engine, rendered_prompt, image, params, callback)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_generation(
+    engine: &mut crate::engine::Engine,
+    prompt_tokens: Vec<u32>,
+    prompt_len: usize,
+    params: &GenerateParams,
+    start: Instant,
+    rng: &mut SmallRng,
+    mut sampler: SamplerChain,
+    mut constraint: Option<StructuredDecoder>,
+    mut logits: Vec<f32>,
+    mut backend_argmax: Option<u32>,
+    mut callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
 
@@ -476,14 +567,14 @@ fn generate_stream_impl_with_tokens(
         let token = if let Some(constraint) = constraint.as_mut() {
             constraint.mask_logits(&mut logits)?;
             params.suppress_eos_logit(&mut logits, eos)?;
-            sampler.sample(&mut logits, &generated_tokens, &mut rng)
+            sampler.sample(&mut logits, &generated_tokens, rng)
         } else if let Some(token) =
             backend_argmax.filter(|token| !params.ignore_eos || *token != eos)
         {
             token
         } else {
             params.suppress_eos_logit(&mut logits, eos)?;
-            sampler.sample(&mut logits, &generated_tokens, &mut rng)
+            sampler.sample(&mut logits, &generated_tokens, rng)
         };
 
         if params.should_stop(token, eos) {

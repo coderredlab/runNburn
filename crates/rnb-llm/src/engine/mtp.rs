@@ -1606,6 +1606,7 @@ fn run_mtp_block_decode(
         0,
         cache_pos_start,
         rope_pos_start,
+        false,
         None,
         None,
         None,

@@ -146,6 +146,7 @@ impl Engine {
 
     pub fn clear_sequence_state(&mut self) -> crate::error::Result<()> {
         self.kv_cache.clear();
+        self.sequence_cursor = None;
         if let Some(model) = self
             .weights
             .as_mut()

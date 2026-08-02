@@ -5,8 +5,7 @@ mod vision_math;
 mod vision_preprocess;
 
 pub use multimodal_positions::{
-    plan_qwen36_multimodal_positions, Qwen36PositionError, Qwen36PositionPlan,
-    Qwen36PositionSpan,
+    plan_qwen36_multimodal_positions, Qwen36PositionError, Qwen36PositionPlan, Qwen36PositionSpan,
 };
 pub use vision::{inspect_qwen36_vision_projector, Qwen36VisionCapability, Qwen36VisionError};
 pub use vision_encoder::{

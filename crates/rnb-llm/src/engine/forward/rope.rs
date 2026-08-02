@@ -79,15 +79,33 @@ pub(super) fn apply_prefill_rope(
     pos_start: usize,
     head_dim: usize,
     kv_dim: usize,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
 ) -> crate::error::Result<(Tensor, Option<Tensor>)> {
     if matches!(architecture, ModelArchitecture::NemotronHMoE) {
         return Ok((q, k.cloned()));
     }
 
-    #[cfg(not(feature = "cuda"))]
     let fwd = |e: rnb_core::error::RnbError| crate::error::LlmError::Forward(e.to_string());
     let (rope_dim, rope_theta, proportional_rope) =
         resolve_rope_params(metadata, architecture, layer_idx, head_dim);
+    if let Some((positions, sections)) = imrope_positions {
+        if architecture != ModelArchitecture::Qwen35MoE {
+            return Err(crate::error::LlmError::Forward(format!(
+                "explicit IMRoPE positions require Qwen35MoE, got {architecture:?}"
+            )));
+        }
+        let q = kernels::rope::rope_imrope(&q, positions, head_dim, rope_dim, sections, rope_theta)
+            .map_err(fwd)?;
+        let k = k
+            .map(|tensor| {
+                kernels::rope::rope_imrope(
+                    tensor, positions, head_dim, rope_dim, sections, rope_theta,
+                )
+                .map_err(fwd)
+            })
+            .transpose()?;
+        return Ok((q, k));
+    }
     let freq_factors =
         gemma_rope_freq_factors(rope_freqs, metadata, architecture, layer_idx, head_dim);
     let qwen_mrope_dim = qwen_text_mrope_dim(metadata, architecture, rope_dim, head_dim);
