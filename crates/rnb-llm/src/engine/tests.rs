@@ -6623,7 +6623,7 @@ fn test_dequantize_row_to_slice_q6k_matches_vec_path() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn test_gemv_into_q8_q8_0_matches_f32_path() {
+fn test_gemv_into_q8_q8_0_matches_quantized_oracle() {
     let values: Vec<i8> = (0..64).map(|i| (i as i8 % 7) - 3).collect();
     let weight = make_q8_0_weight(2, 32, &values);
     let input: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.25).collect();
@@ -6635,13 +6635,17 @@ fn test_gemv_into_q8_q8_0_matches_f32_path() {
         .gemv_into_q8(&q8, &mut out_q8)
         .expect("q8 path should succeed");
 
-    let mut out_f32 = vec![0.0f32; 2];
-    weight
-        .gemv_into(&input, &mut out_f32)
-        .expect("f32 path should succeed");
-
-    for (a, b) in out_q8.iter().zip(out_f32.iter()) {
-        assert!((a - b).abs() < 1e-4, "q8={a}, f32={b}");
+    for (row, actual) in out_q8.iter().enumerate() {
+        let dot: i32 = values[row * 32..(row + 1) * 32]
+            .iter()
+            .zip(q8[0].qs)
+            .map(|(&weight, input)| i32::from(weight) * i32::from(input))
+            .sum();
+        let expected = q8[0].d * dot as f32;
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "q8={actual}, oracle={expected}"
+        );
     }
 }
 

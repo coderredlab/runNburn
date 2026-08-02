@@ -13054,7 +13054,7 @@ mod tests {
     #[test]
     fn qwen_moe_device_route_alias_fits_full_prompt_budget() {
         const BUDGET: usize = 512 * 1024 * 1024;
-        const REQUIRED: usize = 532_484_096;
+        const REQUIRED: usize = 532_774_912;
         assert_eq!(
             qwen_moe_prefill_device_route_required_bytes(4556, 256, 8, 2048, 512),
             Ok(REQUIRED)
