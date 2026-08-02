@@ -264,6 +264,7 @@ Architecture-aware paths exist for:
 - Nemotron-H MoE
 - HY3 sparse MoE
 - GLM-DSA
+- DeepSeek 4 Flash
 
 Exact tensor layouts, quantization formats, context features, and accelerated
 coverage vary by architecture. Recognition does not imply full support. A GGUF
