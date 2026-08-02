@@ -3,6 +3,8 @@ use crate::engine::dequant::dequantize_bytes_to_f32;
 use crate::engine::scalar_gemv::{
     gemv_host_quantized, gemv_host_quantized_batch, host_quant_gemv_supported,
 };
+#[cfg(feature = "cuda")]
+use crate::error::LlmError;
 use crate::error::Result;
 use rayon::prelude::*;
 use rnb_loader::convert::ggml_quant_params;
@@ -53,6 +55,20 @@ pub(super) fn forward_moe_batch(
         .zip(token_ids.par_iter())
         .map(|(input, &token_id)| route(input, token_id, weights, config))
         .collect();
+
+    #[cfg(feature = "cuda")]
+    if routed_cuda_supported(weights, config) {
+        let sparse = compute_sparse_experts_cuda_batch(inputs, &routes, weights, config)?;
+        let shared = &weights.weights;
+        let mut shared_gate = shared.shared_gate.gemv_vec(inputs)?;
+        let mut shared_up = shared.shared_up.gemv_vec(inputs)?;
+        swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
+        let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
+        for (dst, sparse) in output.iter_mut().zip(sparse) {
+            *dst += sparse;
+        }
+        return Ok(output);
+    }
 
     let mut assignments = vec![Vec::<(usize, usize, f32)>::new(); config.expert_count];
     for (token, (experts, route_weights)) in routes.iter().enumerate() {
@@ -178,6 +194,65 @@ fn softplus(value: f32) -> f32 {
     } else {
         value.exp().ln_1p()
     }
+}
+
+#[cfg(feature = "cuda")]
+fn routed_cuda_supported(weights: &DeepSeek4MoeWeights, config: &DeepSeek4Config) -> bool {
+    let moe = &weights.weights;
+    moe.gate_quant == GGMLType::IQ2_XXS
+        && moe.up_quant == GGMLType::IQ2_XXS
+        && moe.down_quant == GGMLType::IQ3_XXS
+        && config.hidden_dim % 256 == 0
+        && config.expert_ffn_dim % 256 == 0
+}
+
+#[cfg(feature = "cuda")]
+fn compute_sparse_experts_cuda_batch(
+    inputs: &[f32],
+    routes: &[(Vec<usize>, Vec<f32>)],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Vec<f32>> {
+    let moe = &weights.weights;
+    let gate_expert_bytes =
+        config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.gate_quant);
+    let up_expert_bytes = config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.up_quant);
+    let down_expert_bytes =
+        config.hidden_dim * bytes_per_row(config.expert_ffn_dim, moe.down_quant);
+    let gate_bytes = moe.gate_exps_bytes().expect("DeepSeek4 gate expert bytes");
+    let up_bytes = moe.up_exps_bytes().expect("DeepSeek4 up expert bytes");
+    let down_bytes = moe.down_exps_bytes().expect("DeepSeek4 down expert bytes");
+    let slot_count = routes.len() * config.expert_used_count;
+    let mut gate_slots = Vec::with_capacity(slot_count);
+    let mut up_slots = Vec::with_capacity(slot_count);
+    let mut down_slots = Vec::with_capacity(slot_count);
+    let mut route_weights = Vec::with_capacity(slot_count);
+    let mut token_ids = Vec::with_capacity(slot_count);
+    for (token, (experts, weights)) in routes.iter().enumerate() {
+        for (&expert, &route_weight) in experts.iter().zip(weights) {
+            let gate_start = expert * gate_expert_bytes;
+            let up_start = expert * up_expert_bytes;
+            let down_start = expert * down_expert_bytes;
+            gate_slots.push(&gate_bytes[gate_start..gate_start + gate_expert_bytes]);
+            up_slots.push(&up_bytes[up_start..up_start + up_expert_bytes]);
+            down_slots.push(&down_bytes[down_start..down_start + down_expert_bytes]);
+            route_weights.push(route_weight);
+            token_ids.push(token as u32);
+        }
+    }
+    crate::engine::backend_runtime::moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu(
+        &gate_slots,
+        &up_slots,
+        &down_slots,
+        &route_weights,
+        &token_ids,
+        routes.len(),
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        inputs,
+        weights.routed_clamp,
+    )
+    .map_err(LlmError::Forward)
 }
 
 fn compute_sparse_expert(

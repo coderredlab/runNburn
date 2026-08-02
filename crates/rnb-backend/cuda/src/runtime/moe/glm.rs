@@ -24,6 +24,25 @@ pub(super) fn glm_slot_identity(
     )
 }
 
+fn grouped_glm_unique_expert_count(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    group_meta: &[u32],
+) -> usize {
+    let mut previous = None;
+    let mut unique = 0usize;
+    for group in group_meta.chunks_exact(2) {
+        let slot = group[0] as usize;
+        let identity = glm_slot_identity(gate_weights[slot], up_weights[slot], down_weights[slot]);
+        if previous != Some(identity) {
+            unique += 1;
+            previous = Some(identity);
+        }
+    }
+    unique
+}
+
 pub(super) fn group_glm_slots<'a>(
     gate_weights: &[&'a [u8]],
     up_weights: &[&'a [u8]],
@@ -275,6 +294,7 @@ impl CudaState {
         down_quant: u32,
         file_regions: Option<&[rnb_core::tensor::FileBackedRegion; 3]>,
         direct_file: bool,
+        activation_limit: Option<f32>,
         route_weights: &[f32],
         token_ids: &[u32],
         token_count: usize,
@@ -316,6 +336,13 @@ impl CudaState {
             return Err(format!(
                 "GLM batched sparse dims must be divisible by 256, got n_ff={n_ff} n_embd={n_embd}"
             ));
+        }
+        if let Some(limit) = activation_limit {
+            if !limit.is_finite() || limit <= 0.0 {
+                return Err(format!(
+                    "batched sparse SwiGLU clamp must be finite and positive, got {limit}"
+                ));
+            }
         }
 
         let (gate_block_bytes, gate_kernel, grouped_gate_kernel) = match gate_quant {
@@ -392,17 +419,18 @@ impl CudaState {
             }
         }
 
-        let grouped_slots = tuning::glm_expert_grouped_enabled(token_count, slots)
-            .then(|| {
-                group_glm_slots(
-                    gate_weights,
-                    up_weights,
-                    down_weights,
-                    route_weights,
-                    token_ids,
-                )
-            })
-            .filter(|grouped| grouped.group_meta.len() / 2 < slots);
+        let grouped_slots = (activation_limit.is_some()
+            || tuning::glm_expert_grouped_enabled(token_count, slots))
+        .then(|| {
+            group_glm_slots(
+                gate_weights,
+                up_weights,
+                down_weights,
+                route_weights,
+                token_ids,
+            )
+        })
+        .filter(|grouped| activation_limit.is_some() || grouped.group_meta.len() / 2 < slots);
         let (gate_weights, up_weights, down_weights, route_weights, token_ids, group_meta) =
             if let Some(grouped) = grouped_slots.as_ref() {
                 (
@@ -470,9 +498,16 @@ impl CudaState {
         } else {
             None
         };
-        if let Some(file_regions) = direct_file_regions
-            .filter(|_| !group_meta.is_empty() && tuning::glm_direct_file_expert_stream_enabled())
-        {
+        if let Some(file_regions) = direct_file_regions.filter(|_| {
+            !group_meta.is_empty()
+                && tuning::glm_direct_file_expert_stream_enabled()
+                && grouped_glm_unique_expert_count(
+                    gate_weights,
+                    up_weights,
+                    down_weights,
+                    group_meta,
+                ) >= 2
+        }) {
             return self.glm_sparse_experts_iq_by_token_direct_file_stream(
                 super::glm_stream::GlmDirectFileStreamRequest {
                     gate_weights,
@@ -484,6 +519,7 @@ impl CudaState {
                     file_regions,
                     grouped_gate_kernel,
                     grouped_down_kernel,
+                    activation_limit,
                     token_count,
                     n_ff,
                     n_embd,
@@ -584,7 +620,11 @@ impl CudaState {
                 gate_dev,
                 up_dev,
             )?;
-            self.launch_silu_mul(gate_dev, up_dev, slots * n_ff)?;
+            if let Some(limit) = activation_limit {
+                self.launch_swiglu_clamped(gate_dev, up_dev, limit, slots * n_ff)?;
+            } else {
+                self.launch_silu_mul(gate_dev, up_dev, slots * n_ff)?;
+            }
         }
         if direct_file_pipeline
             || (!temp_slab_ptrs.is_empty() && tuning::prefill_down_copy_overlap_enabled())

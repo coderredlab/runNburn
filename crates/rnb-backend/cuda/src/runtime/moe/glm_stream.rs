@@ -18,6 +18,7 @@ pub(super) struct GlmDirectFileStreamRequest<'a> {
     pub(super) file_regions: &'a [FileBackedRegion; 3],
     pub(super) grouped_gate_kernel: &'static str,
     pub(super) grouped_down_kernel: &'static str,
+    pub(super) activation_limit: Option<f32>,
     pub(super) token_count: usize,
     pub(super) n_ff: usize,
     pub(super) n_embd: usize,
@@ -401,7 +402,16 @@ impl CudaState {
                     request.gate_dev,
                     request.up_dev,
                 )?;
-                self.launch_silu_mul(request.gate_dev, request.up_dev, slots * request.n_ff)?;
+                if let Some(limit) = request.activation_limit {
+                    self.launch_swiglu_clamped(
+                        request.gate_dev,
+                        request.up_dev,
+                        limit,
+                        slots * request.n_ff,
+                    )?;
+                } else {
+                    self.launch_silu_mul(request.gate_dev, request.up_dev, slots * request.n_ff)?;
+                }
                 self.launch_selected_glm_iq_down_accum_by_token_group4(
                     request.grouped_down_kernel,
                     down_ptrs_dev,

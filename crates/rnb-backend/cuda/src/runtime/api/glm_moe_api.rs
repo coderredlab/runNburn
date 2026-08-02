@@ -155,6 +155,72 @@ pub fn glm_sparse_experts_iq_by_token(
     n_embd: usize,
     input: &[f32],
 ) -> Result<Vec<f32>, String> {
+    sparse_experts_iq_by_token_impl(
+        gate_weights,
+        up_weights,
+        down_weights,
+        gate_quant,
+        down_quant,
+        file_regions,
+        direct_file,
+        None,
+        route_weights,
+        token_ids,
+        token_count,
+        n_ff,
+        n_embd,
+        input,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    route_weights: &[f32],
+    token_ids: &[u32],
+    token_count: usize,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    activation_limit: f32,
+) -> Result<Vec<f32>, String> {
+    sparse_experts_iq_by_token_impl(
+        gate_weights,
+        up_weights,
+        down_weights,
+        16,
+        18,
+        None,
+        false,
+        Some(activation_limit),
+        route_weights,
+        token_ids,
+        token_count,
+        n_ff,
+        n_embd,
+        input,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sparse_experts_iq_by_token_impl(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    gate_quant: u32,
+    down_quant: u32,
+    file_regions: Option<&[FileBackedRegion; 3]>,
+    direct_file: bool,
+    activation_limit: Option<f32>,
+    route_weights: &[f32],
+    token_ids: &[u32],
+    token_count: usize,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+) -> Result<Vec<f32>, String> {
     let slot_count = gate_weights.len();
     if token_count == 0 || slot_count == 0 || slot_count % token_count != 0 {
         return Err(format!(
@@ -197,6 +263,7 @@ pub fn glm_sparse_experts_iq_by_token(
             down_quant,
             file_regions,
             direct_file,
+            activation_limit,
             route_weights,
             token_ids,
             token_count,
@@ -287,6 +354,7 @@ pub fn glm_sparse_experts_iq_by_token(
                     down_quant,
                     file_regions,
                     direct_file,
+                    activation_limit,
                     &secondary_route,
                     &secondary_token_ids,
                     token_count,
@@ -303,6 +371,7 @@ pub fn glm_sparse_experts_iq_by_token(
                 down_quant,
                 file_regions,
                 direct_file,
+                activation_limit,
                 &primary_route,
                 &primary_token_ids,
                 token_count,

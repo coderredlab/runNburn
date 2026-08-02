@@ -52,6 +52,34 @@ pub fn glm_moe_prefill_sparse_experts_iq_by_token(
     .map_err(|err| format!("CUDA GLM batched sparse IQ MoE failed: {err}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu(
+    gate: &[&[u8]],
+    up: &[&[u8]],
+    down: &[&[u8]],
+    route_weights: &[f32],
+    token_ids: &[u32],
+    token_count: usize,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    activation_limit: f32,
+) -> Result<Vec<f32>> {
+    backend::sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu(
+        gate,
+        up,
+        down,
+        route_weights,
+        token_ids,
+        token_count,
+        n_ff,
+        n_embd,
+        input,
+        activation_limit,
+    )
+    .map_err(|err| format!("CUDA batched sparse clamped SwiGLU MoE failed: {err}"))
+}
+
 pub fn glm_moe_decode_shared_expert_q5k_q6k(
     gate: &[u8],
     up: &[u8],

@@ -5022,6 +5022,30 @@ impl CudaState {
         )
     }
 
+    pub(in crate::runtime) fn launch_swiglu_clamped(
+        &mut self,
+        gate_dev: u64,
+        up_dev: u64,
+        limit: f32,
+        len: usize,
+    ) -> Result<(), String> {
+        let mut gate_arg = gate_dev;
+        let mut up_arg = up_dev;
+        let mut limit_arg = limit;
+        let mut len_arg = len as u32;
+        self.launch_cached_gemv(
+            "rnb_swiglu_clamped_inplace",
+            &[
+                (&mut gate_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut up_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut limit_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (((len as u32).saturating_add(255)) / 256, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_silu_mul_group4_pack_f32(
         &mut self,
         gate_dev: u64,

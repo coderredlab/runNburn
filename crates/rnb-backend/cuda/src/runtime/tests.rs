@@ -8527,6 +8527,111 @@ fn cuda_glm_sparse_iq2xxs_iq3xxs_by_token_matches_individual_dispatches() {
 }
 
 #[test]
+fn cuda_sparse_iq2xxs_iq3xxs_clamped_swiglu_matches_cpu_reference() {
+    use rnb_cpu::gemm::dequant::{dequantize_bytes_to_f32, DequantType};
+
+    let _guard = runtime_test_lock();
+    if let Err(error) = CudaState::open() {
+        eprintln!("skipping clamped sparse IQ2_XXS/IQ3_XXS CUDA test: {error}");
+        return;
+    }
+    let _parallel = EnvVarGuard::set("RNB_CUDA_GLM_EXPERT_PARALLEL", "0");
+    let _grouped = EnvVarGuard::set("RNB_CUDA_GLM_EXPERT_GROUPED", "0");
+    let token_count = 2usize;
+    let selected = 2usize;
+    let expert_count = token_count * selected;
+    let n_ff = 256usize;
+    let n_embd = 256usize;
+    let activation_limit = 0.5f32;
+    let route = [0.625f32, 0.375, 0.25, 0.75];
+    let input = (0..token_count * n_embd)
+        .map(|index| 100.0 + (index % 31) as f32 * 0.25)
+        .collect::<Vec<_>>();
+    let gate = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_ff, n_embd, 66, expert * 3))
+        .collect::<Vec<_>>();
+    let up = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_ff, n_embd, 66, expert * 3 + 1))
+        .collect::<Vec<_>>();
+    let down = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_embd, n_ff, 98, expert * 3 + 2))
+        .collect::<Vec<_>>();
+    let gate_f32 = gate
+        .iter()
+        .map(|weights| dequantize_bytes_to_f32(weights, DequantType::IQ2XXS))
+        .collect::<Vec<_>>();
+    let up_f32 = up
+        .iter()
+        .map(|weights| dequantize_bytes_to_f32(weights, DequantType::IQ2XXS))
+        .collect::<Vec<_>>();
+    let down_f32 = down
+        .iter()
+        .map(|weights| dequantize_bytes_to_f32(weights, DequantType::IQ3XXS))
+        .collect::<Vec<_>>();
+    let gate_slots = gate.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let up_slots = up.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let down_slots = down.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let token_ids = [0u32, 0, 1, 1];
+    let mut expected = vec![0.0f32; token_count * n_embd];
+    let mut clamp_observed = false;
+    for token in 0..token_count {
+        let token_input = &input[token * n_embd..(token + 1) * n_embd];
+        for slot in 0..selected {
+            let expert = token * selected + slot;
+            let mut activation = vec![0.0f32; n_ff];
+            for row in 0..n_ff {
+                let gate_value = gate_f32[expert][row * n_embd..(row + 1) * n_embd]
+                    .iter()
+                    .zip(token_input)
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>();
+                let up_value = up_f32[expert][row * n_embd..(row + 1) * n_embd]
+                    .iter()
+                    .zip(token_input)
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>();
+                clamp_observed |=
+                    gate_value > activation_limit || up_value.abs() > activation_limit;
+                let gate_value = gate_value.min(activation_limit);
+                let up_value = up_value.clamp(-activation_limit, activation_limit);
+                activation[row] = (gate_value / (1.0 + (-gate_value).exp())) * up_value;
+            }
+            for row in 0..n_embd {
+                let value = down_f32[expert][row * n_ff..(row + 1) * n_ff]
+                    .iter()
+                    .zip(&activation)
+                    .map(|(weight, activation)| weight * activation)
+                    .sum::<f32>();
+                expected[token * n_embd + row] += route[expert] * value;
+            }
+        }
+    }
+    assert!(clamp_observed, "synthetic input must exercise the clamp");
+
+    let actual = sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu(
+        &gate_slots,
+        &up_slots,
+        &down_slots,
+        &route,
+        &token_ids,
+        token_count,
+        n_ff,
+        n_embd,
+        &input,
+        activation_limit,
+    )
+    .expect("clamped sparse IQ2_XXS/IQ3_XXS CUDA dispatch");
+    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        let diff = (actual - expected).abs();
+        let tolerance = 2.0e-4 + expected.abs() * 2.0e-4;
+        assert!(
+            diff <= tolerance,
+            "clamped sparse IQ2_XXS/IQ3_XXS index {index} mismatch: actual={actual} expected={expected} diff={diff} tolerance={tolerance}"
+        );
+    }
+}
+
+#[test]
 fn cuda_glm_sparse_iq2s_iq4xs_by_token_matches_cpu_reference() {
     use rnb_cpu::gemm::dequant::{dequantize_bytes_to_f32, DequantType};
 

@@ -151,10 +151,13 @@ pub(super) use cuda_basic::{
 };
 #[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{nemotron_q5_q8_register_layer, nemotron_q5_register_layer};
-#[cfg(feature = "cuda")]
-pub(super) use glm_moe::glm_moe_prefill_sparse_experts_iq_by_token;
 pub(super) use glm_moe::{
     glm_moe_decode_shared_expert_q5k_q6k, glm_moe_decode_sparse_experts_iq2xxs_iq3xxs,
+};
+#[cfg(feature = "cuda")]
+pub(super) use glm_moe::{
+    glm_moe_prefill_sparse_experts_iq_by_token,
+    moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu,
 };
 #[cfg(feature = "cuda")]
 pub(super) use gpu_gdn::ssm_prefill_delta_net_snapshots;

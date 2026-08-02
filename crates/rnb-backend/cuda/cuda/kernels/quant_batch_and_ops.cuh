@@ -2491,6 +2491,20 @@ extern "C" __global__ void rnb_silu_mul_inplace(
     gate[i] = (x / (1.0f + expf(-x))) * up[i];
 }
 
+extern "C" __global__ void rnb_swiglu_clamped_inplace(
+    float* __restrict__ gate,
+    const float* __restrict__ up,
+    float limit,
+    unsigned len) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= len) {
+        return;
+    }
+    const float gate_value = fminf(gate[i], limit);
+    const float up_value = fminf(fmaxf(up[i], -limit), limit);
+    gate[i] = (gate_value / (1.0f + expf(-gate_value))) * up_value;
+}
+
 extern "C" __global__ void rnb_silu_mul_group4_pack_f32(
     const float* __restrict__ gate,
     const float* __restrict__ up,
