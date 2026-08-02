@@ -212,6 +212,7 @@ mod tests {
             mtp: None,
             assistant: None,
             glm_indexer: None,
+            deepseek4: None,
         }
     }
 

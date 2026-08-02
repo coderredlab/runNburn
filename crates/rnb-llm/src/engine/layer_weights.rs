@@ -76,6 +76,7 @@ pub(super) struct ModelWeights {
     pub(super) output_norm: Tensor,         // F32 [hidden]
     pub(super) output: QuantizedWeight,     // [vocab, hidden]
     pub(super) layers: Vec<LayerType>,
+    pub(super) deepseek4: Option<super::models::deepseek4::DeepSeek4Weights>,
     pub(super) gemma_per_layer: Option<GemmaPerLayerWeights>,
     pub(super) glm_dsa_attention: Option<Vec<super::models::glm_dsa::GlmDsaAttentionLayerWeights>>,
     pub(super) rope_freqs: Option<Tensor>,

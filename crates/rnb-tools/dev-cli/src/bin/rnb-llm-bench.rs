@@ -2128,7 +2128,8 @@ fn main() {
         engine.architecture(),
         rnb_loader::Architecture::Gemma | rnb_loader::Architecture::Gemma4
     );
-    let exact_greedy_chat_arch = gemma_chat || gemma_arch;
+    let deepseek4_chat = chat_mode && engine.architecture() == rnb_loader::Architecture::DeepSeek4;
+    let exact_greedy_chat_arch = gemma_chat || gemma_arch || deepseek4_chat;
     let nemotron_chat =
         chat_mode && engine.architecture() == rnb_loader::Architecture::NemotronHMoE;
     let default_repetition_penalty = if chat_mode && !exact_greedy_chat_arch {
@@ -2145,6 +2146,15 @@ fn main() {
             tokens = build_nemotron_chat_tokens(&engine, &prompt_text);
         } else if gemma_chat {
             tokens = build_gemma_chat_tokens(&engine, bos, &prompt_text);
+        } else if deepseek4_chat {
+            let rendered = engine
+                .tokenizer
+                .render_chat_prompt(
+                    &[rnb_llm::ChatMessage::new("user", &prompt_text)],
+                    rnb_llm::ChatTemplateOptions::default(),
+                )
+                .expect("DeepSeek4 GGUF chat template rendering failed");
+            tokens = engine.tokenizer.encode(&rendered);
         } else {
             let im_start = im_start_id.expect("missing <|im_start|>");
             let im_end = im_end_id.expect("missing <|im_end|>");
@@ -2476,6 +2486,15 @@ fn main() {
         let wrapped_prompt: String;
         let effective_prompt: &str = if gemma_chat {
             wrapped_prompt = build_gemma_chat_prompt_text(&prompt_text);
+            &wrapped_prompt
+        } else if deepseek4_chat {
+            wrapped_prompt = engine
+                .tokenizer
+                .render_chat_prompt(
+                    &[rnb_llm::ChatMessage::new("user", &prompt_text)],
+                    rnb_llm::ChatTemplateOptions::default(),
+                )
+                .expect("DeepSeek4 GGUF chat template rendering failed");
             &wrapped_prompt
         } else {
             &prompt_text

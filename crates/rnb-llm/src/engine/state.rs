@@ -129,6 +129,9 @@ impl Engine {
     }
 
     pub fn durable_sequence_state_supported(&self) -> bool {
+        if self.architecture == ModelArchitecture::DeepSeek4 {
+            return false;
+        }
         if cfg!(any(
             feature = "vulkan",
             feature = "opencl",

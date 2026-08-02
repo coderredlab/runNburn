@@ -28,6 +28,7 @@ pub enum Architecture {
     NemotronHMoE,
     Hy3,
     GlmDsa,
+    DeepSeek4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub struct ModelMetadata {
     /// pm119: GLM DSA lightning indexer 메타 (`<arch>.attention.indexer.*`).
     /// GlmDsa 에서 세 키가 모두 있을 때만 Some.
     pub glm_indexer: Option<GlmIndexerMetadata>,
+    pub deepseek4: Option<DeepSeek4Metadata>,
 }
 
 /// pm119: DSA lightning indexer 하이퍼파라미터 (GLM-5.2: heads=32, key=128, top_k=2048).
@@ -149,6 +151,26 @@ pub struct GlmIndexerMetadata {
     pub head_count: usize,
     pub key_length: usize,
     pub top_k: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepSeek4Metadata {
+    pub q_lora_rank: usize,
+    pub indexer: GlmIndexerMetadata,
+    pub output_group_count: usize,
+    pub output_lora_rank: usize,
+    pub compress_ratios: Vec<usize>,
+    pub compress_rope_theta: f32,
+    pub hyper_connection_count: usize,
+    pub sinkhorn_iterations: usize,
+    pub hyper_connection_eps: f32,
+    pub hash_layer_count: usize,
+    pub swiglu_clamp_exp: Vec<f32>,
+    pub swiglu_clamp_shared: Vec<f32>,
+    pub rope_scaling_factor: f32,
+    pub rope_original_context_length: usize,
+    pub rope_yarn_beta_fast: f32,
+    pub rope_yarn_beta_slow: f32,
 }
 
 pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architecture, LoaderError> {
@@ -165,6 +187,7 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
         "nemotron_h_moe" => Ok(Architecture::NemotronHMoE),
         "hy_v3" => Ok(Architecture::Hy3),
         "glm-dsa" => Ok(Architecture::GlmDsa),
+        "deepseek4" => Ok(Architecture::DeepSeek4),
         other => Err(LoaderError::UnsupportedArchitecture(other.to_string())),
     }
 }
@@ -186,6 +209,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         Architecture::NemotronHMoE => "nemotron_h_moe",
         Architecture::Hy3 => "hy_v3",
         Architecture::GlmDsa => "glm-dsa",
+        Architecture::DeepSeek4 => "deepseek4",
     };
     // 실제 GGUF에 있는 키를 먼저 시도하고, 없으면 known prefix로 fallback
     let prefix = if get_u32(metadata, &format!("{arch_str}.embedding_length")).is_ok() {
@@ -279,6 +303,69 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             }),
             _ => None,
         }
+    } else {
+        None
+    };
+    let deepseek4 = if arch == Architecture::DeepSeek4 {
+        let compress_ratios =
+            get_u32_array(metadata, &format!("{prefix}.attention.compress_ratios"))?
+                .into_iter()
+                .take(num_layers)
+                .map(|ratio| ratio as usize)
+                .collect::<Vec<_>>();
+        if compress_ratios.len() != num_layers {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!(
+                    "{prefix}.attention.compress_ratios has {} trunk entries, expected {num_layers}",
+                    compress_ratios.len()
+                ),
+            });
+        }
+        Some(DeepSeek4Metadata {
+            q_lora_rank: get_u32(metadata, &format!("{prefix}.attention.q_lora_rank"))? as usize,
+            indexer: GlmIndexerMetadata {
+                head_count: get_u32(metadata, &format!("{prefix}.attention.indexer.head_count"))?
+                    as usize,
+                key_length: get_u32(metadata, &format!("{prefix}.attention.indexer.key_length"))?
+                    as usize,
+                top_k: get_u32(metadata, &format!("{prefix}.attention.indexer.top_k"))? as usize,
+            },
+            output_group_count: get_u32(
+                metadata,
+                &format!("{prefix}.attention.output_group_count"),
+            )? as usize,
+            output_lora_rank: get_u32(metadata, &format!("{prefix}.attention.output_lora_rank"))?
+                as usize,
+            compress_ratios,
+            compress_rope_theta: get_f32(
+                metadata,
+                &format!("{prefix}.attention.compress_rope_freq_base"),
+            )?,
+            hyper_connection_count: get_u32(metadata, &format!("{prefix}.hyper_connection.count"))?
+                as usize,
+            sinkhorn_iterations: get_u32(
+                metadata,
+                &format!("{prefix}.hyper_connection.sinkhorn_iterations"),
+            )? as usize,
+            hyper_connection_eps: get_f32(metadata, &format!("{prefix}.hyper_connection.epsilon"))?,
+            hash_layer_count: get_u32(metadata, &format!("{prefix}.hash_layer_count"))? as usize,
+            swiglu_clamp_exp: get_f32_array(metadata, &format!("{prefix}.swiglu_clamp_exp"))?,
+            swiglu_clamp_shared: get_f32_array(metadata, &format!("{prefix}.swiglu_clamp_shexp"))?,
+            rope_scaling_factor: get_f32(metadata, &format!("{prefix}.rope.scaling.factor"))?,
+            rope_original_context_length: get_u32(
+                metadata,
+                &format!("{prefix}.rope.scaling.original_context_length"),
+            )? as usize,
+            rope_yarn_beta_fast: get_f32(
+                metadata,
+                &format!("{prefix}.rope.scaling.yarn_beta_fast"),
+            )?,
+            rope_yarn_beta_slow: get_f32(
+                metadata,
+                &format!("{prefix}.rope.scaling.yarn_beta_slow"),
+            )?,
+        })
     } else {
         None
     };
@@ -486,6 +573,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         mtp,
         assistant,
         glm_indexer,
+        deepseek4,
     })
 }
 
@@ -604,7 +692,8 @@ pub fn build_graph(meta: &ModelMetadata) -> Result<Graph, LoaderError> {
         | Architecture::Qwen35MoE
         | Architecture::NemotronHMoE
         | Architecture::Hy3
-        | Architecture::GlmDsa => Ok(llama::build_llama_graph(meta)),
+        | Architecture::GlmDsa
+        | Architecture::DeepSeek4 => Ok(llama::build_llama_graph(meta)),
         // Gemma4 shares the structural graph builder with Gemma for now; the actual Gemma4-specific
         // forward semantics (ISWA, PLE, KV sharing, f_attention_scale=1.0) live in the engine path
         // and are layered on top. Graph-level split will come if/when builder-level differences
@@ -1179,5 +1268,120 @@ mod tests {
         assert_eq!(m.head_dim, 128);
         assert_eq!(m.intermediate_size, 11008);
         assert!((m.rope_theta - 10000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_extract_metadata_deepseek4_contract() {
+        let meta = vec![
+            (
+                "general.architecture".to_string(),
+                GGUFValue::String("deepseek4".to_string()),
+            ),
+            (
+                "deepseek4.embedding_length".to_string(),
+                GGUFValue::U32(4096),
+            ),
+            ("deepseek4.block_count".to_string(), GGUFValue::U32(2)),
+            (
+                "deepseek4.attention.head_count".to_string(),
+                GGUFValue::U32(64),
+            ),
+            (
+                "deepseek4.attention.head_count_kv".to_string(),
+                GGUFValue::U32(1),
+            ),
+            (
+                "deepseek4.attention.key_length".to_string(),
+                GGUFValue::U32(512),
+            ),
+            (
+                "deepseek4.rope.dimension_count".to_string(),
+                GGUFValue::U32(64),
+            ),
+            (
+                "deepseek4.expert_feed_forward_length".to_string(),
+                GGUFValue::U32(2048),
+            ),
+            ("deepseek4.expert_count".to_string(), GGUFValue::U32(256)),
+            ("deepseek4.expert_used_count".to_string(), GGUFValue::U32(6)),
+            (
+                "deepseek4.attention.q_lora_rank".to_string(),
+                GGUFValue::U32(1024),
+            ),
+            (
+                "deepseek4.attention.indexer.head_count".to_string(),
+                GGUFValue::U32(64),
+            ),
+            (
+                "deepseek4.attention.indexer.key_length".to_string(),
+                GGUFValue::U32(128),
+            ),
+            (
+                "deepseek4.attention.indexer.top_k".to_string(),
+                GGUFValue::U32(512),
+            ),
+            (
+                "deepseek4.attention.output_group_count".to_string(),
+                GGUFValue::U32(8),
+            ),
+            (
+                "deepseek4.attention.output_lora_rank".to_string(),
+                GGUFValue::U32(1024),
+            ),
+            (
+                "deepseek4.attention.compress_ratios".to_string(),
+                GGUFValue::Array(vec![GGUFValue::I32(0), GGUFValue::I32(4)]),
+            ),
+            (
+                "deepseek4.attention.compress_rope_freq_base".to_string(),
+                GGUFValue::F32(160000.0),
+            ),
+            (
+                "deepseek4.hyper_connection.count".to_string(),
+                GGUFValue::U32(4),
+            ),
+            (
+                "deepseek4.hyper_connection.sinkhorn_iterations".to_string(),
+                GGUFValue::U32(20),
+            ),
+            (
+                "deepseek4.hyper_connection.epsilon".to_string(),
+                GGUFValue::F32(1e-6),
+            ),
+            ("deepseek4.hash_layer_count".to_string(), GGUFValue::U32(1)),
+            (
+                "deepseek4.swiglu_clamp_exp".to_string(),
+                GGUFValue::Array(vec![GGUFValue::F32(10.0), GGUFValue::F32(10.0)]),
+            ),
+            (
+                "deepseek4.swiglu_clamp_shexp".to_string(),
+                GGUFValue::Array(vec![GGUFValue::F32(10.0), GGUFValue::F32(10.0)]),
+            ),
+            (
+                "deepseek4.rope.scaling.factor".to_string(),
+                GGUFValue::F32(16.0),
+            ),
+            (
+                "deepseek4.rope.scaling.original_context_length".to_string(),
+                GGUFValue::U32(65536),
+            ),
+            (
+                "deepseek4.rope.scaling.yarn_beta_fast".to_string(),
+                GGUFValue::F32(32.0),
+            ),
+            (
+                "deepseek4.rope.scaling.yarn_beta_slow".to_string(),
+                GGUFValue::F32(1.0),
+            ),
+        ];
+        let metadata = extract_metadata(&meta).unwrap();
+        assert_eq!(metadata.architecture, Architecture::DeepSeek4);
+        assert_eq!(metadata.head_dim, 512);
+        assert_eq!(metadata.rope_dim, 64);
+        let deepseek4 = metadata.deepseek4.expect("DeepSeek4 metadata");
+        assert_eq!(deepseek4.compress_ratios, vec![0, 4]);
+        assert_eq!(deepseek4.indexer.top_k, 512);
+        assert_eq!(deepseek4.hyper_connection_count, 4);
+        assert_eq!(deepseek4.hash_layer_count, 1);
     }
 }

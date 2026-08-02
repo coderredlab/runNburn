@@ -1,3 +1,4 @@
+pub(super) mod deepseek4;
 pub(super) mod gemma;
 pub(super) mod glm_dsa;
 pub(super) mod nemotron;

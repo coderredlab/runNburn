@@ -143,6 +143,13 @@ impl Engine {
 
     pub fn clear_sequence_state(&mut self) -> crate::error::Result<()> {
         self.kv_cache.clear();
+        if let Some(model) = self
+            .weights
+            .as_mut()
+            .and_then(|weights| weights.deepseek4.as_mut())
+        {
+            model.clear_state();
+        }
         self.mtp_clear_sequence_state();
         self.backend_runtime.clear_sequence_state()
     }

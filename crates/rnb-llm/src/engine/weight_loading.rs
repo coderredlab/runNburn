@@ -5,7 +5,7 @@ mod tensor_values;
 
 use super::backend_runtime::is_attention_layer;
 use super::layer_weights::{LayerType, ModelWeights, MtpLayerWeights};
-use super::models::{gemma, nemotron, shared_expert_moe};
+use super::models::{deepseek4, gemma, nemotron, shared_expert_moe};
 use output::build_tied_output_weight;
 use quantized::load_quantized_weight;
 use rnb_loader::{Architecture as ModelArchitecture, LoadedModel, ModelLayerKind};
@@ -46,11 +46,17 @@ pub(super) fn load_model_weights(
         build_tied_output_weight(&token_embd)
     };
 
+    let deepseek4 = deepseek4::load_deepseek4_weights(
+        model,
+        tensor_values::load_f32_weight,
+        quantized::load_quantized_weight,
+    );
+
     let mut layers = Vec::with_capacity(num_layers);
     let mut n_attn = 0usize;
     let mut n_gdn = 0usize;
 
-    for i in 0..num_layers {
+    for i in 0..if deepseek4.is_some() { 0 } else { num_layers } {
         let split_moe_layer = matches!(
             model.metadata.architecture,
             ModelArchitecture::Qwen35MoE | ModelArchitecture::Hy3 | ModelArchitecture::GlmDsa
@@ -117,16 +123,21 @@ pub(super) fn load_model_weights(
         }
     }
 
-    eprintln!(
-        "[INFO] Weights loaded: {} layers ({} attention + {} GDN)",
-        num_layers, n_attn, n_gdn
-    );
+    if deepseek4.is_some() {
+        eprintln!("[INFO] Weights loaded: {num_layers} DeepSeek4 trunk layers");
+    } else {
+        eprintln!(
+            "[INFO] Weights loaded: {} layers ({} attention + {} GDN)",
+            num_layers, n_attn, n_gdn
+        );
+    }
 
     ModelWeights {
         token_embd,
         output_norm,
         output,
         layers,
+        deepseek4,
         gemma_per_layer: gemma::load_gemma_per_layer(
             model,
             num_layers,

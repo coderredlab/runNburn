@@ -1771,8 +1771,43 @@ impl Engine {
         }
     }
 
+    fn forward_deepseek4(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "DeepSeek4 forward requires at least one token".to_string(),
+            ));
+        }
+        let expected_position = self.kv_cache.current_len();
+        let mut weights = self.weights.take().ok_or_else(|| {
+            crate::error::LlmError::Forward("DeepSeek4 weights are unavailable".to_string())
+        })?;
+        let result = {
+            let model = weights.deepseek4.as_mut().ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "DeepSeek4 architecture has no DeepSeek4 weight bundle".to_string(),
+                )
+            })?;
+            super::models::deepseek4::forward_tokens(
+                model,
+                &weights.token_embd,
+                &weights.output_norm,
+                &weights.output,
+                tokens,
+                expected_position,
+            )
+        };
+        self.weights = Some(weights);
+        let (logits, final_hidden) = result?;
+        self.kv_cache.set_len(expected_position + tokens.len());
+        self.last_layer_hidden_cached = final_hidden;
+        Ok(logits)
+    }
+
     pub fn forward(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {
         crate::generate::check_generation_cancellation()?;
+        if self.architecture == rnb_loader::Architecture::DeepSeek4 {
+            return self.forward_deepseek4(tokens);
+        }
         // Zero-alloc fast path for single-token decode
         if tokens.len() == 1 && self.scratch.is_some() && self.weights.is_some() {
             // Keep decode on the same resident fullpath state established by
@@ -1910,6 +1945,9 @@ impl Engine {
     }
 
     pub(crate) fn forward_with_logits(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {
+        if self.architecture == rnb_loader::Architecture::DeepSeek4 {
+            return self.forward_deepseek4(tokens);
+        }
         if tokens.len() == 1 && self.scratch.is_some() && self.weights.is_some() {
             self.forward_decode(tokens[0])
         } else {

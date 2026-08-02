@@ -4,7 +4,9 @@ pub mod error;
 pub mod gguf;
 mod mtp_sidecar;
 
-pub use arch::{Architecture, ModelLayerKind, ModelMetadata, MtpLayerTensors, MtpMetadata};
+pub use arch::{
+    Architecture, DeepSeek4Metadata, ModelLayerKind, ModelMetadata, MtpLayerTensors, MtpMetadata,
+};
 pub use error::LoaderError;
 pub use gguf::types::GGMLType;
 
@@ -200,6 +202,7 @@ mod model_ir_tests {
             mtp: None,
             assistant: None,
             glm_indexer: None,
+            deepseek4: None,
         }
     }
 
@@ -405,6 +408,7 @@ mod mtp_sidecar_tests {
             mtp: None,
             assistant: None,
             glm_indexer: None,
+            deepseek4: None,
         };
         metadata.architecture = Architecture::Qwen35;
         let mut weights: HashMap<String, Tensor> = HashMap::new();
@@ -494,6 +498,7 @@ mod mtp_sidecar_tests {
             mtp: None,
             assistant: None,
             glm_indexer: None,
+            deepseek4: None,
         };
         let mut weights: HashMap<String, Tensor> = HashMap::new();
         let mut float_shapes: HashMap<String, Vec<usize>> = HashMap::new();

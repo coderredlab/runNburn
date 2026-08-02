@@ -472,6 +472,7 @@ fn mtp_device_verify_collects_qwen35_gdn_moe_layer_graph_from_engine_parts() {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -576,6 +577,7 @@ fn mtp_device_verify_refuses_partial_graph_when_qwen35_attention_layer_is_presen
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -663,6 +665,7 @@ fn mtp_device_verify_collects_qwen35_attention_moe_layer_graph_from_engine_parts
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -778,6 +781,7 @@ fn mtp_device_verify_collects_qwen35_dense_attention_layer_graph_from_engine_par
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let metadata = ModelMetadata {
         num_layers: 1,
@@ -896,6 +900,7 @@ fn fullpath_gdn_extraction_accepts_f32_alpha_beta() {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
 
     assert_eq!(
@@ -1173,6 +1178,7 @@ fn make_decode_test_engine(vocab_size: usize) -> Engine {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
 
@@ -1216,6 +1222,7 @@ fn test_prepare_gemma_per_layer_base_uses_token_branch_when_model_proj_is_zero()
         gemma_per_layer: Some(gemma),
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let hidden = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[1, 4]);
 
@@ -1362,6 +1369,7 @@ fn make_multi_layer_attention_engine(
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
 
@@ -1520,6 +1528,7 @@ fn make_hybrid_slice1_engine(vocab_size: usize) -> Engine {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
     let mut kv_cache = KVCache::new(
@@ -1780,6 +1789,7 @@ fn make_hybrid_slice1_gqa_engine_with_suffix(vocab_size: usize) -> Engine {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
     let mut kv_cache = KVCache::new(
@@ -1961,6 +1971,7 @@ fn make_real_gpu_multi_layer_attention_engine(
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
     Engine {
@@ -2146,6 +2157,7 @@ fn make_real_gpu_hybrid_slice1_engine(vocab_size: usize, with_suffix: bool) -> E
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
     let mut kv_cache = KVCache::new(
@@ -2348,6 +2360,7 @@ fn make_real_gpu_hybrid_slice1_gqa_engine_with_suffix(vocab_size: usize) -> Engi
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     };
     let scratch = ScratchBuffers::new(&metadata, ffn_inner_dim);
     let mut kv_cache = KVCache::new(
@@ -6680,6 +6693,7 @@ fn make_empty_model_weights() -> ModelWeights {
         gemma_per_layer: None,
         glm_dsa_attention: None,
         rope_freqs: None,
+        deepseek4: None,
     }
 }
 
