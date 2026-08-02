@@ -9,7 +9,8 @@ pub use multimodal_positions::{
 };
 pub use vision::{inspect_qwen36_vision_projector, Qwen36VisionCapability, Qwen36VisionError};
 pub use vision_encoder::{
-    encode_qwen36_vision_intermediate, Qwen36VisionLayerSummary, Qwen36VisionOutput,
+    encode_qwen36_vision_intermediate, encode_qwen36_vision_intermediate_with_executor,
+    Qwen36VisionExecutor, Qwen36VisionLayerSummary, Qwen36VisionOutput,
 };
 pub use vision_preprocess::{
     prepare_qwen36_vision_intermediate, qwen36_smart_resize, Qwen36RgbImage, Qwen36TensorStats,

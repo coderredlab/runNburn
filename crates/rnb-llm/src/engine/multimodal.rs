@@ -1,8 +1,10 @@
 use rnb_core::tensor::Tensor;
 use rnb_loader::Architecture as ModelArchitecture;
-use rnb_model_qwen::{
-    encode_qwen36_vision_intermediate, prepare_qwen36_vision_intermediate, Qwen36RgbImage,
-};
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+use rnb_model_qwen::encode_qwen36_vision_intermediate;
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+use rnb_model_qwen::{encode_qwen36_vision_intermediate_with_executor, Qwen36VisionExecutor};
+use rnb_model_qwen::{prepare_qwen36_vision_intermediate, Qwen36RgbImage};
 
 use super::models::gemma::apply_embedding_scale_inplace;
 use super::prefill::run_prefill_layers_cpu_range_with_positions;
@@ -12,6 +14,68 @@ use crate::multimodal::{
     assemble_prompt_hidden, compile_qwen36_prompt, qwen36_image_fingerprint, CompiledPrompt,
     SequenceCursor,
 };
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+struct MetalVisionExecutor {
+    enabled: bool,
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl Qwen36VisionExecutor for MetalVisionExecutor {
+    fn linear_bf16(
+        &mut self,
+        weight: &[u16],
+        input: &[f32],
+        bias: &[f32],
+        rows: usize,
+        cols: usize,
+        sequence_length: usize,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        crate::runtime::metal::metal_qwen36_vision_linear_bf16(
+            weight,
+            input,
+            bias,
+            rows,
+            cols,
+            sequence_length,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn full_attention(
+        &mut self,
+        qkv: &[f32],
+        embedding_length: usize,
+        head_count: usize,
+        sequence_length: usize,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        crate::runtime::metal::metal_qwen36_vision_full_attention(
+            qkv,
+            embedding_length,
+            head_count,
+            sequence_length,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_vision_enabled() -> bool {
+    super::policy::env_string("RNB_METAL_VISION")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
 
 impl Engine {
     pub fn has_vision_projector(&self) -> bool {
@@ -40,6 +104,15 @@ impl Engine {
 
         let intermediate = prepare_qwen36_vision_intermediate(projector, image)
             .map_err(|error| LlmError::Forward(error.to_string()))?;
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let vision = {
+            let mut executor = MetalVisionExecutor {
+                enabled: metal_vision_enabled(),
+            };
+            encode_qwen36_vision_intermediate_with_executor(projector, intermediate, &mut executor)
+                .map_err(|error| LlmError::Forward(error.to_string()))?
+        };
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
         let vision = encode_qwen36_vision_intermediate(projector, intermediate)
             .map_err(|error| LlmError::Forward(error.to_string()))?;
         let mut token_ids = Vec::new();

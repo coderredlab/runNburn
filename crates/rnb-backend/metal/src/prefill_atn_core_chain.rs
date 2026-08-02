@@ -29,6 +29,7 @@ pub(crate) struct PrefillAtnCoreCarrier {
     pub hidden_dim: usize,
     pub q_dim: usize,
     pub kv_dim: usize,
+    pub n_rot: usize,
     hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     attn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -113,6 +114,42 @@ fn prefill_rope_cos_sin(
     table
 }
 
+fn prefill_imrope_cos_sin(
+    positions: &[[u32; 4]],
+    n_rot: usize,
+    sections: [usize; 4],
+    theta: f32,
+) -> Vec<f32> {
+    if n_rot == 0 {
+        return vec![1.0, 0.0];
+    }
+    let half = n_rot / 2;
+    let section_pairs = sections.iter().sum::<usize>();
+    debug_assert_eq!(section_pairs, half);
+    let theta_scale = theta.powf(-2.0f32 / n_rot as f32);
+    let mut table = Vec::with_capacity(positions.len() * n_rot);
+    for position in positions {
+        let mut frequency = 1.0f32;
+        for pair in 0..half {
+            let sector = pair % section_pairs;
+            let axis = if sector % 3 == 1 && sector < 3 * sections[1] {
+                1
+            } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                2
+            } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                0
+            } else {
+                3
+            };
+            let angle = position[axis] as f32 * frequency;
+            table.push(angle.cos());
+            table.push(angle.sin());
+            frequency *= theta_scale;
+        }
+    }
+    table
+}
+
 impl PrefillAtnCoreCarrier {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -140,6 +177,7 @@ impl PrefillAtnCoreCarrier {
             hidden_dim,
             q_dim,
             kv_dim,
+            n_rot,
             hidden_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
             attn_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
             q_norm_w_dev: empty_f32_buf(ctx, head_dim),
@@ -189,6 +227,20 @@ impl PrefillAtnCoreCarrier {
         copy_f32(attn_norm_w, &self.attn_norm_w_dev);
         copy_f32(q_norm_w, &self.q_norm_w_dev);
         copy_f32(k_norm_w, &self.k_norm_w_dev);
+    }
+
+    fn update_rope_cos_sin(
+        &self,
+        positions: Option<&[[u32; 4]]>,
+        sections: [usize; 4],
+        theta: f32,
+        pos_start: usize,
+    ) {
+        let table = positions.map_or_else(
+            || prefill_rope_cos_sin(self.seq_len, self.head_dim, self.n_rot, theta, pos_start),
+            |positions| prefill_imrope_cos_sin(positions, self.n_rot, sections, theta),
+        );
+        copy_f32(&table, &self.rope_cos_sin_dev);
     }
 }
 
@@ -432,7 +484,11 @@ impl<'a> PrefillAtnCoreOpsWeights<'a> {
 #[derive(Clone, Copy)]
 enum PrefillAtnNormMode {
     LegacyTree,
-    Exact { eps: f32, n_rot: usize },
+    Exact {
+        eps: f32,
+        n_rot: usize,
+        imrope: bool,
+    },
 }
 
 fn encode_atn_core_ops(
@@ -590,7 +646,7 @@ fn encode_atn_core_ops(
             );
             compute::chain_barrier(ctx, enc);
         }
-        PrefillAtnNormMode::Exact { eps, n_rot } => {
+        PrefillAtnNormMode::Exact { eps, n_rot, imrope } => {
             crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
                 ctx,
                 enc,
@@ -613,30 +669,57 @@ fn encode_atn_core_ops(
                 eps,
             )
             .map_err(|error| format!("Metal prefill ATN exact k RMS norm failed: {error:?}"))?;
-            compute::encode_prefill_rope_only(
-                ctx,
-                enc,
-                &carrier.q_normed_dev,
-                &carrier.q_normed_dev,
-                &carrier.rope_cos_sin_dev,
-                carrier.num_heads,
-                carrier.head_dim,
-                n_rot,
-                carrier.seq_len,
-            )
-            .map_err(|error| format!("Metal prefill ATN q RoPE failed: {error:?}"))?;
-            compute::encode_prefill_rope_only(
-                ctx,
-                enc,
-                &carrier.k_normed_dev,
-                &carrier.k_normed_dev,
-                &carrier.rope_cos_sin_dev,
-                carrier.num_kv_heads,
-                carrier.head_dim,
-                n_rot,
-                carrier.seq_len,
-            )
-            .map_err(|error| format!("Metal prefill ATN k RoPE failed: {error:?}"))?;
+            if imrope {
+                compute::encode_prefill_imrope_only(
+                    ctx,
+                    enc,
+                    &carrier.q_normed_dev,
+                    &carrier.q_normed_dev,
+                    &carrier.rope_cos_sin_dev,
+                    carrier.num_heads,
+                    carrier.head_dim,
+                    n_rot,
+                    carrier.seq_len,
+                )
+                .map_err(|error| format!("Metal prefill ATN q IMRoPE failed: {error:?}"))?;
+                compute::encode_prefill_imrope_only(
+                    ctx,
+                    enc,
+                    &carrier.k_normed_dev,
+                    &carrier.k_normed_dev,
+                    &carrier.rope_cos_sin_dev,
+                    carrier.num_kv_heads,
+                    carrier.head_dim,
+                    n_rot,
+                    carrier.seq_len,
+                )
+                .map_err(|error| format!("Metal prefill ATN k IMRoPE failed: {error:?}"))?;
+            } else {
+                compute::encode_prefill_rope_only(
+                    ctx,
+                    enc,
+                    &carrier.q_normed_dev,
+                    &carrier.q_normed_dev,
+                    &carrier.rope_cos_sin_dev,
+                    carrier.num_heads,
+                    carrier.head_dim,
+                    n_rot,
+                    carrier.seq_len,
+                )
+                .map_err(|error| format!("Metal prefill ATN q RoPE failed: {error:?}"))?;
+                compute::encode_prefill_rope_only(
+                    ctx,
+                    enc,
+                    &carrier.k_normed_dev,
+                    &carrier.k_normed_dev,
+                    &carrier.rope_cos_sin_dev,
+                    carrier.num_kv_heads,
+                    carrier.head_dim,
+                    n_rot,
+                    carrier.seq_len,
+                )
+                .map_err(|error| format!("Metal prefill ATN k RoPE failed: {error:?}"))?;
+            }
         }
     }
     if let Some(sampler) = stage_sampler.as_deref_mut() {
@@ -823,6 +906,12 @@ pub(crate) fn encode_prefill_atn_o_tail_ops_profiled(
             core.head_dim,
         ));
     }
+    core.update_rope_cos_sin(
+        spec_core.imrope_positions,
+        spec_core.imrope_sections,
+        spec_core.rope_theta,
+        spec_core.pos_start,
+    );
     let hidden_bytes = core
         .seq_len
         .checked_mul(core.hidden_dim)
@@ -879,6 +968,7 @@ pub(crate) fn encode_prefill_atn_o_tail_ops_profiled(
         PrefillAtnNormMode::Exact {
             eps: spec_core.norm_eps,
             n_rot: spec_core.n_rot,
+            imrope: spec_core.imrope_positions.is_some(),
         },
         &o_w_buf,
         o_w_off,
@@ -1177,7 +1267,10 @@ pub(crate) fn prefill_atn_full_layer_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rnb_cpu::kernels::{norm::rms_norm_into, rope::rope_partial_inplace};
+    use rnb_cpu::kernels::{
+        norm::rms_norm_into,
+        rope::{rope_imrope_inplace, rope_partial_inplace},
+    };
 
     fn assert_f32_bits(label: &str, got: &[f32], expected: &[f32]) {
         assert_eq!(got.len(), expected.len(), "{label} length");
@@ -1288,5 +1381,59 @@ mod tests {
                 &rope_expected,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn qwen_prefill_imrope_matches_cpu() {
+        const SEQ_LEN: usize = 4;
+        const NUM_HEADS: usize = 2;
+        const HEAD_DIM: usize = 256;
+        const N_ROT: usize = 64;
+        const THETA: f32 = 10_000_000.0;
+        const SECTIONS: [usize; 4] = [11, 11, 10, 0];
+        let positions = [[0, 0, 0, 0], [1, 5, 9, 1], [2, 7, 3, 2], [11, 11, 11, 11]];
+        let len = SEQ_LEN * NUM_HEADS * HEAD_DIM;
+        let input = (0..len)
+            .map(|index| ((index.wrapping_mul(29) % 251) as f32 - 125.0) / 128.0)
+            .collect::<Vec<_>>();
+        let mut expected = input.clone();
+        rope_imrope_inplace(
+            &mut expected,
+            &positions,
+            HEAD_DIM,
+            NUM_HEADS * HEAD_DIM,
+            N_ROT,
+            SECTIONS,
+            THETA,
+        );
+
+        let ctx = compute::build_metal_context().expect("Metal context");
+        let input_dev = shared_f32_buf(&ctx, &input);
+        let output_dev = empty_f32_buf(&ctx, len);
+        let table_dev = shared_f32_buf(
+            &ctx,
+            &prefill_imrope_cos_sin(&positions, N_ROT, SECTIONS, THETA),
+        );
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = compute::try_chain_compute_encoder(&ctx, &cmd).expect("compute encoder");
+        compute::encode_prefill_imrope_only(
+            &ctx,
+            &enc,
+            &input_dev,
+            &output_dev,
+            &table_dev,
+            NUM_HEADS,
+            HEAD_DIM,
+            N_ROT,
+            SEQ_LEN,
+        )
+        .expect("IMRoPE encode");
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        ensure_command_completed(&cmd).expect("command completed");
+
+        assert_f32_close("IMRoPE", &readback(&output_dev, len), &expected);
     }
 }

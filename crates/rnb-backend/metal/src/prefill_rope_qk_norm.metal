@@ -3,8 +3,8 @@ using namespace metal;
 
 // pm48 device-resident attention chain 선행 부품:
 //   prefill(seq_len>1) q/k 를 device 에 머문 채 per-head RMSNorm(qk_norm) → text M-RoPE
-//   순서로 적용. CPU ground-truth 순서(projection.rs: qk_norm 먼저, 그다음 forward/rope.rs
-//   rope_mrope_text)와 1:1.
+//   또는 explicit IMRoPE 순서로 적용. CPU ground-truth 순서(projection.rs: qk_norm 먼저,
+//   그다음 forward/rope.rs)와 1:1.
 //
 // 1 threadgroup = (token t, head h). grid = seq_len * num_heads (linear).
 //   tg_lin = t * num_heads + h, base = tg_lin * head_dim.
@@ -121,6 +121,41 @@ kernel void prefill_rope_only(
             values[col + 1u] = x0_sin + x1_cos;
             col += 2u;
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint col = tid; col < head_dim; col += tg_size) {
+        out[base + col] = values[col];
+    }
+}
+
+kernel void prefill_imrope_only(
+    device const float* in           [[buffer(0)]],
+    device float*       out          [[buffer(1)]],
+    device const float2* rope_cos_sin [[buffer(2)]],
+    constant uint&      num_heads    [[buffer(3)]],
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      n_rot        [[buffer(5)]],
+    uint group   [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint token = group / num_heads;
+    uint base = group * head_dim;
+    threadgroup float values[256];
+
+    for (uint col = tid; col < head_dim; col += tg_size) {
+        values[col] = in[base + col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint half_rot = min(n_rot, head_dim) / 2u;
+    if (tid < half_rot) {
+        float2 cos_sin = rope_cos_sin[token * half_rot + tid];
+        float x0 = values[tid];
+        float x1 = values[half_rot + tid];
+        values[tid] = x0 * cos_sin.x - x1 * cos_sin.y;
+        values[half_rot + tid] = x0 * cos_sin.y + x1 * cos_sin.x;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
