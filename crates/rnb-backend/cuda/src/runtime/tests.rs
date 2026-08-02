@@ -8860,6 +8860,32 @@ fn attention_prefill_flash_hd256_matches_cpu_reference() {
 }
 
 #[test]
+fn attention_prefill_non_causal_exposes_future_rows() {
+    let _guard = runtime_test_lock();
+    let seq_len = 2usize;
+    let kv_len = 2usize;
+    let head_dim = 4usize;
+    let q = vec![0.0f32; seq_len * head_dim];
+    let k = vec![0.0f32; kv_len * head_dim];
+    let v = [vec![2.0f32; head_dim], vec![10.0f32; head_dim]].concat();
+
+    let actual = match attention_prefill_flash_f32_non_causal(
+        &q, &k, &v, seq_len, kv_len, 1, 1, head_dim, 1.0,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping CUDA non-causal attention test: {error}");
+            return;
+        }
+    };
+
+    assert_eq!(actual.len(), seq_len * head_dim);
+    for value in actual {
+        assert!((value - 6.0).abs() < 1e-5, "expected 6, got {value}");
+    }
+}
+
+#[test]
 fn attention_prefill_flash_hd256_f16kv_window_matches_cpu_reference() {
     let _guard = runtime_test_lock();
 

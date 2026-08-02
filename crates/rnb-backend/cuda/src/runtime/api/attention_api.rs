@@ -522,6 +522,65 @@ pub fn attention_prefill_flash_f32(
     sliding_window: Option<usize>,
     softcap: Option<f32>,
 ) -> Result<Vec<f32>, String> {
+    attention_prefill_flash_f32_with_mask(
+        q,
+        k,
+        v,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        sliding_window,
+        softcap,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_flash_f32_non_causal(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<Vec<f32>, String> {
+    attention_prefill_flash_f32_with_mask(
+        q,
+        k,
+        v,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        None,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_prefill_flash_f32_with_mask(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+    causal: bool,
+) -> Result<Vec<f32>, String> {
     if seq_len == 0 || kv_len < seq_len || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
         return Err(format!(
             "CUDA attention invalid shape: seq_len={seq_len} kv_len={kv_len} heads={num_heads} kv_heads={num_kv_heads} head_dim={head_dim}"
@@ -546,6 +605,11 @@ pub fn attention_prefill_flash_f32(
     }
     if softcap.is_some_and(|cap| !cap.is_finite() || cap <= 0.0) {
         return Err("CUDA attention softcap must be finite and positive".to_string());
+    }
+    if !causal && (sliding_window.is_some() || softcap.is_some()) {
+        return Err(
+            "CUDA non-causal attention does not support sliding window or softcap".to_string(),
+        );
     }
     let q_expected = seq_len
         .checked_mul(num_heads)
@@ -590,6 +654,7 @@ pub fn attention_prefill_flash_f32(
             scale,
             sliding_window,
             softcap,
+            causal,
         )
 }
 

@@ -171,6 +171,33 @@ pub fn prefill_attention_hd256_if_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_non_causal_if_supported(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<Option<Vec<f32>>> {
+    backend::attention_prefill_flash_f32_non_causal(
+        q,
+        k,
+        v,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+    )
+    .map(Some)
+    .map_err(|err| format!("CUDA non-causal prefill attention failed: {err}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_f16kv_if_supported(
     q: &[f32],
     k: &[u16],

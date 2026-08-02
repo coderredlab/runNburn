@@ -89,6 +89,7 @@ pub(super) use cuda_basic::{
     prefill_attention_f16kv_dense_chain_if_supported, prefill_attention_f16kv_if_supported,
     prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported, prefill_attention_hd256_if_supported,
+    prefill_attention_non_causal_if_supported,
     prefill_attention_q4k_f16_q_attention_hd256_cached_f16kv_window_dense_chain_if_supported,
     prefill_attention_q4k_f16_q_attention_hd512_cached_f16kv_dense_chain_if_supported,
     prefill_attention_q4k_f16_qkv_attention_hd512_dense_chain_if_supported,

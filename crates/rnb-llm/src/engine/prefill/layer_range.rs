@@ -34,6 +34,49 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range(
         seq_len,
         pos_start,
         None,
+        false,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rope_theta,
+        norm_eps,
+        true,
+        None,
+    )
+    .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn run_prefill_layers_cpu_range_non_causal(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    gemma_per_layer_base: Option<&GemmaPerLayerBase>,
+    hidden: Tensor,
+    layer_range: Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+) -> crate::error::Result<Tensor> {
+    run_prefill_layers_cpu_range_impl(
+        kv_cache,
+        metadata,
+        architecture,
+        weights,
+        gemma_per_layer_base,
+        hidden,
+        layer_range,
+        seq_len,
+        pos_start,
+        None,
+        true,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -82,6 +125,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_with_positions(
         seq_len,
         pos_start,
         Some((positions, rope_sections)),
+        false,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -124,6 +168,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_mtp_resident_kv(
         seq_len,
         pos_start,
         None,
+        false,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -166,6 +211,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_carrier(
         seq_len,
         pos_start,
         None,
+        false,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -206,6 +252,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_prefix_state(
         seq_len,
         pos_start,
         None,
+        false,
         num_heads,
         num_kv_heads,
         head_dim,
@@ -1584,13 +1631,14 @@ fn run_prefill_layers_cpu_range_impl(
     seq_len: usize,
     pos_start: usize,
     imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
+    non_causal: bool,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     kv_dim: usize,
     rope_theta: f32,
     norm_eps: f32,
-    mirror_attention_kv_to_host: bool,
+    _mirror_attention_kv_to_host: bool,
     mut prefix_collector: Option<&mut verify_window::GdnPrefixStateCollector>,
 ) -> crate::error::Result<hidden_carrier::PrefillHidden> {
     #[cfg(feature = "cuda")]
@@ -1814,7 +1862,7 @@ fn run_prefill_layers_cpu_range_impl(
                             *device_rope_theta,
                             pos_start,
                             norm_eps,
-                            mirror_attention_kv_to_host,
+                            _mirror_attention_kv_to_host,
                         ) {
                             Ok(output) => output,
                             Err(err) => {
@@ -2468,6 +2516,7 @@ fn run_prefill_layers_cpu_range_impl(
                             rope_theta,
                             norm_eps,
                             ple_fusion.as_ref(),
+                            non_causal,
                         )?
                     };
                     let attention_gemma4_ple_fused = attention_output.gemma4_ple_fused;

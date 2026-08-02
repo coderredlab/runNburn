@@ -36,6 +36,7 @@ pub(super) fn compute_prefill_attention(
     seq_len: usize,
     pos_start: usize,
     kv_len: usize,
+    non_causal: bool,
 ) -> crate::error::Result<Tensor> {
     let _attn_diag = if crate::engine::policy::env_string("RNB_DIAG_ATTN_COMPUTE_TIME").as_deref()
         == Some("1")
@@ -60,7 +61,7 @@ pub(super) fn compute_prefill_attention(
             "token-wise CPU prefill attention was requested for CUDA layer {layer_idx}; CPU fallback is disabled"
         )));
     }
-    let f16_attention_out = if !force_tokenwise {
+    let f16_attention_out = if !non_causal && !force_tokenwise {
         if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
             if has_sliding_window {
                 backend_runtime::prefill_attention_f16kv_window_if_supported(
@@ -98,7 +99,7 @@ pub(super) fn compute_prefill_attention(
         None
     };
 
-    let needs_f32_kv = force_tokenwise || f16_attention_out.is_none();
+    let needs_f32_kv = non_causal || force_tokenwise || f16_attention_out.is_none();
     let cached_f32_storage =
         if needs_f32_kv && !(cached_k_tensor.is_some() && cached_v_tensor.is_some()) {
             if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
@@ -211,7 +212,43 @@ pub(super) fn compute_prefill_attention(
     } else {
         None
     };
-    let mut attn_out = if let Some((k_f16, v_f16)) = kv_f16_for_simd {
+    let mut attn_out = if non_causal {
+        if let Some(window) = sliding_window {
+            if kv_len > window {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "Gemma 4 non-causal image span length {kv_len} exceeds sliding attention window {window}"
+                )));
+            }
+        }
+        if let Some(out) = backend_runtime::prefill_attention_non_causal_if_supported(
+            kernels::tensor_as_f32_slice(q),
+            kernels::tensor_as_f32_slice(cached_k_tensor.expect("cached K tensor materialized")),
+            kernels::tensor_as_f32_slice(cached_v_tensor.expect("cached V tensor materialized")),
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            resolve_attention_scale(metadata, architecture),
+        )? {
+            Tensor::from_vec(out, &[seq_len, layout.q_dim])
+        } else {
+            #[cfg(feature = "cuda")]
+            return Err(crate::error::LlmError::Forward(format!(
+                "CUDA non-causal prefill attention is unavailable for layer {layer_idx}"
+            )));
+            #[cfg(not(feature = "cuda"))]
+            compute_non_causal_attention_cpu(
+                q,
+                cached_k_tensor.expect("cached K tensor materialized"),
+                cached_v_tensor.expect("cached V tensor materialized"),
+                layout,
+                seq_len,
+                kv_len,
+                resolve_attention_scale(metadata, architecture),
+            )?
+        }
+    } else if let Some((k_f16, v_f16)) = kv_f16_for_simd {
         let q_data = kernels::tensor_as_f32_slice(q);
         let scale = resolve_attention_scale(metadata, architecture);
         let softcap = resolve_attention_softcap(architecture);
@@ -401,6 +438,111 @@ pub(super) fn compute_prefill_attention(
     }
 
     Ok(attn_out)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn compute_non_causal_attention_cpu(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    layout: AttentionLayout,
+    seq_len: usize,
+    kv_len: usize,
+    scale: f32,
+) -> crate::error::Result<Tensor> {
+    use rayon::prelude::*;
+
+    if layout.num_heads == 0
+        || layout.num_kv_heads == 0
+        || layout.head_dim == 0
+        || layout.num_heads % layout.num_kv_heads != 0
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "non-causal attention has invalid layout: heads={} kv_heads={} head_dim={}",
+            layout.num_heads, layout.num_kv_heads, layout.head_dim
+        )));
+    }
+    let q_data = kernels::tensor_as_f32_slice(q);
+    let k_data = kernels::tensor_as_f32_slice(k);
+    let v_data = kernels::tensor_as_f32_slice(v);
+    if q_data.len() != seq_len * layout.q_dim
+        || k_data.len() != kv_len * layout.kv_dim
+        || v_data.len() != kv_len * layout.kv_dim
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "non-causal attention shape mismatch: q={} k={} v={} expected q={} k/v={}",
+            q_data.len(),
+            k_data.len(),
+            v_data.len(),
+            seq_len * layout.q_dim,
+            kv_len * layout.kv_dim
+        )));
+    }
+
+    let heads_per_group = layout.num_heads / layout.num_kv_heads;
+    let mut output = vec![0.0f32; seq_len * layout.q_dim];
+    output
+        .par_chunks_mut(layout.q_dim)
+        .enumerate()
+        .for_each(|(query_index, output_row)| {
+            let q_row = &q_data[query_index * layout.q_dim..(query_index + 1) * layout.q_dim];
+            let mut scores = vec![0.0f32; kv_len];
+            for head in 0..layout.num_heads {
+                let kv_head = head / heads_per_group;
+                let q_head = &q_row[head * layout.head_dim..(head + 1) * layout.head_dim];
+                let mut max_score = f32::NEG_INFINITY;
+                for (key_index, score) in scores.iter_mut().enumerate() {
+                    let key_offset = key_index * layout.kv_dim + kv_head * layout.head_dim;
+                    let key_head = &k_data[key_offset..key_offset + layout.head_dim];
+                    let dot = q_head
+                        .iter()
+                        .zip(key_head)
+                        .fold(0.0f32, |sum, (&query, &key)| sum + query * key);
+                    *score = dot * scale;
+                    max_score = max_score.max(*score);
+                }
+                let mut score_sum = 0.0f32;
+                for score in &mut scores {
+                    *score = (*score - max_score).exp();
+                    score_sum += *score;
+                }
+                let output_head =
+                    &mut output_row[head * layout.head_dim..(head + 1) * layout.head_dim];
+                for (key_index, &score) in scores.iter().enumerate() {
+                    let probability = score / score_sum;
+                    let value_offset = key_index * layout.kv_dim + kv_head * layout.head_dim;
+                    let value_head = &v_data[value_offset..value_offset + layout.head_dim];
+                    for (dst, &value) in output_head.iter_mut().zip(value_head) {
+                        *dst += probability * value;
+                    }
+                }
+            }
+        });
+    Ok(Tensor::from_vec(output, &[seq_len, layout.q_dim]))
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_causal_attention_exposes_future_image_rows() {
+        let layout = AttentionLayout {
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            q_dim: 1,
+            kv_dim: 1,
+            has_gated_attn: false,
+        };
+        let q = Tensor::from_vec(vec![0.0, 0.0], &[2, 1]);
+        let k = Tensor::from_vec(vec![1.0, 3.0], &[2, 1]);
+        let v = Tensor::from_vec(vec![2.0, 10.0], &[2, 1]);
+
+        let output = compute_non_causal_attention_cpu(&q, &k, &v, layout, 2, 2, 1.0).unwrap();
+
+        assert_eq!(kernels::tensor_as_f32_slice(&output), &[6.0, 6.0]);
+    }
 }
 
 /// mt93 step1 — observation-only reference softmax dump.

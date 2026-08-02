@@ -1983,6 +1983,38 @@ pub(in crate::engine) fn prefill_attention_hd256_if_supported(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn prefill_attention_non_causal_if_supported(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::prefill_attention_non_causal_if_supported(
+            q,
+            k,
+            v,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        )
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn prefill_attention_f16kv_if_supported(
     q: &[f32],
     k: &[u16],

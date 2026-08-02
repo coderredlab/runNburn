@@ -615,7 +615,8 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256(
     unsigned head_dim,
     float scale,
     unsigned window,
-    float softcap) {
+    float softcap,
+    unsigned causal) {
     const unsigned tid = threadIdx.x;
     const unsigned i = blockIdx.x;
     const unsigned h = blockIdx.y;
@@ -627,6 +628,7 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256(
     const unsigned heads_per_group = num_heads / num_kv_heads;
     const unsigned kv_h = h / heads_per_group;
     const unsigned global_pos = kv_len - seq_len + i;
+    const unsigned attention_end = causal != 0u ? global_pos : kv_len - 1u;
     const unsigned start =
         window > 0u && global_pos + 1u > window ? global_pos + 1u - window : 0u;
     const unsigned lane = tid & 31u;
@@ -639,7 +641,7 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256(
         float row_sum = 0.0f;
         float acc = 0.0f;
 
-        for (unsigned j = start; j <= global_pos; ++j) {
+        for (unsigned j = start; j <= attention_end; ++j) {
             float dot = 0.0f;
             for (unsigned d = tid; d < head_dim; d += 256u) {
                 dot += q[i * num_heads * head_dim + h * head_dim + d]

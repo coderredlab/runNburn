@@ -9,7 +9,7 @@ pub use attention::{
     decode_attention_hd256_if_supported, prefill_attention_f16kv_dense_chain_if_supported,
     prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported, prefill_attention_hd256_if_supported,
-    try_delta_step_if_supported,
+    prefill_attention_non_causal_if_supported, try_delta_step_if_supported,
 };
 pub use gdn::{
     begin_nemotron_prefill_workspace, end_nemotron_prefill_workspace,

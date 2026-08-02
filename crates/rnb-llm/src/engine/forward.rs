@@ -101,6 +101,7 @@ pub(super) fn forward_attention_layer(
         norm_eps,
         None,
         None,
+        false,
     )?
     .hidden)
 }
@@ -143,6 +144,7 @@ pub(super) fn forward_attention_layer_with_rope_pos(
         norm_eps,
         None,
         None,
+        false,
     )?
     .hidden)
 }
@@ -186,6 +188,7 @@ pub(super) fn forward_attention_layer_with_positions(
         norm_eps,
         Some((positions, rope_sections)),
         None,
+        false,
     )
 }
 
@@ -207,6 +210,7 @@ pub(super) fn forward_attention_layer_with_gemma4_ple_fusion(
     rope_theta: f32,
     norm_eps: f32,
     ple_fusion: Option<&Gemma4PrefillPleFusion<'_>>,
+    non_causal: bool,
 ) -> crate::error::Result<PrefillAttentionLayerOutput> {
     forward_attention_layer_impl(
         kv_cache,
@@ -227,6 +231,7 @@ pub(super) fn forward_attention_layer_with_gemma4_ple_fusion(
         norm_eps,
         None,
         ple_fusion,
+        non_causal,
     )
 }
 
@@ -250,8 +255,10 @@ fn forward_attention_layer_impl(
     norm_eps: f32,
     imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     ple_fusion: Option<&Gemma4PrefillPleFusion<'_>>,
+    non_causal: bool,
 ) -> crate::error::Result<PrefillAttentionLayerOutput> {
-    if imrope_positions.is_none()
+    if !non_causal
+        && imrope_positions.is_none()
         && super::models::shared_expert_moe::qwen35_verify_tokens2_decode_equivalent_enabled(
             architecture,
             seq_len,
@@ -354,7 +361,11 @@ fn forward_attention_layer_impl(
 
     // --- Attention sub-block ---
     let fused_t0 = std::time::Instant::now();
-    if positions_aligned && gemma4_reuse_q_only && !kv_cache.layer_uses_kvarn(kv_cache_layer) {
+    if !non_causal
+        && positions_aligned
+        && gemma4_reuse_q_only
+        && !kv_cache.layer_uses_kvarn(kv_cache_layer)
+    {
         let kv_len = pos_start + seq_len;
         let (cached_k_f16, cached_v_f16) = kv_cache.get_up_to(kv_cache_layer, kv_len);
         if let Some(fused) = try_prefill_q4k_f16_reuse_q_hd256_window_dense_chain(
@@ -413,7 +424,7 @@ fn forward_attention_layer_impl(
         }
     }
 
-    if positions_aligned {
+    if !non_causal && positions_aligned {
         if let Some(fused) = try_prefill_q4k_f16_qkv_hd256_window_dense_chain(
             metadata,
             architecture,
@@ -451,7 +462,7 @@ fn forward_attention_layer_impl(
         }
     }
 
-    if positions_aligned {
+    if !non_causal && positions_aligned {
         if let Some(fused) = try_prefill_q4k_f16_qkv_hd512_dense_chain(
             metadata,
             architecture,
@@ -489,7 +500,7 @@ fn forward_attention_layer_impl(
         }
     }
 
-    let attn_step = if positions_aligned {
+    let attn_step = if !non_causal && positions_aligned {
         if let Some(fused) = try_prefill_atn_full_layer_metal(
             metadata,
             architecture,
@@ -662,6 +673,7 @@ fn forward_attention_layer_impl(
                 kv_dim,
                 norm_eps,
                 imrope_positions,
+                non_causal,
                 projection,
                 &prof,
                 t0,
@@ -702,6 +714,7 @@ fn forward_attention_layer_impl(
             kv_dim,
             norm_eps,
             imrope_positions,
+            non_causal,
             projection,
             &prof,
             t0,
@@ -883,6 +896,7 @@ fn compute_prefill_attention_from_projection<F>(
     kv_dim: usize,
     norm_eps: f32,
     imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
+    non_causal: bool,
     projection: projection::PrefillAttentionProjection,
     prof: &F,
     t_projection: std::time::Instant,
@@ -1197,31 +1211,33 @@ where
     let t0 = std::time::Instant::now();
     let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
     let has_softcap = resolve_attention_softcap(architecture).is_some();
-    if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
-        if let Some(chained_hidden) = try_prefill_f16kv_attention_output_ffn_chain(
-            metadata,
-            architecture,
-            gemma_runtime_flavor,
-            &hidden,
-            w,
-            &q,
-            cached_k_f16,
-            cached_v_f16,
-            layout,
-            layer_idx,
-            seq_len,
-            kv_len,
-            norm_eps,
-            sliding_window,
-            has_softcap,
-        )? {
-            if kv_cache.layer_uses_kvarn(kv_cache_layer) {
-                kv_cache
-                    .compact_layer(kv_cache_layer)
-                    .map_err(crate::error::LlmError::Forward)?;
+    if !non_causal {
+        if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
+            if let Some(chained_hidden) = try_prefill_f16kv_attention_output_ffn_chain(
+                metadata,
+                architecture,
+                gemma_runtime_flavor,
+                &hidden,
+                w,
+                &q,
+                cached_k_f16,
+                cached_v_f16,
+                layout,
+                layer_idx,
+                seq_len,
+                kv_len,
+                norm_eps,
+                sliding_window,
+                has_softcap,
+            )? {
+                if kv_cache.layer_uses_kvarn(kv_cache_layer) {
+                    kv_cache
+                        .compact_layer(kv_cache_layer)
+                        .map_err(crate::error::LlmError::Forward)?;
+                }
+                prof("attention+o_proj+ffn_chain", t0);
+                return Ok(PrefillAttentionStep::FinalHidden(chained_hidden));
             }
-            prof("attention+o_proj+ffn_chain", t0);
-            return Ok(PrefillAttentionStep::FinalHidden(chained_hidden));
         }
     }
 
@@ -1239,6 +1255,7 @@ where
         seq_len,
         pos_start,
         kv_len,
+        non_causal,
     )?;
     if kv_cache.layer_uses_kvarn(kv_cache_layer) {
         kv_cache

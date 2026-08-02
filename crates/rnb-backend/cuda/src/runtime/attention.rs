@@ -1216,6 +1216,7 @@ impl CudaState {
         scale: f32,
         sliding_window: Option<usize>,
         softcap: Option<f32>,
+        causal: bool,
     ) -> Result<Vec<f32>, String> {
         let q_bytes = std::mem::size_of_val(q);
         let k_bytes = std::mem::size_of_val(k);
@@ -1259,6 +1260,7 @@ impl CudaState {
         let mut scale_arg = scale;
         let mut window_arg = sliding_window.unwrap_or(0) as u32;
         let mut softcap_arg = softcap.unwrap_or(0.0);
+        let mut causal_arg = u32::from(causal);
         self.launch_cached_gemv(
             "rnb_attention_prefill_flash_hd256",
             &[
@@ -1274,6 +1276,7 @@ impl CudaState {
                 (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                 (&mut window_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut softcap_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut causal_arg as *mut u32).cast::<libc::c_void>(),
             ],
             (seq_len as u32, num_heads as u32, 1),
             (256, 1, 1),
