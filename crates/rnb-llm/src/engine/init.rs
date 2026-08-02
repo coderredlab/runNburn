@@ -256,7 +256,9 @@ impl Engine {
         let weight_count = model.weights.len();
         eprintln!("[INFO] GGUF weights: {}", weight_count);
 
-        let (tokenizer, vocab_size) = load_stage!("build_tokenizer", { build_tokenizer(&model) });
+        let (tokenizer, vocab_size) = load_stage!("build_tokenizer", {
+            build_tokenizer(&model.metadata.tokenizer)
+        })?;
         let metadata = load_stage!("build_metadata", {
             build_model_metadata(&model, vocab_size)
         });

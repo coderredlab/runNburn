@@ -1,9 +1,9 @@
 use crate::arch::{Architecture, ModelMetadata, MtpMetadata};
-use crate::convert::compute_tensor_size;
+use crate::convert::checked_tensor_size;
 use crate::error::LoaderError;
 use crate::gguf::types::GGMLType;
 use rnb_core::tensor::Tensor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -62,14 +62,34 @@ pub(crate) fn parse_mtp1_sidecar_bytes(bytes: &[u8]) -> Result<Vec<MtpSidecarTen
         return Err(parse_error(0, "invalid MTP sidecar magic"));
     }
     let tensor_count = read_u32(bytes, &mut pos)? as usize;
+    const MIN_TENSOR_HEADER_BYTES: usize = 28;
+    if tensor_count > bytes.len().saturating_sub(pos) / MIN_TENSOR_HEADER_BYTES {
+        return Err(parse_error(
+            pos,
+            &format!("MTP tensor count {tensor_count} cannot fit in the remaining file"),
+        ));
+    }
     let mut headers = Vec::with_capacity(tensor_count);
+    let mut tensor_names = HashSet::new();
     for _ in 0..tensor_count {
         let record_offset = pos;
         let name_len = read_u32(bytes, &mut pos)? as usize;
         let name = std::str::from_utf8(read_exact(bytes, &mut pos, name_len)?)
             .map_err(|_| parse_error(record_offset, "invalid UTF-8 tensor name"))?
             .to_string();
+        if !tensor_names.insert(name.clone()) {
+            return Err(parse_error(
+                record_offset,
+                &format!("duplicate MTP tensor name '{name}'"),
+            ));
+        }
         let dim_count = read_u32(bytes, &mut pos)? as usize;
+        if dim_count > 4 {
+            return Err(parse_error(
+                record_offset,
+                &format!("MTP tensor '{name}' has {dim_count} dimensions; maximum is 4"),
+            ));
+        }
         let mut shape = Vec::with_capacity(dim_count);
         for _ in 0..dim_count {
             shape.push(read_u32(bytes, &mut pos)? as usize);
@@ -77,9 +97,26 @@ pub(crate) fn parse_mtp1_sidecar_bytes(bytes: &[u8]) -> Result<Vec<MtpSidecarTen
         let ggml_type_raw = read_u32(bytes, &mut pos)?;
         let ggml_type = GGMLType::try_from(ggml_type_raw)
             .map_err(|raw| LoaderError::UnsupportedGGMLType(raw))?;
-        let data_offset = read_u64(bytes, &mut pos)? as usize;
-        let data_size = read_u64(bytes, &mut pos)? as usize;
-        let expected_size = compute_tensor_size(&shape, ggml_type);
+        let data_offset_raw = read_u64(bytes, &mut pos)?;
+        let data_offset = usize::try_from(data_offset_raw).map_err(|_| {
+            parse_error(
+                record_offset,
+                &format!("MTP tensor '{name}' data offset does not fit usize"),
+            )
+        })?;
+        let data_size_raw = read_u64(bytes, &mut pos)?;
+        let data_size = usize::try_from(data_size_raw).map_err(|_| {
+            parse_error(
+                record_offset,
+                &format!("MTP tensor '{name}' data size does not fit usize"),
+            )
+        })?;
+        let expected_size = checked_tensor_size(&shape, ggml_type).map_err(|reason| {
+            parse_error(
+                record_offset,
+                &format!("MTP tensor '{name}' has invalid shape: {reason}"),
+            )
+        })?;
         if data_size != expected_size {
             return Err(parse_error(
                 record_offset,
@@ -88,9 +125,16 @@ pub(crate) fn parse_mtp1_sidecar_bytes(bytes: &[u8]) -> Result<Vec<MtpSidecarTen
         }
         headers.push((name, shape, ggml_type, data_offset, data_size));
     }
+    let header_end = pos;
 
     let mut tensors = Vec::with_capacity(headers.len());
     for (name, shape, ggml_type, data_offset, data_size) in headers {
+        if data_offset < header_end {
+            return Err(parse_error(
+                data_offset,
+                &format!("MTP tensor '{name}' data overlaps the header"),
+            ));
+        }
         let data_end = data_offset.checked_add(data_size).ok_or_else(|| {
             parse_error(
                 data_offset,

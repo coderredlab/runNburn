@@ -32,17 +32,27 @@ pub struct TokenizerData {
     pub tokens: Vec<String>,
     /// token scores (SentencePiece BPE 우선순위)
     pub scores: Vec<f32>,
+    /// GGUF token type values (1=normal, 2=unknown, 3=control,
+    /// 4=user-defined, 5=unused, 6=byte)
+    pub token_types: Vec<u32>,
     /// BPE merge rules ("token1 token2" 형식)
     pub merges: Vec<String>,
-    /// BOS token id
-    pub bos_id: u32,
-    /// EOS token id
-    pub eos_id: u32,
+    /// tokenizer.ggml.added_tokens entries
+    pub added_tokens: Vec<String>,
+    pub bos_id: Option<u32>,
+    pub eos_id: Option<u32>,
+    pub unknown_id: Option<u32>,
+    pub separator_id: Option<u32>,
+    pub padding_id: Option<u32>,
     /// 토크나이저 모델 타입 ("llama" = SentencePiece, "gpt2" = GPT-2 BPE)
     pub model: String,
+    /// tokenizer.ggml.pre pre-tokenizer identifier
+    pub pre: Option<String>,
     /// GGUF Jinja chat template used to serialize role/content messages.
     pub chat_template: Option<String>,
     pub add_bos_token: bool,
+    pub add_eos_token: bool,
+    pub add_sep_token: bool,
     pub add_space_prefix: bool,
 }
 
@@ -53,12 +63,20 @@ impl TokenizerData {
             vocab_size,
             tokens: Vec::new(),
             scores: Vec::new(),
+            token_types: Vec::new(),
             merges: Vec::new(),
-            bos_id: 1,
-            eos_id: 2,
+            added_tokens: Vec::new(),
+            bos_id: None,
+            eos_id: None,
+            unknown_id: None,
+            separator_id: None,
+            padding_id: None,
             model: String::new(),
+            pre: None,
             chat_template: None,
             add_bos_token: true,
+            add_eos_token: false,
+            add_sep_token: false,
             add_space_prefix: true,
         }
     }
@@ -358,6 +376,30 @@ mod mtp_sidecar_tests {
         assert_eq!(fc.shape, vec![2, 4]);
         assert_eq!(fc.ggml_type, GGMLType::F16);
         assert_eq!(fc.data, vec![1u8; 16]);
+    }
+
+    #[test]
+    fn mtp1_sidecar_parser_rejects_invalid_quant_shape_without_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"MTP1");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let name = "mtp.invalid.weight";
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&31u32.to_le_bytes());
+        bytes.extend_from_slice(&(GGMLType::Q4_0 as u32).to_le_bytes());
+        let offset_position = bytes.len();
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&18u64.to_le_bytes());
+        let data_offset = bytes.len() as u64;
+        bytes[offset_position..offset_position + 8].copy_from_slice(&data_offset.to_le_bytes());
+        bytes.extend_from_slice(&[0; 18]);
+
+        assert!(matches!(
+            crate::mtp_sidecar::parse_mtp1_sidecar_bytes(&bytes),
+            Err(LoaderError::ParseError { msg, .. }) if msg.contains("block size")
+        ));
     }
 
     #[test]

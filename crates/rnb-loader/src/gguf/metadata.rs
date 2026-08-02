@@ -1,6 +1,24 @@
 use crate::error::LoaderError;
 use crate::gguf::types::GGUFValue;
 
+fn integer_as_u64(value: &GGUFValue) -> Option<u64> {
+    match value {
+        GGUFValue::U8(value) => Some(u64::from(*value)),
+        GGUFValue::I8(value) => u64::try_from(*value).ok(),
+        GGUFValue::U16(value) => Some(u64::from(*value)),
+        GGUFValue::I16(value) => u64::try_from(*value).ok(),
+        GGUFValue::U32(value) => Some(u64::from(*value)),
+        GGUFValue::I32(value) => u64::try_from(*value).ok(),
+        GGUFValue::U64(value) => Some(*value),
+        GGUFValue::I64(value) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn integer_as_u32(value: &GGUFValue) -> Option<u32> {
+    integer_as_u64(value).and_then(|value| u32::try_from(value).ok())
+}
+
 pub fn get_string<'a>(
     metadata: &'a [(String, GGUFValue)],
     key: &str,
@@ -20,44 +38,24 @@ pub fn get_string<'a>(
 }
 
 pub fn get_u32(metadata: &[(String, GGUFValue)], key: &str) -> Result<u32, LoaderError> {
-    for (k, v) in metadata {
+    for (k, value) in metadata {
         if k == key {
-            return match v {
-                GGUFValue::U32(n) => Ok(*n),
-                GGUFValue::I32(n) => Ok(*n as u32),
-                GGUFValue::U64(n) => Ok(*n as u32),
-                GGUFValue::I64(n) => Ok(*n as u32),
-                GGUFValue::U16(n) => Ok(*n as u32),
-                GGUFValue::I16(n) => Ok(*n as u32),
-                GGUFValue::U8(n) => Ok(*n as u32),
-                GGUFValue::I8(n) => Ok(*n as u32),
-                _ => Err(LoaderError::TypeMismatch {
-                    key: key.to_string(),
-                    expected: "U32".to_string(),
-                }),
-            };
+            return integer_as_u32(value).ok_or_else(|| LoaderError::TypeMismatch {
+                key: key.to_string(),
+                expected: "non-negative integer fitting U32".to_string(),
+            });
         }
     }
     Err(LoaderError::MissingKey(key.to_string()))
 }
 
 pub fn get_u64(metadata: &[(String, GGUFValue)], key: &str) -> Result<u64, LoaderError> {
-    for (k, v) in metadata {
+    for (k, value) in metadata {
         if k == key {
-            return match v {
-                GGUFValue::U64(n) => Ok(*n),
-                GGUFValue::U32(n) => Ok(*n as u64),
-                GGUFValue::I64(n) => Ok(*n as u64),
-                GGUFValue::I32(n) => Ok(*n as u64),
-                GGUFValue::U16(n) => Ok(*n as u64),
-                GGUFValue::I16(n) => Ok(*n as u64),
-                GGUFValue::U8(n) => Ok(*n as u64),
-                GGUFValue::I8(n) => Ok(*n as u64),
-                _ => Err(LoaderError::TypeMismatch {
-                    key: key.to_string(),
-                    expected: "U64".to_string(),
-                }),
-            };
+            return integer_as_u64(value).ok_or_else(|| LoaderError::TypeMismatch {
+                key: key.to_string(),
+                expected: "non-negative integer fitting U64".to_string(),
+            });
         }
     }
     Err(LoaderError::MissingKey(key.to_string()))
@@ -79,13 +77,27 @@ pub fn get_f32(metadata: &[(String, GGUFValue)], key: &str) -> Result<f32, Loade
     Err(LoaderError::MissingKey(key.to_string()))
 }
 
-/// key가 없으면 None 반환 (optional 필드용)
-pub fn get_u32_opt(metadata: &[(String, GGUFValue)], key: &str) -> Option<u32> {
-    get_u32(metadata, key).ok()
+fn optional<T>(value: Result<T, LoaderError>) -> Result<Option<T>, LoaderError> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(LoaderError::MissingKey(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
-pub fn get_f32_opt(metadata: &[(String, GGUFValue)], key: &str) -> Option<f32> {
-    get_f32(metadata, key).ok()
+/// key가 없으면 None을 반환하고, 값이 있으면 타입 오류를 보존한다.
+pub fn get_u32_opt(
+    metadata: &[(String, GGUFValue)],
+    key: &str,
+) -> Result<Option<u32>, LoaderError> {
+    optional(get_u32(metadata, key))
+}
+
+pub fn get_f32_opt(
+    metadata: &[(String, GGUFValue)],
+    key: &str,
+) -> Result<Option<f32>, LoaderError> {
+    optional(get_f32(metadata, key))
 }
 
 pub fn get_bool(metadata: &[(String, GGUFValue)], key: &str) -> Result<bool, LoaderError> {
@@ -103,8 +115,11 @@ pub fn get_bool(metadata: &[(String, GGUFValue)], key: &str) -> Result<bool, Loa
     Err(LoaderError::MissingKey(key.to_string()))
 }
 
-pub fn get_bool_opt(metadata: &[(String, GGUFValue)], key: &str) -> Option<bool> {
-    get_bool(metadata, key).ok()
+pub fn get_bool_opt(
+    metadata: &[(String, GGUFValue)],
+    key: &str,
+) -> Result<Option<bool>, LoaderError> {
+    optional(get_bool(metadata, key))
 }
 
 pub fn get_bool_array(
@@ -147,22 +162,12 @@ pub fn get_u32_array(metadata: &[(String, GGUFValue)], key: &str) -> Result<Vec<
                 GGUFValue::Array(items) => {
                     let mut result = Vec::with_capacity(items.len());
                     for item in items {
-                        match item {
-                            GGUFValue::U32(v) => result.push(*v),
-                            GGUFValue::I32(v) => result.push(*v as u32),
-                            GGUFValue::U64(v) => result.push(*v as u32),
-                            GGUFValue::I64(v) => result.push(*v as u32),
-                            GGUFValue::U16(v) => result.push(*v as u32),
-                            GGUFValue::I16(v) => result.push(*v as u32),
-                            GGUFValue::U8(v) => result.push(*v as u32),
-                            GGUFValue::I8(v) => result.push(*v as u32),
-                            _ => {
-                                return Err(LoaderError::TypeMismatch {
-                                    key: key.to_string(),
-                                    expected: "Array<U32>".to_string(),
-                                })
-                            }
-                        }
+                        let value =
+                            integer_as_u32(item).ok_or_else(|| LoaderError::TypeMismatch {
+                                key: key.to_string(),
+                                expected: "Array<non-negative integer fitting U32>".to_string(),
+                            })?;
+                        result.push(value);
                     }
                     Ok(result)
                 }
@@ -295,8 +300,52 @@ mod tests {
     }
 
     #[test]
-    fn test_get_u32_opt_missing() {
+    fn test_get_u32_opt_preserves_missing_and_type_errors() {
         let meta: Vec<(String, GGUFValue)> = vec![];
-        assert_eq!(get_u32_opt(&meta, "missing"), None);
+        assert_eq!(get_u32_opt(&meta, "missing").unwrap(), None);
+
+        let meta = vec![kv("k", GGUFValue::String("wrong".to_string()))];
+        assert!(matches!(
+            get_u32_opt(&meta, "k"),
+            Err(LoaderError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_unsigned_accessors_reject_negative_and_overflowing_values() {
+        for value in [
+            GGUFValue::I8(-1),
+            GGUFValue::I16(-1),
+            GGUFValue::I32(-1),
+            GGUFValue::I64(-1),
+            GGUFValue::U64(u64::from(u32::MAX) + 1),
+        ] {
+            let meta = vec![kv("k", value)];
+            assert!(matches!(
+                get_u32(&meta, "k"),
+                Err(LoaderError::TypeMismatch { .. })
+            ));
+        }
+
+        let meta = vec![kv("k", GGUFValue::I64(-1))];
+        assert!(matches!(
+            get_u64(&meta, "k"),
+            Err(LoaderError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_get_u32_array_rejects_negative_and_overflowing_values() {
+        for value in [
+            GGUFValue::I32(-1),
+            GGUFValue::I64(-1),
+            GGUFValue::U64(u64::from(u32::MAX) + 1),
+        ] {
+            let meta = vec![kv("k", GGUFValue::Array(vec![value]))];
+            assert!(matches!(
+                get_u32_array(&meta, "k"),
+                Err(LoaderError::TypeMismatch { .. })
+            ));
+        }
     }
 }

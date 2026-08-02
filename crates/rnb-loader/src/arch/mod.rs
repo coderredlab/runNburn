@@ -5,7 +5,7 @@ pub mod phi;
 
 use crate::error::LoaderError;
 use crate::gguf::metadata::{
-    get_bool, get_bool_array, get_bool_opt, get_f32, get_f32_array, get_f32_opt, get_string,
+    get_bool_array, get_bool_opt, get_f32, get_f32_array, get_f32_opt, get_string,
     get_string_array, get_u32, get_u32_array, get_u32_opt,
 };
 use crate::gguf::types::GGUFValue;
@@ -244,6 +244,14 @@ fn validate_deepseek4_compression_ratios(
     Ok(())
 }
 
+fn optional_metadata<T>(value: Result<T, LoaderError>) -> Result<Option<T>, LoaderError> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(LoaderError::MissingKey(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadata, LoaderError> {
     let arch = detect_architecture(metadata)?;
 
@@ -263,22 +271,20 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         Architecture::GlmDsa => "glm-dsa",
         Architecture::DeepSeek4 => "deepseek4",
     };
-    // 실제 GGUF에 있는 키를 먼저 시도하고, 없으면 known prefix로 fallback
     let prefix = if get_u32(metadata, &format!("{arch_str}.embedding_length")).is_ok() {
         arch_str
     } else {
         known_prefix
     };
 
-    let vocab_size = get_u32(metadata, &format!("{prefix}.vocab_size"))
-        .or_else(|_| get_u32(metadata, "tokenizer.ggml.tokens"))
-        .map(|v| v as usize)
+    let vocab_size = get_u32_opt(metadata, &format!("{prefix}.vocab_size"))?
+        .map(|value| value as usize)
         .unwrap_or(32000);
 
     let hidden_size = get_u32(metadata, &format!("{prefix}.embedding_length"))? as usize;
     let total_block_count = get_u32(metadata, &format!("{prefix}.block_count"))? as usize;
     let declared_nextn_predict_layers =
-        get_u32_opt(metadata, &format!("{prefix}.nextn_predict_layers")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.nextn_predict_layers"))?.unwrap_or(0) as usize;
     // External Gemma4 assistant GGUFs use `nextn_predict_layers` to describe
     // their own decoder depth. Unlike an in-model MTP tail, those blocks are
     // all executable drafter layers and must not be subtracted from block_count.
@@ -303,39 +309,47 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         nextn_predict_layers,
     });
     let num_heads = get_u32(metadata, &format!("{prefix}.attention.head_count"))? as usize;
-    // attention.head_count_kv 는 단일 u32 또는 per-layer array (gemma4 26B-A4B 등 MoE 변형).
-    // Array 면 Vec 보존하고, 단일값은 max (또는 첫 번째) 로 num_kv_heads 도 채움.
-    let head_count_kv_per_layer: Option<Vec<usize>> =
-        get_u32_array(metadata, &format!("{prefix}.attention.head_count_kv"))
-            .ok()
-            .map(|v| v.into_iter().map(|x| x as usize).collect());
-    let num_kv_heads = match &head_count_kv_per_layer {
-        Some(v) if !v.is_empty() => *v.iter().max().unwrap(),
-        _ => get_u32_opt(metadata, &format!("{prefix}.attention.head_count_kv"))
-            .map(|v| v as usize)
-            .unwrap_or(num_heads),
+    // attention.head_count_kv accepts either a scalar or a per-layer array.
+    let head_count_kv_key = format!("{prefix}.attention.head_count_kv");
+    let (head_count_kv_per_layer, num_kv_heads) = match get_u32_array(metadata, &head_count_kv_key)
+    {
+        Ok(values) => {
+            let values = values
+                .into_iter()
+                .map(|value| value as usize)
+                .collect::<Vec<_>>();
+            let max = values.iter().copied().max().unwrap_or(num_heads);
+            (Some(values), max)
+        }
+        Err(LoaderError::TypeMismatch { .. }) => {
+            (None, get_u32(metadata, &head_count_kv_key)? as usize)
+        }
+        Err(LoaderError::MissingKey(_)) => (None, num_heads),
+        Err(error) => return Err(error),
     };
-    let intermediate_size = get_u32(metadata, &format!("{prefix}.feed_forward_length"))
-        .map(|v| v as usize)
-        .or_else(|_| {
-            get_u32_array(metadata, &format!("{prefix}.feed_forward_length"))
-                .map(|vals| vals.into_iter().map(|v| v as usize).max().unwrap_or(0))
-        })
-        .or_else(|_| {
-            // MoE-only models (e.g. qwen35moe) have no dense FFN, so
-            // `feed_forward_length` is absent. Fall back to
-            // `expert_feed_forward_length` so scratch/debug sizing stays sane.
-            get_u32(metadata, &format!("{prefix}.expert_feed_forward_length")).map(|v| v as usize)
-        })?;
-    let declared_max_seq_len = get_u32(metadata, &format!("{prefix}.context_length"))
-        .map(|v| v as usize)
+    let feed_forward_key = format!("{prefix}.feed_forward_length");
+    let intermediate_size = match get_u32(metadata, &feed_forward_key) {
+        Ok(value) => value as usize,
+        Err(LoaderError::TypeMismatch { .. }) => get_u32_array(metadata, &feed_forward_key)?
+            .into_iter()
+            .map(|value| value as usize)
+            .max()
+            .unwrap_or(0),
+        Err(LoaderError::MissingKey(_)) => {
+            // MoE-only models (e.g. qwen35moe) have no dense FFN.
+            get_u32(metadata, &format!("{prefix}.expert_feed_forward_length"))? as usize
+        }
+        Err(error) => return Err(error),
+    };
+    let declared_max_seq_len = get_u32_opt(metadata, &format!("{prefix}.context_length"))?
+        .map(|value| value as usize)
         .unwrap_or(4096);
     // The current GLM DSA path evaluates dense attention and is equivalent to
     // the model's sparse top-k attention only while every cached token fits in
     // the selected set. Keep the advertised 1M context disabled until the
     // IndexShare selector is wired.
     let max_seq_len = if arch == Architecture::GlmDsa {
-        get_u32_opt(metadata, &format!("{prefix}.attention.indexer.top_k"))
+        get_u32_opt(metadata, &format!("{prefix}.attention.indexer.top_k"))?
             .map(|top_k| declared_max_seq_len.min(top_k as usize))
             .unwrap_or(declared_max_seq_len)
     } else {
@@ -344,9 +358,9 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     // pm119: DSA lightning indexer 메타 (GlmDsa 한정, 세 키 모두 있을 때만).
     let glm_indexer = if arch == Architecture::GlmDsa {
         match (
-            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.head_count")),
-            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.key_length")),
-            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.top_k")),
+            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.head_count"))?,
+            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.key_length"))?,
+            get_u32_opt(metadata, &format!("{prefix}.attention.indexer.top_k"))?,
         ) {
             (Some(head_count), Some(key_length), Some(top_k)) => Some(GlmIndexerMetadata {
                 head_count: head_count as usize,
@@ -433,17 +447,20 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     } else {
         None
     };
-    let rope_theta = get_f32_opt(metadata, &format!("{prefix}.rope.freq_base")).unwrap_or(10000.0);
+    let rope_theta = get_f32_opt(metadata, &format!("{prefix}.rope.freq_base"))?.unwrap_or(10000.0);
     let rope_theta_swa =
-        get_f32_opt(metadata, &format!("{prefix}.rope.freq_base_swa")).unwrap_or(rope_theta);
-    let rope_dim = get_u32_opt(metadata, &format!("{prefix}.rope.dimension_count"))
+        get_f32_opt(metadata, &format!("{prefix}.rope.freq_base_swa"))?.unwrap_or(rope_theta);
+    let rope_dim = get_u32_opt(metadata, &format!("{prefix}.rope.dimension_count"))?
         .map(|v| v as usize)
         .unwrap_or(0);
-    let rope_dim_swa = get_u32_opt(metadata, &format!("{prefix}.rope.dimension_count_swa"))
+    let rope_dim_swa = get_u32_opt(metadata, &format!("{prefix}.rope.dimension_count_swa"))?
         .map(|v| v as usize)
         .unwrap_or(rope_dim);
-    let rope_sections_vec =
-        get_u32_array(metadata, &format!("{prefix}.rope.dimension_sections")).unwrap_or_default();
+    let rope_sections_vec = optional_metadata(get_u32_array(
+        metadata,
+        &format!("{prefix}.rope.dimension_sections"),
+    ))?
+    .unwrap_or_default();
     let rope_sections = [
         rope_sections_vec.first().copied().unwrap_or(0) as usize,
         rope_sections_vec.get(1).copied().unwrap_or(0) as usize,
@@ -453,16 +470,16 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     let norm_eps = get_f32_opt(
         metadata,
         &format!("{prefix}.attention.layer_norm_rms_epsilon"),
-    )
+    )?
     .unwrap_or(1e-5);
     let final_logit_softcapping =
-        get_f32_opt(metadata, &format!("{prefix}.final_logit_softcapping")).unwrap_or(0.0);
+        get_f32_opt(metadata, &format!("{prefix}.final_logit_softcapping"))?.unwrap_or(0.0);
 
     // head_dim: explicit key_length or hidden_size / num_heads
-    let head_dim = get_u32_opt(metadata, &format!("{prefix}.attention.key_length"))
+    let head_dim = get_u32_opt(metadata, &format!("{prefix}.attention.key_length"))?
         .map(|v| v as usize)
         .unwrap_or(hidden_size / num_heads);
-    let query_pre_attn_scalar = get_f32_opt(metadata, &format!("{prefix}.query_pre_attn_scalar"))
+    let query_pre_attn_scalar = get_f32_opt(metadata, &format!("{prefix}.query_pre_attn_scalar"))?
         .unwrap_or_else(|| match arch {
             Architecture::Gemma => 256.0,
             // Gemma4 uses self.scaling = 1.0 (no pre-attn Q scaling); see runtime contract §2.
@@ -471,44 +488,45 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             _ => head_dim as f32,
         });
     let sliding_window =
-        get_u32_opt(metadata, &format!("{prefix}.attention.sliding_window")).unwrap_or(0) as usize;
-    let shared_kv_layers = get_u32_opt(metadata, &format!("{prefix}.attention.shared_kv_layers"))
+        get_u32_opt(metadata, &format!("{prefix}.attention.sliding_window"))?.unwrap_or(0) as usize;
+    let shared_kv_layers = get_u32_opt(metadata, &format!("{prefix}.attention.shared_kv_layers"))?
         .unwrap_or(0) as usize;
-    let sliding_window_pattern = get_bool_array(
+    let sliding_window_pattern = optional_metadata(get_bool_array(
         metadata,
         &format!("{prefix}.attention.sliding_window_pattern"),
-    )
+    ))?
     .unwrap_or_default();
     let key_length_full =
-        get_u32_opt(metadata, &format!("{prefix}.attention.key_length")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.attention.key_length"))?.unwrap_or(0) as usize;
     let key_length_swa =
-        get_u32_opt(metadata, &format!("{prefix}.attention.key_length_swa")).unwrap_or(0) as usize;
-    let value_length_swa = get_u32_opt(metadata, &format!("{prefix}.attention.value_length_swa"))
+        get_u32_opt(metadata, &format!("{prefix}.attention.key_length_swa"))?.unwrap_or(0) as usize;
+    let value_length_swa = get_u32_opt(metadata, &format!("{prefix}.attention.value_length_swa"))?
         .unwrap_or(0) as usize;
     let embedding_length_per_layer_input = get_u32_opt(
         metadata,
         &format!("{prefix}.embedding_length_per_layer_input"),
-    )
+    )?
     .unwrap_or(0) as usize;
 
     // MoE 메타 (gemma4 26B-A4B 등). dense 모델은 0.
     let expert_count =
-        get_u32_opt(metadata, &format!("{prefix}.expert_count")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.expert_count"))?.unwrap_or(0) as usize;
     let expert_used_count =
-        get_u32_opt(metadata, &format!("{prefix}.expert_used_count")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.expert_used_count"))?.unwrap_or(0) as usize;
     let expert_weights_scale =
-        get_f32_opt(metadata, &format!("{prefix}.expert_weights_scale")).unwrap_or(1.0);
+        get_f32_opt(metadata, &format!("{prefix}.expert_weights_scale"))?.unwrap_or(1.0);
     let expert_feed_forward_length =
-        get_u32_opt(metadata, &format!("{prefix}.expert_feed_forward_length")).unwrap_or(0)
+        get_u32_opt(metadata, &format!("{prefix}.expert_feed_forward_length"))?.unwrap_or(0)
             as usize;
     let expert_shared_count =
-        get_u32_opt(metadata, &format!("{prefix}.expert_shared_count")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.expert_shared_count"))?.unwrap_or(0) as usize;
     let leading_dense_block_count =
-        get_u32_opt(metadata, &format!("{prefix}.leading_dense_block_count")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.leading_dense_block_count"))?.unwrap_or(0)
+            as usize;
     let expert_gating_func =
-        get_u32_opt(metadata, &format!("{prefix}.expert_gating_func")).unwrap_or(0);
+        get_u32_opt(metadata, &format!("{prefix}.expert_gating_func"))?.unwrap_or(0);
     let expert_weights_norm =
-        get_bool_opt(metadata, &format!("{prefix}.expert_weights_norm")).unwrap_or(false);
+        get_bool_opt(metadata, &format!("{prefix}.expert_weights_norm"))?.unwrap_or(false);
     if arch == Architecture::DeepSeek4 && expert_gating_func != 4 {
         return Err(LoaderError::ParseError {
             offset: 0,
@@ -520,43 +538,104 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
 
     // SSM/Delta Net parameters (Qwen3.5 etc.)
     let ssm_d_inner =
-        get_u32_opt(metadata, &format!("{prefix}.ssm.inner_size")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.ssm.inner_size"))?.unwrap_or(0) as usize;
     let ssm_d_state =
-        get_u32_opt(metadata, &format!("{prefix}.ssm.state_size")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.ssm.state_size"))?.unwrap_or(0) as usize;
     let ssm_n_group =
-        get_u32_opt(metadata, &format!("{prefix}.ssm.group_count")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.ssm.group_count"))?.unwrap_or(0) as usize;
     let ssm_dt_rank =
-        get_u32_opt(metadata, &format!("{prefix}.ssm.time_step_rank")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.ssm.time_step_rank"))?.unwrap_or(0) as usize;
     let ssm_conv_kernel =
-        get_u32_opt(metadata, &format!("{prefix}.ssm.conv_kernel")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.ssm.conv_kernel"))?.unwrap_or(0) as usize;
     let full_attention_interval =
-        get_u32_opt(metadata, &format!("{prefix}.full_attention_interval")).unwrap_or(0) as usize;
+        get_u32_opt(metadata, &format!("{prefix}.full_attention_interval"))?.unwrap_or(0) as usize;
     let layer_kinds =
         extract_layer_kinds(metadata, prefix, arch, num_layers, full_attention_interval)?;
 
-    // 토크나이저 데이터 파싱 (없으면 빈 벡터로 fallback)
-    let tokens = get_string_array(metadata, "tokenizer.ggml.tokens").unwrap_or_default();
-    let scores = get_f32_array(metadata, "tokenizer.ggml.scores").unwrap_or_default();
-    let merges = get_string_array(metadata, "tokenizer.ggml.merges").unwrap_or_default();
-    let bos_id = get_u32_opt(metadata, "tokenizer.ggml.bos_token_id").unwrap_or(1);
-    let eos_id = get_u32_opt(metadata, "tokenizer.ggml.eos_token_id").unwrap_or(2);
-    let tokenizer_model = get_string(metadata, "tokenizer.ggml.model").unwrap_or_default();
-    let chat_template = metadata
-        .iter()
-        .any(|(key, _)| key == "tokenizer.chat_template")
-        .then(|| get_string(metadata, "tokenizer.chat_template").map(str::to_owned))
-        .transpose()?;
-    let add_bos_token = get_bool_opt(metadata, "tokenizer.ggml.add_bos_token")
+    let tokens =
+        optional_metadata(get_string_array(metadata, "tokenizer.ggml.tokens"))?.unwrap_or_default();
+    let scores = optional_metadata(get_f32_array(metadata, "tokenizer.ggml.scores"))?;
+    let token_types = optional_metadata(get_u32_array(metadata, "tokenizer.ggml.token_type"))?;
+    let merges =
+        optional_metadata(get_string_array(metadata, "tokenizer.ggml.merges"))?.unwrap_or_default();
+    let added_tokens =
+        optional_metadata(get_string_array(metadata, "tokenizer.ggml.added_tokens"))?
+            .unwrap_or_default();
+    let bos_id = get_u32_opt(metadata, "tokenizer.ggml.bos_token_id")?;
+    let eos_id = get_u32_opt(metadata, "tokenizer.ggml.eos_token_id")?;
+    let unknown_id = get_u32_opt(metadata, "tokenizer.ggml.unknown_token_id")?;
+    let padding_id = get_u32_opt(metadata, "tokenizer.ggml.padding_token_id")?;
+    let separator_id = match (
+        get_u32_opt(metadata, "tokenizer.ggml.separator_token_id")?,
+        get_u32_opt(metadata, "tokenizer.ggml.seperator_token_id")?,
+    ) {
+        (Some(standard), Some(legacy)) if standard != legacy => {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!("conflicting tokenizer separator token ids: {standard} != {legacy}"),
+            });
+        }
+        (Some(id), _) | (_, Some(id)) => Some(id),
+        (None, None) => None,
+    };
+    let tokenizer_model =
+        optional_metadata(get_string(metadata, "tokenizer.ggml.model"))?.unwrap_or_default();
+    let tokenizer_pre =
+        optional_metadata(get_string(metadata, "tokenizer.ggml.pre"))?.map(str::to_owned);
+    let chat_template =
+        optional_metadata(get_string(metadata, "tokenizer.chat_template"))?.map(str::to_owned);
+    let add_bos_token = get_bool_opt(metadata, "tokenizer.ggml.add_bos_token")?
         .unwrap_or(!matches!(arch, Architecture::Hy3 | Architecture::GlmDsa));
+    let add_eos_token = get_bool_opt(metadata, "tokenizer.ggml.add_eos_token")?.unwrap_or(false);
+    let add_sep_token = get_bool_opt(metadata, "tokenizer.ggml.add_sep_token")?.unwrap_or(false);
     let add_space_prefix =
-        get_bool_opt(metadata, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
+        get_bool_opt(metadata, "tokenizer.ggml.add_space_prefix")?.unwrap_or(true);
 
-    // vocab_size는 tokens 배열이 있으면 그 길이, 없으면 메타데이터 값 사용
+    for (key, values_len) in [
+        ("tokenizer.ggml.scores", scores.as_ref().map(Vec::len)),
+        (
+            "tokenizer.ggml.token_type",
+            token_types.as_ref().map(Vec::len),
+        ),
+    ] {
+        if let Some(len) = values_len.filter(|len| *len != tokens.len()) {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!("{key} has {len} entries, expected {}", tokens.len()),
+            });
+        }
+    }
+    let scores = scores.unwrap_or_default();
+    let token_types = token_types.unwrap_or_default();
+    if let Some(token_type) = token_types.iter().copied().find(|value| *value > 6) {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!("tokenizer.ggml.token_type contains unsupported value {token_type}"),
+        });
+    }
+
     let effective_vocab_size = if !tokens.is_empty() {
         tokens.len()
     } else {
         vocab_size
     };
+    for (key, id) in [
+        ("tokenizer.ggml.bos_token_id", bos_id),
+        ("tokenizer.ggml.eos_token_id", eos_id),
+        ("tokenizer.ggml.unknown_token_id", unknown_id),
+        ("tokenizer.ggml.separator_token_id", separator_id),
+        ("tokenizer.ggml.padding_token_id", padding_id),
+    ] {
+        if id.is_some_and(|id| id as usize >= effective_vocab_size) {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!(
+                    "{key} ({}) is outside vocabulary size {effective_vocab_size}",
+                    id.unwrap()
+                ),
+            });
+        }
+    }
 
     // Gemma4 assistant (drafter) 전용 key 추출. 2026-07 포맷은
     // `gemma4-assistant` + `nextn.*` direct-vocab head를 쓰고, 이전 포맷은
@@ -564,20 +643,27 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     // metadata로 정규화하되 head 선택 정보는 optional 값으로 보존한다.
     let assistant = if arch == Architecture::Gemma4Assistant {
         Some(AssistantMetadata {
-            n_centroids: get_u32_opt(metadata, &format!("{prefix}.n_centroids")).unwrap_or(0),
-            centroid_top_k: get_u32_opt(metadata, &format!("{prefix}.centroid_top_k")).unwrap_or(0),
+            n_centroids: get_u32_opt(metadata, &format!("{prefix}.n_centroids"))?.unwrap_or(0),
+            centroid_top_k: get_u32_opt(metadata, &format!("{prefix}.centroid_top_k"))?
+                .unwrap_or(0),
             n_embd_backbone: get_u32(metadata, &format!("{prefix}.n_embd_backbone"))
                 .or_else(|_| get_u32(metadata, &format!("{prefix}.embedding_length_out")))?,
-            use_ordered_embeddings: get_bool(metadata, &format!("{prefix}.use_ordered_embeddings"))
-                .unwrap_or(false),
-            requires_target_arch: get_string(metadata, &format!("{prefix}.requires_target_arch"))
-                .unwrap_or("gemma4")
-                .to_string(),
+            use_ordered_embeddings: get_bool_opt(
+                metadata,
+                &format!("{prefix}.use_ordered_embeddings"),
+            )?
+            .unwrap_or(false),
+            requires_target_arch: optional_metadata(get_string(
+                metadata,
+                &format!("{prefix}.requires_target_arch"),
+            ))?
+            .unwrap_or("gemma4")
+            .to_string(),
             shared_kv_layers: get_u32(metadata, &format!("{prefix}.attention.shared_kv_layers"))?,
-            sliding_window_pattern: get_bool_array(
+            sliding_window_pattern: optional_metadata(get_bool_array(
                 metadata,
                 &format!("{prefix}.attention.sliding_window_pattern"),
-            )
+            ))?
             .unwrap_or_default(),
             key_length_full: get_u32(metadata, &format!("{prefix}.attention.key_length"))?,
             key_length_swa: get_u32(metadata, &format!("{prefix}.attention.key_length_swa"))?,
@@ -627,12 +713,20 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
             vocab_size: effective_vocab_size,
             tokens,
             scores,
+            token_types,
             merges,
+            added_tokens,
             bos_id,
             eos_id,
+            unknown_id,
+            separator_id,
+            padding_id,
             model: tokenizer_model.to_string(),
+            pre: tokenizer_pre,
             chat_template,
             add_bos_token,
+            add_eos_token,
+            add_sep_token,
             add_space_prefix,
         },
         ssm_d_inner,
@@ -1340,6 +1434,94 @@ mod tests {
         assert_eq!(m.head_dim, 128);
         assert_eq!(m.intermediate_size, 11008);
         assert!((m.rope_theta - 10000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn optional_metadata_preserves_present_type_errors() {
+        let mut meta = make_llama_meta();
+        meta.push((
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GGUFValue::U32(1),
+        ));
+
+        assert!(matches!(
+            extract_metadata(&meta),
+            Err(LoaderError::TypeMismatch { key, .. })
+                if key == "tokenizer.ggml.add_bos_token"
+        ));
+    }
+
+    #[test]
+    fn tokenizer_metadata_preserves_types_and_special_ids() {
+        let mut meta = make_llama_meta();
+        meta.extend([
+            (
+                "tokenizer.ggml.model".to_string(),
+                GGUFValue::String("llama".to_string()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_string(),
+                GGUFValue::String("default".to_string()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                GGUFValue::Array(
+                    ["<unk>", "<s>", "</s>", "word"]
+                        .into_iter()
+                        .map(|token| GGUFValue::String(token.to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                GGUFValue::Array([2, 3, 3, 1].into_iter().map(GGUFValue::I32).collect()),
+            ),
+            ("tokenizer.ggml.bos_token_id".to_string(), GGUFValue::U32(1)),
+            ("tokenizer.ggml.eos_token_id".to_string(), GGUFValue::U32(2)),
+            (
+                "tokenizer.ggml.unknown_token_id".to_string(),
+                GGUFValue::U32(0),
+            ),
+            (
+                "tokenizer.ggml.padding_token_id".to_string(),
+                GGUFValue::U32(2),
+            ),
+            (
+                "tokenizer.ggml.seperator_token_id".to_string(),
+                GGUFValue::U32(3),
+            ),
+        ]);
+
+        let tokenizer = extract_metadata(&meta).unwrap().tokenizer;
+        assert_eq!(tokenizer.model, "llama");
+        assert_eq!(tokenizer.pre.as_deref(), Some("default"));
+        assert_eq!(tokenizer.token_types, vec![2, 3, 3, 1]);
+        assert_eq!(tokenizer.bos_id, Some(1));
+        assert_eq!(tokenizer.eos_id, Some(2));
+        assert_eq!(tokenizer.unknown_id, Some(0));
+        assert_eq!(tokenizer.padding_id, Some(2));
+        assert_eq!(tokenizer.separator_id, Some(3));
+    }
+
+    #[test]
+    fn tokenizer_metadata_rejects_mismatched_token_types() {
+        let mut meta = make_llama_meta();
+        meta.extend([
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                GGUFValue::Array(vec![GGUFValue::String("only".to_string())]),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                GGUFValue::Array(vec![GGUFValue::I32(1), GGUFValue::I32(3)]),
+            ),
+        ]);
+
+        assert!(matches!(
+            extract_metadata(&meta),
+            Err(LoaderError::ParseError { msg, .. })
+                if msg.contains("tokenizer.ggml.token_type has 2 entries, expected 1")
+        ));
     }
 
     #[test]

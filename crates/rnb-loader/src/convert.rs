@@ -21,12 +21,25 @@ pub fn ggml_type_to_dtype(t: GGMLType) -> DType {
 
 /// 텐서의 실제 바이트 크기 계산 (양자화 블록 구조 반영)
 pub fn compute_tensor_size(shape: &[usize], ggml_type: GGMLType) -> usize {
-    let numel: usize = shape.iter().product();
-    // (block_size, type_size_bytes)
+    checked_tensor_size(shape, ggml_type)
+        .expect("tensor shape must be representable and row-aligned to its GGML block size")
+}
+
+pub(crate) fn checked_tensor_size(shape: &[usize], ggml_type: GGMLType) -> Result<usize, String> {
     let (block_size, type_bytes) = ggml_quant_params(ggml_type);
-    // numel must be divisible by block_size for quantized types
-    let blocks = numel.div_ceil(block_size);
-    blocks * type_bytes
+    let row_elements = shape.last().copied().unwrap_or(1);
+    if row_elements % block_size != 0 {
+        return Err(format!(
+            "row has {row_elements} elements, not divisible by block size {block_size}"
+        ));
+    }
+    let numel = shape
+        .iter()
+        .try_fold(1usize, |total, dimension| total.checked_mul(*dimension));
+    let numel = numel.ok_or_else(|| "element count overflows usize".to_string())?;
+    (numel / block_size)
+        .checked_mul(type_bytes)
+        .ok_or_else(|| "tensor byte size overflows usize".to_string())
 }
 
 /// llama.cpp 기준 양자화 파라미터: (elements per block, bytes per block)
@@ -95,6 +108,13 @@ pub fn map_tensors(
     ),
     LoaderError,
 > {
+    if !gguf.alignment.is_power_of_two() {
+        return Err(LoaderError::ParseError {
+            offset: gguf.data_start,
+            msg: format!("invalid GGUF alignment {}", gguf.alignment),
+        });
+    }
+    let file_len = mmap.len();
     let storage = Arc::new(Storage::FileMmap(mmap));
 
     let mut tensors = HashMap::new();
@@ -103,15 +123,44 @@ pub fn map_tensors(
     let mut file_offsets: HashMap<String, usize> = HashMap::new();
 
     for info in &gguf.tensor_infos {
-        let dtype = ggml_type_to_dtype(info.ggml_type);
-        let byte_offset = gguf.data_start + info.offset as usize;
+        let relative_offset =
+            usize::try_from(info.offset).map_err(|_| LoaderError::ParseError {
+                offset: gguf.data_start,
+                msg: format!("tensor '{}' offset does not fit usize", info.name),
+            })?;
+        let actual_bytes = checked_tensor_size(&info.shape, info.ggml_type).map_err(|reason| {
+            LoaderError::ParseError {
+                offset: gguf.data_start,
+                msg: format!("tensor '{}' has invalid shape: {reason}", info.name),
+            }
+        })?;
+        let byte_offset = gguf
+            .data_start
+            .checked_add(relative_offset)
+            .ok_or_else(|| LoaderError::ParseError {
+                offset: gguf.data_start,
+                msg: format!("tensor '{}' absolute offset overflows usize", info.name),
+            })?;
+        let data_end =
+            byte_offset
+                .checked_add(actual_bytes)
+                .ok_or_else(|| LoaderError::ParseError {
+                    offset: byte_offset,
+                    msg: format!("tensor '{}' data end overflows usize", info.name),
+                })?;
+        if data_end > file_len {
+            return Err(LoaderError::ParseError {
+                offset: byte_offset,
+                msg: format!(
+                    "tensor '{}' ends at {data_end}, beyond file length {file_len}",
+                    info.name
+                ),
+            });
+        }
 
-        // 양자화 타입의 경우 실제 바이트 크기와 float numel이 다름.
-        // 따라서 양자화 타입은 [actual_bytes] 1D로 저장하고,
-        // 원래 float shape은 float_shapes에 따로 보존한다.
+        let dtype = ggml_type_to_dtype(info.ggml_type);
         let (mmap_shape, actual_dtype) = match dtype {
             DType::U8 | DType::I8 => {
-                let actual_bytes = compute_tensor_size(&info.shape, info.ggml_type);
                 float_shapes.insert(info.name.clone(), info.shape.clone());
                 (vec![actual_bytes], dtype)
             }
@@ -125,6 +174,7 @@ pub fn map_tensors(
         file_offsets.insert(info.name.clone(), byte_offset);
         tensors.insert(info.name.clone(), tensor);
     }
+
     Ok((tensors, float_shapes, ggml_types, file_offsets))
 }
 
@@ -230,6 +280,73 @@ mod tests {
     }
 
     #[test]
+    fn test_map_tensors_rejects_truncated_tensor_data() {
+        use crate::gguf::parser::GGUFFile;
+        use rnb_core::memory::mmap::MmapLoader;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut data = make_test_gguf_with_tensor();
+        data.pop();
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let mmap = MmapLoader::load_file_backed(file.path()).unwrap();
+        let gguf = GGUFFile::parse(mmap.as_slice()).unwrap();
+        assert!(map_tensors(&gguf, mmap).is_err());
+    }
+
+    #[test]
+    fn test_map_tensors_allows_aligned_gap_before_tensor() {
+        use crate::gguf::parser::GGUFFile;
+        use crate::gguf::types::TensorInfo;
+        use rnb_core::memory::mmap::MmapLoader;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&[0; 64]).unwrap();
+        file.flush().unwrap();
+        let mmap = MmapLoader::load_file_backed(file.path()).unwrap();
+        let gguf = GGUFFile {
+            version: 3,
+            metadata: vec![],
+            tensor_infos: vec![TensorInfo {
+                name: "test.weight".to_string(),
+                shape: vec![1],
+                ggml_type: GGMLType::F32,
+                offset: 32,
+            }],
+            data_start: 0,
+            alignment: 32,
+        };
+
+        let (_, _, _, file_offsets) = map_tensors(&gguf, mmap).unwrap();
+        assert_eq!(file_offsets["test.weight"], 32);
+    }
+
+    #[test]
+    fn test_map_tensors_rejects_quant_row_not_divisible_by_block() {
+        use crate::gguf::parser::GGUFFile;
+        use rnb_core::memory::mmap::MmapLoader;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let data = make_test_gguf_with_importance_quant_tensor(GGMLType::Q4_0, 31, 18);
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let mmap = MmapLoader::load_file_backed(file.path()).unwrap();
+        let gguf = GGUFFile::parse(mmap.as_slice()).unwrap();
+        assert!(matches!(
+            map_tensors(&gguf, mmap),
+            Err(LoaderError::ParseError { msg, .. }) if msg.contains("block size")
+        ));
+    }
+
+    #[test]
     fn test_map_tensors_importance_quants() {
         use crate::gguf::parser::GGUFFile;
         use rnb_core::memory::mmap::MmapLoader;
@@ -250,7 +367,7 @@ mod tests {
             GGMLType::TQ2_0,
         ] {
             let data_size = compute_tensor_size(&[256], ggml_type);
-            let data = make_test_gguf_with_importance_quant_tensor(ggml_type, data_size);
+            let data = make_test_gguf_with_importance_quant_tensor(ggml_type, 256, data_size);
             let mut file = NamedTempFile::new().unwrap();
             file.write_all(&data).unwrap();
             file.flush().unwrap();
@@ -275,6 +392,7 @@ mod tests {
 
     fn make_test_gguf_with_importance_quant_tensor(
         ggml_type: GGMLType,
+        elements: usize,
         data_size: usize,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -293,7 +411,7 @@ mod tests {
         buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&256u64.to_le_bytes());
+        buf.extend_from_slice(&(elements as u64).to_le_bytes());
         buf.extend_from_slice(&(ggml_type as u32).to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         let pad = (32 - (buf.len() % 32)) % 32;

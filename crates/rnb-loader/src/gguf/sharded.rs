@@ -256,7 +256,7 @@ mod tests {
         builder.write_u32(2);
         builder.write_bytes(&shard_count.to_le_bytes());
         builder.write_string(SPLIT_TENSORS_COUNT_KEY);
-        builder.write_u32(12);
+        builder.write_u32(10);
         builder.write_u64(total_tensors);
 
         builder.write_string(tensor_name);

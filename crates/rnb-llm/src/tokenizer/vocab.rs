@@ -14,6 +14,10 @@ pub struct Vocab {
     pub id_to_token: Vec<String>,
     pub token_to_id: HashMap<String, u32>,
     pub special: SpecialTokens,
+    token_types: Vec<u32>,
+    tokenization_special_ids: Vec<u32>,
+    pub unknown: Option<u32>,
+    pub separator: Option<u32>,
 }
 
 impl Vocab {
@@ -27,7 +31,49 @@ impl Vocab {
             id_to_token: tokens,
             token_to_id,
             special,
+            token_types: Vec::new(),
+            tokenization_special_ids: Vec::new(),
+            unknown: None,
+            separator: None,
         }
+    }
+
+    pub fn set_token_metadata(
+        &mut self,
+        token_types: Vec<u32>,
+        unknown: Option<u32>,
+        separator: Option<u32>,
+        mut added_token_ids: Vec<u32>,
+    ) {
+        let inferred_unknown = token_types
+            .iter()
+            .position(|token_type| *token_type == 2)
+            .map(|id| id as u32);
+        let mut tokenization_special_ids = token_types
+            .iter()
+            .enumerate()
+            .filter_map(|(id, token_type)| matches!(token_type, 2 | 3 | 4).then_some(id as u32))
+            .collect::<Vec<_>>();
+        tokenization_special_ids.append(&mut added_token_ids);
+        tokenization_special_ids.sort_unstable();
+        tokenization_special_ids.dedup();
+
+        self.token_types = token_types;
+        self.tokenization_special_ids = tokenization_special_ids;
+        self.unknown = unknown.or(inferred_unknown);
+        self.separator = separator;
+    }
+
+    pub fn has_explicit_token_types(&self) -> bool {
+        !self.token_types.is_empty()
+    }
+
+    pub fn tokenization_special_ids(&self) -> &[u32] {
+        &self.tokenization_special_ids
+    }
+
+    pub fn unknown_id(&self) -> Option<u32> {
+        self.unknown
     }
 
     pub fn size(&self) -> usize {
@@ -109,5 +155,15 @@ mod tests {
         assert_eq!(v.special.bos, 1);
         assert_eq!(v.special.eos, 2);
         assert!(v.special.pad.is_none());
+    }
+
+    #[test]
+    fn token_metadata_derives_unknown_and_atomic_special_ids() {
+        let mut vocab = make_vocab();
+        vocab.set_token_metadata(vec![2, 3, 4, 1, 1, 1, 1], None, Some(6), vec![5]);
+
+        assert_eq!(vocab.unknown_id(), Some(0));
+        assert_eq!(vocab.separator, Some(6));
+        assert_eq!(vocab.tokenization_special_ids(), &[0, 1, 2, 5]);
     }
 }

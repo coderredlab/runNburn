@@ -550,7 +550,7 @@ impl Tokenizer {
         while cursor < text.len() {
             let matched = special_tokens
                 .iter()
-                .filter(|(token, _)| text[cursor..].starts_with(token.as_str()))
+                .filter(|(token, _)| text[cursor..].starts_with(*token))
                 .max_by_key(|(token, _)| token.len());
 
             if let Some((token, token_id)) = matched {
@@ -561,7 +561,7 @@ impl Tokenizer {
 
             let next_special = special_tokens
                 .iter()
-                .filter_map(|(token, _)| text[cursor..].find(token).map(|idx| cursor + idx))
+                .filter_map(|(token, _)| text[cursor..].find(*token).map(|idx| cursor + idx))
                 .min()
                 .unwrap_or(text.len());
 
@@ -578,19 +578,28 @@ impl Tokenizer {
         out
     }
 
-    fn special_control_tokens(&self) -> Vec<(String, u32)> {
-        let mut out = self
-            .vocab
-            .id_to_token
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, token)| {
-                let enclosed = (token.starts_with('<') && token.ends_with('>'))
-                    || (token.starts_with('[') && token.ends_with(']'));
-                let looks_special = enclosed && token.len() > 2 && token != "<0x0A>";
-                looks_special.then(|| (token.clone(), idx as u32))
-            })
-            .collect::<Vec<_>>();
+    fn special_control_tokens(&self) -> Vec<(&str, u32)> {
+        let mut out = if self.vocab.has_explicit_token_types()
+            || !self.vocab.tokenization_special_ids().is_empty()
+        {
+            self.vocab
+                .tokenization_special_ids()
+                .iter()
+                .filter_map(|id| self.vocab.token_str(*id).map(|token| (token, *id)))
+                .collect::<Vec<_>>()
+        } else {
+            self.vocab
+                .id_to_token
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, token)| {
+                    let enclosed = (token.starts_with('<') && token.ends_with('>'))
+                        || (token.starts_with('[') && token.ends_with(']'));
+                    let looks_special = enclosed && token.len() > 2 && token != "<0x0A>";
+                    looks_special.then(|| (token.as_str(), idx as u32))
+                })
+                .collect::<Vec<_>>()
+        };
         out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         out
     }
@@ -632,7 +641,7 @@ impl Tokenizer {
                 return id;
             }
         }
-        0
+        self.vocab.unknown_id().unwrap_or(0)
     }
 
     fn initial_tokenize_gemma4_spm(&self, text: &str) -> Vec<u32> {
@@ -789,7 +798,7 @@ impl Tokenizer {
         while cursor < text.len() {
             let matched = special_tokens
                 .iter()
-                .filter(|(token, _)| text[cursor..].starts_with(token.as_str()))
+                .filter(|(token, _)| text[cursor..].starts_with(*token))
                 .max_by_key(|(token, _)| token.len());
             if let Some((token, token_id)) = matched {
                 out.push(*token_id);
@@ -798,7 +807,7 @@ impl Tokenizer {
             }
             let next_special = special_tokens
                 .iter()
-                .filter_map(|(token, _)| text[cursor..].find(token).map(|idx| cursor + idx))
+                .filter_map(|(token, _)| text[cursor..].find(*token).map(|idx| cursor + idx))
                 .min()
                 .unwrap_or(text.len());
             let segment = &text[cursor..next_special];
@@ -841,7 +850,10 @@ impl Tokenizer {
             .map(|&b| {
                 let c = byte_to_unicode[b as usize];
                 let s = c.to_string();
-                self.vocab.token_id(&s).unwrap_or(0)
+                self.vocab
+                    .token_id(&s)
+                    .or_else(|| self.vocab.unknown_id())
+                    .unwrap_or(0)
             })
             .collect()
     }
@@ -861,7 +873,7 @@ impl Tokenizer {
         while cursor < text.len() {
             let matched = special_tokens
                 .iter()
-                .find(|(token, _)| text[cursor..].starts_with(token.as_str()));
+                .find(|(token, _)| text[cursor..].starts_with(*token));
             if let Some((token, token_id)) = matched {
                 out.push(*token_id);
                 cursor += token.len();
@@ -870,7 +882,7 @@ impl Tokenizer {
 
             let next_special = special_tokens
                 .iter()
-                .filter_map(|(token, _)| text[cursor..].find(token).map(|idx| cursor + idx))
+                .filter_map(|(token, _)| text[cursor..].find(*token).map(|idx| cursor + idx))
                 .min()
                 .unwrap_or(text.len());
             if next_special > cursor {
@@ -1218,6 +1230,33 @@ mod tests {
             vec![3, 5, 4, 6]
         );
         assert_eq!(tok.encode("[gMASK][MASK][sMASK]"), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn explicit_token_types_override_delimiter_heuristics() {
+        let tokens = vec![
+            "<unk>".to_string(),
+            "<s>".to_string(),
+            "</s>".to_string(),
+            "[ordinary]".to_string(),
+            "CONTROL".to_string(),
+        ];
+        let special = SpecialTokens {
+            bos: 1,
+            eos: 2,
+            pad: None,
+        };
+        let mut vocab = Vocab::new(tokens, special);
+        vocab.set_token_metadata(vec![2, 3, 3, 1, 3], None, None, vec![]);
+        let tokenizer = Tokenizer::new_gpt2(vocab, vec![]);
+
+        let mut ids = tokenizer
+            .special_control_tokens()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2, 4]);
     }
     #[test]
     #[ignore = "performance guard for GPT-2 BPE long-prompt merge behavior"]

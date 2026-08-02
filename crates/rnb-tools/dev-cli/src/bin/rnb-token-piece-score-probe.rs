@@ -23,7 +23,8 @@ fn main() {
             pad: rnb_loader::gguf::metadata::get_u32_opt(
                 &gguf.metadata,
                 "tokenizer.ggml.padding_token_id",
-            ),
+            )
+            .expect("invalid tokenizer.ggml.padding_token_id"),
         },
     );
 
