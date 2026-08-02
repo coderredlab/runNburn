@@ -365,6 +365,8 @@ mod tests {
 
     #[test]
     fn multimodal_snapshot_preserves_logical_tokens_cursor_and_image_identity() {
+        #[cfg(feature = "cuda")]
+        let _sequence_state_guard = crate::cuda_sequence_state_test_lock();
         let mut engine = mock_engine();
         engine.kv_cache =
             KVCache::new_per_layer_with_format(64, &[1], &[128], KvCacheFormat::KvarnK4V4G128)

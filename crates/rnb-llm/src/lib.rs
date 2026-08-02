@@ -106,5 +106,12 @@ pub fn compiled_runtime_backends() -> Vec<&'static str> {
         .collect()
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) fn cuda_sequence_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(Default::default);
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod runtime_boundary_tests;

@@ -1751,6 +1751,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn engine_checkpoint_restore_keeps_cuda_resident_delta_snapshot() {
+        let _sequence_state_guard = crate::cuda_sequence_state_test_lock();
         let _ = crate::engine::cuda_runtime::reset_state_for_engine_init();
         let mut engine = make_spec_test_engine(9);
         let num_heads = 2usize;
