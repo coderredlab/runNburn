@@ -132,6 +132,18 @@ Load the model once and keep multi-turn conversation history in the CLI:
   /path/to/model.gguf
 ```
 
+For Qwen3.6 vision models, provide the projector and an initial image:
+
+```bash
+./target/release/runNburn chat \
+  --mmproj /path/to/mmproj.gguf \
+  --image /path/to/image.png \
+  /path/to/model.gguf
+```
+
+Later turns reuse the retained multimodal sequence state instead of reprocessing
+the image prefix. `/clear` discards both the conversation and retained image state.
+
 Responses stream as they are generated. Use `/clear` to reset conversation history,
 `/set system <prompt>` to replace the system prompt, `/show system` to inspect it,
 and `/bye` to exit. Run `runNburn chat --help` for sampling and memory options.
@@ -150,6 +162,10 @@ Each server process loads one GGUF model and serializes inference through a boun
   --api-key-file /path/to/api-key \
   /path/to/model.gguf
 ```
+
+Add `--mmproj /path/to/mmproj.gguf` when serving a Qwen3.6 vision model. The
+Responses and Chat Completions endpoints accept base64 image data URLs in their
+standard multimodal content arrays.
 
 Point an OpenAI client at `http://127.0.0.1:8000/v1`.
 
@@ -182,8 +198,8 @@ curl http://127.0.0.1:8000/v1/responses \
 | Method | Endpoint | Notes |
 |---|---|---|
 | `GET` | `/v1/models` | Returns the model served by this process |
-| `POST` | `/v1/chat/completions` | Non-streaming and SSE streaming; tools and structured output |
-| `POST` | `/v1/responses` | Non-streaming and SSE streaming; tools, structured output, and stateful continuation |
+| `POST` | `/v1/chat/completions` | Non-streaming and SSE streaming; multimodal input, tools, and structured output |
+| `POST` | `/v1/responses` | Non-streaming and SSE streaming; multimodal input, tools, structured output, and stateful continuation |
 | `GET`, `DELETE` | `/v1/responses/{id}` | In-memory stored response lookup and deletion |
 | `GET` | `/v1/responses/{id}/input_items` | Cursor pagination with `order`, `after`, and `limit` |
 | `POST` | `/v1/conversations` | Creates an in-memory conversation |
