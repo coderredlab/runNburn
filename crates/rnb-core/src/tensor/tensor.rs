@@ -81,6 +81,13 @@ impl Tensor {
             quant: None,
         }
     }
+    /// Registers this tensor's host allocation for external zero-copy views.
+    ///
+    /// The registry keeps only a weak reference; callers that resolve a lease
+    /// decide how long the allocation must remain alive.
+    pub fn register_host_storage(&self) {
+        register_host_storage(&self.storage);
+    }
 
     pub fn shape(&self) -> &[usize] {
         &self.shape
@@ -377,6 +384,17 @@ mod tests {
         let t = Tensor::from_slice(&data, &[2, 3]);
         assert_eq!(t.shape(), &[2, 3]);
         assert_eq!(t.numel(), 6);
+    }
+
+    #[test]
+    fn owned_tensor_registration_enables_host_storage_lease() {
+        let tensor = Tensor::from_slice(&[1.0f32, 2.0], &[2]);
+        let bytes = tensor.as_bytes().unwrap();
+        assert!(crate::tensor::host_storage_lease(bytes).is_none());
+
+        tensor.register_host_storage();
+
+        assert!(crate::tensor::host_storage_lease(bytes).is_some());
     }
 
     #[test]
