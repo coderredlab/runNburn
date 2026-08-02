@@ -1101,6 +1101,65 @@ pub fn metal_deepseek4_attention_decode_requested() -> bool {
     !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_DECODE")
 }
 
+pub fn metal_deepseek4_attention_q_front_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_Q_FRONT")
+}
+
+pub fn metal_deepseek4_q_front_if_supported(
+    quants: &[GGMLType],
+    weights: &[&[u8]],
+    q_norm: &[u8],
+    input: &[f32],
+    layout: &[(usize, usize)],
+    eps: f32,
+) -> Result<Option<(Vec<f32>, Vec<Vec<f32>>)>> {
+    if !metal_deepseek4_attention_decode_requested()
+        || !metal_deepseek4_attention_q_front_requested()
+        || quants.len() != layout.len()
+        || weights.len() != layout.len()
+        || layout.len() < 2
+    {
+        return Ok(None);
+    }
+    let (q_rank, hidden_dim) = layout[0];
+    let q_a_bytes = q_rank.saturating_mul(hidden_dim / 256).saturating_mul(176);
+    if quants[0] != GGMLType::Q5_K
+        || q_rank == 0
+        || hidden_dim == 0
+        || hidden_dim % 256 != 0
+        || weights[0].len() < q_a_bytes
+        || q_norm.len() != q_rank.saturating_mul(std::mem::size_of::<f32>())
+        || input.len() != hidden_dim
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        return Ok(None);
+    }
+    for ((&quant, raw), &(rows, cols)) in quants[1..].iter().zip(&weights[1..]).zip(&layout[1..]) {
+        let expected = rows.saturating_mul(cols / 32).saturating_mul(34);
+        if quant != GGMLType::Q8_0
+            || rows == 0
+            || cols != q_rank
+            || cols % 32 != 0
+            || raw.len() < expected
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(METAL.with(|backend| {
+        backend.deepseek4_q_front(
+            weights[0],
+            q_norm,
+            &weights[1..],
+            input,
+            hidden_dim,
+            q_rank,
+            &layout[1..],
+            eps,
+        )
+    })))
+}
+
 pub fn metal_deepseek4_q8_multi_gemv_if_supported(
     quants: &[GGMLType],
     weights: &[&[u8]],
@@ -6010,10 +6069,14 @@ mod deepseek4_attention_prefill_batch_policy_tests {
         let global_key = "RNB_METAL_GLM_MOE_DECODE";
         let global_previous = std::env::var(global_key).ok();
         std::env::remove_var(global_key);
-        let policies: [(&str, fn() -> bool); 2] = [
+        let policies: [(&str, fn() -> bool); 3] = [
             (
                 "RNB_METAL_DEEPSEEK4_ATTN_DECODE",
                 metal_deepseek4_attention_decode_requested,
+            ),
+            (
+                "RNB_METAL_DEEPSEEK4_ATTN_Q_FRONT",
+                metal_deepseek4_attention_q_front_requested,
             ),
             (
                 "RNB_METAL_DEEPSEEK4_MOE_DECODE",

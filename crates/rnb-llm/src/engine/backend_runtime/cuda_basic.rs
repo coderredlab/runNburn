@@ -13,6 +13,7 @@ use crate::engine::metal_runtime;
 use crate::engine::quantized_weight_types::backend_ggml_type;
 use crate::engine::quantized_weight_types::QuantizedWeight;
 use crate::runtime::QuantFormat;
+use rnb_core::tensor::Tensor;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use rnb_loader::GGMLType;
 
@@ -2981,6 +2982,53 @@ pub(in crate::engine) fn metal_deepseek4_attention_prefill_index_batch_requested
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
         false
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_q_front_if_supported(
+    q_a: &QuantizedWeight,
+    q_norm: &Tensor,
+    output_weights: &[&QuantizedWeight],
+    input: &[f32],
+    eps: f32,
+) -> crate::error::Result<Option<(Vec<f32>, Vec<Vec<f32>>)>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(q_a_raw) = q_a.data.as_bytes() else {
+            return Ok(None);
+        };
+        let Some(q_norm_raw) = q_norm.as_bytes() else {
+            return Ok(None);
+        };
+        let Some(output_raw) = output_weights
+            .iter()
+            .map(|weight| weight.data.as_bytes())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let mut quants = Vec::with_capacity(output_weights.len() + 1);
+        quants.push(q_a.ggml_type);
+        quants.extend(output_weights.iter().map(|weight| weight.ggml_type));
+        let mut raw = Vec::with_capacity(output_weights.len() + 1);
+        raw.push(q_a_raw);
+        raw.extend(output_raw);
+        let mut layout = Vec::with_capacity(output_weights.len() + 1);
+        layout.push((q_a.rows, q_a.cols));
+        layout.extend(
+            output_weights
+                .iter()
+                .map(|weight| (weight.rows, weight.cols)),
+        );
+        return metal_runtime::metal_deepseek4_q_front_if_supported(
+            &quants, &raw, q_norm_raw, input, &layout, eps,
+        )
+        .map_err(|err| crate::error::LlmError::Forward(err.to_string()));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (q_a, q_norm, output_weights, input, eps);
+        Ok(None)
     }
 }
 

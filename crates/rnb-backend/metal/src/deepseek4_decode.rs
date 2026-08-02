@@ -1,5 +1,143 @@
 use super::*;
 
+pub(crate) struct QFrontCarrier {
+    hidden_dim: usize,
+    q_rank: usize,
+    output_layout: Vec<(usize, usize)>,
+    input: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_a: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_norm: Retained<ProtocolObject<dyn MTLBuffer>>,
+    outputs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    output_rows: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
+    rank: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_a_weight_offset: Retained<ProtocolObject<dyn MTLBuffer>>,
+    zero_offset: Retained<ProtocolObject<dyn MTLBuffer>>,
+    eps: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+impl QFrontCarrier {
+    pub(crate) fn new(
+        ctx: &compute::MetalContext,
+        hidden_dim: usize,
+        q_rank: usize,
+        output_layout: &[(usize, usize)],
+    ) -> Self {
+        debug_assert!(output_layout.iter().all(|&(_, cols)| cols == q_rank));
+        Self {
+            hidden_dim,
+            q_rank,
+            output_layout: output_layout.to_vec(),
+            input: ffn_chain::empty_f32_buf(ctx, hidden_dim),
+            q_a: ffn_chain::empty_f32_buf(ctx, q_rank),
+            q_norm: ffn_chain::empty_f32_buf(ctx, q_rank),
+            outputs: output_layout
+                .iter()
+                .map(|&(rows, _)| ffn_chain::empty_f32_buf(ctx, rows))
+                .collect(),
+            output_rows: output_layout
+                .iter()
+                .map(|&(rows, _)| ffn_chain::u32_buf(ctx, rows as u32))
+                .collect(),
+            hidden: ffn_chain::u32_buf(ctx, hidden_dim as u32),
+            rank: ffn_chain::u32_buf(ctx, q_rank as u32),
+            q_a_weight_offset: ffn_chain::u32_buf(ctx, 0),
+            zero_offset: ffn_chain::u32_buf(ctx, 0),
+            eps: ffn_chain::f32_buf(ctx, 0.0),
+        }
+    }
+
+    fn store_scalar<T: Copy>(buffer: &ProtocolObject<dyn MTLBuffer>, value: T) {
+        unsafe {
+            std::ptr::write(buffer.contents().as_ptr() as *mut T, value);
+        }
+    }
+
+    pub(crate) fn dispatch(
+        &self,
+        ctx: &compute::MetalContext,
+        q_a_weight: &(Retained<ProtocolObject<dyn MTLBuffer>>, u32),
+        q_norm_weight: &(Retained<ProtocolObject<dyn MTLBuffer>>, u32),
+        output_weights: &[(Retained<ProtocolObject<dyn MTLBuffer>>, u32)],
+        input: &[f32],
+        eps: f32,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        assert_eq!(input.len(), self.hidden_dim);
+        assert_eq!(output_weights.len(), self.output_layout.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                self.input.contents().as_ptr() as *mut f32,
+                input.len(),
+            );
+        }
+        Self::store_scalar(&self.q_a_weight_offset, q_a_weight.1);
+        Self::store_scalar(&self.eps, eps);
+
+        let command = ctx.queue.commandBuffer().expect("command buffer");
+        let encoder = command.computeCommandEncoder().expect("compute encoder");
+        compute::encode_gemv_q5k_auto(
+            ctx,
+            &encoder,
+            &q_a_weight.0,
+            &self.input,
+            &self.q_a,
+            &self.rank,
+            &self.hidden,
+            &self.q_a_weight_offset,
+            self.q_rank,
+        );
+        ffn_chain::encode_rms_norm_at(
+            ctx,
+            &encoder,
+            &self.q_a,
+            &q_norm_weight.0,
+            q_norm_weight.1 as usize,
+            &self.q_norm,
+            &self.rank,
+            &self.eps,
+        );
+        for (index, ((weight, output), &(rows, _))) in output_weights
+            .iter()
+            .zip(&self.outputs)
+            .zip(&self.output_layout)
+            .enumerate()
+        {
+            compute::encode_gemv_q8_0_at(
+                ctx,
+                &encoder,
+                &weight.0,
+                weight.1 as usize,
+                &self.q_norm,
+                0,
+                output,
+                0,
+                &self.output_rows[index],
+                &self.rank,
+                &self.zero_offset,
+                rows,
+            );
+        }
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+
+        let q_norm = unsafe {
+            std::slice::from_raw_parts(self.q_norm.contents().as_ptr() as *const f32, self.q_rank)
+                .to_vec()
+        };
+        let outputs = self
+            .output_layout
+            .iter()
+            .zip(&self.outputs)
+            .map(|(&(rows, _), output)| unsafe {
+                std::slice::from_raw_parts(output.contents().as_ptr() as *const f32, rows).to_vec()
+            })
+            .collect();
+        (q_norm, outputs)
+    }
+}
+
 pub(crate) struct Q8MultiGemvCarrier {
     layout: Vec<(usize, usize)>,
     input_offsets: Vec<usize>,
@@ -233,6 +371,43 @@ impl PrefillQ8MultiCarrier {
 }
 
 impl MetalBackend {
+    pub fn deepseek4_q_front(
+        &self,
+        q_a_weight: &[u8],
+        q_norm_weight: &[u8],
+        output_weights: &[&[u8]],
+        input: &[f32],
+        hidden_dim: usize,
+        q_rank: usize,
+        output_layout: &[(usize, usize)],
+        eps: f32,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
+        assert_eq!(output_weights.len(), output_layout.len());
+        self.ensure_weight_residency(ctx);
+        let q_a_weight = self.glm_mla_wrap(ctx, q_a_weight);
+        let q_norm_weight = self.glm_mla_wrap(ctx, q_norm_weight);
+        let output_weights = output_weights
+            .iter()
+            .map(|&raw| self.glm_mla_wrap(ctx, raw))
+            .collect::<Vec<_>>();
+        let mut key = Vec::with_capacity(output_layout.len() + 1);
+        key.push((q_rank, hidden_dim));
+        key.extend_from_slice(output_layout);
+        let mut carriers = self.deepseek4_q_front_carriers.borrow_mut();
+        let carrier = carriers
+            .entry(key)
+            .or_insert_with(|| QFrontCarrier::new(ctx, hidden_dim, q_rank, output_layout));
+        carrier.dispatch(
+            ctx,
+            &q_a_weight,
+            &q_norm_weight,
+            &output_weights,
+            input,
+            eps,
+        )
+    }
+
     pub fn deepseek4_q8_multi_gemv(
         &self,
         weights: &[&[u8]],
@@ -327,6 +502,90 @@ impl MetalBackend {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q_front_keeps_q5_rms_q8_intermediate_on_device() {
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            return;
+        }
+
+        let hidden_dim = 256;
+        let q_rank = 32;
+        let output_rows = 37;
+        let q_a_raw = crate::tests_fixture::scaled_q5k_matrix(q_rank, hidden_dim, 13);
+        let q_b_raw = crate::tests_fixture::scaled_q8_0_matrix(output_rows, q_rank, 29);
+        let q_norm = (0..q_rank)
+            .map(|index| 0.75 + index as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let input = (0..hidden_dim)
+            .map(|index| ((index * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect::<Vec<_>>();
+        let q_a_tensor = rnb_core::tensor::Tensor::from_slice(&q_a_raw, &[q_a_raw.len()]);
+        let q_b_tensor = rnb_core::tensor::Tensor::from_slice(&q_b_raw, &[q_b_raw.len()]);
+        let q_norm_tensor = rnb_core::tensor::Tensor::from_slice(&q_norm, &[q_norm.len()]);
+        q_a_tensor.register_host_storage();
+        q_b_tensor.register_host_storage();
+        q_norm_tensor.register_host_storage();
+
+        let (actual_norm, actual_outputs) = backend.deepseek4_q_front(
+            q_a_tensor.as_bytes().expect("Q5_K bytes"),
+            q_norm_tensor.as_bytes().expect("RMS weight bytes"),
+            &[q_b_tensor.as_bytes().expect("Q8_0 bytes")],
+            &input,
+            hidden_dim,
+            q_rank,
+            &[(output_rows, q_rank)],
+            1.0e-6,
+        );
+
+        let mut expected_q_a = Vec::with_capacity(q_rank);
+        for row in q_a_raw.chunks_exact(176) {
+            let dequant = crate::tests_fixture::q5k_dequant(row);
+            expected_q_a.push(
+                dequant
+                    .iter()
+                    .zip(&input)
+                    .map(|(&weight, &value)| weight * value)
+                    .sum::<f32>(),
+            );
+        }
+        let scale = (expected_q_a.iter().map(|value| value * value).sum::<f32>() / q_rank as f32
+            + 1.0e-6)
+            .sqrt()
+            .recip();
+        let expected_norm = expected_q_a
+            .iter()
+            .zip(&q_norm)
+            .map(|(&value, &gain)| value * scale * gain)
+            .collect::<Vec<_>>();
+        let expected_output = q_b_raw
+            .chunks_exact(34)
+            .map(|row| {
+                crate::tests_fixture::q8_0_dequant(row)
+                    .iter()
+                    .zip(&expected_norm)
+                    .map(|(&weight, &value)| weight * value)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+
+        let max_norm_error = actual_norm
+            .iter()
+            .zip(&expected_norm)
+            .map(|(&actual, &expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let max_output_error = actual_outputs[0]
+            .iter()
+            .zip(&expected_output)
+            .map(|(&actual, &expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_norm_error < 1.0e-4, "max norm error {max_norm_error}");
+        assert!(
+            max_output_error < 1.0e-4,
+            "max output error {max_output_error}"
+        );
+    }
 
     #[test]
     fn prefill_carrier_cache_is_layout_bounded_and_grows_in_place() {

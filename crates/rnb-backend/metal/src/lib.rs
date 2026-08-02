@@ -1404,6 +1404,9 @@ pub struct MetalBackend {
     decode_chain_hidden: RefCell<HashMap<usize, Retained<ProtocolObject<dyn MTLBuffer>>>>,
     /// pm112: GLM MLA decode chain scratch. shape 키 별 1회 alloc.
     glm_mla_carriers: RefCell<HashMap<(usize, usize, usize, usize), ffn_chain::GlmMlaCarrier>>,
+    /// DeepSeek4 q_a Q5_K → RMS → q_b Q8_0 device-resident decode front.
+    deepseek4_q_front_carriers:
+        RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::QFrontCarrier>>,
     /// DeepSeek4 decode phase layout → fused Q8_0 multi-projection carrier.
     deepseek4_q8_multi_carriers:
         RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::Q8MultiGemvCarrier>>,
@@ -1721,6 +1724,7 @@ impl MetalBackend {
                 constant_u32: RefCell::new(HashMap::new()),
                 decode_chain_hidden: RefCell::new(HashMap::new()),
                 glm_mla_carriers: RefCell::new(HashMap::new()),
+                deepseek4_q_front_carriers: RefCell::new(HashMap::new()),
                 deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
                 deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
                 weight_residency: RefCell::new(None),
@@ -1883,6 +1887,7 @@ impl MetalBackend {
             constant_u32: RefCell::new(HashMap::new()),
             decode_chain_hidden: RefCell::new(HashMap::new()),
             glm_mla_carriers: RefCell::new(HashMap::new()),
+            deepseek4_q_front_carriers: RefCell::new(HashMap::new()),
             deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
             deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
             weight_residency: RefCell::new(None),

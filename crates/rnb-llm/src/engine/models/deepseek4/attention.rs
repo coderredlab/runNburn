@@ -3,7 +3,7 @@ use crate::engine::backend_runtime::{
     metal_deepseek4_attention_prefill_index_batch_requested,
     metal_deepseek4_attention_prefill_output_batch_requested,
     metal_deepseek4_prefill_q8_multi_gemm_if_supported, metal_deepseek4_q8_multi_gemv_if_supported,
-    metal_prefill_gdn_proj_into_if_supported,
+    metal_deepseek4_q_front_if_supported, metal_prefill_gdn_proj_into_if_supported,
 };
 use crate::engine::dense_dispatch::gemv_f32;
 use crate::engine::quantized_weight_types::QuantizedWeight;
@@ -51,7 +51,7 @@ fn forward_attention_metal_decode(
     state: &mut AttentionState,
     config: &DeepSeek4Config,
 ) -> Result<Option<Vec<f32>>> {
-    let mut front_weights = vec![&weights.q_a, &weights.kv];
+    let mut front_weights = vec![&weights.kv];
     if let Some(compressor) = &weights.compressor {
         front_weights.extend([&compressor.kv, &compressor.gate]);
     }
@@ -63,7 +63,6 @@ fn forward_attention_metal_decode(
         return Ok(None);
     };
     let mut front_outputs = front_outputs.into_iter();
-    let q_a = front_outputs.next().expect("DeepSeek4 q_a projection");
     let kv = front_outputs.next().expect("DeepSeek4 kv projection");
     let compressor_projected = weights.compressor.as_ref().map(|_| {
         (
@@ -87,14 +86,32 @@ fn forward_attention_metal_decode(
     });
     debug_assert!(front_outputs.next().is_none());
 
-    let qr = rms_norm(&q_a, &weights.q_a_norm, config.norm_eps);
     let mut query_weights = vec![&weights.q_b];
     if let Some(indexer) = &weights.indexer {
         query_weights.push(&indexer.q_b);
     }
-    let query_inputs = vec![qr.as_slice(); query_weights.len()];
-    let Some(query_outputs) = project_attention_decode_phase(&query_weights, &query_inputs)? else {
-        return Ok(None);
+    let (qr, query_outputs) = match metal_deepseek4_q_front_if_supported(
+        &weights.q_a,
+        &weights.q_a_norm,
+        &query_weights,
+        input,
+        config.norm_eps,
+    )? {
+        Some(outputs) => outputs,
+        None => {
+            let qr = rms_norm(
+                &weights.q_a.gemv_vec(input)?,
+                &weights.q_a_norm,
+                config.norm_eps,
+            );
+            let query_inputs = vec![qr.as_slice(); query_weights.len()];
+            let Some(query_outputs) =
+                project_attention_decode_phase(&query_weights, &query_inputs)?
+            else {
+                return Ok(None);
+            };
+            (qr, query_outputs)
+        }
     };
     let mut query_outputs = query_outputs.into_iter();
     let mut query = query_outputs.next().expect("DeepSeek4 q_b projection");
