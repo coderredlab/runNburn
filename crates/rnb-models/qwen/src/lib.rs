@@ -1,8 +1,13 @@
+mod multimodal_positions;
 mod vision;
 mod vision_encoder;
 mod vision_math;
 mod vision_preprocess;
 
+pub use multimodal_positions::{
+    plan_qwen36_multimodal_positions, Qwen36PositionError, Qwen36PositionPlan,
+    Qwen36PositionSpan,
+};
 pub use vision::{inspect_qwen36_vision_projector, Qwen36VisionCapability, Qwen36VisionError};
 pub use vision_encoder::{
     encode_qwen36_vision_intermediate, Qwen36VisionLayerSummary, Qwen36VisionOutput,

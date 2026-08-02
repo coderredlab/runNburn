@@ -331,6 +331,91 @@ pub fn rope_mrope_text_inplace(
         }
     }
 }
+/// Qwen interleaved M-RoPE with one explicit four-axis position per sequence row.
+///
+/// `sections` counts rotary pairs assigned to each axis. Qwen's IMRoPE layout
+/// interleaves temporal, vertical, and horizontal pairs, then assigns any
+/// remaining pairs to the fourth axis. Pairing is NeoX-style inside `n_rot`.
+pub fn rope_imrope(
+    input: &Tensor,
+    positions: &[[u32; 4]],
+    head_dim: usize,
+    n_rot: usize,
+    sections: [usize; 4],
+    theta: f32,
+) -> Result<Tensor> {
+    let mut out = tensor_as_f32_slice(input).to_vec();
+    let shape = input.shape();
+    let dim = if shape.len() >= 2 {
+        shape[1..].iter().product::<usize>()
+    } else {
+        out.len()
+    };
+    rope_imrope_inplace(
+        &mut out, positions, head_dim, dim, n_rot, sections, theta,
+    );
+    Ok(Tensor::from_vec(out, input.shape()))
+}
+
+pub fn rope_imrope_inplace(
+    data: &mut [f32],
+    positions: &[[u32; 4]],
+    head_dim: usize,
+    dim: usize,
+    n_rot: usize,
+    sections: [usize; 4],
+    theta: f32,
+) {
+    if data.is_empty() || head_dim == 0 || n_rot == 0 {
+        assert!(
+            data.is_empty() || positions.is_empty(),
+            "IMRoPE positions must match the sequence row count"
+        );
+        return;
+    }
+    assert!(dim > 0 && data.len() % dim == 0);
+    assert_eq!(dim % head_dim, 0);
+    assert_eq!(positions.len(), data.len() / dim);
+
+    let n_rot = n_rot.min(head_dim);
+    assert!(
+        n_rot % 2 == 0,
+        "IMRoPE rotated dimension must be even, got {n_rot}"
+    );
+    let half = n_rot / 2;
+    let section_pairs = sections.iter().sum::<usize>();
+    assert_eq!(
+        section_pairs, half,
+        "IMRoPE sections must cover {half} rotary pairs, got {section_pairs}"
+    );
+    let theta_scale = theta.powf(-2.0 / n_rot as f32);
+
+    for (token_slice, position) in data.chunks_exact_mut(dim).zip(positions) {
+        for head in token_slice.chunks_exact_mut(head_dim) {
+            let mut frequency = 1.0f32;
+            for pair in 0..half {
+                let sector = pair % section_pairs;
+                let axis = if sector % 3 == 1 && sector < 3 * sections[1] {
+                    1
+                } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                    2
+                } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                    0
+                } else {
+                    3
+                };
+                let angle = position[axis] as f32 * frequency;
+                let cos_angle = angle.cos();
+                let sin_angle = angle.sin();
+                let x0 = head[pair];
+                let x1 = head[half + pair];
+                head[pair] = x0 * cos_angle - x1 * sin_angle;
+                head[half + pair] = x0 * sin_angle + x1 * cos_angle;
+                frequency *= theta_scale;
+            }
+        }
+    }
+}
 
 /// mc73: GGML-aligned accumulator pattern with freq_factors (`theta_base *=
 /// theta_scale` per pair, `theta = theta_base / factor`, separated `cos`/`sin`).
@@ -734,5 +819,53 @@ mod tests {
         for (a, b) in data.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-5, "mrope mismatch: {} vs {}", a, b);
         }
+    }
+
+    fn input_data_at(input: &Tensor, index: usize) -> f32 {
+        tensor_as_f32_slice(input)[index]
+    }
+
+    #[test]
+    fn test_imrope_selects_interleaved_position_axes() {
+        let input = Tensor::from_slice(
+            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[1, 8],
+        );
+        let output =
+            rope_imrope(&input, &[[1, 2, 3, 4]], 8, 8, [1, 1, 1, 1], 10000.0).unwrap();
+        let data = tensor_to_f32_vec(&output);
+        let angles = [1.0f32, 0.2, 0.03, 0.004];
+
+        for pair in 0..4 {
+            let cos_angle = angles[pair].cos();
+            let sin_angle = angles[pair].sin();
+            let x0 = input_data_at(&input, pair);
+            let x1 = input_data_at(&input, 4 + pair);
+            assert!((data[pair] - (x0 * cos_angle - x1 * sin_angle)).abs() < 1e-5);
+            assert!((data[4 + pair] - (x0 * sin_angle + x1 * cos_angle)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_imrope_text_positions_match_text_mrope() {
+        let input_data = (0..32)
+            .map(|index| index as f32 * 0.125 - 1.0)
+            .collect::<Vec<_>>();
+        let input = Tensor::from_slice(&input_data, &[2, 16]);
+        let text = rope_mrope_text(&input, 5, 8, 8, 10000.0).unwrap();
+        let interleaved = rope_imrope(
+            &input,
+            &[[5, 5, 5, 5], [6, 6, 6, 6]],
+            8,
+            8,
+            [1, 1, 1, 1],
+            10000.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tensor_as_f32_slice(&text),
+            tensor_as_f32_slice(&interleaved)
+        );
     }
 }
