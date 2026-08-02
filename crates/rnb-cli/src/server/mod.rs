@@ -37,6 +37,7 @@ struct ServeOptions {
     host: String,
     port: u16,
     model_path: PathBuf,
+    mmproj_path: Option<PathBuf>,
     model_name: String,
     api_key: Option<Arc<str>>,
     ram_budget_bytes: Option<u64>,
@@ -71,6 +72,9 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
     let mut load_config = rnb_llm::EngineLoadConfig::default();
     if let Some(bytes) = options.ram_budget_bytes {
         load_config = load_config.with_host_ram_budget_bytes(bytes);
+    }
+    if let Some(path) = options.mmproj_path.as_ref() {
+        load_config = load_config.with_vision_projector(path);
     }
     let worker = worker::start(
         options.model_path.clone(),
@@ -128,6 +132,7 @@ impl ServeOptions {
         let mut host = "127.0.0.1".to_string();
         let mut port = 8000_u16;
         let mut model_path = None;
+        let mut mmproj_path = None;
         let mut model_name = None;
         let mut ram_budget_bytes = None;
         let mut response_cache_bytes = None;
@@ -154,6 +159,14 @@ impl ServeOptions {
                     nonempty(required_value(args, index, "--model-name")?, "--model-name")?
                         .to_string(),
                 );
+            } else if let Some(value) = arg.strip_prefix("--mmproj=") {
+                mmproj_path = Some(PathBuf::from(nonempty(value, "--mmproj")?));
+            } else if arg == "--mmproj" {
+                index += 1;
+                mmproj_path = Some(PathBuf::from(nonempty(
+                    required_value(args, index, "--mmproj")?,
+                    "--mmproj",
+                )?));
             } else if let Some(value) = arg.strip_prefix("--api-key-file=") {
                 api_key_file = Some(PathBuf::from(nonempty(value, "--api-key-file")?));
             } else if arg == "--api-key-file" {
@@ -200,6 +213,12 @@ impl ServeOptions {
         {
             return Err("serve requires a GGUF model path".to_string());
         }
+        if mmproj_path
+            .as_ref()
+            .is_some_and(|path| path.extension().and_then(|value| value.to_str()) != Some("gguf"))
+        {
+            return Err("--mmproj requires a GGUF projector path".to_string());
+        }
         let model_name = model_name.unwrap_or_else(|| {
             model_path
                 .file_stem()
@@ -220,6 +239,7 @@ impl ServeOptions {
             host,
             port,
             model_path,
+            mmproj_path,
             model_name,
             api_key,
             ram_budget_bytes,
@@ -285,6 +305,7 @@ fn print_usage() {
     eprintln!("  --host HOST          Bind host (default: 127.0.0.1)");
     eprintln!("  --port PORT          Bind port (default: 8000)");
     eprintln!("  --model-name NAME    Model ID exposed through /v1/models");
+    eprintln!("  --mmproj PATH        Qwen3.6 vision projector GGUF");
     eprintln!("  --ram-budget SIZE    Host RAM budget, for example 8GiB");
     eprintln!("  --response-cache-budget SIZE  Stored response/KV cache cap");
     eprintln!("  --api-key-file PATH  Read the bearer API key from a one-line file");
@@ -913,6 +934,8 @@ mod tests {
             "9000".to_string(),
             "--ram-budget=4GiB".to_string(),
             "--response-cache-budget=512MiB".to_string(),
+            "--mmproj".to_string(),
+            "/models/mmproj.gguf".to_string(),
             "/models/gemma.gguf".to_string(),
         ])
         .unwrap();
@@ -920,6 +943,10 @@ mod tests {
         assert_eq!(options.host, "0.0.0.0");
         assert_eq!(options.port, 9000);
         assert_eq!(options.model_name, "gemma");
+        assert_eq!(
+            options.mmproj_path.as_deref(),
+            Some(std::path::Path::new("/models/mmproj.gguf"))
+        );
         assert_eq!(options.ram_budget_bytes, Some(4_u64 << 30));
         assert_eq!(options.response_cache_bytes, Some(512_u64 << 20));
     }

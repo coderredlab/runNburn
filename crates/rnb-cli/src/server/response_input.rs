@@ -121,7 +121,7 @@ fn normalize_function_output(
     let content = normalize_text_content(output, index, "output")?;
     Ok(ChatMessage {
         role: "tool".to_string(),
-        content: Some(content),
+        content: Some(rnb_llm::ChatContent::Text(content)),
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),
         name: None,

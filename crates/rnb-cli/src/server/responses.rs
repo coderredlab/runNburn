@@ -94,6 +94,7 @@ impl ResponseRequest {
         let generation = GenerationRequest {
             model: self.model,
             messages,
+            image: None,
             max_tokens: self.max_output_tokens,
             max_tokens_param: "max_output_tokens",
             input_param: "input",

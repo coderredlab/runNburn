@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]

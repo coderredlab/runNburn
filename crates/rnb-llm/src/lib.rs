@@ -15,7 +15,7 @@ pub mod speculative;
 pub mod tokenizer;
 pub mod tool_call;
 
-pub use chat::{ChatMessage, ChatTemplateOptions};
+pub use chat::{ChatContent, ChatContentPart, ChatMessage, ChatTemplateOptions};
 pub use constrained::GenerationConstraint;
 pub use engine::moe::MoeLayerView;
 pub use engine::moe_trace;

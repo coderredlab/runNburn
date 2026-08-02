@@ -1,10 +1,15 @@
-use rnb_llm::{ChatMessage, ChatTemplateOptions, Engine, EngineLoadConfig, GenerateParams};
+use rnb_llm::{
+    generate_stream_multimodal, ChatMessage, ChatTemplateOptions, Engine, EngineLoadConfig,
+    GenerateParams, Qwen36RgbImage,
+};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Debug)]
 struct ChatConfig {
     model_path: PathBuf,
+    mmproj_path: Option<PathBuf>,
+    image_path: Option<PathBuf>,
     ram_budget_bytes: Option<u64>,
     system_prompt: Option<String>,
     params: GenerateParams,
@@ -30,6 +35,7 @@ enum InputAction {
 struct ChatHistory {
     system_prompt: Option<String>,
     messages: Vec<ChatMessage>,
+    has_image_message: bool,
 }
 
 impl ChatHistory {
@@ -37,6 +43,7 @@ impl ChatHistory {
         let mut history = Self {
             system_prompt,
             messages: Vec::new(),
+            has_image_message: false,
         };
         history.clear();
         history
@@ -44,6 +51,7 @@ impl ChatHistory {
 
     fn clear(&mut self) {
         self.messages.clear();
+        self.has_image_message = false;
         if let Some(system_prompt) = self
             .system_prompt
             .as_deref()
@@ -61,6 +69,15 @@ impl ChatHistory {
 
     fn push(&mut self, role: &str, content: String) {
         self.messages.push(ChatMessage::new(role, content));
+    }
+
+    fn push_user(&mut self, content: String, attach_image: bool) {
+        if attach_image {
+            self.messages.push(ChatMessage::with_image("user", content));
+            self.has_image_message = true;
+        } else {
+            self.push("user", content);
+        }
     }
 }
 
@@ -83,19 +100,35 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
     if let Some(bytes) = config.ram_budget_bytes {
         load_config = load_config.with_host_ram_budget_bytes(bytes);
     }
+    if let Some(path) = config.mmproj_path.as_ref() {
+        load_config = load_config.with_vision_projector(path);
+    }
     let mut engine = Engine::from_gguf_with_config(&config.model_path, load_config)
         .map_err(|error| format!("failed to load model: {error}"))?;
+    let image = config
+        .image_path
+        .as_ref()
+        .map(|path| load_image(path.as_path()))
+        .transpose()?;
 
     eprintln!("Model loaded. Type /help for commands.");
     let stdin = io::stdin();
     let interactive = stdin.is_terminal();
     let mut stdout = io::stdout().lock();
-    run_session(&mut engine, &config, stdin.lock(), &mut stdout, interactive)
+    run_session(
+        &mut engine,
+        &config,
+        image.as_ref(),
+        stdin.lock(),
+        &mut stdout,
+        interactive,
+    )
 }
 
 fn run_session(
     engine: &mut Engine,
     config: &ChatConfig,
+    image: Option<&Qwen36RgbImage>,
     mut input: impl BufRead,
     output: &mut impl Write,
     interactive: bool,
@@ -151,7 +184,7 @@ fn run_session(
                     .map_err(|error| error.to_string())?;
             }
             InputAction::Prompt(prompt) => {
-                history.push("user", prompt);
+                history.push_user(prompt, image.is_some() && !history.has_image_message);
                 let rendered = engine
                     .tokenizer
                     .render_chat_prompt(
@@ -163,14 +196,22 @@ fn run_session(
                     )
                     .map_err(|error| format!("failed to render chat prompt: {error}"))?;
 
-                let result = engine
-                    .generate_stream(&rendered, &config.params, |piece| {
+                let result = if let Some(image) = image {
+                    generate_stream_multimodal(engine, &rendered, image, &config.params, |piece| {
                         if write!(output, "{piece}").is_err() || output.flush().is_err() {
                             return false;
                         }
                         true
                     })
-                    .map_err(|error| format!("generation failed: {error}"))?;
+                } else {
+                    engine.generate_stream(&rendered, &config.params, |piece| {
+                        if write!(output, "{piece}").is_err() || output.flush().is_err() {
+                            return false;
+                        }
+                        true
+                    })
+                }
+                .map_err(|error| format!("generation failed: {error}"))?;
                 writeln!(output).map_err(|error| error.to_string())?;
                 history.push("assistant", result.text);
             }
@@ -178,6 +219,19 @@ fn run_session(
     }
 }
 
+fn load_image(path: &std::path::Path) -> Result<Qwen36RgbImage, String> {
+    let decoded = image::ImageReader::open(path)
+        .map_err(|error| format!("failed to open image {}: {error}", path.display()))?
+        .decode()
+        .map_err(|error| format!("failed to decode image {}: {error}", path.display()))?
+        .into_rgb8();
+    Qwen36RgbImage::new(
+        decoded.width() as usize,
+        decoded.height() as usize,
+        decoded.into_raw(),
+    )
+    .map_err(|error| format!("invalid image {}: {error}", path.display()))
+}
 fn parse_input(line: &str) -> Result<InputAction, String> {
     let input = line.trim();
     if input.is_empty() {
@@ -209,6 +263,8 @@ fn parse_input(line: &str) -> Result<InputAction, String> {
 
 fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     let mut model_path = None;
+    let mut mmproj_path = None;
+    let mut image_path = None;
     let mut ram_budget_bytes = None;
     let mut system_prompt = None;
     let mut params = GenerateParams::default();
@@ -234,6 +290,8 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
         let option = matches!(
             name,
             "--ram-budget"
+                | "--mmproj"
+                | "--image"
                 | "--system"
                 | "--max-tokens"
                 | "--temperature"
@@ -257,6 +315,8 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
                             .map_err(|message| format!("invalid --ram-budget: {message}"))?,
                     );
                 }
+                "--mmproj" => mmproj_path = Some(PathBuf::from(value)),
+                "--image" => image_path = Some(PathBuf::from(value)),
                 "--system" => system_prompt = Some(value.to_string()),
                 "--max-tokens" => {
                     params.max_tokens = value
@@ -301,8 +361,19 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     if model_path.extension().and_then(|value| value.to_str()) != Some("gguf") {
         return Err("chat requires a GGUF model path".to_string());
     }
+    if image_path.is_some() != mmproj_path.is_some() {
+        return Err("--image and --mmproj must be specified together".to_string());
+    }
+    if mmproj_path
+        .as_ref()
+        .is_some_and(|path| path.extension().and_then(|value| value.to_str()) != Some("gguf"))
+    {
+        return Err("--mmproj requires a GGUF projector path".to_string());
+    }
     Ok(ParsedArgs::Run(ChatConfig {
         model_path,
+        mmproj_path,
+        image_path,
         ram_budget_bytes,
         system_prompt,
         params,
@@ -328,6 +399,14 @@ fn print_help(mut output: impl Write) -> io::Result<()> {
     writeln!(
         output,
         "  --ram-budget <size>   Host RAM budget, for example 8GiB"
+    )?;
+    writeln!(
+        output,
+        "  --mmproj <path>       Qwen3.6 vision projector GGUF used with --image"
+    )?;
+    writeln!(
+        output,
+        "  --image <path>        Local PNG or JPEG included in the conversation"
     )?;
     writeln!(
         output,
@@ -401,12 +480,24 @@ mod tests {
             "--seed",
             "7",
             "--thinking",
+            "--mmproj",
+            "projector.gguf",
+            "--image",
+            "picture.png",
             "model.gguf",
         ]))
         .unwrap() else {
             panic!("expected runnable chat config");
         };
         assert_eq!(config.model_path, PathBuf::from("model.gguf"));
+        assert_eq!(
+            config.mmproj_path.as_deref(),
+            Some(std::path::Path::new("projector.gguf"))
+        );
+        assert_eq!(
+            config.image_path.as_deref(),
+            Some(std::path::Path::new("picture.png"))
+        );
         assert_eq!(config.ram_budget_bytes, Some(8_u64 << 30));
         assert_eq!(config.system_prompt.as_deref(), Some("Be concise."));
         assert_eq!(config.params.max_tokens, 64);
@@ -416,6 +507,8 @@ mod tests {
         assert_eq!(config.params.seed, Some(7));
         assert!(config.enable_thinking);
         assert!(parse_args(&strings(&["model.rnb"])).is_err());
+        assert!(parse_args(&strings(&["--image", "picture.png", "model.gguf"])).is_err());
+        assert!(parse_args(&strings(&["--mmproj", "projector.gguf", "model.gguf"])).is_err());
     }
 
     #[test]
@@ -442,13 +535,25 @@ mod tests {
         let mut history = ChatHistory::new(Some("Be concise.".to_string()));
         history.push("user", "Hello".to_string());
         history.push("assistant", "Hi".to_string());
+        history.push_user("Look".to_string(), true);
+        assert!(history.has_image_message);
+        assert!(matches!(
+            history.messages[3].content,
+            Some(rnb_llm::ChatContent::Parts(_))
+        ));
         history.clear();
         assert_eq!(history.messages.len(), 1);
         assert_eq!(history.messages[0].role, "system");
-        assert_eq!(history.messages[0].content.as_deref(), Some("Be concise."));
+        assert_eq!(
+            history.messages[0].content,
+            Some(rnb_llm::ChatContent::Text("Be concise.".to_string()))
+        );
 
         history.set_system("Use Korean.".to_string());
         assert_eq!(history.messages.len(), 1);
-        assert_eq!(history.messages[0].content.as_deref(), Some("Use Korean."));
+        assert_eq!(
+            history.messages[0].content,
+            Some(rnb_llm::ChatContent::Text("Use Korean.".to_string()))
+        );
     }
 }

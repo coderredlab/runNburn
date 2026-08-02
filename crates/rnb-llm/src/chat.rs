@@ -6,9 +6,23 @@ use serde_json::Value;
 
 const REQUEST_REJECTED_PREFIX: &str = "__RNB_CHAT_REQUEST_REJECTED__:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text { text: String },
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: Option<String>,
+    pub content: Option<ChatContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21,7 +35,20 @@ impl ChatMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: Some(content.into()),
+            content: Some(ChatContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn with_image(role: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(ChatContent::Parts(vec![
+                ChatContentPart::Image,
+                ChatContentPart::Text { text: text.into() },
+            ])),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -237,7 +264,7 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".to_string(),
-                content: Some("sunny".to_string()),
+                content: Some(ChatContent::Text("sunny".to_string())),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
                 name: None,
@@ -257,5 +284,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(rendered, "weather|weather|call_1");
+    }
+
+    #[test]
+    fn renders_image_and_text_content_parts_for_qwen_templates() {
+        let tokenizer = tokenizer(
+            true,
+            Some(
+                "{% for part in messages[0].content %}{% if part.type == 'image' %}<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ part.text }}{% endif %}{% endfor %}",
+            ),
+        );
+
+        let rendered = tokenizer
+            .render_chat_prompt(
+                &[ChatMessage::with_image("user", "Describe the image.")],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            "<|vision_start|><|image_pad|><|vision_end|>Describe the image."
+        );
     }
 }

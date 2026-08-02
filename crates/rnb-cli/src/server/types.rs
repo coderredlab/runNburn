@@ -1,8 +1,14 @@
 use super::http::ApiError;
 use super::structured::{prepare_generation_constraint, prepare_tools};
-use rnb_llm::{ChatMessage, ChatTemplateOptions, Engine, GenerateParams};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use image::{ImageFormat, ImageReader, Limits};
+use rnb_llm::{
+    ChatContent, ChatContentPart, ChatMessage, ChatTemplateOptions, Engine, GenerateParams,
+    Qwen36RgbImage,
+};
 use serde::Deserialize;
 use serde_json::Value;
+use std::io::Cursor;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatCompletionRequest {
@@ -56,8 +62,14 @@ struct ContentPart {
     #[serde(rename = "type")]
     kind: String,
     text: Option<String>,
+    image_url: Option<ImageUrl>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImageUrl {
+    url: String,
+    detail: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum StopSequences {
@@ -79,11 +91,13 @@ pub(super) struct PreparedGenerationRequest {
     pub tool_names: Vec<String>,
     pub parallel_tool_calls: bool,
     pub response_history_affixes: Option<(String, String)>,
+    pub image: Option<Qwen36RgbImage>,
 }
 
 pub(super) struct GenerationRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    pub image: Option<Qwen36RgbImage>,
     pub max_tokens: Option<usize>,
     pub max_tokens_param: &'static str,
     pub input_param: &'static str,
@@ -168,12 +182,21 @@ impl ChatCompletionRequest {
             ));
         }
 
-        let messages = self
-            .messages
-            .into_iter()
-            .enumerate()
-            .map(|(index, message)| message.into_chat_message(index))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut messages = Vec::with_capacity(self.messages.len());
+        let mut image = None;
+        for (index, message) in self.messages.into_iter().enumerate() {
+            let (message, message_image) = message.into_chat_message(index)?;
+            if let Some(message_image) = message_image {
+                if image.replace(message_image).is_some() {
+                    return Err(ApiError::invalid(
+                        "only one image is supported per chat completion",
+                        Some("messages"),
+                        Some("unsupported_value"),
+                    ));
+                }
+            }
+            messages.push(message);
+        }
         let stop_sequences = match self.stop {
             None => Vec::new(),
             Some(StopSequences::One(value)) => vec![value],
@@ -183,6 +206,7 @@ impl ChatCompletionRequest {
         GenerationRequest {
             model: self.model,
             messages,
+            image,
             max_tokens: self.max_completion_tokens.or(self.max_tokens),
             max_tokens_param: "max_completion_tokens",
             input_param: "messages",
@@ -340,16 +364,34 @@ impl GenerationRequest {
         params.seed = self.seed;
         params.constraint = constraint;
 
-        let prompt_tokens =
-            engine.tokenizer.encode(&prompt).len() + usize::from(engine.tokenizer.should_add_bos());
-        let available_tokens = engine.metadata.max_seq_len.saturating_sub(prompt_tokens);
-        if prompt_tokens >= engine.metadata.max_seq_len || params.max_tokens > available_tokens {
+        if self.image.is_none() {
+            let prompt_tokens = engine.tokenizer.encode(&prompt).len()
+                + usize::from(engine.tokenizer.should_add_bos());
+            let available_tokens = engine.metadata.max_seq_len.saturating_sub(prompt_tokens);
+            if prompt_tokens >= engine.metadata.max_seq_len || params.max_tokens > available_tokens
+            {
+                return Err(ApiError::invalid(
+                    format!(
+                        "This model's maximum context length is {} tokens, but the request uses {} prompt tokens and allows {} completion tokens",
+                        engine.metadata.max_seq_len, prompt_tokens, params.max_tokens
+                    ),
+                    Some(self.input_param),
+                    Some("context_length_exceeded"),
+                ));
+            }
+        } else if !engine.has_vision_projector() {
+            return Err(ApiError::invalid(
+                "image input requires the server to start with --mmproj",
+                Some(self.input_param),
+                Some("invalid_value"),
+            ));
+        } else if params.max_tokens >= engine.metadata.max_seq_len {
             return Err(ApiError::invalid(
                 format!(
-                    "This model's maximum context length is {} tokens, but the request uses {} prompt tokens and allows {} completion tokens",
-                    engine.metadata.max_seq_len, prompt_tokens, params.max_tokens
+                    "This model's maximum context length is {} tokens, but the request allows {} completion tokens",
+                    engine.metadata.max_seq_len, params.max_tokens
                 ),
-                Some(self.input_param),
+                Some(self.max_tokens_param),
                 Some("context_length_exceeded"),
             ));
         }
@@ -365,12 +407,16 @@ impl GenerationRequest {
             tool_names: tools.names,
             parallel_tool_calls,
             response_history_affixes,
+            image: self.image,
         })
     }
 }
 
 impl ApiMessage {
-    fn into_chat_message(self, index: usize) -> Result<ChatMessage, ApiError> {
+    fn into_chat_message(
+        self,
+        index: usize,
+    ) -> Result<(ChatMessage, Option<Qwen36RgbImage>), ApiError> {
         if !matches!(
             self.role.as_str(),
             "system" | "developer" | "user" | "assistant" | "tool"
@@ -428,9 +474,12 @@ impl ApiMessage {
             }
             None => None,
         };
-        let content = match self.content {
-            Some(content) => Some(content.into_text(index)?),
-            None if self.role == "assistant" && tool_calls.is_some() => None,
+        let (content, image) = match self.content {
+            Some(content) => {
+                let (content, image) = content.into_chat_content(index, &self.role)?;
+                (Some(content), image)
+            }
+            None if self.role == "assistant" && tool_calls.is_some() => (None, None),
             None => {
                 return Err(ApiError::invalid(
                     format!("messages[{index}].content must contain text"),
@@ -440,47 +489,193 @@ impl ApiMessage {
             }
         };
 
-        Ok(ChatMessage {
-            role: self.role,
-            content,
-            tool_calls,
-            tool_call_id,
-            name: self.name,
-        })
+        Ok((
+            ChatMessage {
+                role: self.role,
+                content,
+                tool_calls,
+                tool_call_id,
+                name: self.name,
+            },
+            image,
+        ))
     }
 }
 
 impl MessageContent {
-    fn into_text(self, message_index: usize) -> Result<String, ApiError> {
+    fn into_chat_content(
+        self,
+        message_index: usize,
+        role: &str,
+    ) -> Result<(ChatContent, Option<Qwen36RgbImage>), ApiError> {
         match self {
-            Self::Text(text) => Ok(text),
+            Self::Text(text) => Ok((ChatContent::Text(text), None)),
             Self::Parts(parts) => {
-                let mut text = String::new();
+                let mut content = Vec::with_capacity(parts.len());
+                let mut image = None;
                 for (part_index, part) in parts.into_iter().enumerate() {
-                    if part.kind != "text" {
-                        return Err(ApiError::invalid(
-                            format!(
-                                "messages[{message_index}].content[{part_index}] type '{}' is not supported",
-                                part.kind
-                            ),
-                            Some("messages"),
-                            Some("unsupported_value"),
-                        ));
+                    match part.kind.as_str() {
+                        "text" => {
+                            let text = part.text.ok_or_else(|| {
+                                invalid_content_part(
+                                    message_index,
+                                    part_index,
+                                    "text is required",
+                                    "invalid_value",
+                                )
+                            })?;
+                            content.push(ChatContentPart::Text { text });
+                        }
+                        "image_url" => {
+                            if role != "user" {
+                                return Err(invalid_content_part(
+                                    message_index,
+                                    part_index,
+                                    "image_url is only valid for user messages",
+                                    "invalid_value",
+                                ));
+                            }
+                            if part
+                                .image_url
+                                .as_ref()
+                                .and_then(|image_url| image_url.detail.as_deref())
+                                .is_some_and(|detail| !matches!(detail, "auto" | "low" | "high"))
+                            {
+                                return Err(invalid_content_part(
+                                    message_index,
+                                    part_index,
+                                    "image_url.detail must be auto, low, or high",
+                                    "invalid_value",
+                                ));
+                            }
+                            let image_url = part.image_url.ok_or_else(|| {
+                                invalid_content_part(
+                                    message_index,
+                                    part_index,
+                                    "image_url is required",
+                                    "invalid_value",
+                                )
+                            })?;
+                            if image.replace(decode_data_image(&image_url.url)?).is_some() {
+                                return Err(invalid_content_part(
+                                    message_index,
+                                    part_index,
+                                    "only one image is supported per message",
+                                    "unsupported_value",
+                                ));
+                            }
+                            content.push(ChatContentPart::Image);
+                        }
+                        kind => {
+                            return Err(invalid_content_part(
+                                message_index,
+                                part_index,
+                                &format!("type '{kind}' is not supported"),
+                                "unsupported_value",
+                            ));
+                        }
                     }
-                    text.push_str(part.text.as_deref().ok_or_else(|| {
-                        ApiError::invalid(
-                            format!(
-                                "messages[{message_index}].content[{part_index}].text is required"
-                            ),
-                            Some("messages"),
-                            Some("invalid_value"),
-                        )
-                    })?);
                 }
-                Ok(text)
+                Ok((ChatContent::Parts(content), image))
             }
         }
     }
+}
+
+fn invalid_content_part(
+    message_index: usize,
+    part_index: usize,
+    detail: &str,
+    code: &'static str,
+) -> ApiError {
+    ApiError::invalid(
+        format!("messages[{message_index}].content[{part_index}] {detail}"),
+        Some("messages"),
+        Some(code),
+    )
+}
+
+fn decode_data_image(url: &str) -> Result<Qwen36RgbImage, ApiError> {
+    const MAX_ENCODED_BYTES: usize = 28 * 1024 * 1024;
+    const MAX_DECODED_ALLOC: u64 = 256 * 1024 * 1024;
+    const MAX_DIMENSION: u32 = 8192;
+
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Err(unsupported(
+            "messages",
+            "remote image URLs are not supported; use a PNG or JPEG data URL",
+        ));
+    }
+    let (header, payload) = url.split_once(',').ok_or_else(|| {
+        ApiError::invalid(
+            "image_url.url must be a PNG or JPEG data URL",
+            Some("messages"),
+            Some("invalid_image"),
+        )
+    })?;
+    let claimed_format = match header {
+        "data:image/png;base64" => ImageFormat::Png,
+        "data:image/jpeg;base64" => ImageFormat::Jpeg,
+        _ => {
+            return Err(ApiError::invalid(
+                "image_url.url must use data:image/png;base64 or data:image/jpeg;base64",
+                Some("messages"),
+                Some("invalid_image"),
+            ));
+        }
+    };
+    if payload.len() > MAX_ENCODED_BYTES {
+        return Err(ApiError::invalid(
+            "image data URL exceeds the 28 MiB encoded limit",
+            Some("messages"),
+            Some("invalid_image"),
+        ));
+    }
+    let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
+        ApiError::invalid(
+            format!("image data URL contains invalid base64: {error}"),
+            Some("messages"),
+            Some("invalid_image"),
+        )
+    })?;
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| {
+            ApiError::invalid(
+                format!("could not identify image data: {error}"),
+                Some("messages"),
+                Some("invalid_image"),
+            )
+        })?;
+    if reader.format() != Some(claimed_format) {
+        return Err(ApiError::invalid(
+            "image MIME type does not match the encoded image",
+            Some("messages"),
+            Some("invalid_image"),
+        ));
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|error| {
+        ApiError::invalid(
+            format!("could not decode image: {error}"),
+            Some("messages"),
+            Some("invalid_image"),
+        )
+    })?;
+    let rgb = decoded.into_rgb8();
+    Qwen36RgbImage::new(rgb.width() as usize, rgb.height() as usize, rgb.into_raw()).map_err(
+        |error| {
+            ApiError::invalid(
+                format!("invalid image: {error}"),
+                Some("messages"),
+                Some("invalid_image"),
+            )
+        },
+    )
 }
 
 fn validate_message_tool_calls(value: &Value, message_index: usize) -> Result<(), ApiError> {
@@ -616,19 +811,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_parts_are_joined_and_non_text_parts_are_rejected() {
+    fn accepts_text_and_data_url_image_parts_but_rejects_remote_urls() {
         let content: MessageContent = serde_json::from_str(
             r#"[{"type":"text","text":"hello "},{"type":"text","text":"world"}]"#,
         )
         .unwrap();
-        assert_eq!(content.into_text(0).unwrap(), "hello world");
-
-        let image: MessageContent =
-            serde_json::from_str(r#"[{"type":"image_url","image_url":{"url":"x"}}]"#).unwrap();
+        let (content, image) = content.into_chat_content(0, "user").unwrap();
         assert_eq!(
-            image.into_text(0).unwrap_err().code,
+            content,
+            ChatContent::Parts(vec![
+                ChatContentPart::Text {
+                    text: "hello ".to_string(),
+                },
+                ChatContentPart::Text {
+                    text: "world".to_string(),
+                },
+            ])
+        );
+        assert!(image.is_none());
+
+        let content: MessageContent = serde_json::from_str(
+            r#"[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}},{"type":"text","text":"describe"}]"#,
+        )
+        .unwrap();
+        let (content, image) = content.into_chat_content(0, "user").unwrap();
+        assert_eq!(
+            content,
+            ChatContent::Parts(vec![
+                ChatContentPart::Image,
+                ChatContentPart::Text {
+                    text: "describe".to_string(),
+                },
+            ])
+        );
+        let image = image.unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
+
+        let remote: MessageContent = serde_json::from_str(
+            r#"[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remote.into_chat_content(0, "user").unwrap_err().code,
             Some("unsupported_value")
         );
+    }
+
+    #[test]
+    fn rejects_malformed_image_data_urls() {
+        for url in [
+            "data:image/gif;base64,AAAA",
+            "data:image/png;base64,not-base64",
+        ] {
+            let content: MessageContent = serde_json::from_value(serde_json::json!([{
+                "type": "image_url",
+                "image_url": {"url": url}
+            }]))
+            .unwrap();
+            assert_eq!(
+                content.into_chat_content(0, "user").unwrap_err().code,
+                Some("invalid_image")
+            );
+        }
     }
 
     #[test]
@@ -669,7 +913,8 @@ mod tests {
             r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Seoul\"}"}}]}"#,
         )
         .unwrap();
-        let assistant = assistant.into_chat_message(0).unwrap();
+        let (assistant, image) = assistant.into_chat_message(0).unwrap();
+        assert!(image.is_none());
         assert!(assistant.content.is_none());
         assert_eq!(
             assistant.tool_calls.unwrap()[0]["function"]["name"],
@@ -679,9 +924,13 @@ mod tests {
         let response: ApiMessage =
             serde_json::from_str(r#"{"role":"tool","tool_call_id":"call_1","content":"sunny"}"#)
                 .unwrap();
-        let response = response.into_chat_message(1).unwrap();
+        let (response, image) = response.into_chat_message(1).unwrap();
+        assert!(image.is_none());
         assert_eq!(response.role, "tool");
         assert_eq!(response.tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(response.content.as_deref(), Some("sunny"));
+        assert_eq!(
+            response.content,
+            Some(rnb_llm::ChatContent::Text("sunny".to_string()))
+        );
     }
 }

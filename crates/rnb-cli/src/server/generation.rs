@@ -1,8 +1,8 @@
 use super::http::ApiError;
 use super::types::PreparedGenerationRequest;
 use rnb_llm::{
-    parse_assistant_output, Engine, EngineSequenceState, GenerationCancellation,
-    ParsedAssistantOutput, TextStopFilter,
+    generate_stream_multimodal, generate_stream_multimodal_cancellable, parse_assistant_output,
+    Engine, EngineSequenceState, GenerationCancellation, ParsedAssistantOutput, TextStopFilter,
 };
 
 pub(super) struct GeneratedCompletion {
@@ -52,27 +52,54 @@ pub(super) fn run_generation(
             should_continue
         })
     };
-    let result = match (resume_state, cancellation) {
-        (Some(state), Some(cancellation)) => engine.generate_stream_resuming_cancellable(
-            &prepared.prompt,
-            &prepared.params,
-            state,
-            cancellation,
-            &mut callback,
-        ),
-        (Some(state), None) => engine.generate_stream_resuming(
-            &prepared.prompt,
-            &prepared.params,
-            state,
-            &mut callback,
-        ),
-        (None, Some(cancellation)) => engine.generate_stream_cancellable(
-            &prepared.prompt,
-            &prepared.params,
-            cancellation,
-            &mut callback,
-        ),
-        (None, None) => engine.generate_stream(&prepared.prompt, &prepared.params, &mut callback),
+    let result = if let Some(image) = prepared.image.as_ref() {
+        if resume_state.is_some() {
+            return Err(ApiError::internal(
+                "multimodal generation cannot resume a cached sequence",
+            ));
+        }
+        match cancellation {
+            Some(cancellation) => generate_stream_multimodal_cancellable(
+                engine,
+                &prepared.prompt,
+                image,
+                &prepared.params,
+                cancellation,
+                &mut callback,
+            ),
+            None => generate_stream_multimodal(
+                engine,
+                &prepared.prompt,
+                image,
+                &prepared.params,
+                &mut callback,
+            ),
+        }
+    } else {
+        match (resume_state, cancellation) {
+            (Some(state), Some(cancellation)) => engine.generate_stream_resuming_cancellable(
+                &prepared.prompt,
+                &prepared.params,
+                state,
+                cancellation,
+                &mut callback,
+            ),
+            (Some(state), None) => engine.generate_stream_resuming(
+                &prepared.prompt,
+                &prepared.params,
+                state,
+                &mut callback,
+            ),
+            (None, Some(cancellation)) => engine.generate_stream_cancellable(
+                &prepared.prompt,
+                &prepared.params,
+                cancellation,
+                &mut callback,
+            ),
+            (None, None) => {
+                engine.generate_stream(&prepared.prompt, &prepared.params, &mut callback)
+            }
+        }
     }
     .map_err(|error| match error {
         rnb_llm::error::LlmError::Cancelled => ApiError::cancelled(),

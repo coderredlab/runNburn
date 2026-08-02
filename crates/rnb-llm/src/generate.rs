@@ -492,6 +492,13 @@ pub fn generate_stream_multimodal(
     check_generation_cancellation()?;
     let compiled = engine.compile_qwen36_multimodal_prompt(rendered_prompt, image)?;
     let prompt_len = compiled.executed_rows;
+    let total_rows = prompt_len.saturating_add(params.max_tokens);
+    if total_rows > engine.metadata.max_seq_len {
+        return Err(crate::error::LlmError::InvalidChatRequest(format!(
+            "multimodal prompt executes {prompt_len} rows and allows {} completion rows, exceeding context limit {}",
+            params.max_tokens, engine.metadata.max_seq_len
+        )));
+    }
     let prompt_tokens = compiled.sampler_token_ids.clone();
     let mut rng = match params.seed {
         Some(seed) => SmallRng::seed_from_u64(seed),
