@@ -1109,6 +1109,7 @@ fn metal_qwen_prefill_attention_spec<'a>(
     layer_idx: usize,
     seq_len: usize,
     pos_start: usize,
+    imrope_positions: Option<(&'a [[u32; 4]], [usize; 4])>,
     norm_eps: f32,
 ) -> Option<crate::engine::metal_runtime::MetalPrefillAtnOTailSpec<'a>> {
     if use_gemma_block_semantics(architecture)
@@ -1140,7 +1141,8 @@ fn metal_qwen_prefill_attention_spec<'a>(
     if proportional_rope || rope_dim == 0 || rope_dim >= layout.head_dim {
         return None;
     }
-    if qwen_text_mrope_dim(metadata, architecture, rope_dim, layout.head_dim).is_some()
+    if (imrope_positions.is_none()
+        && qwen_text_mrope_dim(metadata, architecture, rope_dim, layout.head_dim).is_some())
         || gemma_rope_freq_factors(
             rope_freqs,
             metadata,
@@ -1173,6 +1175,8 @@ fn metal_qwen_prefill_attention_spec<'a>(
             scale: resolve_attention_scale(metadata, architecture),
             norm_eps,
             pos_start,
+            imrope_positions: imrope_positions.map(|(positions, _)| positions),
+            imrope_sections: imrope_positions.map_or([0; 4], |(_, sections)| sections),
         },
         o_weight: metal_qwen_quant_weight_ref(&w.o_weight)?,
     })
@@ -1200,7 +1204,10 @@ fn metal_qwen_prefill_moe_product_tuple(
             shared_down,
             rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
         );
-    n_expert_used <= 8 && sparse && shared_q4
+    let shared_q8 = shared_gate == rnb_loader::GGMLType::Q8_0
+        && shared_up == rnb_loader::GGMLType::Q8_0
+        && shared_down == rnb_loader::GGMLType::Q8_0;
+    n_expert_used <= 8 && sparse && (shared_q4 || shared_q8)
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -1416,6 +1423,7 @@ fn try_run_metal_qwen_prefill_chain(
     layer_range: &Range<usize>,
     seq_len: usize,
     pos_start: usize,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     norm_eps: f32,
     profiler_enabled: bool,
 ) -> crate::error::Result<Option<Tensor>> {
@@ -1492,6 +1500,7 @@ fn try_run_metal_qwen_prefill_chain(
                         layer_idx,
                         seq_len,
                         pos_start,
+                        imrope_positions,
                         norm_eps,
                     ) else {
                         return metal_qwen_prefill_chain_fallback(
@@ -1713,7 +1722,7 @@ fn run_prefill_layers_cpu_range_impl(
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    if imrope_positions.is_none() && prefix_collector.is_none() && gemma_per_layer_base.is_none() {
+    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
         let chain_end = match metal_qwen_prefill_chain_diag_layers() {
             Some(0) => layer_range.start,
             Some(prefix_layers) => layer_range
@@ -1736,6 +1745,7 @@ fn run_prefill_layers_cpu_range_impl(
                 &chain_range,
                 seq_len,
                 pos_start,
+                imrope_positions,
                 norm_eps,
                 profiler.enabled(),
             )? {
@@ -3125,6 +3135,15 @@ mod tests {
                 shared_down,
             ));
         }
+        assert!(super::metal_qwen_prefill_moe_product_tuple(
+            8,
+            GGMLType::Q4_K,
+            GGMLType::Q4_K,
+            GGMLType::Q5_K,
+            GGMLType::Q8_0,
+            GGMLType::Q8_0,
+            GGMLType::Q8_0,
+        ));
         assert!(!super::metal_qwen_prefill_moe_product_tuple(
             9,
             GGMLType::Q4_K,
@@ -3135,14 +3154,6 @@ mod tests {
             GGMLType::Q6_K,
         ));
         for malformed in [
-            [
-                GGMLType::Q4_K,
-                GGMLType::Q4_K,
-                GGMLType::Q4_K,
-                GGMLType::Q8_0,
-                GGMLType::Q8_0,
-                GGMLType::Q8_0,
-            ],
             [
                 GGMLType::Q8_0,
                 GGMLType::Q4_K,

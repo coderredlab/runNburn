@@ -6,8 +6,8 @@ use rnb_loader::{GGMLType, LoadedVisionProjector};
 
 use super::vision::{inspect_qwen36_vision_projector, Qwen36VisionError};
 use super::vision_math::{
-    add_in_place, apply_vision_mrope, ensure_finite, full_attention, gelu_in_place,
-    layer_norm_affine,
+    add_in_place, apply_vision_mrope, ensure_finite, full_attention as full_attention_cpu,
+    gelu_in_place, layer_norm_affine,
 };
 use super::vision_preprocess::{
     tensor_f32, tensor_stats, Qwen36TensorStats, Qwen36VisionIntermediate,
@@ -35,9 +35,38 @@ pub struct Qwen36VisionOutput {
     pub embeddings: Vec<f32>,
 }
 
+pub trait Qwen36VisionExecutor {
+    fn linear_bf16(
+        &mut self,
+        weight: &[u16],
+        input: &[f32],
+        bias: &[f32],
+        rows: usize,
+        cols: usize,
+        sequence_length: usize,
+    ) -> Result<Option<Vec<f32>>, String>;
+
+    fn full_attention(
+        &mut self,
+        qkv: &[f32],
+        embedding_length: usize,
+        head_count: usize,
+        sequence_length: usize,
+    ) -> Result<Option<Vec<f32>>, String>;
+}
+
 pub fn encode_qwen36_vision_intermediate(
     projector: &LoadedVisionProjector,
     intermediate: Qwen36VisionIntermediate,
+) -> Result<Qwen36VisionOutput, Qwen36VisionError> {
+    let mut executor = CpuVisionExecutor;
+    encode_qwen36_vision_intermediate_with_executor(projector, intermediate, &mut executor)
+}
+
+pub fn encode_qwen36_vision_intermediate_with_executor(
+    projector: &LoadedVisionProjector,
+    intermediate: Qwen36VisionIntermediate,
+    executor: &mut dyn Qwen36VisionExecutor,
 ) -> Result<Qwen36VisionOutput, Qwen36VisionError> {
     let capability = inspect_qwen36_vision_projector(&projector.descriptor)?;
     validate_intermediate(&intermediate, &capability)?;
@@ -67,6 +96,7 @@ pub fn encode_qwen36_vision_intermediate(
             .checked_mul(3)
             .ok_or_else(|| error("vision QKV width overflows usize"))?;
         let mut qkv = linear_bf16(
+            executor,
             projector,
             &format!("{prefix}.attn_qkv.weight"),
             &normalized,
@@ -83,7 +113,8 @@ pub fn encode_qwen36_vision_intermediate(
             capability.embedding_length,
             capability.head_count,
         )?;
-        let attended = full_attention(
+        let attended = full_attention_with_executor(
+            executor,
             &qkv,
             capability.embedding_length,
             capability.head_count,
@@ -91,6 +122,7 @@ pub fn encode_qwen36_vision_intermediate(
         )?;
         let attention_bias = tensor_f32(projector, &format!("{prefix}.attn_out.bias"))?;
         let attention_output = linear_bf16(
+            executor,
             projector,
             &format!("{prefix}.attn_out.weight"),
             &attended,
@@ -112,6 +144,7 @@ pub fn encode_qwen36_vision_intermediate(
         )?;
         let up_bias = tensor_f32(projector, &format!("{prefix}.ffn_up.bias"))?;
         let mut feed_forward = linear_bf16(
+            executor,
             projector,
             &format!("{prefix}.ffn_up.weight"),
             &normalized,
@@ -123,6 +156,7 @@ pub fn encode_qwen36_vision_intermediate(
         gelu_in_place(&mut feed_forward);
         let down_bias = tensor_f32(projector, &format!("{prefix}.ffn_down.bias"))?;
         let feed_forward = linear_bf16(
+            executor,
             projector,
             &format!("{prefix}.ffn_down.weight"),
             &feed_forward,
@@ -165,6 +199,7 @@ pub fn encode_qwen36_vision_intermediate(
         .ok_or_else(|| error("vision merger width overflows usize"))?;
     let merger_bias = tensor_f32(projector, "mm.0.bias")?;
     let mut merged = linear_bf16(
+        executor,
         projector,
         "mm.0.weight",
         &post_normalized,
@@ -176,6 +211,7 @@ pub fn encode_qwen36_vision_intermediate(
     gelu_in_place(&mut merged);
     let projection_bias = tensor_f32(projector, "mm.2.bias")?;
     let embeddings = linear_bf16(
+        executor,
         projector,
         "mm.2.weight",
         &merged,
@@ -246,6 +282,7 @@ fn validate_intermediate(
 }
 
 fn linear_bf16(
+    executor: &mut dyn Qwen36VisionExecutor,
     projector: &LoadedVisionProjector,
     weight_name: &str,
     input: &[f32],
@@ -275,14 +312,99 @@ fn linear_bf16(
             "tensor '{weight_name}' output size overflows usize"
         ))
     })?;
-    let mut output = vec![0.0f32; output_len];
+    match executor
+        .linear_bf16(weight, input, bias, rows, cols, sequence_length)
+        .map_err(|message| error(format!("tensor '{weight_name}' executor failed: {message}")))?
+    {
+        Some(output) if output.len() == output_len => Ok(output),
+        Some(output) => Err(error(format!(
+            "tensor '{weight_name}' executor returned {} values, expected {output_len}",
+            output.len()
+        ))),
+        None => Ok(linear_bf16_cpu(
+            weight,
+            input,
+            bias,
+            rows,
+            cols,
+            sequence_length,
+        )),
+    }
+}
+
+fn full_attention_with_executor(
+    executor: &mut dyn Qwen36VisionExecutor,
+    qkv: &[f32],
+    embedding_length: usize,
+    head_count: usize,
+    sequence_length: usize,
+) -> Result<Vec<f32>, Qwen36VisionError> {
+    let output_len = sequence_length
+        .checked_mul(embedding_length)
+        .ok_or_else(|| error("vision attention output size overflows usize"))?;
+    match executor
+        .full_attention(qkv, embedding_length, head_count, sequence_length)
+        .map_err(|message| error(format!("vision attention executor failed: {message}")))?
+    {
+        Some(output) if output.len() == output_len => Ok(output),
+        Some(output) => Err(error(format!(
+            "vision attention executor returned {} values, expected {output_len}",
+            output.len(),
+        ))),
+        None => full_attention_cpu(qkv, embedding_length, head_count, sequence_length),
+    }
+}
+struct CpuVisionExecutor;
+
+impl Qwen36VisionExecutor for CpuVisionExecutor {
+    fn linear_bf16(
+        &mut self,
+        weight: &[u16],
+        input: &[f32],
+        bias: &[f32],
+        rows: usize,
+        cols: usize,
+        sequence_length: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        Ok(Some(linear_bf16_cpu(
+            weight,
+            input,
+            bias,
+            rows,
+            cols,
+            sequence_length,
+        )))
+    }
+
+    fn full_attention(
+        &mut self,
+        qkv: &[f32],
+        embedding_length: usize,
+        head_count: usize,
+        sequence_length: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        full_attention_cpu(qkv, embedding_length, head_count, sequence_length)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn linear_bf16_cpu(
+    weight: &[u16],
+    input: &[f32],
+    bias: &[f32],
+    rows: usize,
+    cols: usize,
+    sequence_length: usize,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; rows * sequence_length];
     gemv_bf16(weight, input, &mut output, rows, cols, sequence_length);
     output.par_chunks_mut(rows).for_each(|row| {
         for index in 0..rows {
             row[index] += bias[index];
         }
     });
-    Ok(output)
+    output
 }
 
 fn tensor_bf16_words<'a>(

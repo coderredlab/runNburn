@@ -1230,6 +1230,8 @@ pub struct PrefillAtnCoreBackendSpecRef<'a> {
     pub scale: f32,
     pub norm_eps: f32,
     pub pos_start: usize,
+    pub imrope_positions: Option<&'a [[u32; 4]]>,
+    pub imrope_sections: [usize; 4],
 }
 
 #[cfg(target_os = "macos")]
@@ -2481,6 +2483,12 @@ impl MetalBackend {
         {
             return Ok(false);
         }
+        if core.imrope_positions.is_some_and(|positions| {
+            positions.len() != core.seq_len
+                || core.imrope_sections.iter().sum::<usize>() != core.n_rot / 2
+        }) {
+            return Ok(false);
+        }
         let q_dim = Self::atn_core_checked_mul(core.num_heads, core.head_dim, "q_dim")?;
         let kv_dim = Self::atn_core_checked_mul(core.num_kv_heads, core.head_dim, "kv_dim")?;
         let q_rows = Self::atn_core_checked_mul(core.q_dim, 2, "q weight rows")?;
@@ -3726,6 +3734,8 @@ impl MetalBackend {
                         scale: core.scale,
                         norm_eps: core.norm_eps,
                         pos_start: core.pos_start,
+                        imrope_positions: None,
+                        imrope_sections: [0; 4],
                     },
                     o_weight: req.o_weight,
                 },
@@ -10754,6 +10764,37 @@ impl MetalBackend {
             };
         }
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn qwen36_vision_linear_bf16(
+        &self,
+        weight: &[u16],
+        input: &[f32],
+        bias: &[f32],
+        rows: usize,
+        cols: usize,
+        tokens: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        compute::vision_linear_bf16(ctx, weight, input, bias, rows, cols, tokens)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn qwen36_vision_full_attention(
+        &self,
+        qkv: &[f32],
+        embedding_length: usize,
+        head_count: usize,
+        sequence_length: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        compute::vision_full_attention(ctx, qkv, embedding_length, head_count, sequence_length)
+            .map(Some)
+    }
 }
 
 impl Backend for MetalBackend {
@@ -10812,6 +10853,105 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn qwen36_vision_linear_bf16_matches_cpu_reference() {
+        const ROWS: usize = 47;
+        const COLS: usize = 96;
+        const TOKENS: usize = 67;
+        let weight = (0..ROWS * COLS)
+            .map(|index| {
+                let value = ((index.wrapping_mul(31) % 257) as f32 - 128.0) / 256.0;
+                (value.to_bits() >> 16) as u16
+            })
+            .collect::<Vec<_>>();
+        let input = (0..TOKENS * COLS)
+            .map(|index| ((index.wrapping_mul(17) % 251) as f32 - 125.0) / 128.0)
+            .collect::<Vec<_>>();
+        let bias = (0..ROWS)
+            .map(|index| (index as f32 - 23.0) / 512.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; TOKENS * ROWS];
+        rnb_cpu::gemm::f32_gemv::gemv_bf16(&weight, &input, &mut expected, ROWS, COLS, TOKENS);
+        for row in expected.chunks_exact_mut(ROWS) {
+            for (value, bias) in row.iter_mut().zip(&bias) {
+                *value += bias;
+            }
+        }
+
+        let ctx = compute::build_metal_context().expect("Metal context");
+        let actual = compute::vision_linear_bf16(&ctx, &weight, &input, &bias, ROWS, COLS, TOKENS)
+            .expect("Metal vision linear")
+            .expect("M5 BF16 pipeline");
+        let mut max_rel = 0.0f32;
+        for (&actual, &expected) in actual.iter().zip(&expected) {
+            let rel = (actual - expected).abs() / expected.abs().max(1.0e-3);
+            max_rel = max_rel.max(rel);
+        }
+        assert!(max_rel < 5.0e-3, "max_rel={max_rel}");
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn qwen36_vision_full_attention_matches_cpu_reference() {
+        const EMBEDDING: usize = 64;
+        const HEADS: usize = 2;
+        const TOKENS: usize = 37;
+        let qkv_width = EMBEDDING * 3;
+        let head_dim = EMBEDDING / HEADS;
+        let qkv = (0..TOKENS * qkv_width)
+            .map(|index| ((index.wrapping_mul(29) % 509) as f32 - 254.0) / 256.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; TOKENS * EMBEDDING];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut scores = vec![0.0f32; TOKENS];
+        for head in 0..HEADS {
+            for query in 0..TOKENS {
+                let query_start = query * qkv_width + head * head_dim;
+                let mut maximum = f32::NEG_INFINITY;
+                for key in 0..TOKENS {
+                    let key_start = key * qkv_width + EMBEDDING + head * head_dim;
+                    let score = qkv[query_start..query_start + head_dim]
+                        .iter()
+                        .zip(&qkv[key_start..key_start + head_dim])
+                        .map(|(&query, &key)| query * key)
+                        .sum::<f32>()
+                        * scale;
+                    scores[key] = score;
+                    maximum = maximum.max(score);
+                }
+                let sum = scores
+                    .iter_mut()
+                    .map(|score| {
+                        *score = (*score - maximum).exp();
+                        *score as f64
+                    })
+                    .sum::<f64>();
+                for (key, &score) in scores.iter().enumerate() {
+                    let probability = score / sum as f32;
+                    let value_start = key * qkv_width + 2 * EMBEDDING + head * head_dim;
+                    let output_start = query * EMBEDDING + head * head_dim;
+                    for dimension in 0..head_dim {
+                        expected[output_start + dimension] +=
+                            probability * qkv[value_start + dimension];
+                    }
+                }
+            }
+        }
+
+        let ctx = compute::build_metal_context().expect("Metal context");
+        let actual = compute::vision_full_attention(&ctx, &qkv, EMBEDDING, HEADS, TOKENS)
+            .expect("Metal vision attention");
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&actual, &expected) in actual.iter().zip(&expected) {
+            max_abs = max_abs.max((actual - expected).abs());
+            max_rel = max_rel.max((actual - expected).abs() / expected.abs().max(1.0e-3));
+        }
+        assert!(max_abs < 2.0e-4, "max_abs={max_abs} max_rel={max_rel}");
+        assert!(max_rel < 2.0e-3, "max_abs={max_abs} max_rel={max_rel}");
     }
     fn mapped_test_tensor(raw: &[u8]) -> rnb_core::tensor::Tensor {
         let mut mmap = memmap2::MmapMut::map_anon(raw.len()).expect("anonymous mmap");
@@ -11165,6 +11305,8 @@ mod tests {
                     scale: 0.0,
                     norm_eps: 0.0,
                     pos_start: 0,
+                    imrope_positions: None,
+                    imrope_sections: [0; 4],
                 },
                 o_weight: weight,
             },

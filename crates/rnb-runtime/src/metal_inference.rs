@@ -145,6 +145,8 @@ pub struct MetalPrefillAtnCoreSpec<'a> {
     pub scale: f32,
     pub norm_eps: f32,
     pub pos_start: usize,
+    pub imrope_positions: Option<&'a [[u32; 4]]>,
+    pub imrope_sections: [usize; 4],
 }
 
 pub struct MetalPrefillAtnOTailSpec<'a> {
@@ -226,6 +228,46 @@ pub struct MetalQwenPrefillChainOut {
 // resident/carrier 캐시 재사용.
 thread_local! {
     static METAL: rnb_backend_metal::MetalBackend = rnb_backend_metal::MetalBackend::new();
+}
+
+pub fn metal_qwen36_vision_linear_bf16(
+    weight: &[u16],
+    input: &[f32],
+    bias: &[f32],
+    rows: usize,
+    cols: usize,
+    tokens: usize,
+) -> Result<Option<Vec<f32>>> {
+    #[cfg(target_os = "macos")]
+    {
+        return METAL.with(|backend| {
+            backend.qwen36_vision_linear_bf16(weight, input, bias, rows, cols, tokens)
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (weight, input, bias, rows, cols, tokens);
+        Ok(None)
+    }
+}
+
+pub fn metal_qwen36_vision_full_attention(
+    qkv: &[f32],
+    embedding_length: usize,
+    head_count: usize,
+    sequence_length: usize,
+) -> Result<Option<Vec<f32>>> {
+    #[cfg(target_os = "macos")]
+    {
+        return METAL.with(|backend| {
+            backend.qwen36_vision_full_attention(qkv, embedding_length, head_count, sequence_length)
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (qkv, embedding_length, head_count, sequence_length);
+        Ok(None)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -318,6 +360,12 @@ fn qwen_prefill_chain_attention_spec<'a>(
     {
         return None;
     }
+    if core.imrope_positions.is_some_and(|positions| {
+        positions.len() != core.seq_len
+            || core.imrope_sections.iter().sum::<usize>() != core.n_rot / 2
+    }) {
+        return None;
+    }
     let q_dim = core.num_heads.checked_mul(core.head_dim)?;
     let kv_dim = core.num_kv_heads.checked_mul(core.head_dim)?;
     let q_weight_rows = q_dim.checked_mul(2)?;
@@ -373,6 +421,8 @@ fn qwen_prefill_chain_attention_spec<'a>(
             scale: core.scale,
             norm_eps: core.norm_eps,
             pos_start: core.pos_start,
+            imrope_positions: core.imrope_positions,
+            imrope_sections: core.imrope_sections,
         },
         o_weight,
     })
@@ -7335,6 +7385,8 @@ mod qwen_prefill_chain_conversion_tests {
                 scale: 0.0625,
                 norm_eps: 1.0e-6,
                 pos_start: 0,
+                imrope_positions: None,
+                imrope_sections: [0; 4],
             },
             o_weight: MetalQuantWeightRef {
                 ggml_type: GGMLType::Q4_K,

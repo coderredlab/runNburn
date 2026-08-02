@@ -733,6 +733,8 @@ impl QwenMoeLlamaPrefillLayerChainFixture {
                     scale: 1.0 / (Self::HEAD_DIM as f32).sqrt(),
                     norm_eps: 1e-6,
                     pos_start: 0,
+                    imrope_positions: None,
+                    imrope_sections: [0; 4],
                 },
                 o_weight,
             },

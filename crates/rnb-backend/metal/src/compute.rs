@@ -36,6 +36,8 @@ const GEMM_DENSE_F16_MICROBENCH_SRC: &str = include_str!("gemm_dense_f16_microbe
 // pm48 ②: prefill(seq_len>1) fused qk_norm→rope device 커널. production 승격
 // (device-resident attention chain 의 rope/qk_norm 단계, ctx 캐시 pipeline).
 const PREFILL_ROPE_QK_NORM_SRC: &str = include_str!("prefill_rope_qk_norm.metal");
+const VISION_LINEAR_BF16_SRC: &str = include_str!("vision_linear_bf16.metal");
+const VISION_ATTENTION_SRC: &str = include_str!("vision_attention.metal");
 const GEMV_Q6K_SIMD_SRC: &str = include_str!("gemv_q6k_simd.metal");
 const GEMV_Q6K_COALESCED_SRC: &str = include_str!("gemv_q6k_coalesced.metal");
 const GEMV_Q6K_COALESCED_NSG2_SRC: &str = include_str!("gemv_q6k_coalesced_nsg2.metal");
@@ -801,6 +803,10 @@ pub struct MetalContext {
     /// per-head RMSNorm → text M-RoPE(partial n_rot) 를 device q/k 에 in-chain 적용. 항상 build.
     pub(crate) prefill_rope_qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(crate) prefill_rope_only_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) prefill_imrope_only_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) vision_linear_bf16_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) vision_attention_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 /// chain decode 측정 모드: dispatch 를 class 별로 emit 해 GPU time 을 격리(pm21 REST 분해).
@@ -1485,7 +1491,6 @@ fn build_library_v4(
 
     let source = NSString::from_str(src);
     let options = MTLCompileOptions::new();
-    options.setFastMathEnabled(false);
     options.setMathMode(MTLMathMode::Safe);
     device
         .newLibraryWithSource_options_error(&source, Some(&options))
@@ -2286,6 +2291,12 @@ pub fn build_metal_context_with_opts(
         build_pipeline(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_rope_qk_norm");
     let prefill_rope_only_pipeline =
         build_pipeline_safe_math(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_rope_only");
+    let prefill_imrope_only_pipeline =
+        build_pipeline_safe_math(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_imrope_only");
+    let vision_linear_bf16_pipeline = tensorops_capable
+        .then(|| build_pipeline_v4(&device, VISION_LINEAR_BF16_SRC, "vision_linear_bf16"));
+    let vision_attention_pipeline =
+        build_pipeline_safe_math(&device, VISION_ATTENTION_SRC, "vision_full_attention");
 
     // pm21 승격: default on. baseline 은 RNB_METAL_GEMV_SIMD=0 으로 opt-out(측정 비교 보존).
     let gemv_simd = std::env::var("RNB_METAL_GEMV_SIMD")
@@ -2505,6 +2516,9 @@ pub fn build_metal_context_with_opts(
         flash_attn_prefill_tg_pipeline,
         prefill_rope_qk_norm_pipeline,
         prefill_rope_only_pipeline,
+        prefill_imrope_only_pipeline,
+        vision_linear_bf16_pipeline,
+        vision_attention_pipeline,
     })
 }
 
@@ -13082,6 +13096,244 @@ pub(crate) fn encode_prefill_rope_only(
     );
     chain_barrier(ctx, enc);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_prefill_imrope_only(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rope_cos_sin: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    head_dim: usize,
+    n_rot: usize,
+    seq_len: usize,
+) -> Result<(), QwenMoeLlamaIdError> {
+    if seq_len == 0
+        || num_heads == 0
+        || head_dim == 0
+        || head_dim > 256
+        || n_rot > head_dim
+        || n_rot % 2 != 0
+    {
+        return Err(QwenMoeLlamaIdError::InvalidShape);
+    }
+    let groups = seq_len
+        .checked_mul(num_heads)
+        .ok_or(QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let rope_table_bytes = seq_len
+        .checked_mul(n_rot)
+        .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    if rope_cos_sin.length() < rope_table_bytes {
+        return Err(QwenMoeLlamaIdError::InvalidShape);
+    }
+    let num_heads =
+        u32::try_from(num_heads).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let head_dim =
+        u32::try_from(head_dim).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let n_rot = u32::try_from(n_rot).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+
+    enc.setComputePipelineState(&ctx.prefill_imrope_only_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(input), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(output), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(rope_cos_sin), 0, 2);
+    }
+    set_u32_bytes(enc, num_heads, 3);
+    set_u32_bytes(enc, head_dim, 4);
+    set_u32_bytes(enc, n_rot, 5);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    chain_barrier(ctx, enc);
+    Ok(())
+}
+
+pub(crate) fn vision_linear_bf16(
+    ctx: &MetalContext,
+    weight: &[u16],
+    input: &[f32],
+    bias: &[f32],
+    rows: usize,
+    cols: usize,
+    tokens: usize,
+) -> Result<Option<Vec<f32>>, String> {
+    let Some(pipeline) = ctx.vision_linear_bf16_pipeline.as_ref() else {
+        return Ok(None);
+    };
+    let expected_weight = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "Metal vision linear weight size overflow".to_string())?;
+    let expected_input = tokens
+        .checked_mul(cols)
+        .ok_or_else(|| "Metal vision linear input size overflow".to_string())?;
+    let output_len = tokens
+        .checked_mul(rows)
+        .ok_or_else(|| "Metal vision linear output size overflow".to_string())?;
+    if weight.len() != expected_weight || input.len() != expected_input || bias.len() != rows {
+        return Err(format!(
+            "Metal vision linear shape mismatch: weight={} expected={expected_weight}, input={} expected={expected_input}, bias={} expected={rows}",
+            weight.len(),
+            input.len(),
+            bias.len(),
+        ));
+    }
+    let weight_bytes = unsafe {
+        std::slice::from_raw_parts(weight.as_ptr().cast::<u8>(), std::mem::size_of_val(weight))
+    };
+    let (weight_buf, weight_offset) = wrap_nocopy(ctx, weight_bytes);
+    if weight_offset % 2 != 0 {
+        return Err("Metal vision BF16 weight offset is not two-byte aligned".to_string());
+    }
+    let input_buf = crate::ffn_chain::shared_f32_buf(ctx, input);
+    let bias_buf = crate::ffn_chain::shared_f32_buf(ctx, bias);
+    let output_buf = crate::ffn_chain::empty_f32_buf(ctx, output_len);
+    let rows =
+        u32::try_from(rows).map_err(|_| "Metal vision linear rows exceed u32".to_string())?;
+    let cols =
+        u32::try_from(cols).map_err(|_| "Metal vision linear cols exceed u32".to_string())?;
+    let tokens =
+        u32::try_from(tokens).map_err(|_| "Metal vision linear tokens exceed u32".to_string())?;
+    let command = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal vision linear command buffer creation failed".to_string())?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal vision linear encoder creation failed".to_string())?;
+    encoder.setComputePipelineState(pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(
+            Some(&weight_buf),
+            usize::try_from(weight_offset).expect("weight offset fits usize"),
+            0,
+        );
+        encoder.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(&bias_buf), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 3);
+    }
+    set_u32_bytes(&encoder, rows, 4);
+    set_u32_bytes(&encoder, cols, 5);
+    set_u32_bytes(&encoder, tokens, 6);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: usize::try_from(rows).expect("rows fit usize").div_ceil(32),
+            height: usize::try_from(tokens)
+                .expect("tokens fit usize")
+                .div_ceil(64),
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    if command.status() != MTLCommandBufferStatus::Completed {
+        return Err(format!(
+            "Metal vision linear command failed: status={:?} error={:?}",
+            command.status(),
+            command.error(),
+        ));
+    }
+    Ok(Some(crate::ffn_chain::readback(&output_buf, output_len)))
+}
+
+pub(crate) fn vision_full_attention(
+    ctx: &MetalContext,
+    qkv: &[f32],
+    embedding_length: usize,
+    head_count: usize,
+    sequence_length: usize,
+) -> Result<Vec<f32>, String> {
+    if head_count == 0
+        || embedding_length == 0
+        || embedding_length % head_count != 0
+        || embedding_length / head_count > 96
+    {
+        return Err("Metal vision attention shape is unsupported".to_string());
+    }
+    let qkv_width = embedding_length
+        .checked_mul(3)
+        .ok_or_else(|| "Metal vision attention QKV width overflow".to_string())?;
+    let expected_qkv = sequence_length
+        .checked_mul(qkv_width)
+        .ok_or_else(|| "Metal vision attention QKV size overflow".to_string())?;
+    let output_len = sequence_length
+        .checked_mul(embedding_length)
+        .ok_or_else(|| "Metal vision attention output size overflow".to_string())?;
+    if qkv.len() != expected_qkv {
+        return Err(format!(
+            "Metal vision attention QKV length {} != {expected_qkv}",
+            qkv.len()
+        ));
+    }
+    let qkv_buf = crate::ffn_chain::shared_f32_buf(ctx, qkv);
+    let output_buf = crate::ffn_chain::empty_f32_buf(ctx, output_len);
+    let embedding_length_u32 = u32::try_from(embedding_length)
+        .map_err(|_| "Metal vision attention embedding length exceeds u32".to_string())?;
+    let head_count_u32 = u32::try_from(head_count)
+        .map_err(|_| "Metal vision attention head count exceeds u32".to_string())?;
+    let sequence_length_u32 = u32::try_from(sequence_length)
+        .map_err(|_| "Metal vision attention sequence length exceeds u32".to_string())?;
+    let scale = 1.0f32 / ((embedding_length / head_count) as f32).sqrt();
+    let groups = sequence_length
+        .div_ceil(4)
+        .checked_mul(head_count)
+        .ok_or_else(|| "Metal vision attention grid overflow".to_string())?;
+    let command = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal vision attention command buffer creation failed".to_string())?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal vision attention encoder creation failed".to_string())?;
+    encoder.setComputePipelineState(&ctx.vision_attention_pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(&qkv_buf), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 1);
+    }
+    set_u32_bytes(&encoder, embedding_length_u32, 2);
+    set_u32_bytes(&encoder, head_count_u32, 3);
+    set_u32_bytes(&encoder, sequence_length_u32, 4);
+    set_f32_bytes(&encoder, scale, 5);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    if command.status() != MTLCommandBufferStatus::Completed {
+        return Err(format!(
+            "Metal vision attention command failed: status={:?} error={:?}",
+            command.status(),
+            command.error(),
+        ));
+    }
+    Ok(crate::ffn_chain::readback(&output_buf, output_len))
 }
 
 /// Decode(seq_len=1) depthwise causal conv1d + SiLU. `input`/`weight`=[kernel_size*channels],

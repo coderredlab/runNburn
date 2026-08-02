@@ -19,7 +19,7 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| "rnb-qwen36-vision-smoke".into());
     let usage = || {
         eprintln!(
-            "usage: {} <path-to-mmproj.gguf> [--white-reference] [--model <path-to-model.gguf>] [--write-image <path.ppm>]",
+            "usage: {} <path-to-mmproj.gguf> [--white-reference] [--model <path-to-model.gguf>] [--write-image <path.ppm>] [--skip-standalone-encoder]",
             program.to_string_lossy()
         );
     };
@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     let mut white_reference = false;
     let mut model_path = None;
     let mut reference_image_path = None;
+    let mut skip_standalone_encoder = false;
     while let Some(value) = args.next() {
         if value == OsStr::new("--white-reference") {
             white_reference = true;
@@ -45,6 +46,8 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             };
             reference_image_path = Some(PathBuf::from(value));
+        } else if value == OsStr::new("--skip-standalone-encoder") {
+            skip_standalone_encoder = true;
         } else {
             usage();
             return ExitCode::from(2);
@@ -150,34 +153,36 @@ fn main() -> ExitCode {
         &intermediate.patch_embeddings[..8]
     );
 
-    let output = match encode_qwen36_vision_intermediate(&projector, intermediate) {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("Qwen3.6 vision encoder failed: {error}");
-            return ExitCode::FAILURE;
+    if !skip_standalone_encoder {
+        let output = match encode_qwen36_vision_intermediate(&projector, intermediate) {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("Qwen3.6 vision encoder failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for index in [
+            0,
+            output.layer_summaries.len() / 2,
+            output.layer_summaries.len() - 1,
+        ] {
+            let summary = &output.layer_summaries[index];
+            print_stats(&format!("block_{:02}", summary.layer_index), summary.stats);
+            println!(
+                "block_{:02}_first8 = {:?}",
+                summary.layer_index, summary.first_values
+            );
         }
-    };
-    for index in [
-        0,
-        output.layer_summaries.len() / 2,
-        output.layer_summaries.len() - 1,
-    ] {
-        let summary = &output.layer_summaries[index];
-        print_stats(&format!("block_{:02}", summary.layer_index), summary.stats);
+        print_stats("post_layer_norm", output.post_layer_norm_stats);
         println!(
-            "block_{:02}_first8 = {:?}",
-            summary.layer_index, summary.first_values
+            "embedding_shape = [{}, {}]",
+            output.merged_grid_width * output.merged_grid_height,
+            output.projection_dim
         );
+        print_stats("embedding", output.embedding_stats);
+        println!("embedding_sha256 = {}", hash_f32(&output.embeddings));
+        println!("embedding_first8 = {:?}", &output.embeddings[..8]);
     }
-    print_stats("post_layer_norm", output.post_layer_norm_stats);
-    println!(
-        "embedding_shape = [{}, {}]",
-        output.merged_grid_width * output.merged_grid_height,
-        output.projection_dim
-    );
-    print_stats("embedding", output.embedding_stats);
-    println!("embedding_sha256 = {}", hash_f32(&output.embeddings));
-    println!("embedding_first8 = {:?}", &output.embeddings[..8]);
 
     if let Some(model_path) = model_path {
         const PROMPT: &str = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What are the dominant colors in this image?<|im_end|>\n<|im_start|>assistant\n<think>\n";
@@ -189,6 +194,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let started = std::time::Instant::now();
         let logits = match engine.debug_qwen36_multimodal_prefill_logits(PROMPT, &image) {
             Ok(logits) => logits,
             Err(error) => {
@@ -196,6 +202,10 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        println!(
+            "mixed_prefill_wall_ms = {:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
         let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();
         ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
         println!("base_model = {}", model_path.display());
