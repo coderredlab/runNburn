@@ -58,6 +58,30 @@ pub(super) fn gemv_host_quantized(
     };
     quant_gemv::gemv_quantized(bytes, x_data, output, rows, cols, 1, bytes_per_row, quant);
 }
+pub(super) fn gemv_host_quantized_batch(
+    bytes: &[u8],
+    x_data: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    seq_len: usize,
+    bytes_per_row: usize,
+    ggml_type: GGMLType,
+) {
+    let Some(quant) = quant_gemv_type(ggml_type) else {
+        panic!("host expert batch GEMV requested for unsupported quant {ggml_type:?}");
+    };
+    quant_gemv::gemv_quantized(
+        bytes,
+        x_data,
+        output,
+        rows,
+        cols,
+        seq_len,
+        bytes_per_row,
+        quant,
+    );
+}
 
 #[cfg(feature = "cuda")]
 fn cuda_gemv_or_panic(

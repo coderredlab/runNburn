@@ -1,6 +1,8 @@
 use crate::engine::dense_dispatch::gemv_f32;
 use crate::engine::dequant::dequantize_bytes_to_f32;
-use crate::engine::scalar_gemv::{gemv_host_quantized, host_quant_gemv_supported};
+use crate::engine::scalar_gemv::{
+    gemv_host_quantized, gemv_host_quantized_batch, host_quant_gemv_supported,
+};
 use crate::error::Result;
 use rayon::prelude::*;
 use rnb_loader::convert::ggml_quant_params;
@@ -34,6 +36,78 @@ pub(super) fn forward_moe(
     for expert_output in sparse_outputs {
         for (dst, value) in output.iter_mut().zip(expert_output) {
             *dst += value;
+        }
+    }
+    Ok(output)
+}
+pub(super) fn forward_moe_batch(
+    inputs: &[f32],
+    token_ids: &[u32],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Vec<f32>> {
+    let seq_len = token_ids.len();
+    debug_assert_eq!(inputs.len(), seq_len * config.hidden_dim);
+    let routes: Vec<(Vec<usize>, Vec<f32>)> = inputs
+        .par_chunks_exact(config.hidden_dim)
+        .zip(token_ids.par_iter())
+        .map(|(input, &token_id)| route(input, token_id, weights, config))
+        .collect();
+
+    let mut assignments = vec![Vec::<(usize, usize, f32)>::new(); config.expert_count];
+    for (token, (experts, route_weights)) in routes.iter().enumerate() {
+        for (slot, (&expert, &route_weight)) in experts.iter().zip(route_weights).enumerate() {
+            assignments[expert].push((token, slot, route_weight));
+        }
+    }
+
+    let sparse_groups: Vec<(Vec<(usize, usize, f32)>, Vec<f32>)> = assignments
+        .into_par_iter()
+        .enumerate()
+        .filter(|(_, assignments)| !assignments.is_empty())
+        .map(|(expert, assignments)| {
+            let group_len = assignments.len();
+            let mut expert_inputs = Vec::with_capacity(group_len * config.hidden_dim);
+            for &(token, _, _) in &assignments {
+                let start = token * config.hidden_dim;
+                expert_inputs.extend_from_slice(&inputs[start..start + config.hidden_dim]);
+            }
+            let expert_output =
+                compute_sparse_expert_batch(&expert_inputs, expert, group_len, weights, config);
+            (assignments, expert_output)
+        })
+        .collect();
+
+    let shared = &weights.weights;
+    let mut shared_gate = shared.shared_gate.gemv_vec(inputs)?;
+    let mut shared_up = shared.shared_up.gemv_vec(inputs)?;
+    swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
+    let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
+
+    let slot_stride = config.expert_used_count * config.hidden_dim;
+    let mut sparse_by_slot = vec![0.0f32; seq_len * slot_stride];
+    for (assignments, expert_output) in sparse_groups {
+        for (group_row, &(token, slot, route_weight)) in assignments.iter().enumerate() {
+            let src_start = group_row * config.hidden_dim;
+            let dst_start = token * slot_stride + slot * config.hidden_dim;
+            for (dst, &value) in sparse_by_slot[dst_start..dst_start + config.hidden_dim]
+                .iter_mut()
+                .zip(&expert_output[src_start..src_start + config.hidden_dim])
+            {
+                *dst = value * route_weight;
+            }
+        }
+    }
+    for token in 0..seq_len {
+        let output_row = &mut output[token * config.hidden_dim..(token + 1) * config.hidden_dim];
+        for slot in 0..config.expert_used_count {
+            let start = token * slot_stride + slot * config.hidden_dim;
+            for (dst, &value) in output_row
+                .iter_mut()
+                .zip(&sparse_by_slot[start..start + config.hidden_dim])
+            {
+                *dst += value;
+            }
         }
     }
     Ok(output)
@@ -163,6 +237,63 @@ fn compute_sparse_expert(
     }
     output
 }
+fn compute_sparse_expert_batch(
+    inputs: &[f32],
+    expert: usize,
+    seq_len: usize,
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Vec<f32> {
+    let moe = &weights.weights;
+    let gate_bpr = bytes_per_row(config.hidden_dim, moe.gate_quant);
+    let up_bpr = bytes_per_row(config.hidden_dim, moe.up_quant);
+    let down_bpr = bytes_per_row(config.expert_ffn_dim, moe.down_quant);
+    let gate_expert_bytes = config.expert_ffn_dim * gate_bpr;
+    let up_expert_bytes = config.expert_ffn_dim * up_bpr;
+    let down_expert_bytes = config.hidden_dim * down_bpr;
+    let gate_bytes = moe.gate_exps_bytes().expect("DeepSeek4 gate expert bytes");
+    let up_bytes = moe.up_exps_bytes().expect("DeepSeek4 up expert bytes");
+    let down_bytes = moe.down_exps_bytes().expect("DeepSeek4 down expert bytes");
+    let gate_slice = &gate_bytes[expert * gate_expert_bytes..(expert + 1) * gate_expert_bytes];
+    let up_slice = &up_bytes[expert * up_expert_bytes..(expert + 1) * up_expert_bytes];
+    let down_slice = &down_bytes[expert * down_expert_bytes..(expert + 1) * down_expert_bytes];
+
+    let mut gate = vec![0.0f32; seq_len * config.expert_ffn_dim];
+    let mut up = vec![0.0f32; seq_len * config.expert_ffn_dim];
+    host_gemv_batch(
+        gate_slice,
+        inputs,
+        &mut gate,
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        seq_len,
+        gate_bpr,
+        moe.gate_quant,
+    );
+    host_gemv_batch(
+        up_slice,
+        inputs,
+        &mut up,
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        seq_len,
+        up_bpr,
+        moe.up_quant,
+    );
+    swiglu_clamped(&mut gate, &mut up, weights.routed_clamp);
+    let mut output = vec![0.0f32; seq_len * config.hidden_dim];
+    host_gemv_batch(
+        down_slice,
+        &gate,
+        &mut output,
+        config.hidden_dim,
+        config.expert_ffn_dim,
+        seq_len,
+        down_bpr,
+        moe.down_quant,
+    );
+    output
+}
 
 fn host_gemv(
     bytes: &[u8],
@@ -187,6 +318,52 @@ fn host_gemv(
             .map(|(&left, &right)| left * right)
             .sum();
     });
+}
+#[allow(clippy::too_many_arguments)]
+fn host_gemv_batch(
+    bytes: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    seq_len: usize,
+    bytes_per_row: usize,
+    quant: GGMLType,
+) {
+    if host_quant_gemv_supported(quant) {
+        gemv_host_quantized_batch(
+            bytes,
+            input,
+            output,
+            rows,
+            cols,
+            seq_len,
+            bytes_per_row,
+            quant,
+        );
+        return;
+    }
+    let mut row_major = vec![0.0f32; rows * seq_len];
+    row_major
+        .par_chunks_mut(seq_len)
+        .enumerate()
+        .for_each(|(row, values)| {
+            let row_bytes = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+            let dequantized = dequantize_bytes_to_f32(row_bytes, quant);
+            for (token, dst) in values.iter_mut().enumerate() {
+                *dst = dequantized
+                    .iter()
+                    .take(cols)
+                    .zip(&input[token * cols..(token + 1) * cols])
+                    .map(|(&left, &right)| left * right)
+                    .sum();
+            }
+        });
+    for row in 0..rows {
+        for token in 0..seq_len {
+            output[token * rows + row] = row_major[row * seq_len + token];
+        }
+    }
 }
 
 fn swiglu_clamped(gate: &mut [f32], up: &mut [f32], limit: f32) {
