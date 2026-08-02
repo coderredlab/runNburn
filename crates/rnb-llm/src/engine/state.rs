@@ -125,7 +125,7 @@ impl Engine {
     }
 
     pub fn sequence_state_byte_size_estimate(&self) -> u64 {
-        let mtp_bytes = if self.mtp_spec_requested() {
+        let mtp_bytes = if self.sequence_cursor.is_none() && self.mtp_spec_requested() {
             self.mtp_runtime.as_ref().map_or(0, |runtime| {
                 runtime.sequence_state_heap_byte_size_estimate()
             })
@@ -142,18 +142,20 @@ impl Engine {
             )
     }
 
+    fn sequence_state_backend_supported(&self) -> bool {
+        self.architecture != ModelArchitecture::DeepSeek4
+            && !cfg!(any(
+                feature = "vulkan",
+                feature = "opencl",
+                feature = "mediatek"
+            ))
+    }
+
     pub fn durable_sequence_state_supported(&self) -> bool {
-        if self.architecture == ModelArchitecture::DeepSeek4 {
+        if !self.sequence_state_backend_supported() {
             return false;
         }
-        if cfg!(any(
-            feature = "vulkan",
-            feature = "opencl",
-            feature = "mediatek"
-        )) {
-            return false;
-        }
-        if !self.mtp_spec_requested() {
+        if self.sequence_cursor.is_some() || !self.mtp_spec_requested() {
             return true;
         }
         if crate::runtime::mtp_draft_only_enabled()
@@ -228,7 +230,7 @@ impl Engine {
             }
             physical_cached_len
         };
-        let mtp = if self.mtp_spec_requested() {
+        let mtp = if sequence_cursor.is_none() && self.mtp_spec_requested() {
             Some(
                 self.mtp_runtime
                     .as_ref()
@@ -257,13 +259,18 @@ impl Engine {
         &mut self,
         state: &EngineSequenceState,
     ) -> crate::error::Result<()> {
-        if !self.durable_sequence_state_supported() {
+        if !self.sequence_state_backend_supported() {
             return Err(crate::error::LlmError::Unsupported(
                 "durable sequence snapshots are unsupported by the active runtime".to_string(),
             ));
         }
-        let mtp_requested = self.mtp_spec_requested();
-        if mtp_requested != state.mtp.is_some() {
+        if state.sequence_cursor.is_some() {
+            if state.mtp.is_some() {
+                return Err(crate::error::LlmError::Forward(
+                    "multimodal sequence snapshots must not contain MTP state".to_string(),
+                ));
+            }
+        } else if self.mtp_spec_requested() != state.mtp.is_some() {
             return Err(crate::error::LlmError::Forward(
                 "sequence snapshot MTP mode does not match the active runtime".to_string(),
             ));

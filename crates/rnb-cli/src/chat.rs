@@ -1,6 +1,7 @@
 use rnb_llm::{
-    generate_stream_multimodal, ChatMessage, ChatTemplateOptions, Engine, EngineLoadConfig,
-    GenerateParams, Qwen36RgbImage,
+    generate_stream_multimodal, generate_stream_multimodal_resuming, ChatMessage,
+    ChatTemplateOptions, Engine, EngineLoadConfig, EngineSequenceState, GenerateParams,
+    GenerateResult, Qwen36RgbImage,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -135,6 +136,7 @@ fn run_session(
 ) -> Result<(), String> {
     let mut history = ChatHistory::new(config.system_prompt.clone());
     let mut line = String::new();
+    let mut sequence_state: Option<EngineSequenceState> = None;
 
     loop {
         if interactive {
@@ -165,6 +167,10 @@ fn run_session(
             InputAction::Exit => return Ok(()),
             InputAction::Clear => {
                 history.clear();
+                sequence_state = None;
+                engine
+                    .clear_sequence_state()
+                    .map_err(|error| format!("failed to clear sequence state: {error}"))?;
                 writeln!(output, "Conversation cleared.").map_err(|error| error.to_string())?;
             }
             InputAction::Help => {
@@ -180,6 +186,10 @@ fn run_session(
             }
             InputAction::SetSystem(system_prompt) => {
                 history.set_system(system_prompt);
+                sequence_state = None;
+                engine
+                    .clear_sequence_state()
+                    .map_err(|error| format!("failed to clear sequence state: {error}"))?;
                 writeln!(output, "System prompt updated; conversation cleared.")
                     .map_err(|error| error.to_string())?;
             }
@@ -196,27 +206,89 @@ fn run_session(
                     )
                     .map_err(|error| format!("failed to render chat prompt: {error}"))?;
 
-                let result = if let Some(image) = image {
-                    generate_stream_multimodal(engine, &rendered, image, &config.params, |piece| {
-                        if write!(output, "{piece}").is_err() || output.flush().is_err() {
-                            return false;
-                        }
-                        true
-                    })
-                } else {
-                    engine.generate_stream(&rendered, &config.params, |piece| {
-                        if write!(output, "{piece}").is_err() || output.flush().is_err() {
-                            return false;
-                        }
-                        true
-                    })
+                let mut on_piece = |piece: &str| {
+                    if write!(output, "{piece}").is_err() || output.flush().is_err() {
+                        return false;
+                    }
+                    true
+                };
+                let result = match (image, sequence_state.as_ref()) {
+                    (Some(image), Some(state)) => generate_stream_multimodal_resuming(
+                        engine,
+                        &rendered,
+                        image,
+                        &config.params,
+                        state,
+                        &mut on_piece,
+                    ),
+                    (Some(image), None) => generate_stream_multimodal(
+                        engine,
+                        &rendered,
+                        image,
+                        &config.params,
+                        &mut on_piece,
+                    ),
+                    (None, Some(state)) => engine.generate_stream_resuming(
+                        &rendered,
+                        &config.params,
+                        state,
+                        &mut on_piece,
+                    ),
+                    (None, None) => {
+                        engine.generate_stream(&rendered, &config.params, &mut on_piece)
+                    }
                 }
                 .map_err(|error| format!("generation failed: {error}"))?;
                 writeln!(output).map_err(|error| error.to_string())?;
+                sequence_state = capture_chat_sequence_state(
+                    engine,
+                    &history.messages,
+                    &rendered,
+                    &result,
+                    config.enable_thinking,
+                )?;
                 history.push("assistant", result.text);
             }
         }
     }
+}
+
+fn capture_chat_sequence_state(
+    engine: &mut Engine,
+    messages_before_assistant: &[ChatMessage],
+    rendered_prompt: &str,
+    result: &GenerateResult,
+    enable_thinking: bool,
+) -> Result<Option<EngineSequenceState>, String> {
+    if !engine.durable_sequence_state_supported() {
+        return Ok(None);
+    }
+    let (prompt_prefix, append_text) = crate::chat_alignment::render_chat_resume_alignment(
+        &engine.tokenizer,
+        messages_before_assistant,
+        &result.text,
+        ChatTemplateOptions {
+            add_generation_prompt: false,
+            enable_thinking,
+        },
+        &[],
+    )
+    .map_err(|error| format!("failed to align chat continuation: {error}"))?;
+    let mut token_ids = if result.prompt_token_ids.is_empty() {
+        let mut token_ids = Vec::new();
+        if engine.tokenizer.should_add_bos() {
+            token_ids.push(engine.tokenizer.vocab.special.bos);
+        }
+        token_ids.extend(engine.tokenizer.encode(rendered_prompt));
+        token_ids
+    } else {
+        result.prompt_token_ids.clone()
+    };
+    token_ids.extend_from_slice(&result.generated_token_ids);
+    engine
+        .capture_sequence_state_with_prompt_alignment(token_ids, prompt_prefix, append_text)
+        .map(Some)
+        .map_err(|error| format!("failed to capture chat sequence state: {error}"))
 }
 
 fn load_image(path: &std::path::Path) -> Result<Qwen36RgbImage, String> {
@@ -459,6 +531,82 @@ fn print_session_help(mut output: impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rnb_llm::engine::ModelMetadata;
+    use rnb_llm::tokenizer::vocab::{SpecialTokens, Vocab};
+
+    fn mock_engine() -> Engine {
+        let vocab = Vocab::new(
+            (0..16).map(|index| format!("t{index}")).collect(),
+            SpecialTokens {
+                bos: 1,
+                eos: 2,
+                pad: None,
+            },
+        );
+        let mut tokenizer = rnb_llm::Tokenizer::new_sentencepiece_with_config(
+            vocab,
+            Vec::new(),
+            Vec::new(),
+            false,
+            true,
+        );
+        tokenizer.set_chat_template(Some(
+            "{% for message in messages %}<{{ message.role }}>{{ message.content | trim }}</{{ message.role }}>{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}"
+                .to_string(),
+        ));
+        Engine::mock(
+            tokenizer,
+            ModelMetadata {
+                num_layers: 1,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                vocab_size: 16,
+                max_seq_len: 64,
+                hidden_dim: 8,
+                rope_theta: 10_000.0,
+                rope_theta_swa: 10_000.0,
+                rope_dim: 0,
+                rope_dim_swa: 0,
+                rope_sections: [0; 4],
+                norm_eps: 1e-5,
+                final_logit_softcapping: 0.0,
+                query_pre_attn_scalar: 256.0,
+                sliding_window: 0,
+                shared_kv_layers: 0,
+                sliding_window_pattern: vec![],
+                key_length_full: 0,
+                key_length_swa: 0,
+                value_length_swa: 0,
+                head_count_kv_per_layer: None,
+                embedding_length_per_layer_input: 0,
+                expert_used_count: 0,
+                expert_weights_scale: 1.0,
+                ssm_d_inner: 0,
+                ssm_d_state: 0,
+                ssm_n_group: 0,
+                ssm_dt_rank: 0,
+                ssm_conv_kernel: 0,
+                full_attention_interval: 0,
+            },
+        )
+    }
+
+    fn chat_config(max_tokens: usize) -> ChatConfig {
+        ChatConfig {
+            model_path: PathBuf::from("model.gguf"),
+            mmproj_path: None,
+            image_path: None,
+            ram_budget_bytes: None,
+            system_prompt: None,
+            params: GenerateParams {
+                max_tokens,
+                temperature: 0.0,
+                ..GenerateParams::default()
+            },
+            enable_thinking: false,
+        }
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -555,5 +703,63 @@ mod tests {
             history.messages[0].content,
             Some(rnb_llm::ChatContent::Text("Use Korean.".to_string()))
         );
+    }
+
+    #[test]
+    fn captured_chat_state_resumes_only_the_appended_turn() {
+        let mut engine = mock_engine();
+        let params = chat_config(1).params;
+        let first_messages = vec![ChatMessage::new("user", "first")];
+        let first_prompt = engine
+            .tokenizer
+            .render_chat_prompt(&first_messages, ChatTemplateOptions::default())
+            .unwrap();
+        let first = engine
+            .generate_stream(&first_prompt, &params, |_| true)
+            .unwrap();
+        engine.kv_cache.append(0, 0, &[0.0, 0.0], &[0.0, 0.0]);
+        let state =
+            capture_chat_sequence_state(&mut engine, &first_messages, &first_prompt, &first, false)
+                .unwrap()
+                .unwrap();
+
+        let second_messages = vec![
+            ChatMessage::new("user", "first"),
+            ChatMessage::new("assistant", first.text.clone()),
+            ChatMessage::new("user", "second"),
+        ];
+        let second_prompt = engine
+            .tokenizer
+            .render_chat_prompt(&second_messages, ChatTemplateOptions::default())
+            .unwrap();
+        let second = engine
+            .generate_stream_resuming(&second_prompt, &params, &state, |_| true)
+            .unwrap();
+
+        assert_eq!(second.cached_prompt_tokens, state.token_len());
+        assert!(second.cached_prompt_tokens > 0);
+    }
+
+    #[test]
+    fn clear_command_releases_cached_sequence_state() {
+        let mut engine = mock_engine();
+        engine.kv_cache.append(0, 0, &[0.0, 0.0], &[0.0, 0.0]);
+        let config = chat_config(1);
+        let mut output = Vec::new();
+
+        run_session(
+            &mut engine,
+            &config,
+            None,
+            std::io::Cursor::new(b"/clear\n/bye\n"),
+            &mut output,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(engine.kv_cache.current_len(), 0);
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("Conversation cleared."));
     }
 }

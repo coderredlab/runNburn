@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 mod chat;
+mod chat_alignment;
 mod runtime_boundary;
 mod server;
 

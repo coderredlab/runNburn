@@ -95,7 +95,6 @@ pub(super) struct PreparedGenerationRequest {
 pub(super) struct ResponseHistoryContext {
     messages: Vec<ChatMessage>,
     prompt_definitions: Vec<Value>,
-    append_text: String,
 }
 
 impl ResponseHistoryContext {
@@ -104,28 +103,16 @@ impl ResponseHistoryContext {
         engine: &Engine,
         assistant_content: &str,
     ) -> Result<(String, String), String> {
-        let mut user_sentinel = "__RNB_RESPONSE_NEXT_USER_CONTENT_51D8E604__".to_string();
-        while assistant_content.contains(&user_sentinel) {
-            user_sentinel.push('_');
-        }
-        let mut messages = self.messages.clone();
-        messages.push(ChatMessage::new("assistant", assistant_content));
-        messages.push(ChatMessage::new("user", user_sentinel.clone()));
-        let rendered = engine
-            .tokenizer
-            .render_chat_prompt_with_tools(
-                &messages,
-                ChatTemplateOptions {
-                    add_generation_prompt: false,
-                    enable_thinking: false,
-                },
-                &self.prompt_definitions,
-            )
-            .map_err(|error| error.to_string())?;
-        let (prompt_prefix, _) = rendered
-            .split_once(&user_sentinel)
-            .ok_or_else(|| "chat template omitted the next user content".to_string())?;
-        Ok((prompt_prefix.to_string(), self.append_text.clone()))
+        crate::chat_alignment::render_chat_resume_alignment(
+            &engine.tokenizer,
+            &self.messages,
+            assistant_content,
+            ChatTemplateOptions {
+                add_generation_prompt: false,
+                enable_thinking: false,
+            },
+            &self.prompt_definitions,
+        )
     }
 }
 
@@ -318,46 +305,12 @@ impl GenerationRequest {
                 }
                 error => ApiError::internal(error.to_string()),
             })?;
-        let response_history_context = if self.capture_response_history {
-            let mut assistant_sentinel = "__RNB_RESPONSE_ASSISTANT_CONTENT_7F43A9C2__".to_string();
-            let mut user_sentinel = "__RNB_RESPONSE_NEXT_USER_CONTENT_51D8E604__".to_string();
-            while prompt.contains(&assistant_sentinel) || prompt.contains(&user_sentinel) {
-                assistant_sentinel.push('_');
-                user_sentinel.push('_');
-            }
-            let mut history_messages = self.messages.clone();
-            history_messages.push(ChatMessage::new("assistant", assistant_sentinel.clone()));
-            history_messages.push(ChatMessage::new("user", user_sentinel.clone()));
-            let rendered = engine
-                .tokenizer
-                .render_chat_prompt_with_tools(
-                    &history_messages,
-                    ChatTemplateOptions {
-                        add_generation_prompt: false,
-                        enable_thinking: false,
-                    },
-                    &tools.prompt_definitions,
-                )
-                .map_err(|error| match error {
-                    rnb_llm::error::LlmError::InvalidChatRequest(message) => {
-                        ApiError::invalid(message, Some(self.input_param), Some("invalid_value"))
-                    }
-                    error => ApiError::internal(error.to_string()),
-                })?;
-            let (_, tail) = rendered.split_once(&assistant_sentinel).ok_or_else(|| {
-                ApiError::internal("chat template omitted the assistant response content")
-            })?;
-            let (bridge, _) = tail
-                .split_once(&user_sentinel)
-                .ok_or_else(|| ApiError::internal("chat template omitted the next user content"))?;
-            Some(ResponseHistoryContext {
-                messages: self.messages.clone(),
-                prompt_definitions: tools.prompt_definitions.clone(),
-                append_text: bridge.to_string(),
-            })
-        } else {
-            None
-        };
+        let response_history_context =
+            self.capture_response_history
+                .then(|| ResponseHistoryContext {
+                    messages: self.messages.clone(),
+                    prompt_definitions: tools.prompt_definitions.clone(),
+                });
 
         let mut params = GenerateParams::default();
         params.max_tokens = self.max_tokens.unwrap_or(params.max_tokens);
