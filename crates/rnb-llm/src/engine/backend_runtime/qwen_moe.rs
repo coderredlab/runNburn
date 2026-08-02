@@ -3354,7 +3354,7 @@ mod tests {
         restore_env(key, previous);
     }
 
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     #[test]
     fn qwen_moe_prefill_cpu_route_arrays_match_token_major_topk() {
         let router_w = [
