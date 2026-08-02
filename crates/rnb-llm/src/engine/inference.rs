@@ -606,13 +606,13 @@ impl Engine {
         _commit_final_states: bool,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         let pos_start = self.kv_cache.current_len();
-        let rope_pos_start = Self::mtp_target_position_start(
-            self.sequence_cursor.map(|cursor| cursor.logical_position),
-            pos_start,
-            0,
-        );
         #[cfg(feature = "cuda")]
         {
+            let rope_pos_start = Self::mtp_target_position_start(
+                self.sequence_cursor.map(|cursor| cursor.logical_position),
+                pos_start,
+                0,
+            );
             let request = _request;
             let prefix_tokens = _prefix_tokens;
             let commit_final_states = _commit_final_states;
