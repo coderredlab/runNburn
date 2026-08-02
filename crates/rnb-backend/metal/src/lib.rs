@@ -33,6 +33,8 @@ mod device;
 
 #[cfg(target_os = "macos")]
 mod compute;
+#[cfg(target_os = "macos")]
+mod deepseek4_decode;
 #[cfg(all(test, target_os = "macos"))]
 mod qwen_moe_llama_id_microbench;
 
@@ -1402,6 +1404,12 @@ pub struct MetalBackend {
     decode_chain_hidden: RefCell<HashMap<usize, Retained<ProtocolObject<dyn MTLBuffer>>>>,
     /// pm112: GLM MLA decode chain scratch. shape 키 별 1회 alloc.
     glm_mla_carriers: RefCell<HashMap<(usize, usize, usize, usize), ffn_chain::GlmMlaCarrier>>,
+    /// DeepSeek4 decode phase layout → fused Q8_0 multi-projection carrier.
+    deepseek4_q8_multi_carriers:
+        RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::Q8MultiGemvCarrier>>,
+    /// DeepSeek4 prefill projection layout → largest reusable input/output carrier.
+    deepseek4_prefill_q8_multi_carriers:
+        RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::PrefillQ8MultiCarrier>>,
     /// pm112: wrap 된 weight buffer 를 queue-attached MTLResidencySet 에 등록해
     /// 매 command buffer submit 의 wiring(drv) 비용을 줄인다. 예산 초과 시 LRU evict
     /// (무제한 wiring 은 RAM 스래싱 — 20토큰 GLM 런에서 wired 38GB 관측).
@@ -1713,6 +1721,8 @@ impl MetalBackend {
                 constant_u32: RefCell::new(HashMap::new()),
                 decode_chain_hidden: RefCell::new(HashMap::new()),
                 glm_mla_carriers: RefCell::new(HashMap::new()),
+                deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
+                deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
                 weight_residency: RefCell::new(None),
                 ffn_carriers: RefCell::new(HashMap::new()),
                 prefill_ffn_carriers: RefCell::new(HashMap::new()),
@@ -1873,6 +1883,8 @@ impl MetalBackend {
             constant_u32: RefCell::new(HashMap::new()),
             decode_chain_hidden: RefCell::new(HashMap::new()),
             glm_mla_carriers: RefCell::new(HashMap::new()),
+            deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
+            deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
             weight_residency: RefCell::new(None),
             ffn_carriers: RefCell::new(HashMap::new()),
             prefill_ffn_carriers: RefCell::new(HashMap::new()),

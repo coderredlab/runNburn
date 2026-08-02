@@ -2941,6 +2941,133 @@ pub(in crate::engine) struct MetalProjTrace {
     pub(in crate::engine) timing_enabled: bool,
 }
 
+pub(in crate::engine) fn metal_deepseek4_attention_prefill_batch_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_attention_prefill_batch_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_attention_prefill_output_batch_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_attention_prefill_output_batch_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+pub(in crate::engine) fn metal_deepseek4_attention_prefill_compressor_fused_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_attention_prefill_compressor_fused_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_attention_prefill_index_batch_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_attention_prefill_index_batch_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_q8_multi_gemv_if_supported(
+    weights: &[&QuantizedWeight],
+    inputs: &[&[f32]],
+) -> crate::error::Result<Option<Vec<Vec<f32>>>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(raw) = weights
+            .iter()
+            .map(|weight| weight.data.as_bytes())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let quants = weights
+            .iter()
+            .map(|weight| weight.ggml_type)
+            .collect::<Vec<_>>();
+        let layout = weights
+            .iter()
+            .map(|weight| (weight.rows, weight.cols))
+            .collect::<Vec<_>>();
+        return metal_runtime::metal_deepseek4_q8_multi_gemv_if_supported(
+            &quants, &raw, inputs, &layout,
+        )
+        .map_err(|err| crate::error::LlmError::Forward(err.to_string()));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (weights, inputs);
+        Ok(None)
+    }
+}
+pub(in crate::engine) fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
+    weights: &[&QuantizedWeight],
+    input: &[f32],
+    seq_len: usize,
+) -> crate::error::Result<Option<Vec<Vec<f32>>>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(raw) = weights
+            .iter()
+            .map(|weight| weight.data.as_bytes())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let quants = weights
+            .iter()
+            .map(|weight| weight.ggml_type)
+            .collect::<Vec<_>>();
+        let layout = weights
+            .iter()
+            .map(|weight| (weight.rows, weight.cols))
+            .collect::<Vec<_>>();
+        return metal_runtime::metal_deepseek4_prefill_q8_multi_gemm_if_supported(
+            &quants, &raw, input, seq_len, &layout,
+        )
+        .map_err(|err| crate::error::LlmError::Forward(err.to_string()));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (weights, input, seq_len);
+        Ok(None)
+    }
+}
+
+pub(in crate::engine) fn metal_deepseek4_attention_prefill_batch_tokens(
+    seq_len: usize,
+    scratch_bytes_per_token: usize,
+) -> usize {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_deepseek4_attention_prefill_batch_tokens(
+            seq_len,
+            scratch_bytes_per_token,
+        );
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = scratch_bytes_per_token;
+        seq_len.min(1)
+    }
+}
+
 pub(in crate::engine) fn metal_prefill_gdn_proj_into_if_supported(
     weight: &QuantizedWeight,
     normed: &[f32],

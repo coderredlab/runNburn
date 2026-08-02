@@ -3,7 +3,10 @@ use crate::engine::quantized_weight_types::QuantizedWeight;
 use crate::error::{LlmError, Result};
 use rnb_core::tensor::Tensor;
 
-use super::attention::forward_attention;
+use super::attention::{
+    attention_prefill_batch_scratch_bytes_per_token, forward_attention,
+    forward_attention_batch_if_supported,
+};
 use super::math::{hyper_head, hyper_post, hyper_pre, rms_norm};
 use super::moe::{forward_moe, forward_moe_batch};
 use super::weights::DeepSeek4Weights;
@@ -40,19 +43,88 @@ pub(in crate::engine) fn forward_tokens(
     }
 
     for (layer, attention_state) in model.layers.iter().zip(&mut model.state.layers) {
-        let mut attention_hidden = Vec::with_capacity(hidden.len());
-        for (token, residual) in hidden.chunks_exact(row_width).enumerate() {
-            let mix = hyper_pre(residual, &layer.attn_hc, config);
-            let attn_input = rms_norm(&mix.branch, &layer.attn_norm, config.norm_eps);
-            let attn_output = forward_attention(
-                &attn_input,
-                start_position + token,
-                &layer.attention,
-                attention_state,
-                config,
-            )?;
-            attention_hidden.extend(hyper_post(&attn_output, residual, mix, config));
-        }
+        let attention_batch_tokens =
+            if crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_requested() {
+                attention_prefill_batch_scratch_bytes_per_token(&layer.attention, config)
+                    .map(|scratch_bytes_per_token| {
+                        crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_tokens(
+                            seq_len,
+                            scratch_bytes_per_token,
+                        )
+                    })
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+        let attention_hidden = if attention_batch_tokens >= 2 {
+            let mut next_hidden = Vec::with_capacity(hidden.len());
+            let mut chunk_start_token = 0;
+            for residual_chunk in hidden.chunks(attention_batch_tokens * row_width) {
+                let chunk_len = residual_chunk.len() / row_width;
+                let mut mixes = Vec::with_capacity(chunk_len);
+                let mut attention_inputs = Vec::with_capacity(chunk_len * config.hidden_dim);
+                for residual in residual_chunk.chunks_exact(row_width) {
+                    let mut mix = hyper_pre(residual, &layer.attn_hc, config);
+                    attention_inputs.extend(rms_norm(
+                        &mix.branch,
+                        &layer.attn_norm,
+                        config.norm_eps,
+                    ));
+                    mix.branch = Vec::new();
+                    mixes.push(mix);
+                }
+                let batched = forward_attention_batch_if_supported(
+                    &attention_inputs,
+                    start_position + chunk_start_token,
+                    &layer.attention,
+                    attention_state,
+                    config,
+                )?;
+                if let Some(attention_outputs) = batched {
+                    debug_assert_eq!(attention_outputs.len(), chunk_len * config.hidden_dim);
+                    for ((residual, mix), attn_output) in residual_chunk
+                        .chunks_exact(row_width)
+                        .zip(mixes)
+                        .zip(attention_outputs.chunks_exact(config.hidden_dim))
+                    {
+                        next_hidden.extend(hyper_post(attn_output, residual, mix, config));
+                    }
+                } else {
+                    for (token, ((residual, mix), attn_input)) in residual_chunk
+                        .chunks_exact(row_width)
+                        .zip(mixes)
+                        .zip(attention_inputs.chunks_exact(config.hidden_dim))
+                        .enumerate()
+                    {
+                        let attn_output = forward_attention(
+                            attn_input,
+                            start_position + chunk_start_token + token,
+                            &layer.attention,
+                            attention_state,
+                            config,
+                        )?;
+                        next_hidden.extend(hyper_post(&attn_output, residual, mix, config));
+                    }
+                }
+                chunk_start_token += chunk_len;
+            }
+            next_hidden
+        } else {
+            let mut next_hidden = Vec::with_capacity(hidden.len());
+            for (token, residual) in hidden.chunks_exact(row_width).enumerate() {
+                let mix = hyper_pre(residual, &layer.attn_hc, config);
+                let attn_input = rms_norm(&mix.branch, &layer.attn_norm, config.norm_eps);
+                let attn_output = forward_attention(
+                    &attn_input,
+                    start_position + token,
+                    &layer.attention,
+                    attention_state,
+                    config,
+                )?;
+                next_hidden.extend(hyper_post(&attn_output, residual, mix, config));
+            }
+            next_hidden
+        };
         hidden = attention_hidden;
 
         let mut mixes = Vec::with_capacity(seq_len);

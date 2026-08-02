@@ -1082,6 +1082,141 @@ fn env_falsey(var: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn metal_deepseek4_attention_prefill_batch_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_BATCH")
+}
+
+pub fn metal_deepseek4_attention_prefill_output_batch_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_OUTPUT_BATCH")
+}
+pub fn metal_deepseek4_attention_prefill_compressor_fused_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_COMPRESS_FUSED")
+}
+
+pub fn metal_deepseek4_attention_prefill_index_batch_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_INDEX_BATCH")
+}
+
+pub fn metal_deepseek4_attention_decode_requested() -> bool {
+    !env_falsey("RNB_METAL_DEEPSEEK4_ATTN_DECODE")
+}
+
+pub fn metal_deepseek4_q8_multi_gemv_if_supported(
+    quants: &[GGMLType],
+    weights: &[&[u8]],
+    inputs: &[&[f32]],
+    layout: &[(usize, usize)],
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if !metal_deepseek4_attention_decode_requested()
+        || quants.len() != layout.len()
+        || weights.len() != layout.len()
+        || inputs.len() != layout.len()
+        || layout.is_empty()
+    {
+        return Ok(None);
+    }
+    for (((&quant, raw), input), &(rows, cols)) in
+        quants.iter().zip(weights).zip(inputs).zip(layout)
+    {
+        let expected = rows.saturating_mul(cols / 32).saturating_mul(34);
+        if quant != GGMLType::Q8_0
+            || rows == 0
+            || cols == 0
+            || cols % 32 != 0
+            || input.len() != cols
+            || raw.len() < expected
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(METAL.with(|backend| {
+        backend.deepseek4_q8_multi_gemv(weights, inputs, layout)
+    })))
+}
+pub fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
+    quants: &[GGMLType],
+    weights: &[&[u8]],
+    input: &[f32],
+    seq_len: usize,
+    layout: &[(usize, usize)],
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if quants.len() != layout.len()
+        || weights.len() != layout.len()
+        || layout.is_empty()
+        || seq_len < 2
+    {
+        return Ok(None);
+    }
+    let hidden_dim = layout[0].1;
+    if input.len() != seq_len.saturating_mul(hidden_dim) {
+        return Ok(None);
+    }
+    for ((&quant, raw), &(rows, cols)) in quants.iter().zip(weights).zip(layout) {
+        let expected = rows.saturating_mul(cols / 32).saturating_mul(34);
+        if quant != GGMLType::Q8_0
+            || rows == 0
+            || cols != hidden_dim
+            || cols % 32 != 0
+            || raw.len() < expected
+        {
+            return Ok(None);
+        }
+    }
+    Ok(METAL
+        .with(|backend| backend.deepseek4_prefill_q8_multi_gemm(weights, input, seq_len, layout)))
+}
+
+// Temporary projection buffers must stay small beside file-backed weights on unified memory.
+// The capacity fraction bounds cold allocations; the available-memory fraction shrinks first
+// under pressure from the mapped model or other applications.
+const DEEPSEEK4_PREFILL_SCRATCH_CAPACITY_DIVISOR: u64 = 64;
+const DEEPSEEK4_PREFILL_SCRATCH_PRESSURE_DIVISOR: u64 = 8;
+
+pub fn metal_deepseek4_attention_prefill_batch_tokens(
+    seq_len: usize,
+    scratch_bytes_per_token: usize,
+) -> usize {
+    metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+        seq_len,
+        scratch_bytes_per_token,
+        rnb_platform::host_physical_memory_bytes(),
+        rnb_platform::host_available_memory_bytes(),
+    )
+}
+
+fn metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+    seq_len: usize,
+    scratch_bytes_per_token: usize,
+    physical_ram_bytes: Option<u64>,
+    available_ram_bytes: Option<u64>,
+) -> usize {
+    if seq_len < 2 {
+        return seq_len;
+    }
+    let Ok(scratch_bytes_per_token) = u64::try_from(scratch_bytes_per_token) else {
+        return 1;
+    };
+    if scratch_bytes_per_token == 0 {
+        return 1;
+    }
+
+    let capacity_budget = physical_ram_bytes
+        .filter(|&bytes| bytes > 0)
+        .map(|bytes| bytes / DEEPSEEK4_PREFILL_SCRATCH_CAPACITY_DIVISOR);
+    let pressure_budget = available_ram_bytes
+        .filter(|&bytes| bytes > 0)
+        .map(|bytes| bytes / DEEPSEEK4_PREFILL_SCRATCH_PRESSURE_DIVISOR);
+    let scratch_budget = match (capacity_budget, pressure_budget) {
+        (Some(capacity), Some(pressure)) => capacity.min(pressure),
+        (Some(capacity), None) => capacity,
+        (None, Some(pressure)) => pressure,
+        (None, None) => return 1,
+    };
+    usize::try_from(scratch_budget / scratch_bytes_per_token)
+        .unwrap_or(seq_len)
+        .clamp(1, seq_len)
+}
+
 fn metal_prefill_atn_full_layer_requested() -> bool {
     !env_falsey("RNB_METAL_PREFILL_ATN_FULL_LAYER")
 }
@@ -5700,6 +5835,193 @@ mod gdn_full_ffn_policy_tests {
 fn metal_inference_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod deepseek4_attention_prefill_batch_policy_tests {
+    use super::*;
+
+    #[test]
+    fn deepseek4_attention_prefill_batch_defaults_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let key = "RNB_METAL_DEEPSEEK4_ATTN_BATCH";
+        let previous = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(metal_deepseek4_attention_prefill_batch_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(
+                !metal_deepseek4_attention_prefill_batch_requested(),
+                "{value} should opt out"
+            );
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(
+                metal_deepseek4_attention_prefill_batch_requested(),
+                "{value} should keep the default enabled"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_attention_prefill_output_batch_defaults_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let key = "RNB_METAL_DEEPSEEK4_ATTN_OUTPUT_BATCH";
+        let previous = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(metal_deepseek4_attention_prefill_output_batch_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(
+                !metal_deepseek4_attention_prefill_output_batch_requested(),
+                "{value} should opt out"
+            );
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(
+                metal_deepseek4_attention_prefill_output_batch_requested(),
+                "{value} should keep the default enabled"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_attention_prefill_compressor_fused_defaults_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let key = "RNB_METAL_DEEPSEEK4_ATTN_COMPRESS_FUSED";
+        let previous = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(metal_deepseek4_attention_prefill_compressor_fused_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(
+                !metal_deepseek4_attention_prefill_compressor_fused_requested(),
+                "{value} should opt out"
+            );
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(
+                metal_deepseek4_attention_prefill_compressor_fused_requested(),
+                "{value} should keep the default enabled"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_attention_prefill_index_batch_defaults_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let key = "RNB_METAL_DEEPSEEK4_ATTN_INDEX_BATCH";
+        let previous = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(metal_deepseek4_attention_prefill_index_batch_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(
+                !metal_deepseek4_attention_prefill_index_batch_requested(),
+                "{value} should opt out"
+            );
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(
+                metal_deepseek4_attention_prefill_index_batch_requested(),
+                "{value} should keep the default enabled"
+            );
+        }
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_attention_decode_defaults_on_with_falsey_opt_out() {
+        let _guard = metal_inference_env_lock().lock().expect("env lock");
+        let key = "RNB_METAL_DEEPSEEK4_ATTN_DECODE";
+        let previous = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(metal_deepseek4_attention_decode_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(!metal_deepseek4_attention_decode_requested());
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(metal_deepseek4_attention_decode_requested());
+        }
+
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn deepseek4_attention_prefill_batch_scales_with_memory_pressure() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const SCRATCH_PER_TOKEN: usize = 512 * 1024;
+
+        assert_eq!(
+            metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+                4096,
+                SCRATCH_PER_TOKEN,
+                Some(64 * GIB),
+                Some(8 * GIB),
+            ),
+            2048
+        );
+        assert_eq!(
+            metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+                4096,
+                SCRATCH_PER_TOKEN,
+                Some(64 * GIB),
+                Some(2 * GIB),
+            ),
+            512
+        );
+        assert_eq!(
+            metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+                21,
+                SCRATCH_PER_TOKEN,
+                Some(64 * GIB),
+                Some(8 * GIB),
+            ),
+            21
+        );
+        assert_eq!(
+            metal_deepseek4_attention_prefill_batch_tokens_from_capacity(
+                4096,
+                SCRATCH_PER_TOKEN,
+                None,
+                None,
+            ),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
