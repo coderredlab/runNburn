@@ -38,7 +38,7 @@ pub use tool_call::{
 
 // SharedKvStates / SharedKvLayer 는 rnb-mtp 에 정의된다.
 // rnb-llm 은 rnb-mtp 에 의존 (helper direction). 편의를 위해 re-export.
-pub use rnb_model_qwen::Qwen36RgbImage;
+pub use rnb_core::image::RgbImage;
 pub use rnb_mtp::{SharedKvLayer, SharedKvStates};
 
 pub fn reset_metal_prefill_atn_full_counters() {

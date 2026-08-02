@@ -1,7 +1,7 @@
 use super::http::ApiError;
 use super::image_input::decode_data_image;
 use super::responses::{invalid, unsupported, validate_name};
-use rnb_llm::{ChatContent, ChatContentPart, ChatMessage, Qwen36RgbImage};
+use rnb_llm::{ChatContent, ChatContentPart, ChatMessage, RgbImage};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -15,7 +15,7 @@ pub(super) enum ResponseInput {
 #[derive(Debug)]
 pub(super) struct NormalizedResponseInput {
     pub messages: Vec<ChatMessage>,
-    pub image: Option<Qwen36RgbImage>,
+    pub image: Option<RgbImage>,
 }
 
 impl ResponseInput {
@@ -88,7 +88,7 @@ pub(super) fn normalize_input(
 fn normalize_message(
     object: &Map<String, Value>,
     index: usize,
-) -> Result<(ChatMessage, Option<Qwen36RgbImage>), ApiError> {
+) -> Result<(ChatMessage, Option<RgbImage>), ApiError> {
     let role = object
         .get("role")
         .and_then(Value::as_str)
@@ -119,7 +119,7 @@ fn normalize_message_content(
     content: &Value,
     item_index: usize,
     role: &str,
-) -> Result<(ChatContent, Option<Qwen36RgbImage>), ApiError> {
+) -> Result<(ChatContent, Option<RgbImage>), ApiError> {
     if let Some(text) = content.as_str() {
         return Ok((ChatContent::Text(text.to_string()), None));
     }

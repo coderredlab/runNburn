@@ -3,10 +3,10 @@ use super::layer_weights::ModelWeights;
 use super::mtp::{EngineMtpRuntime, EngineMtpSequenceState, EngineMtpState};
 use super::types::{ModelMetadata, ScratchBuffers};
 use crate::kv_cache::{KVCache, KVCacheSnapshot, KvCacheMetrics};
-use crate::multimodal::{qwen36_image_fingerprint, SequenceCursor};
+use crate::multimodal::{image_fingerprint, SequenceCursor};
 use crate::tokenizer::Tokenizer;
+use rnb_core::image::RgbImage;
 use rnb_loader::Architecture as ModelArchitecture;
-use rnb_model_qwen::Qwen36RgbImage;
 
 #[derive(Clone)]
 struct PromptResumeAlignment {
@@ -33,9 +33,9 @@ impl EngineSequenceState {
         self.sequence_cursor.is_some()
     }
 
-    pub(crate) fn matches_multimodal_image(&self, image: &Qwen36RgbImage) -> bool {
+    pub(crate) fn matches_multimodal_image(&self, image: &RgbImage) -> bool {
         self.sequence_cursor
-            .is_some_and(|cursor| cursor.image_fingerprint == qwen36_image_fingerprint(image))
+            .is_some_and(|cursor| cursor.image_fingerprint == image_fingerprint(image))
     }
 
     pub fn byte_size(&self) -> u64 {
@@ -376,19 +376,19 @@ mod tests {
             let pos = engine.kv_cache.current_len();
             engine.kv_cache.append(0, pos, &row, &row);
         }
-        let image = Qwen36RgbImage::new(1, 1, vec![10, 20, 30]).unwrap();
+        let image = RgbImage::new(1, 1, vec![10, 20, 30]).unwrap();
         engine.sequence_cursor = Some(SequenceCursor {
             physical_rows: 3,
             logical_position: 7,
             token_count: 2,
-            image_fingerprint: qwen36_image_fingerprint(&image),
+            image_fingerprint: image_fingerprint(&image),
         });
 
         let state = engine.capture_sequence_state(vec![3, 4, 5, 6]).unwrap();
         assert_eq!(state.token_len(), 2);
         assert!(state.is_multimodal());
         assert!(state.matches_multimodal_image(&image));
-        let other_image = Qwen36RgbImage::new(1, 1, vec![10, 20, 31]).unwrap();
+        let other_image = RgbImage::new(1, 1, vec![10, 20, 31]).unwrap();
         assert!(!state.matches_multimodal_image(&other_image));
 
         engine.clear_sequence_state().unwrap();
@@ -400,7 +400,7 @@ mod tests {
                 physical_rows: 3,
                 logical_position: 7,
                 token_count: 2,
-                image_fingerprint: qwen36_image_fingerprint(&image),
+                image_fingerprint: image_fingerprint(&image),
             })
         );
     }

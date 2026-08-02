@@ -4,7 +4,7 @@ use crate::sampler::SamplerChain;
 use crate::tokenizer::{TokenStreamDecoder, Tokenizer};
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
-use rnb_model_qwen::Qwen36RgbImage;
+use rnb_core::image::RgbImage;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -484,7 +484,7 @@ fn generate_stream_impl_with_tokens(
 pub fn generate_stream_multimodal_resuming(
     engine: &mut crate::engine::Engine,
     rendered_prompt: &str,
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
     params: &GenerateParams,
     state: &crate::engine::EngineSequenceState,
     callback: impl FnMut(&str) -> bool,
@@ -573,7 +573,7 @@ pub fn generate_stream_multimodal_resuming(
 pub fn generate_stream_multimodal_resuming_cancellable(
     engine: &mut crate::engine::Engine,
     rendered_prompt: &str,
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
     params: &GenerateParams,
     state: &crate::engine::EngineSequenceState,
     cancellation: &GenerationCancellation,
@@ -587,13 +587,13 @@ pub fn generate_stream_multimodal_resuming_cancellable(
 pub fn generate_stream_multimodal(
     engine: &mut crate::engine::Engine,
     rendered_prompt: &str,
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
     params: &GenerateParams,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
     let start = Instant::now();
     check_generation_cancellation()?;
-    let compiled = engine.compile_qwen36_multimodal_prompt(rendered_prompt, image)?;
+    let compiled = engine.compile_multimodal_prompt(rendered_prompt, image)?;
     let prompt_len = compiled.executed_rows;
     let total_rows = prompt_len.saturating_add(params.max_tokens);
     if total_rows > engine.metadata.max_seq_len {
@@ -644,7 +644,7 @@ pub fn generate_stream_multimodal(
 pub fn generate_stream_multimodal_cancellable(
     engine: &mut crate::engine::Engine,
     rendered_prompt: &str,
-    image: &Qwen36RgbImage,
+    image: &RgbImage,
     params: &GenerateParams,
     cancellation: &GenerationCancellation,
     callback: impl FnMut(&str) -> bool,

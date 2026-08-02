@@ -1,7 +1,7 @@
 use rnb_llm::{
     generate_stream_multimodal, generate_stream_multimodal_resuming, ChatMessage,
     ChatTemplateOptions, Engine, EngineLoadConfig, EngineSequenceState, GenerateParams,
-    GenerateResult, Qwen36RgbImage,
+    GenerateResult, RgbImage,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -129,7 +129,7 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
 fn run_session(
     engine: &mut Engine,
     config: &ChatConfig,
-    image: Option<&Qwen36RgbImage>,
+    image: Option<&RgbImage>,
     mut input: impl BufRead,
     output: &mut impl Write,
     interactive: bool,
@@ -291,13 +291,13 @@ fn capture_chat_sequence_state(
         .map_err(|error| format!("failed to capture chat sequence state: {error}"))
 }
 
-fn load_image(path: &std::path::Path) -> Result<Qwen36RgbImage, String> {
+fn load_image(path: &std::path::Path) -> Result<RgbImage, String> {
     let decoded = image::ImageReader::open(path)
         .map_err(|error| format!("failed to open image {}: {error}", path.display()))?
         .decode()
         .map_err(|error| format!("failed to decode image {}: {error}", path.display()))?
         .into_rgb8();
-    Qwen36RgbImage::new(
+    RgbImage::new(
         decoded.width() as usize,
         decoded.height() as usize,
         decoded.into_raw(),
@@ -474,7 +474,7 @@ fn print_help(mut output: impl Write) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "  --mmproj <path>       Qwen3.6 vision projector GGUF used with --image"
+        "  --mmproj <path>       Vision projector GGUF used with --image"
     )?;
     writeln!(
         output,

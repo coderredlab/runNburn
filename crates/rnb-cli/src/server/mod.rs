@@ -306,7 +306,7 @@ fn print_usage() {
     eprintln!("  --host HOST          Bind host (default: 127.0.0.1)");
     eprintln!("  --port PORT          Bind port (default: 8000)");
     eprintln!("  --model-name NAME    Model ID exposed through /v1/models");
-    eprintln!("  --mmproj PATH        Qwen3.6 vision projector GGUF");
+    eprintln!("  --mmproj PATH        Vision projector GGUF");
     eprintln!("  --ram-budget SIZE    Host RAM budget, for example 8GiB");
     eprintln!("  --response-cache-budget SIZE  Stored response/KV cache cap");
     eprintln!("  --api-key-file PATH  Read the bearer API key from a one-line file");

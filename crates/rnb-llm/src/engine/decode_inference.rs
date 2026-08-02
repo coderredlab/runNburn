@@ -1,4 +1,5 @@
 use super::*;
+use crate::multimodal::SequenceCursor;
 
 mod draft;
 mod output;
@@ -23,6 +24,26 @@ pub(crate) struct BatchedVerifyCommit {
     out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>>,
     /// attn layer 의 kv_dim(=num_kv_heads*head_dim), 그 외 None.
     kv_dims: Vec<Option<usize>>,
+}
+
+fn multimodal_decode_position(
+    cursor: Option<SequenceCursor>,
+    architecture: ModelArchitecture,
+    physical_position: usize,
+) -> crate::error::Result<(usize, bool)> {
+    let Some(cursor) = cursor else {
+        return Ok((physical_position, false));
+    };
+    if cursor.physical_rows != physical_position {
+        return Err(crate::error::LlmError::Forward(format!(
+            "multimodal physical cursor {} does not match KV length {physical_position}",
+            cursor.physical_rows
+        )));
+    }
+    Ok((
+        cursor.logical_position as usize,
+        matches!(architecture, ModelArchitecture::Qwen35MoE),
+    ))
 }
 
 impl Engine {
@@ -692,18 +713,8 @@ impl Engine {
         emit_layer_trace("decode-input", usize::MAX, &scratch.hidden[..hidden_dim]);
 
         let pos = self.kv_cache.current_len();
-        let (rope_pos, force_qwen_imrope) = match self.sequence_cursor {
-            Some(cursor) => {
-                if cursor.physical_rows != pos {
-                    return Err(crate::error::LlmError::Forward(format!(
-                        "multimodal physical cursor {} does not match KV length {pos}",
-                        cursor.physical_rows
-                    )));
-                }
-                (cursor.logical_position as usize, true)
-            }
-            None => (pos, false),
-        };
+        let (rope_pos, force_qwen_imrope) =
+            multimodal_decode_position(self.sequence_cursor, self.architecture, pos)?;
 
         // 2. Transformer layers — with per-layer timing for verbose mode
         let t_layers = std::time::Instant::now();
@@ -728,7 +739,7 @@ impl Engine {
         #[cfg(feature = "vulkan")]
         let backend_max_layer = self.decode_backend_max_layer();
         let use_backend_output_logits = backend_runtime::output_logits_enabled_for_runtime();
-        let mtp_collect_hidden = self.mtp_spec_requested() && !force_qwen_imrope;
+        let mtp_collect_hidden = self.sequence_cursor.is_none() && self.mtp_spec_requested();
         let kv_cache = &mut self.kv_cache;
 
         let decode_result: crate::error::Result<Option<Vec<f32>>> = (|| {
@@ -2014,6 +2025,31 @@ mod tests {
         assert!(super::decode_chain_prior_kv_required(Some(4555), 4556));
         assert!(!super::decode_chain_prior_kv_required(Some(4556), 4556));
         assert!(!super::decode_chain_prior_kv_required(Some(4557), 4556));
+    }
+
+    #[test]
+    fn multimodal_decode_uses_imrope_only_for_qwen() {
+        let cursor = super::SequenceCursor {
+            physical_rows: 10,
+            logical_position: 7,
+            token_count: 4,
+            image_fingerprint: [0; 32],
+        };
+
+        assert_eq!(
+            super::multimodal_decode_position(
+                Some(cursor),
+                super::ModelArchitecture::Qwen35MoE,
+                10,
+            )
+            .unwrap(),
+            (7, true)
+        );
+        assert_eq!(
+            super::multimodal_decode_position(Some(cursor), super::ModelArchitecture::Gemma4, 10,)
+                .unwrap(),
+            (7, false)
+        );
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

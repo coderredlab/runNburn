@@ -1,6 +1,8 @@
-use rnb_model_qwen::{
-    plan_qwen36_multimodal_positions, Qwen36PositionSpan, Qwen36RgbImage, Qwen36VisionOutput,
-};
+use std::ops::Range;
+
+use rnb_core::image::RgbImage;
+use rnb_model_gemma::Gemma4VisionOutput;
+use rnb_model_qwen::{plan_qwen36_multimodal_positions, Qwen36PositionSpan, Qwen36VisionOutput};
 use sha2::{Digest, Sha256};
 
 use crate::error::{LlmError, Result};
@@ -20,12 +22,20 @@ pub enum PromptSpan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum PromptPositions {
+    Linear,
+    QwenImrope(Vec<[u32; 4]>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledPrompt {
     pub spans: Vec<PromptSpan>,
-    pub positions: Vec<[u32; 4]>,
+    pub positions: PromptPositions,
     pub executed_rows: usize,
     pub logical_position_end: u32,
     pub sampler_token_ids: Vec<u32>,
+    pub physical_token_ids: Vec<u32>,
+    pub image_rows: Range<usize>,
     pub(crate) image_fingerprint: [u8; 32],
 }
 
@@ -38,7 +48,7 @@ pub(crate) struct SequenceCursor {
 }
 
 impl SequenceCursor {
-    pub(crate) fn qwen_multimodal(prompt: &CompiledPrompt) -> Self {
+    pub(crate) fn multimodal(prompt: &CompiledPrompt) -> Self {
         Self {
             physical_rows: prompt.executed_rows,
             logical_position: prompt.logical_position_end,
@@ -48,7 +58,7 @@ impl SequenceCursor {
     }
 }
 
-pub(crate) fn qwen36_image_fingerprint(image: &Qwen36RgbImage) -> [u8; 32] {
+pub(crate) fn image_fingerprint(image: &RgbImage) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update((image.width() as u64).to_le_bytes());
     hasher.update((image.height() as u64).to_le_bytes());
@@ -132,7 +142,107 @@ pub(crate) fn compile_qwen36_prompt(
         .collect::<Vec<_>>();
     let position_plan = plan_qwen36_multimodal_positions(&position_spans, 0)
         .map_err(|error| LlmError::Forward(error.to_string()))?;
-    let sampler_token_ids = spans
+    let sampler_token_ids = sampler_token_ids(&spans);
+    let physical_token_ids = physical_token_ids(&spans);
+    let image_rows = embedding_range(&spans)?;
+
+    Ok(CompiledPrompt {
+        spans,
+        positions: PromptPositions::QwenImrope(position_plan.positions),
+        executed_rows: position_plan.physical_rows,
+        logical_position_end: position_plan.logical_position_end,
+        sampler_token_ids,
+        physical_token_ids,
+        image_rows,
+        image_fingerprint,
+    })
+}
+
+pub(crate) fn compile_gemma4_prompt(
+    token_ids: Vec<u32>,
+    image_placeholder_id: u32,
+    image_begin_id: u32,
+    image_end_id: u32,
+    vision: Gemma4VisionOutput,
+    image_fingerprint: [u8; 32],
+) -> Result<CompiledPrompt> {
+    let placeholders = token_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &token)| (token == image_placeholder_id).then_some(index))
+        .collect::<Vec<_>>();
+    if placeholders.len() != 1 {
+        return Err(LlmError::InvalidChatRequest(format!(
+            "Gemma 4 multimodal prompt must contain exactly one <|image|> token, got {}",
+            placeholders.len()
+        )));
+    }
+    let image_rows = vision
+        .pooled_grid_width
+        .checked_mul(vision.pooled_grid_height)
+        .ok_or_else(|| LlmError::Forward("Gemma 4 image row count overflows usize".into()))?;
+    let expected_values = image_rows
+        .checked_mul(vision.projection_dim)
+        .ok_or_else(|| LlmError::Forward("Gemma 4 image value count overflows usize".into()))?;
+    if vision.embeddings.len() != expected_values {
+        return Err(LlmError::Forward(format!(
+            "Gemma 4 image embedding has {} values, expected {expected_values}",
+            vision.embeddings.len()
+        )));
+    }
+
+    let placeholder = placeholders[0];
+    let mut spans = Vec::with_capacity(5);
+    if placeholder > 0 {
+        spans.push(PromptSpan::Tokens {
+            ids: token_ids[..placeholder].to_vec(),
+        });
+    }
+    spans.push(PromptSpan::Tokens {
+        ids: vec![image_begin_id],
+    });
+    spans.push(PromptSpan::Embeddings {
+        rows: image_rows,
+        width: vision.projection_dim,
+        values: vision.embeddings,
+        grid_width: vision.pooled_grid_width,
+        grid_height: vision.pooled_grid_height,
+    });
+    spans.push(PromptSpan::Tokens {
+        ids: vec![image_end_id],
+    });
+    if placeholder + 1 < token_ids.len() {
+        spans.push(PromptSpan::Tokens {
+            ids: token_ids[placeholder + 1..].to_vec(),
+        });
+    }
+    let executed_rows = spans.iter().map(prompt_span_rows).sum::<usize>();
+    let logical_position_end = u32::try_from(executed_rows)
+        .map_err(|_| LlmError::Forward("Gemma 4 logical position overflows u32".into()))?;
+    let sampler_token_ids = sampler_token_ids(&spans);
+    let physical_token_ids = physical_token_ids(&spans);
+    let image_rows = embedding_range(&spans)?;
+    Ok(CompiledPrompt {
+        spans,
+        positions: PromptPositions::Linear,
+        executed_rows,
+        logical_position_end,
+        sampler_token_ids,
+        physical_token_ids,
+        image_rows,
+        image_fingerprint,
+    })
+}
+
+fn prompt_span_rows(span: &PromptSpan) -> usize {
+    match span {
+        PromptSpan::Tokens { ids } => ids.len(),
+        PromptSpan::Embeddings { rows, .. } => *rows,
+    }
+}
+
+fn sampler_token_ids(spans: &[PromptSpan]) -> Vec<u32> {
+    spans
         .iter()
         .filter_map(|span| match span {
             PromptSpan::Tokens { ids } => Some(ids.as_slice()),
@@ -140,16 +250,35 @@ pub(crate) fn compile_qwen36_prompt(
         })
         .flatten()
         .copied()
-        .collect();
+        .collect()
+}
 
-    Ok(CompiledPrompt {
-        spans,
-        positions: position_plan.positions,
-        executed_rows: position_plan.physical_rows,
-        logical_position_end: position_plan.logical_position_end,
-        sampler_token_ids,
-        image_fingerprint,
-    })
+fn physical_token_ids(spans: &[PromptSpan]) -> Vec<u32> {
+    spans
+        .iter()
+        .flat_map(|span| match span {
+            PromptSpan::Tokens { ids } => ids.clone(),
+            PromptSpan::Embeddings { rows, .. } => vec![0; *rows],
+        })
+        .collect()
+}
+
+fn embedding_range(spans: &[PromptSpan]) -> Result<Range<usize>> {
+    let mut start = 0usize;
+    let mut found = None;
+    for span in spans {
+        let rows = prompt_span_rows(span);
+        if matches!(span, PromptSpan::Embeddings { .. }) {
+            if found.is_some() {
+                return Err(LlmError::InvalidChatRequest(
+                    "multimodal prompt supports exactly one image span".into(),
+                ));
+            }
+            found = Some(start..start + rows);
+        }
+        start += rows;
+    }
+    found.ok_or_else(|| LlmError::Forward("multimodal prompt has no image span".into()))
 }
 
 pub(crate) fn assemble_prompt_hidden(
@@ -217,6 +346,7 @@ pub(crate) fn assemble_prompt_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rnb_model_gemma::Gemma4TensorStats;
     use rnb_model_qwen::Qwen36TensorStats;
 
     fn vision_output(values: Vec<f32>) -> Qwen36VisionOutput {
@@ -242,6 +372,29 @@ mod tests {
         }
     }
 
+    fn gemma_vision_output(values: Vec<f32>) -> Gemma4VisionOutput {
+        let stats = Gemma4TensorStats {
+            count: values.len(),
+            mean: 0.0,
+            stddev: 0.0,
+            min: 0.0,
+            max: 0.0,
+        };
+        Gemma4VisionOutput {
+            target_width: 96,
+            target_height: 48,
+            patch_grid_width: 6,
+            patch_grid_height: 3,
+            pooled_grid_width: 2,
+            pooled_grid_height: 1,
+            projection_dim: 2,
+            layer_summaries: Vec::new(),
+            pooled_stats: stats,
+            embedding_stats: stats,
+            embeddings: values,
+        }
+    }
+
     #[test]
     fn compile_replaces_only_image_placeholder_with_physical_rows() {
         let prompt =
@@ -251,10 +404,13 @@ mod tests {
         assert_eq!(prompt.executed_rows, 4);
         assert_eq!(prompt.logical_position_end, 4);
         assert_eq!(prompt.sampler_token_ids, vec![10, 11]);
-        assert_eq!(prompt.positions[0], [0, 0, 0, 0]);
-        assert_eq!(prompt.positions[1], [1, 1, 1, 0]);
-        assert_eq!(prompt.positions[2], [1, 1, 2, 0]);
-        assert_eq!(prompt.positions[3], [3, 3, 3, 3]);
+        let PromptPositions::QwenImrope(positions) = &prompt.positions else {
+            panic!("Qwen prompt should carry IMRoPE positions");
+        };
+        assert_eq!(positions[0], [0, 0, 0, 0]);
+        assert_eq!(positions[1], [1, 1, 1, 0]);
+        assert_eq!(positions[2], [1, 1, 2, 0]);
+        assert_eq!(positions[3], [3, 3, 3, 3]);
     }
 
     #[test]
@@ -280,6 +436,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(hidden, vec![20.0, 21.0, 0.25, -0.5, 0.75, -1.0, 22.0, 23.0]);
+    }
+
+    #[test]
+    fn gemma_compile_wraps_non_causal_image_rows_with_boundary_tokens() {
+        let prompt = compile_gemma4_prompt(
+            vec![10, 99, 11],
+            99,
+            77,
+            78,
+            gemma_vision_output(vec![0.25, -0.5, 0.75, -1.0]),
+            [3; 32],
+        )
+        .unwrap();
+
+        assert_eq!(prompt.positions, PromptPositions::Linear);
+        assert_eq!(prompt.executed_rows, 6);
+        assert_eq!(prompt.logical_position_end, 6);
+        assert_eq!(prompt.sampler_token_ids, vec![10, 77, 78, 11]);
+        assert_eq!(prompt.physical_token_ids, vec![10, 77, 0, 0, 78, 11]);
+        assert_eq!(prompt.image_rows, 2..4);
     }
 
     #[test]

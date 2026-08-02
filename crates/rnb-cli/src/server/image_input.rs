@@ -2,14 +2,14 @@ use super::http::ApiError;
 use super::responses::unsupported;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use image::{ImageFormat, ImageReader, Limits};
-use rnb_llm::Qwen36RgbImage;
+use rnb_llm::RgbImage;
 use std::io::Cursor;
 
 pub(super) fn decode_data_image(
     url: &str,
     parameter: &'static str,
     field: &str,
-) -> Result<Qwen36RgbImage, ApiError> {
+) -> Result<RgbImage, ApiError> {
     const MAX_ENCODED_BYTES: usize = 28 * 1024 * 1024;
     const MAX_DECODED_ALLOC: u64 = 256 * 1024 * 1024;
     const MAX_DIMENSION: u32 = 8192;
@@ -81,13 +81,11 @@ pub(super) fn decode_data_image(
         )
     })?;
     let rgb = decoded.into_rgb8();
-    Qwen36RgbImage::new(rgb.width() as usize, rgb.height() as usize, rgb.into_raw()).map_err(
-        |error| {
-            ApiError::invalid(
-                format!("invalid image: {error}"),
-                Some(parameter),
-                Some("invalid_image"),
-            )
-        },
-    )
+    RgbImage::new(rgb.width() as usize, rgb.height() as usize, rgb.into_raw()).map_err(|error| {
+        ApiError::invalid(
+            format!("invalid image: {error}"),
+            Some(parameter),
+            Some("invalid_image"),
+        )
+    })
 }

@@ -3,7 +3,7 @@ use super::image_input::decode_data_image;
 use super::structured::{prepare_generation_constraint, prepare_tools};
 use rnb_llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatTemplateOptions, Engine, GenerateParams,
-    Qwen36RgbImage,
+    RgbImage,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -89,7 +89,7 @@ pub(super) struct PreparedGenerationRequest {
     pub tool_names: Vec<String>,
     pub parallel_tool_calls: bool,
     pub response_history_context: Option<ResponseHistoryContext>,
-    pub image: Option<Qwen36RgbImage>,
+    pub image: Option<RgbImage>,
 }
 
 pub(super) struct ResponseHistoryContext {
@@ -119,7 +119,7 @@ impl ResponseHistoryContext {
 pub(super) struct GenerationRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    pub image: Option<Qwen36RgbImage>,
+    pub image: Option<RgbImage>,
     pub max_tokens: Option<usize>,
     pub max_tokens_param: &'static str,
     pub input_param: &'static str,
@@ -405,10 +405,7 @@ impl GenerationRequest {
 }
 
 impl ApiMessage {
-    fn into_chat_message(
-        self,
-        index: usize,
-    ) -> Result<(ChatMessage, Option<Qwen36RgbImage>), ApiError> {
+    fn into_chat_message(self, index: usize) -> Result<(ChatMessage, Option<RgbImage>), ApiError> {
         if !matches!(
             self.role.as_str(),
             "system" | "developer" | "user" | "assistant" | "tool"
@@ -499,7 +496,7 @@ impl MessageContent {
         self,
         message_index: usize,
         role: &str,
-    ) -> Result<(ChatContent, Option<Qwen36RgbImage>), ApiError> {
+    ) -> Result<(ChatContent, Option<RgbImage>), ApiError> {
         match self {
             Self::Text(text) => Ok((ChatContent::Text(text), None)),
             Self::Parts(parts) => {

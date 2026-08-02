@@ -270,28 +270,50 @@ impl Engine {
             build_model_metadata(&model, vocab_size)
         });
         let vision_projector = if let Some(projector_path) = vision_projector_path {
-            if model.metadata.architecture != ModelArchitecture::Qwen35MoE {
-                return Err(crate::error::LlmError::ModelLoad(format!(
-                    "Qwen3.6 mmproj requires base architecture qwen35moe, got {:?}",
-                    model.metadata.architecture
-                )));
-            }
             let projector = load_stage!("load_vision_projector", {
                 rnb_loader::load_vision_projector(&projector_path)
             })
             .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
-            let capability = rnb_model_qwen::inspect_qwen36_vision_projector(&projector.descriptor)
-                .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))?;
-            if capability.projection_dim != metadata.hidden_dim {
+            let (projection_dim, model_name) = match model.metadata.architecture {
+                ModelArchitecture::Qwen35MoE => {
+                    let capability =
+                        rnb_model_qwen::inspect_qwen36_vision_projector(&projector.descriptor)
+                            .map_err(|error| {
+                                crate::error::LlmError::ModelLoad(error.to_string())
+                            })?;
+                    if tokenizer.token_id("<|image_pad|>").is_none() {
+                        return Err(crate::error::LlmError::ModelLoad(
+                            "Qwen3.6 tokenizer is missing required <|image_pad|> token".into(),
+                        ));
+                    }
+                    (capability.projection_dim, "Qwen3.6")
+                }
+                ModelArchitecture::Gemma4 => {
+                    let capability =
+                        rnb_model_gemma::inspect_gemma4_vision_projector(&projector.descriptor)
+                            .map_err(|error| {
+                                crate::error::LlmError::ModelLoad(error.to_string())
+                            })?;
+                    for token in ["<|image|>", "<|image>", "<image|>"] {
+                        if tokenizer.token_id(token).is_none() {
+                            return Err(crate::error::LlmError::ModelLoad(format!(
+                                "Gemma 4 tokenizer is missing required {token} token"
+                            )));
+                        }
+                    }
+                    (capability.projection_dim, "Gemma 4")
+                }
+                architecture => {
+                    return Err(crate::error::LlmError::ModelLoad(format!(
+                        "vision projector requires Qwen35MoE or Gemma4, got {architecture:?}"
+                    )));
+                }
+            };
+            if projection_dim != metadata.hidden_dim {
                 return Err(crate::error::LlmError::ModelLoad(format!(
-                    "Qwen3.6 mmproj projection width {} does not match base model hidden width {}",
-                    capability.projection_dim, metadata.hidden_dim
+                    "{model_name} mmproj projection width {projection_dim} does not match base model hidden width {}",
+                    metadata.hidden_dim
                 )));
-            }
-            if tokenizer.token_id("<|image_pad|>").is_none() {
-                return Err(crate::error::LlmError::ModelLoad(
-                    "Qwen3.6 tokenizer is missing required <|image_pad|> token".into(),
-                ));
             }
             Some(projector)
         } else {

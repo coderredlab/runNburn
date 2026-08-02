@@ -1,16 +1,22 @@
+use rnb_core::image::RgbImage;
 use rnb_core::tensor::Tensor;
 use rnb_loader::Architecture as ModelArchitecture;
-use rnb_model_qwen::{
-    encode_qwen36_vision_intermediate, prepare_qwen36_vision_intermediate, Qwen36RgbImage,
-};
+use rnb_model_gemma::{encode_gemma4_vision_intermediate, prepare_gemma4_vision_intermediate};
+use rnb_model_qwen::{encode_qwen36_vision_intermediate, prepare_qwen36_vision_intermediate};
 
-use super::models::gemma::apply_embedding_scale_inplace;
-use super::prefill::run_prefill_layers_cpu_range_with_positions;
+use super::models::gemma::{
+    apply_embedding_scale, apply_embedding_scale_inplace, gemma_ple_pre_emb_scale_base,
+    prepare_gemma_per_layer_base,
+};
+use super::prefill::{
+    run_prefill_layers_cpu_range, run_prefill_layers_cpu_range_non_causal,
+    run_prefill_layers_cpu_range_with_positions,
+};
 use super::{finalize_prefill_logits, kernels, Engine};
 use crate::error::{LlmError, Result};
 use crate::multimodal::{
-    assemble_prompt_hidden, compile_qwen36_prompt, qwen36_image_fingerprint, CompiledPrompt,
-    SequenceCursor,
+    assemble_prompt_hidden, compile_gemma4_prompt, compile_qwen36_prompt, image_fingerprint,
+    CompiledPrompt, PromptPositions, PromptSpan, SequenceCursor,
 };
 
 impl Engine {
@@ -18,41 +24,69 @@ impl Engine {
         self.vision_projector.is_some()
     }
 
-    pub fn compile_qwen36_multimodal_prompt(
+    pub(crate) fn compile_multimodal_prompt(
         &self,
         rendered_prompt: &str,
-        image: &Qwen36RgbImage,
+        image: &RgbImage,
     ) -> Result<CompiledPrompt> {
-        if self.architecture != ModelArchitecture::Qwen35MoE {
-            return Err(LlmError::InvalidChatRequest(format!(
-                "image input requires Qwen35MoE, got {:?}",
-                self.architecture
-            )));
-        }
         let projector = self.vision_projector.as_ref().ok_or_else(|| {
             LlmError::InvalidChatRequest(
                 "image input requires an explicitly configured vision projector".into(),
             )
         })?;
-        let image_pad_token_id = self.tokenizer.token_id("<|image_pad|>").ok_or_else(|| {
-            LlmError::Tokenizer("Qwen3.6 tokenizer is missing <|image_pad|>".into())
-        })?;
-
-        let intermediate = prepare_qwen36_vision_intermediate(projector, image)
-            .map_err(|error| LlmError::Forward(error.to_string()))?;
-        let vision = encode_qwen36_vision_intermediate(projector, intermediate)
-            .map_err(|error| LlmError::Forward(error.to_string()))?;
         let mut token_ids = Vec::new();
         if self.tokenizer.should_add_bos() {
             token_ids.push(self.tokenizer.vocab.special.bos);
         }
         token_ids.extend(self.tokenizer.encode(rendered_prompt));
-        let compiled = compile_qwen36_prompt(
-            token_ids,
-            image_pad_token_id,
-            vision,
-            qwen36_image_fingerprint(image),
-        )?;
+
+        let compiled = match self.architecture {
+            ModelArchitecture::Qwen35MoE => {
+                let image_pad_token_id =
+                    self.tokenizer.token_id("<|image_pad|>").ok_or_else(|| {
+                        LlmError::Tokenizer("Qwen3.6 tokenizer is missing <|image_pad|>".into())
+                    })?;
+                let intermediate = prepare_qwen36_vision_intermediate(projector, image)
+                    .map_err(|error| LlmError::Forward(error.to_string()))?;
+                let vision = encode_qwen36_vision_intermediate(projector, intermediate)
+                    .map_err(|error| LlmError::Forward(error.to_string()))?;
+                compile_qwen36_prompt(
+                    token_ids,
+                    image_pad_token_id,
+                    vision,
+                    image_fingerprint(image),
+                )?
+            }
+            ModelArchitecture::Gemma4 => {
+                let image_placeholder_id =
+                    self.tokenizer.token_id("<|image|>").ok_or_else(|| {
+                        LlmError::Tokenizer("Gemma 4 tokenizer is missing <|image|>".into())
+                    })?;
+                let image_begin_id = self.tokenizer.token_id("<|image>").ok_or_else(|| {
+                    LlmError::Tokenizer("Gemma 4 tokenizer is missing <|image>".into())
+                })?;
+                let image_end_id = self.tokenizer.token_id("<image|>").ok_or_else(|| {
+                    LlmError::Tokenizer("Gemma 4 tokenizer is missing <image|>".into())
+                })?;
+                let intermediate = prepare_gemma4_vision_intermediate(projector, image)
+                    .map_err(|error| LlmError::Forward(error.to_string()))?;
+                let vision = encode_gemma4_vision_intermediate(projector, intermediate)
+                    .map_err(|error| LlmError::Forward(error.to_string()))?;
+                compile_gemma4_prompt(
+                    token_ids,
+                    image_placeholder_id,
+                    image_begin_id,
+                    image_end_id,
+                    vision,
+                    image_fingerprint(image),
+                )?
+            }
+            architecture => {
+                return Err(LlmError::InvalidChatRequest(format!(
+                    "image input is unsupported for {architecture:?}"
+                )));
+            }
+        };
         if compiled.executed_rows > self.metadata.max_seq_len {
             return Err(LlmError::InvalidChatRequest(format!(
                 "multimodal prompt executes {} rows, exceeding context limit {}",
@@ -62,36 +96,67 @@ impl Engine {
         Ok(compiled)
     }
 
+    pub fn compile_qwen36_multimodal_prompt(
+        &self,
+        rendered_prompt: &str,
+        image: &RgbImage,
+    ) -> Result<CompiledPrompt> {
+        if self.architecture != ModelArchitecture::Qwen35MoE {
+            return Err(LlmError::InvalidChatRequest(format!(
+                "Qwen3.6 image input requires Qwen35MoE, got {:?}",
+                self.architecture
+            )));
+        }
+        self.compile_multimodal_prompt(rendered_prompt, image)
+    }
+
     /// Runs a fresh Qwen3.6 multimodal prefill and returns the first decode-step logits.
     ///
     /// This is a diagnostic seam for numerical comparison with reference runtimes.
     pub fn debug_qwen36_multimodal_prefill_logits(
         &mut self,
         rendered_prompt: &str,
-        image: &Qwen36RgbImage,
+        image: &RgbImage,
     ) -> Result<Vec<f32>> {
+        if self.architecture != ModelArchitecture::Qwen35MoE {
+            return Err(LlmError::InvalidChatRequest(format!(
+                "Qwen3.6 image input requires Qwen35MoE, got {:?}",
+                self.architecture
+            )));
+        }
         self.clear_sequence_state()?;
-        let prompt = self.compile_qwen36_multimodal_prompt(rendered_prompt, image)?;
+        let prompt = self.compile_multimodal_prompt(rendered_prompt, image)?;
+        self.forward_compiled_prompt(&prompt)
+    }
+
+    /// Runs a fresh Gemma 4 multimodal prefill and returns the first decode-step logits.
+    pub fn debug_gemma4_multimodal_prefill_logits(
+        &mut self,
+        rendered_prompt: &str,
+        image: &RgbImage,
+    ) -> Result<Vec<f32>> {
+        if self.architecture != ModelArchitecture::Gemma4 {
+            return Err(LlmError::InvalidChatRequest(format!(
+                "Gemma 4 image input requires Gemma4, got {:?}",
+                self.architecture
+            )));
+        }
+        self.clear_sequence_state()?;
+        let prompt = self.compile_multimodal_prompt(rendered_prompt, image)?;
         self.forward_compiled_prompt(&prompt)
     }
 
     pub(crate) fn forward_compiled_prompt(&mut self, prompt: &CompiledPrompt) -> Result<Vec<f32>> {
         crate::generate::check_generation_cancellation()?;
-        if self.architecture != ModelArchitecture::Qwen35MoE {
-            return Err(LlmError::Forward(format!(
-                "compiled Qwen3.6 prompt cannot run on {:?}",
-                self.architecture
-            )));
-        }
         if prompt.executed_rows == 0 {
             return Err(LlmError::InvalidChatRequest(
                 "multimodal prompt must execute at least one row".into(),
             ));
         }
-        if prompt.positions.len() != prompt.executed_rows {
+        if prompt.physical_token_ids.len() != prompt.executed_rows {
             return Err(LlmError::Forward(format!(
-                "compiled prompt has {} positions for {} physical rows",
-                prompt.positions.len(),
+                "compiled prompt has {} physical token IDs for {} rows",
+                prompt.physical_token_ids.len(),
                 prompt.executed_rows
             )));
         }
@@ -102,6 +167,33 @@ impl Engine {
             ));
         }
 
+        match self.architecture {
+            ModelArchitecture::Qwen35MoE => self.forward_qwen36_compiled_prompt(prompt),
+            ModelArchitecture::Gemma4 => self.forward_gemma4_compiled_prompt(prompt),
+            architecture => Err(LlmError::Forward(format!(
+                "compiled multimodal prompt cannot run on {architecture:?}"
+            ))),
+        }
+    }
+
+    fn forward_qwen36_compiled_prompt(&mut self, prompt: &CompiledPrompt) -> Result<Vec<f32>> {
+        let positions = match &prompt.positions {
+            PromptPositions::QwenImrope(positions) if positions.len() == prompt.executed_rows => {
+                positions
+            }
+            PromptPositions::QwenImrope(positions) => {
+                return Err(LlmError::Forward(format!(
+                    "compiled prompt has {} positions for {} physical rows",
+                    positions.len(),
+                    prompt.executed_rows
+                )));
+            }
+            PromptPositions::Linear => {
+                return Err(LlmError::Forward(
+                    "Qwen3.6 multimodal prompt requires IMRoPE positions".into(),
+                ));
+            }
+        };
         let weights = self.weights.as_ref().ok_or_else(|| {
             LlmError::Forward("multimodal prefill requires loaded model weights".into())
         })?;
@@ -139,7 +231,7 @@ impl Engine {
             0..self.metadata.num_layers,
             seq_len,
             0,
-            &prompt.positions,
+            positions,
             rope_sections,
             self.metadata.num_heads,
             self.metadata.num_kv_heads,
@@ -159,7 +251,129 @@ impl Engine {
             self.metadata.norm_eps,
             Some(&mut self.last_layer_hidden_cached),
         )?;
-        self.sequence_cursor = Some(SequenceCursor::qwen_multimodal(prompt));
+        self.sequence_cursor = Some(SequenceCursor::multimodal(prompt));
+        Ok(logits)
+    }
+
+    fn forward_gemma4_compiled_prompt(&mut self, prompt: &CompiledPrompt) -> Result<Vec<f32>> {
+        if prompt.positions != PromptPositions::Linear {
+            return Err(LlmError::Forward(
+                "Gemma 4 multimodal prompt requires linear positions".into(),
+            ));
+        }
+        let weights = self.weights.as_ref().ok_or_else(|| {
+            LlmError::Forward("multimodal prefill requires loaded model weights".into())
+        })?;
+        let hidden_dim = self.metadata.hidden_dim;
+        let kv_dim = self.metadata.num_kv_heads * self.metadata.head_dim;
+        let mut last_output = None;
+
+        for span in &prompt.spans {
+            crate::generate::check_generation_cancellation()?;
+            let pos_start = self.kv_cache.current_len();
+            let (raw_hidden, hidden, token_ids, non_causal) = match span {
+                PromptSpan::Tokens { ids } => {
+                    let raw_hidden = weights.token_embd.gather(ids)?;
+                    let hidden = apply_embedding_scale(
+                        raw_hidden.clone(),
+                        &self.metadata,
+                        self.architecture,
+                    );
+                    (raw_hidden, hidden, ids.clone(), false)
+                }
+                PromptSpan::Embeddings {
+                    rows,
+                    width,
+                    values,
+                    ..
+                } => {
+                    if *width != hidden_dim || values.len() != rows * width {
+                        return Err(LlmError::Forward(format!(
+                            "Gemma 4 image embedding shape [{rows}, {width}] does not match hidden width {hidden_dim}"
+                        )));
+                    }
+                    let hidden = Tensor::from_slice(values, &[*rows, *width]);
+                    (hidden.clone(), hidden, vec![0; *rows], true)
+                }
+            };
+            let seq_len = token_ids.len();
+            if seq_len == 0 {
+                continue;
+            }
+            let ple_base = prepare_gemma_per_layer_base(
+                weights,
+                if gemma_ple_pre_emb_scale_base() {
+                    &raw_hidden
+                } else {
+                    &hidden
+                },
+                &token_ids,
+                &self.metadata,
+                self.architecture,
+                self.metadata.norm_eps,
+            )?;
+            let output = if non_causal {
+                run_prefill_layers_cpu_range_non_causal(
+                    &mut self.kv_cache,
+                    &self.metadata,
+                    self.architecture,
+                    weights,
+                    ple_base.as_ref(),
+                    hidden,
+                    0..self.metadata.num_layers,
+                    seq_len,
+                    pos_start,
+                    self.metadata.num_heads,
+                    self.metadata.num_kv_heads,
+                    self.metadata.head_dim,
+                    kv_dim,
+                    self.metadata.rope_theta,
+                    self.metadata.norm_eps,
+                )?
+            } else {
+                run_prefill_layers_cpu_range(
+                    &mut self.kv_cache,
+                    &self.metadata,
+                    self.architecture,
+                    weights,
+                    ple_base.as_ref(),
+                    hidden,
+                    0..self.metadata.num_layers,
+                    seq_len,
+                    pos_start,
+                    self.metadata.num_heads,
+                    self.metadata.num_kv_heads,
+                    self.metadata.head_dim,
+                    kv_dim,
+                    self.metadata.rope_theta,
+                    self.metadata.norm_eps,
+                )?
+            };
+            last_output = Some((output, seq_len, pos_start));
+        }
+
+        if self.kv_cache.current_len() != prompt.executed_rows {
+            return Err(LlmError::Forward(format!(
+                "Gemma 4 multimodal prefill cached {} rows, expected {}",
+                self.kv_cache.current_len(),
+                prompt.executed_rows
+            )));
+        }
+        let (output, seq_len, pos_start) = last_output.ok_or_else(|| {
+            LlmError::Forward("Gemma 4 multimodal prompt produced no hidden rows".into())
+        })?;
+        let logits = finalize_prefill_logits(
+            &mut self.kv_cache,
+            &self.metadata,
+            self.architecture,
+            weights,
+            output,
+            seq_len,
+            pos_start,
+            self.metadata.norm_eps,
+            Some(&mut self.last_layer_hidden_cached),
+        )?;
+        self.sequence_cursor = Some(SequenceCursor::multimodal(prompt));
         Ok(logits)
     }
 }
