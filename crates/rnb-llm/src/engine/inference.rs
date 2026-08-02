@@ -3400,10 +3400,13 @@ fn k_quant_weight_bytes_for_mtp_device<'a>(
 ) -> crate::error::Result<(&'a [u8], rnb_loader::GGMLType)> {
     if !matches!(
         weight.ggml_type,
-        rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K | rnb_loader::GGMLType::Q8_0
+        rnb_loader::GGMLType::Q4_K
+            | rnb_loader::GGMLType::Q5_K
+            | rnb_loader::GGMLType::Q6_K
+            | rnb_loader::GGMLType::Q8_0
     ) {
         return Err(crate::error::LlmError::Forward(format!(
-            "MTP device verify layer {layer_idx} {label} must be Q4_K, Q6_K or Q8_0, got {:?}",
+            "MTP device verify layer {layer_idx} {label} must be Q4_K, Q5_K, Q6_K or Q8_0, got {:?}",
             weight.ggml_type
         )));
     }

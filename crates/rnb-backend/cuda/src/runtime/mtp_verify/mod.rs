@@ -19,7 +19,7 @@ pub(in crate::runtime) use types::{
     Qwen35MtpAttentionOutputWithPriorRequest, Qwen35MtpAttentionQkNormRopeRequest,
     Qwen35MtpAttentionQkvProjectionRequest, Qwen35MtpGdnMoeLayerRequest,
     Qwen35MtpGdnMoeLayerStateCapture, Qwen35MtpGdnProjectionRequest, GGML_F32, GGML_Q4_K,
-    GGML_Q6_K, GGML_Q8_0,
+    GGML_Q5_K, GGML_Q6_K, GGML_Q8_0,
 };
 use validation::{validate_mtp_verify_f32_matrix, validate_mtp_verify_q4k_matrix};
 pub(in crate::runtime) use validation::{
@@ -2112,6 +2112,14 @@ impl super::CudaState {
             (GGML_Q6_K, 1) => {
                 self.q6k_gemv_device_to_device(weights, rows, blocks_per_row, input_dev, output_dev)
             }
+            (GGML_Q5_K, _) => self.q5k_batch_dev_input_to_dev(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_dev,
+                output_dev,
+            ),
             (GGML_Q4_K, _) => self.q4k_batch_dev_input_to_dev(
                 weights,
                 rows,

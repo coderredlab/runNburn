@@ -1,4 +1,4 @@
-use super::types::{GGML_Q4_K, GGML_Q6_K, GGML_Q8_0};
+use super::types::{GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0};
 
 pub(in crate::runtime) fn validate_mtp_verify_prefix_tokens(
     window_tokens: usize,
@@ -48,6 +48,42 @@ pub(super) fn validate_mtp_verify_q4k_matrix(
     if weights.len() != expected {
         return Err(format!(
             "MTP verify {label} Q4_K byte mismatch: got {}, expected {expected}",
+            weights.len()
+        ));
+    }
+    Ok(blocks_per_row)
+}
+
+pub(super) fn validate_mtp_verify_q5k_matrix(
+    label: &str,
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    expected_cols: usize,
+) -> Result<usize, String> {
+    if rows == 0 {
+        return Err(format!("MTP verify {label} rows must be non-zero"));
+    }
+    if cols != expected_cols {
+        return Err(format!(
+            "MTP verify {label} cols must match hidden_dim: cols={cols}, hidden_dim={expected_cols}"
+        ));
+    }
+    if cols == 0 || cols % 256 != 0 {
+        return Err(format!(
+            "MTP verify {label} Q5_K cols must be non-zero and divisible by 256, got {cols}"
+        ));
+    }
+    let blocks_per_row = cols / 256;
+    let expected = rows
+        .checked_mul(blocks_per_row)
+        .and_then(|v| v.checked_mul(176))
+        .ok_or_else(|| {
+            format!("MTP verify {label} Q5_K byte size overflow: rows={rows} cols={cols}")
+        })?;
+    if weights.len() != expected {
+        return Err(format!(
+            "MTP verify {label} Q5_K byte mismatch: got {}, expected {expected}",
             weights.len()
         ));
     }
@@ -163,10 +199,33 @@ pub(in crate::runtime) fn validate_mtp_verify_k_quant_matrix(
 ) -> Result<usize, String> {
     match quant {
         GGML_Q4_K => validate_mtp_verify_q4k_matrix(label, weights, rows, cols, expected_cols),
+        GGML_Q5_K => validate_mtp_verify_q5k_matrix(label, weights, rows, cols, expected_cols),
         GGML_Q6_K => validate_mtp_verify_q6k_matrix(label, weights, rows, cols, expected_cols),
         GGML_Q8_0 => validate_mtp_verify_q8_0_matrix(label, weights, rows, cols, expected_cols),
         other => Err(format!(
-            "MTP verify {label} quant must be Q4_K, Q6_K or Q8_0, got {other}"
+            "MTP verify {label} quant must be Q4_K, Q5_K, Q6_K or Q8_0, got {other}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_mtp_verify_k_quant_matrix, GGML_Q5_K};
+
+    #[test]
+    fn q5k_matrix_accepts_exact_block_layout() {
+        let weights = vec![0u8; 3 * 2 * 176];
+        assert_eq!(
+            validate_mtp_verify_k_quant_matrix("ssm_out", GGML_Q5_K, &weights, 3, 512, 512),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn q5k_matrix_rejects_truncated_block_layout() {
+        let weights = vec![0u8; 3 * 2 * 176 - 1];
+        let error = validate_mtp_verify_k_quant_matrix("ssm_out", GGML_Q5_K, &weights, 3, 512, 512)
+            .unwrap_err();
+        assert!(error.contains("Q5_K byte mismatch"));
     }
 }

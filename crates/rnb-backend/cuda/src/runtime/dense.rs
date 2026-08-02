@@ -927,7 +927,7 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn q5k_batch_dev_input_to_dev(
+    pub(super) fn q5k_batch_dev_input_to_dev(
         &mut self,
         weights: &[u8],
         rows: usize,

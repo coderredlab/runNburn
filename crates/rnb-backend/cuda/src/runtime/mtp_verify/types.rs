@@ -1,5 +1,6 @@
 pub(in crate::runtime) const GGML_F32: u32 = 0;
 pub(in crate::runtime) const GGML_Q4_K: u32 = 12;
+pub(in crate::runtime) const GGML_Q5_K: u32 = 13;
 pub(in crate::runtime) const GGML_Q6_K: u32 = 14;
 pub(in crate::runtime) const GGML_Q8_0: u32 = 8;
 
