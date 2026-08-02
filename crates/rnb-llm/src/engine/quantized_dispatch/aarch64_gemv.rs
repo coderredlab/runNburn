@@ -91,6 +91,34 @@ fn q80_f32_scales<'a>(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn q8k_prequantized_supported(ggml_type: GGMLType) -> bool {
+    matches!(
+        ggml_type,
+        GGMLType::Q3_K
+            | GGMLType::Q4_K
+            | GGMLType::Q5_K
+            | GGMLType::Q6_K
+            | GGMLType::IQ2_XXS
+            | GGMLType::IQ2_S
+            | GGMLType::IQ3_XXS
+            | GGMLType::IQ4_XS
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn q8_prequantized_supported(ggml_type: GGMLType) -> bool {
+    matches!(
+        ggml_type,
+        GGMLType::Q4_0
+            | GGMLType::Q4_1
+            | GGMLType::Q5_0
+            | GGMLType::Q5_1
+            | GGMLType::Q8_0
+            | GGMLType::Q8_1
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
 pub(in crate::engine) fn dispatch_q8k_gemv(
     weight: &QuantizedWeight,
     bytes: &[u8],
@@ -118,14 +146,12 @@ pub(in crate::engine) fn dispatch_q8k_gemv(
     }
 
     match weight.ggml_type {
-        GGMLType::Q2_K
-        | GGMLType::Q3_K
+        GGMLType::Q3_K
         | GGMLType::IQ2_XXS
         | GGMLType::IQ2_S
         | GGMLType::IQ3_XXS
         | GGMLType::IQ4_XS => {
             let quant = match weight.ggml_type {
-                GGMLType::Q2_K => gemm_runtime::quant_gemv::QuantGemvType::Q2K,
                 GGMLType::Q3_K => gemm_runtime::quant_gemv::QuantGemvType::Q3K,
                 GGMLType::IQ2_XXS => gemm_runtime::quant_gemv::QuantGemvType::IQ2XXS,
                 GGMLType::IQ2_S => gemm_runtime::quant_gemv::QuantGemvType::IQ2S,
@@ -372,32 +398,19 @@ fn dispatch_dotprod_f32_input_gemv(
         return Ok(false);
     }
 
-    match weight.ggml_type {
-        GGMLType::Q2_K
-        | GGMLType::Q3_K
-        | GGMLType::Q4_K
-        | GGMLType::Q5_K
-        | GGMLType::Q6_K
-        | GGMLType::IQ2_XXS
-        | GGMLType::IQ2_S
-        | GGMLType::IQ3_XXS
-        | GGMLType::IQ4_XS => {
-            let q8k = quantize_input_q8k(input);
-            dispatch_q8k_gemv(weight, bytes, &q8k, output, seq_len, bytes_per_row)?;
-            Ok(true)
-        }
-        GGMLType::Q4_0
-        | GGMLType::Q4_1
-        | GGMLType::Q5_0
-        | GGMLType::Q5_1
-        | GGMLType::Q8_0
-        | GGMLType::Q8_1 => {
-            let q8 = quantize_input_q8(input);
-            dispatch_q8_gemv(weight, bytes, &q8, output, seq_len, bytes_per_row)?;
-            Ok(true)
-        }
-        _ => Ok(false),
+    if q8k_prequantized_supported(weight.ggml_type) {
+        let q8k = quantize_input_q8k(input);
+        dispatch_q8k_gemv(weight, bytes, &q8k, output, seq_len, bytes_per_row)?;
+        return Ok(true);
     }
+
+    if q8_prequantized_supported(weight.ggml_type) {
+        let q8 = quantize_input_q8(input);
+        dispatch_q8_gemv(weight, bytes, &q8, output, seq_len, bytes_per_row)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -438,6 +451,40 @@ pub(super) fn dispatch_q4k_kernel_backend(
             } else {
                 gemv_q4_k_int8(bytes, q8k, output, rows, cols, seq_len, bytes_per_row);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q8k_prequantized_support_matches_available_aarch64_kernels() {
+        assert!(!q8k_prequantized_supported(GGMLType::Q2_K));
+        for ggml_type in [
+            GGMLType::Q3_K,
+            GGMLType::Q4_K,
+            GGMLType::Q5_K,
+            GGMLType::Q6_K,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_S,
+            GGMLType::IQ3_XXS,
+            GGMLType::IQ4_XS,
+        ] {
+            assert!(q8k_prequantized_supported(ggml_type));
+        }
+
+        assert!(!q8_prequantized_supported(GGMLType::Q2_K));
+        for ggml_type in [
+            GGMLType::Q4_0,
+            GGMLType::Q4_1,
+            GGMLType::Q5_0,
+            GGMLType::Q5_1,
+            GGMLType::Q8_0,
+            GGMLType::Q8_1,
+        ] {
+            assert!(q8_prequantized_supported(ggml_type));
         }
     }
 }
