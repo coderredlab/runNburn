@@ -890,6 +890,16 @@ impl Engine {
             runtime.clear_sequence_state();
         }
     }
+    pub(super) fn mtp_target_position_start(
+        logical_position_end: Option<u32>,
+        physical_position_end: usize,
+        observed_tokens: usize,
+    ) -> usize {
+        logical_position_end.map_or_else(
+            || physical_position_end.saturating_sub(observed_tokens),
+            |position| (position as usize).saturating_sub(observed_tokens),
+        )
+    }
 
     pub(crate) fn mtp_observe_prompt_batch(
         &mut self,
@@ -899,6 +909,11 @@ impl Engine {
         if !self.mtp_spec_requested() || tokens.is_empty() {
             return Ok(());
         }
+        let target_pos_start = Self::mtp_target_position_start(
+            self.sequence_cursor.map(|cursor| cursor.logical_position),
+            self.kv_cache.current_len(),
+            tokens.len(),
+        );
         let Some(mut runtime) = self.mtp_runtime.take() else {
             return Err(LlmError::Forward(
                 "RNB_MTP=1 but model has no loaded MTP runtime".to_string(),
@@ -913,7 +928,7 @@ impl Engine {
             let weights = self.weights.as_ref().ok_or_else(|| {
                 LlmError::Forward("RNB_MTP=1 requires loaded model weights".to_string())
             })?;
-            let target_pos_start = self.kv_cache.current_len().saturating_sub(tokens.len());
+
             observe_target_batch(
                 inner,
                 weights,
@@ -1018,6 +1033,11 @@ impl Engine {
         if !self.mtp_spec_requested() || tokens.is_empty() {
             return Ok(());
         }
+        let target_pos_start = Self::mtp_target_position_start(
+            self.sequence_cursor.map(|cursor| cursor.logical_position),
+            self.kv_cache.current_len(),
+            tokens.len(),
+        );
         let Some(mut runtime) = self.mtp_runtime.take() else {
             return Err(LlmError::Forward(
                 "RNB_MTP=1 but model has no loaded MTP runtime".to_string(),
@@ -1031,7 +1051,7 @@ impl Engine {
             let weights = self.weights.as_ref().ok_or_else(|| {
                 LlmError::Forward("RNB_MTP=1 requires loaded model weights".to_string())
             })?;
-            let target_pos_start = self.kv_cache.current_len().saturating_sub(tokens.len());
+
             observe_target_batch(
                 inner,
                 weights,
@@ -1713,6 +1733,12 @@ fn mtp_cuda_argmax_token(head: &QuantizedWeight, normed: &[f32]) -> Option<u32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multimodal_mtp_positions_follow_logical_cursor_not_physical_cache_rows() {
+        assert_eq!(Engine::mtp_target_position_start(Some(33), 609, 0), 33);
+        assert_eq!(Engine::mtp_target_position_start(Some(33), 609, 2), 31);
+        assert_eq!(Engine::mtp_target_position_start(None, 609, 2), 607);
+    }
 
     fn qwen_mtp_metadata() -> MtpMetadata {
         MtpMetadata {

@@ -742,7 +742,7 @@ impl Engine {
         #[cfg(feature = "vulkan")]
         let backend_max_layer = self.decode_backend_max_layer();
         let use_backend_output_logits = backend_runtime::output_logits_enabled_for_runtime();
-        let mtp_collect_hidden = self.sequence_cursor.is_none() && self.mtp_spec_requested();
+        let mtp_collect_hidden = self.mtp_spec_requested();
         let kv_cache = &mut self.kv_cache;
 
         let decode_result: crate::error::Result<Option<Vec<f32>>> = (|| {

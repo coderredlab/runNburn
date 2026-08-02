@@ -125,7 +125,7 @@ impl Engine {
     }
 
     pub fn sequence_state_byte_size_estimate(&self) -> u64 {
-        let mtp_bytes = if self.sequence_cursor.is_none() && self.mtp_spec_requested() {
+        let mtp_bytes = if self.mtp_spec_requested() {
             self.mtp_runtime.as_ref().map_or(0, |runtime| {
                 runtime.sequence_state_heap_byte_size_estimate()
             })
@@ -141,6 +141,66 @@ impl Engine {
                     .saturating_mul(std::mem::size_of::<u32>()) as u64,
             )
     }
+    pub(crate) const fn sequence_cursor_checkpoint(
+        &self,
+    ) -> Option<crate::multimodal::SequenceCursor> {
+        self.sequence_cursor
+    }
+
+    pub(crate) fn restore_sequence_cursor_checkpoint(
+        &mut self,
+        cursor: Option<crate::multimodal::SequenceCursor>,
+    ) {
+        self.sequence_cursor = cursor;
+    }
+
+    pub(crate) fn sync_sequence_cursor_to_kv_len(&mut self) -> crate::error::Result<()> {
+        let Some(cursor) = self.sequence_cursor.as_mut() else {
+            return Ok(());
+        };
+        let physical_rows = self.kv_cache.current_len();
+        if physical_rows >= cursor.physical_rows {
+            let added = physical_rows - cursor.physical_rows;
+            cursor.logical_position = cursor
+                .logical_position
+                .checked_add(u32::try_from(added).map_err(|_| {
+                    crate::error::LlmError::Forward(
+                        "multimodal sequence cursor delta exceeds u32".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "multimodal logical position overflows during KV commit".into(),
+                    )
+                })?;
+            cursor.token_count = cursor.token_count.checked_add(added).ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "multimodal token count overflows during KV commit".into(),
+                )
+            })?;
+        } else {
+            let removed = cursor.physical_rows - physical_rows;
+            cursor.logical_position = cursor
+                .logical_position
+                .checked_sub(u32::try_from(removed).map_err(|_| {
+                    crate::error::LlmError::Forward(
+                        "multimodal sequence cursor rollback exceeds u32".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "multimodal logical position underflows during KV rollback".into(),
+                    )
+                })?;
+            cursor.token_count = cursor.token_count.checked_sub(removed).ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "multimodal token count underflows during KV rollback".into(),
+                )
+            })?;
+        }
+        cursor.physical_rows = physical_rows;
+        Ok(())
+    }
 
     fn sequence_state_backend_supported(&self) -> bool {
         self.architecture != ModelArchitecture::DeepSeek4
@@ -155,7 +215,7 @@ impl Engine {
         if !self.sequence_state_backend_supported() {
             return false;
         }
-        if self.sequence_cursor.is_some() || !self.mtp_spec_requested() {
+        if !self.mtp_spec_requested() {
             return true;
         }
         if crate::runtime::mtp_draft_only_enabled()
@@ -230,7 +290,7 @@ impl Engine {
             }
             physical_cached_len
         };
-        let mtp = if sequence_cursor.is_none() && self.mtp_spec_requested() {
+        let mtp = if self.mtp_spec_requested() {
             Some(
                 self.mtp_runtime
                     .as_ref()
@@ -264,13 +324,7 @@ impl Engine {
                 "durable sequence snapshots are unsupported by the active runtime".to_string(),
             ));
         }
-        if state.sequence_cursor.is_some() {
-            if state.mtp.is_some() {
-                return Err(crate::error::LlmError::Forward(
-                    "multimodal sequence snapshots must not contain MTP state".to_string(),
-                ));
-            }
-        } else if self.mtp_spec_requested() != state.mtp.is_some() {
+        if self.mtp_spec_requested() != state.mtp.is_some() {
             return Err(crate::error::LlmError::Forward(
                 "sequence snapshot MTP mode does not match the active runtime".to_string(),
             ));
@@ -401,6 +455,41 @@ mod tests {
                 logical_position: 7,
                 token_count: 2,
                 image_fingerprint: image_fingerprint(&image),
+            })
+        );
+    }
+
+    #[test]
+    fn multimodal_cursor_tracks_speculative_kv_commit_and_rollback() {
+        let mut engine = mock_engine();
+        engine.sequence_cursor = Some(SequenceCursor {
+            physical_rows: 10,
+            logical_position: 7,
+            token_count: 4,
+            image_fingerprint: [0; 32],
+        });
+
+        engine.kv_cache.set_len(12);
+        engine.sync_sequence_cursor_to_kv_len().unwrap();
+        assert_eq!(
+            engine.sequence_cursor,
+            Some(SequenceCursor {
+                physical_rows: 12,
+                logical_position: 9,
+                token_count: 6,
+                image_fingerprint: [0; 32],
+            })
+        );
+
+        engine.kv_cache.set_len(11);
+        engine.sync_sequence_cursor_to_kv_len().unwrap();
+        assert_eq!(
+            engine.sequence_cursor,
+            Some(SequenceCursor {
+                physical_rows: 11,
+                logical_position: 8,
+                token_count: 5,
+                image_fingerprint: [0; 32],
             })
         );
     }

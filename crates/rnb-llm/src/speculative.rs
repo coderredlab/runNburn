@@ -7,6 +7,7 @@ pub struct SpecCheckpoint {
     ssm_states: Vec<Option<SsmLayerCheckpoint>>,
     scratch: Option<crate::engine::ScratchBuffers>,
     mtp: Option<crate::engine::mtp::EngineMtpCheckpoint>,
+    sequence_cursor: Option<crate::multimodal::SequenceCursor>,
     #[cfg(feature = "cuda")]
     resident_delta_snapshots: Vec<ResidentDeltaSnapshot>,
 }
@@ -43,6 +44,7 @@ impl SpecCheckpoint {
             ssm_states: checkpoint_ssm_states(&kv_cache.ssm_states, &[]),
             scratch: None,
             mtp: None,
+            sequence_cursor: None,
             #[cfg(feature = "cuda")]
             resident_delta_snapshots: Vec::new(),
         }
@@ -69,6 +71,7 @@ impl SpecCheckpoint {
             ),
             scratch: engine.scratch_checkpoint(),
             mtp: engine.mtp_checkpoint(),
+            sequence_cursor: engine.sequence_cursor_checkpoint(),
             #[cfg(feature = "cuda")]
             resident_delta_snapshots,
         })
@@ -84,6 +87,7 @@ impl SpecCheckpoint {
 
     pub fn restore_engine(&self, engine: &mut Engine) -> crate::error::Result<()> {
         self.restore(&mut engine.kv_cache);
+        engine.restore_sequence_cursor_checkpoint(self.sequence_cursor);
         engine.restore_scratch_checkpoint(&self.scratch);
         engine.mtp_restore_checkpoint(self.mtp.as_ref());
         #[cfg(feature = "cuda")]

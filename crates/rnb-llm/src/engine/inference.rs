@@ -606,6 +606,11 @@ impl Engine {
         _commit_final_states: bool,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         let pos_start = self.kv_cache.current_len();
+        let rope_pos_start = Self::mtp_target_position_start(
+            self.sequence_cursor.map(|cursor| cursor.logical_position),
+            pos_start,
+            0,
+        );
         #[cfg(feature = "cuda")]
         {
             let request = _request;
@@ -737,6 +742,7 @@ impl Engine {
                 verify_tokens: &verify_tokens,
                 prefix_tokens: &prefix_tokens,
                 pos_start,
+                rope_pos_start,
                 hidden_dim: self.metadata.hidden_dim,
                 rope_dim: device_rope_dim,
                 rope_neox: device_rope_neox,
@@ -1170,7 +1176,7 @@ impl Engine {
                 &layer.v_bits[..committed_values],
             );
         }
-        Ok(())
+        self.sync_sequence_cursor_to_kv_len()
     }
 
     #[cfg(any(feature = "cuda", test))]
@@ -1243,7 +1249,7 @@ impl Engine {
             }
             state.conv_state.copy_from_slice(&layer.conv_state);
         }
-        Ok(())
+        self.sync_sequence_cursor_to_kv_len()
     }
 
     pub(super) fn forward_prefill_slice1_candidate(

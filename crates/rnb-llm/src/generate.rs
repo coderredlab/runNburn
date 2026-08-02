@@ -321,6 +321,20 @@ fn select_generate_route(
     }
     GenerateRoute::Standard
 }
+fn select_multimodal_generate_route(
+    has_constraint: bool,
+    spec_enabled: bool,
+    engine_has_weights: bool,
+    mtp_requested: bool,
+) -> GenerateRoute {
+    if has_constraint {
+        return GenerateRoute::Standard;
+    }
+    match select_generate_route(spec_enabled, engine_has_weights, mtp_requested) {
+        GenerateRoute::Mtp => GenerateRoute::Mtp,
+        GenerateRoute::Standard | GenerateRoute::Speculative => GenerateRoute::Standard,
+    }
+}
 
 /// 표준 (non-speculative) 스트리밍 생성 루프
 pub(crate) fn generate_stream_impl(
@@ -579,19 +593,40 @@ pub fn generate_stream_multimodal_resuming(
         .as_ref()
         .map(|constraint| StructuredDecoder::new(&engine.tokenizer, constraint))
         .transpose()?;
-    let mut result = finish_generation(
-        engine,
-        prompt_tokens,
-        prompt_len,
-        params,
-        start,
-        &mut rng,
-        sampler,
-        constraint,
-        logits,
-        None,
-        callback,
-    )?;
+    let mut result = if select_multimodal_generate_route(
+        constraint.is_some(),
+        params.spec_enabled,
+        engine.has_weights(),
+        engine.mtp_spec_requested(),
+    ) == GenerateRoute::Mtp
+    {
+        let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+        let mut mtp_params = params.clone();
+        mtp_params.spec_k = spec_k;
+        crate::mtp_generate::generate_stream_mtp_from_prefill(
+            engine,
+            prompt_tokens,
+            prompt_len,
+            logits,
+            start,
+            &mtp_params,
+            callback,
+        )?
+    } else {
+        finish_generation(
+            engine,
+            prompt_tokens,
+            prompt_len,
+            params,
+            start,
+            &mut rng,
+            sampler,
+            constraint,
+            logits,
+            None,
+            callback,
+        )?
+    };
     result.cached_prompt_tokens = cached_tokens;
     Ok(result)
 }
@@ -654,19 +689,40 @@ pub fn generate_stream_multimodal(
             };
         }
     };
-    finish_generation(
-        engine,
-        prompt_tokens,
-        prompt_len,
-        params,
-        start,
-        &mut rng,
-        sampler,
-        constraint,
-        logits,
-        None,
-        callback,
-    )
+    if select_multimodal_generate_route(
+        constraint.is_some(),
+        params.spec_enabled,
+        engine.has_weights(),
+        engine.mtp_spec_requested(),
+    ) == GenerateRoute::Mtp
+    {
+        let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+        let mut mtp_params = params.clone();
+        mtp_params.spec_k = spec_k;
+        crate::mtp_generate::generate_stream_mtp_from_prefill(
+            engine,
+            prompt_tokens,
+            prompt_len,
+            logits,
+            start,
+            &mtp_params,
+            callback,
+        )
+    } else {
+        finish_generation(
+            engine,
+            prompt_tokens,
+            prompt_len,
+            params,
+            start,
+            &mut rng,
+            sampler,
+            constraint,
+            logits,
+            None,
+            callback,
+        )
+    }
 }
 
 pub fn generate_stream_multimodal_cancellable(
@@ -1129,6 +1185,25 @@ mod tests {
     fn mtp_request_does_not_route_mock_engines_without_weights() {
         assert_eq!(
             select_generate_route(false, false, true),
+            GenerateRoute::Standard
+        );
+    }
+    #[test]
+    fn multimodal_generation_routes_loaded_mtp_runtime_to_mtp() {
+        assert_eq!(
+            select_multimodal_generate_route(false, false, true, true),
+            GenerateRoute::Mtp
+        );
+    }
+
+    #[test]
+    fn multimodal_generation_keeps_generic_speculation_and_constraints_standard() {
+        assert_eq!(
+            select_multimodal_generate_route(false, true, true, false),
+            GenerateRoute::Standard
+        );
+        assert_eq!(
+            select_multimodal_generate_route(true, false, true, true),
             GenerateRoute::Standard
         );
     }

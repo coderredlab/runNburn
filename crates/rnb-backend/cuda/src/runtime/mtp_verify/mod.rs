@@ -5777,8 +5777,8 @@ impl super::CudaState {
         norm_eps: f32,
     ) -> Result<MtpVerifyQwen35RouterBuffers, String> {
         let (router_buffers, _) = self.stage_mtp_verify_qwen35_attention_moe_layer_q4k_inner(
-            buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, norm_eps, false, true,
-            true, false,
+            buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, pos_start, norm_eps, false,
+            true, true, false,
         )?;
         router_buffers
             .ok_or_else(|| "MTP verify attention dense layer has no router buffers".to_string())
@@ -5793,10 +5793,21 @@ impl super::CudaState {
         rope_neox: bool,
         rope_theta: f32,
         pos_start: usize,
+        rope_pos_start: usize,
         norm_eps: f32,
     ) -> Result<Qwen35MtpDeviceVerifyAttentionKvState, String> {
         let (_, attention_kv) = self.stage_mtp_verify_qwen35_attention_moe_layer_q4k_inner(
-            buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, norm_eps, true, true, true,
+            buffers,
+            layer,
+            rope_dim,
+            rope_neox,
+            rope_theta,
+            pos_start,
+            rope_pos_start,
+            norm_eps,
+            true,
+            true,
+            true,
             false,
         )?;
         attention_kv.ok_or_else(|| {
@@ -5815,8 +5826,8 @@ impl super::CudaState {
         norm_eps: f32,
     ) -> Result<Qwen35MtpDeviceVerifyAttentionKvState, String> {
         let (_, attention_kv) = self.stage_mtp_verify_qwen35_attention_moe_layer_q4k_inner(
-            buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, norm_eps, true, true,
-            false, false,
+            buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, pos_start, norm_eps, true,
+            true, false, false,
         )?;
         attention_kv.ok_or_else(|| {
             "MTP device draft attention K/V state was not collected after request".to_string()
@@ -5840,6 +5851,7 @@ impl super::CudaState {
             rope_dim,
             rope_neox,
             rope_theta,
+            pos_start,
             pos_start,
             norm_eps,
             true,
@@ -6119,6 +6131,7 @@ impl super::CudaState {
         rope_neox: bool,
         rope_theta: f32,
         pos_start: usize,
+        rope_pos_start: usize,
         norm_eps: f32,
         collect_kv_state: bool,
         run_ffn: bool,
@@ -6202,7 +6215,7 @@ impl super::CudaState {
                 rope_dim,
                 rope_neox,
                 rope_theta,
-                pos_start,
+                pos_start: rope_pos_start,
                 norm_eps,
                 q_unit_offset: layer.qk_norm_unit_offset,
                 k_unit_offset: layer.qk_norm_unit_offset,

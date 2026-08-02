@@ -477,6 +477,7 @@ pub struct Qwen35MtpDeviceVerifyRequest<'a> {
     pub verify_tokens: &'a [u32],
     pub prefix_tokens: &'a [usize],
     pub pos_start: usize,
+    pub rope_pos_start: usize,
     pub hidden_dim: usize,
     pub rope_dim: usize,
     pub rope_neox: bool,

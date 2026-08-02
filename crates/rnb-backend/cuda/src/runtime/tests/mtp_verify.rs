@@ -2151,7 +2151,7 @@ fn cuda_qwen35_mtp_verify_attention_moe_layer_chains_resident_stages() {
         attention_kv = Some(
             state
                 .stage_mtp_verify_qwen35_attention_moe_layer_q4k_with_kv_state(
-                    &buffers, &layer, head_dim, true, rope_theta, pos_start, 1.0e-5,
+                    &buffers, &layer, head_dim, true, rope_theta, pos_start, pos_start, 1.0e-5,
                 )
                 .expect("stage attention MoE layer"),
         );
@@ -5048,6 +5048,7 @@ fn cuda_qwen35_mtp_device_verify_api_stages_before_unimplemented() {
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: 7,
+        rope_pos_start: 7,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,
@@ -5164,6 +5165,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_attention_projection_before_unimpl
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: 7,
+        rope_pos_start: 7,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,
@@ -5288,6 +5290,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_attention_qk_norm_rope_before_unim
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: 7,
+        rope_pos_start: 7,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,
@@ -5450,6 +5453,7 @@ fn cuda_qwen35_mtp_device_verify_api_returns_attention_kv_states() {
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: prior_tokens,
+        rope_pos_start: prior_tokens,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,
@@ -5587,6 +5591,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_layer_graph_before_unimplemented()
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: 7,
+        rope_pos_start: 7,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,
@@ -5775,6 +5780,7 @@ fn cuda_qwen35_mtp_device_verify_api_returns_gdn_prefix_states() {
         verify_tokens: &verify_tokens,
         prefix_tokens: &prefix_tokens,
         pos_start: 7,
+        rope_pos_start: 7,
         hidden_dim,
         rope_dim: 256,
         rope_neox: true,

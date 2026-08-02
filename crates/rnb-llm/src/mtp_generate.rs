@@ -536,6 +536,11 @@ fn replace_ignored_eos_output_target(
         Ok(target_token)
     }
 }
+struct MtpPrefilledPrompt {
+    physical_prompt_len: usize,
+    logits: Vec<f32>,
+    started_at: Instant,
+}
 
 pub(crate) fn generate_stream_mtp(
     engine: &mut Engine,
@@ -548,7 +553,7 @@ pub(crate) fn generate_stream_mtp(
         prompt_tokens.push(engine.tokenizer.vocab.special.bos);
     }
     prompt_tokens.extend(engine.tokenizer.encode(prompt));
-    generate_stream_mtp_with_tokens(engine, &prompt_tokens, None, params, callback)
+    generate_stream_mtp_with_tokens(engine, &prompt_tokens, None, None, params, callback)
         .map(|result| result.with_prompt_token_ids(prompt_tokens))
 }
 
@@ -559,14 +564,45 @@ pub(crate) fn generate_stream_mtp_resuming(
     params: &GenerateParams,
     callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
-    generate_stream_mtp_with_tokens(engine, &prompt_tokens, Some(resume_from), params, callback)
-        .map(|result| result.with_prompt_token_ids(prompt_tokens))
+    generate_stream_mtp_with_tokens(
+        engine,
+        &prompt_tokens,
+        Some(resume_from),
+        None,
+        params,
+        callback,
+    )
+    .map(|result| result.with_prompt_token_ids(prompt_tokens))
+}
+pub(crate) fn generate_stream_mtp_from_prefill(
+    engine: &mut Engine,
+    prompt_tokens: Vec<u32>,
+    physical_prompt_len: usize,
+    logits: Vec<f32>,
+    started_at: Instant,
+    params: &GenerateParams,
+    callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    generate_stream_mtp_with_tokens(
+        engine,
+        &prompt_tokens,
+        None,
+        Some(MtpPrefilledPrompt {
+            physical_prompt_len,
+            logits,
+            started_at,
+        }),
+        params,
+        callback,
+    )
+    .map(|result| result.with_prompt_token_ids(prompt_tokens))
 }
 
 fn generate_stream_mtp_with_tokens(
     engine: &mut Engine,
     prompt_tokens: &[u32],
     resume_from: Option<usize>,
+    prefilled: Option<MtpPrefilledPrompt>,
     params: &GenerateParams,
     mut callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
@@ -580,20 +616,25 @@ fn generate_stream_mtp_with_tokens(
             "MTP generate currently requires greedy sampling".to_string(),
         ));
     }
+    let start = prefilled
+        .as_ref()
+        .map_or_else(Instant::now, |prompt| prompt.started_at);
 
     if engine.mtp_is_external_runtime() {
         return generate_with_external_drafter(
             engine,
             prompt_tokens,
             resume_from,
+            prefilled,
             params,
             callback,
         );
     }
 
-    let start = Instant::now();
     let eos = engine.tokenizer.vocab.special.eos;
-    let prompt_len = prompt_tokens.len();
+    let prompt_len = prefilled
+        .as_ref()
+        .map_or(prompt_tokens.len(), |prompt| prompt.physical_prompt_len);
 
     let mut rng = match params.seed {
         Some(seed) => SmallRng::seed_from_u64(seed),
@@ -604,25 +645,29 @@ fn generate_stream_mtp_with_tokens(
     let request_prepare_start = Instant::now();
     let mtp_device_verify = engine.mtp_device_verify_requested();
 
-    let forward_tokens = if let Some(resume_from) = resume_from {
-        prompt_tokens.get(resume_from..).ok_or_else(|| {
-            crate::error::LlmError::Forward(format!(
-                "MTP resume offset {resume_from} exceeds prompt length {prompt_len}"
-            ))
-        })?
+    let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
+        (prefilled.logits, elapsed_ms(start))
     } else {
-        engine.clear_sequence_state()?;
-        prompt_tokens
+        let forward_tokens = if let Some(resume_from) = resume_from {
+            prompt_tokens.get(resume_from..).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "MTP resume offset {resume_from} exceeds prompt length {prompt_len}"
+                ))
+            })?
+        } else {
+            engine.clear_sequence_state()?;
+            prompt_tokens
+        };
+        if forward_tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "MTP resume requires at least one uncached prompt token".to_string(),
+            ));
+        }
+        let prompt_prefill_start = Instant::now();
+        let logits = engine.forward_prompt(forward_tokens)?;
+        (logits, elapsed_ms(prompt_prefill_start))
     };
-    if forward_tokens.is_empty() {
-        return Err(crate::error::LlmError::Forward(
-            "MTP resume requires at least one uncached prompt token".to_string(),
-        ));
-    }
     let request_prepare_ms = elapsed_ms(request_prepare_start);
-    let prompt_prefill_start = Instant::now();
-    let mut logits = engine.forward_prompt(forward_tokens)?;
-    let prompt_prefill_ms = elapsed_ms(prompt_prefill_start);
     let mut generated_tokens = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
     let mut tokens_remaining = params.max_tokens;
@@ -1640,33 +1685,42 @@ fn generate_with_external_drafter(
     engine: &mut Engine,
     prompt_tokens: &[u32],
     resume_from: Option<usize>,
+    prefilled: Option<MtpPrefilledPrompt>,
     params: &GenerateParams,
     mut callback: impl FnMut(&str) -> bool,
 ) -> crate::error::Result<GenerateResult> {
     let draft_n = params.spec_k.max(1);
+    let start = prefilled
+        .as_ref()
+        .map_or_else(Instant::now, |prompt| prompt.started_at);
 
-    let start = Instant::now();
     let eos = engine.tokenizer.vocab.special.eos;
-    let prompt_len = prompt_tokens.len();
+    let prompt_len = prefilled
+        .as_ref()
+        .map_or(prompt_tokens.len(), |prompt| prompt.physical_prompt_len);
 
-    let prompt_prefill_start = Instant::now();
-    let forward_tokens = if let Some(resume_from) = resume_from {
-        prompt_tokens.get(resume_from..).ok_or_else(|| {
-            crate::error::LlmError::Forward(format!(
-                "external MTP resume offset {resume_from} exceeds prompt length {prompt_len}"
-            ))
-        })?
+    let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
+        (prefilled.logits, elapsed_ms(start))
     } else {
-        engine.clear_sequence_state()?;
-        prompt_tokens
+        let forward_tokens = if let Some(resume_from) = resume_from {
+            prompt_tokens.get(resume_from..).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "external MTP resume offset {resume_from} exceeds prompt length {prompt_len}"
+                ))
+            })?
+        } else {
+            engine.clear_sequence_state()?;
+            prompt_tokens
+        };
+        if forward_tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "external MTP resume requires at least one uncached prompt token".to_string(),
+            ));
+        }
+        let prompt_prefill_start = Instant::now();
+        let logits = engine.forward_prompt(forward_tokens)?;
+        (logits, elapsed_ms(prompt_prefill_start))
     };
-    if forward_tokens.is_empty() {
-        return Err(crate::error::LlmError::Forward(
-            "external MTP resume requires at least one uncached prompt token".to_string(),
-        ));
-    }
-    let mut logits = engine.forward_prompt(forward_tokens)?;
-    let prompt_prefill_ms = elapsed_ms(prompt_prefill_start);
 
     // ── 3. 첫 token: target 단독 greedy (drafter 루프 진입 전) ─────────────
     // dummy SamplerChain (temperature=0 greedy) 으로 argmax 뽑는다.
@@ -1936,7 +1990,7 @@ fn generate_with_external_drafter(
                     })?;
 
             let new_kv_position = position_before_verify + outcome.accepted_draft_tokens as u32 + 1;
-            engine.commit_kv_through(new_kv_position);
+            engine.commit_kv_through(new_kv_position)?;
             engine.restore_batch_verify_last_hidden(
                 &output_hidden_rows,
                 outcome.accepted_draft_tokens + 1,
@@ -2047,7 +2101,7 @@ fn generate_with_external_drafter(
                 let committed_kv_position = position_before_verify
                     .saturating_add(1)
                     .saturating_add(emitted_draft_tokens as u32);
-                engine.commit_kv_through(committed_kv_position);
+                engine.commit_kv_through(committed_kv_position)?;
             }
             let committed_target_tokens = engine
                 .kv_cache

@@ -337,6 +337,10 @@ impl Engine {
             self.metadata.rope_theta,
             self.metadata.norm_eps,
         )?;
+        let mtp_last_hidden = self.mtp_spec_requested().then(|| {
+            let hidden = kernels::tensor_as_f32_slice(&output);
+            hidden[(seq_len - 1) * hidden_dim..seq_len * hidden_dim].to_vec()
+        });
         let logits = finalize_prefill_logits(
             &mut self.kv_cache,
             &self.metadata,
@@ -349,6 +353,14 @@ impl Engine {
             Some(&mut self.last_layer_hidden_cached),
         )?;
         self.sequence_cursor = Some(SequenceCursor::multimodal(prompt));
+        if let Some(hidden) = mtp_last_hidden {
+            let token = *prompt.sampler_token_ids.last().ok_or_else(|| {
+                LlmError::Forward(
+                    "Qwen3.6 multimodal MTP prefill requires a final sampler token".into(),
+                )
+            })?;
+            self.mtp_observe_target_batch(&[token], &hidden)?;
+        }
         Ok(logits)
     }
 
@@ -460,6 +472,10 @@ impl Engine {
         let (output, seq_len, pos_start) = last_output.ok_or_else(|| {
             LlmError::Forward("Gemma 4 multimodal prompt produced no hidden rows".into())
         })?;
+        let mtp_last_hidden = self.mtp_spec_requested().then(|| {
+            let hidden = kernels::tensor_as_f32_slice(&output);
+            hidden[(seq_len - 1) * hidden_dim..seq_len * hidden_dim].to_vec()
+        });
         let logits = finalize_prefill_logits(
             &mut self.kv_cache,
             &self.metadata,
@@ -472,6 +488,14 @@ impl Engine {
             Some(&mut self.last_layer_hidden_cached),
         )?;
         self.sequence_cursor = Some(SequenceCursor::multimodal(prompt));
+        if let Some(hidden) = mtp_last_hidden {
+            let token = *prompt.sampler_token_ids.last().ok_or_else(|| {
+                LlmError::Forward(
+                    "Gemma 4 multimodal MTP prefill requires a final sampler token".into(),
+                )
+            })?;
+            self.mtp_observe_target_batch(&[token], &hidden)?;
+        }
         Ok(logits)
     }
 }

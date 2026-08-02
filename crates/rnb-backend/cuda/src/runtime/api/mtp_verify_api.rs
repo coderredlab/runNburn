@@ -396,6 +396,7 @@ pub fn qwen35_mtp_device_verify_window(
         request.rope_neox,
         request.rope_theta,
         request.pos_start,
+        request.rope_pos_start,
         request.norm_eps,
     )?;
     trace_mtp_verify_stage(trace, state, "ordered_layers", stage_start)?;
@@ -590,6 +591,7 @@ fn stage_qwen35_mtp_device_verify_ordered_layers(
     rope_neox: bool,
     rope_theta: f32,
     pos_start: usize,
+    rope_pos_start: usize,
     norm_eps: f32,
 ) -> Result<Qwen35MtpDeviceVerifyStateCapture, String> {
     let mut state_capture = Qwen35MtpDeviceVerifyStateCapture::default();
@@ -599,7 +601,14 @@ fn stage_qwen35_mtp_device_verify_ordered_layers(
             let stage_start = Instant::now();
             let attention_kv = state
                 .stage_mtp_verify_qwen35_attention_moe_layer_q4k_with_kv_state(
-                    buffers, layer, rope_dim, rope_neox, rope_theta, pos_start, norm_eps,
+                    buffers,
+                    layer,
+                    rope_dim,
+                    rope_neox,
+                    rope_theta,
+                    pos_start,
+                    rope_pos_start,
+                    norm_eps,
                 )?;
             trace_mtp_verify_stage(
                 trace,
@@ -624,6 +633,7 @@ fn stage_qwen35_mtp_device_verify_ordered_layers(
                         rope_neox,
                         rope_theta,
                         pos_start,
+                        rope_pos_start,
                         norm_eps,
                     )?;
                 trace_mtp_verify_stage(

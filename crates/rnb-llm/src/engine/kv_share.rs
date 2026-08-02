@@ -302,9 +302,10 @@ impl Engine {
     ///
     /// Engine 의 decode position 은 별도 scalar counter 없이 `kv_cache.current_len()`
     /// 이 단독 source 이므로 KV truncate 한 번으로 충분하다.
-    pub(crate) fn commit_kv_through(&mut self, new_position: u32) {
+    pub(crate) fn commit_kv_through(&mut self, new_position: u32) -> crate::error::Result<()> {
         let new_len = (new_position as usize).min(self.kv_cache.max_seq_len);
         self.kv_cache.set_len(new_len);
+        self.sync_sequence_cursor_to_kv_len()
     }
     pub(crate) fn restore_batch_verify_last_hidden(
         &mut self,
