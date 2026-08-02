@@ -1,5 +1,6 @@
 use crate::engine::dense_dispatch::gemv_f32;
 use crate::error::Result;
+use rayon::prelude::*;
 
 use super::math::{
     apply_rope, fp4_quantize_inplace, fp8_quantize_inplace, hadamard_inplace, rms_norm,
@@ -87,10 +88,9 @@ pub(super) fn forward_attention(
     if selected_count > 0 {
         let sinks = tensor_f32(&weights.sinks);
         let scale = (config.head_dim as f32).sqrt().recip();
-        let mut scores = Vec::with_capacity(selected_count);
-        for head_index in 0..config.num_heads {
+        let compute_head = |head_index: usize, output: &mut [f32]| {
             let head = &query[head_index * config.head_dim..(head_index + 1) * config.head_dim];
-            scores.clear();
+            let mut scores = Vec::with_capacity(selected_count);
             for key in &state.window {
                 scores.push(dot(head, key) * scale);
             }
@@ -105,8 +105,6 @@ pub(super) fn forward_attention(
                 *score = (*score - max_score).exp();
                 denominator += *score;
             }
-            let output = &mut attention_output
-                [head_index * config.head_dim..(head_index + 1) * config.head_dim];
             let mut score_index = 0;
             for key in &state.window {
                 let probability = scores[score_index] / denominator;
@@ -131,6 +129,17 @@ pub(super) fn forward_attention(
                 compressed_layer,
                 true,
             );
+        };
+        if selected_count.saturating_mul(config.head_dim) >= config.hidden_dim {
+            attention_output
+                .par_chunks_mut(config.head_dim)
+                .enumerate()
+                .for_each(|(head_index, output)| compute_head(head_index, output));
+        } else {
+            attention_output
+                .chunks_mut(config.head_dim)
+                .enumerate()
+                .for_each(|(head_index, output)| compute_head(head_index, output));
         }
     }
 
