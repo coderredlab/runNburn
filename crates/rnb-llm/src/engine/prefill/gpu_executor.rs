@@ -575,6 +575,7 @@ impl GpuPrefillExecutor {
                         q_dim,
                         kv_dim,
                         false,
+                        false,
                         &mut q_with_rope[q_off..q_off + q_dim],
                         &mut k_with_rope[k_off..k_off + kv_dim],
                     );
