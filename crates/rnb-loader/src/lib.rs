@@ -3,12 +3,17 @@ pub mod convert;
 pub mod error;
 pub mod gguf;
 mod mtp_sidecar;
+pub mod vision_projector;
 
 pub use arch::{
     Architecture, DeepSeek4Metadata, ModelLayerKind, ModelMetadata, MtpLayerTensors, MtpMetadata,
 };
 pub use error::LoaderError;
 pub use gguf::types::GGMLType;
+pub use vision_projector::{
+    load_vision_projector, LoadedVisionProjector, VisionProjectorDescriptor,
+    VisionProjectorEnvelope, VisionProjectorTensor,
+};
 
 use std::collections::HashMap;
 use std::path::Path;

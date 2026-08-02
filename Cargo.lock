@@ -1064,6 +1064,7 @@ dependencies = [
  "rnb-cpu",
  "rnb-llm",
  "rnb-loader",
+ "rnb-model-qwen",
  "rnb-runtime",
  "sha2",
 ]
@@ -1140,6 +1141,11 @@ version = "0.6.2"
 [[package]]
 name = "rnb-model-qwen"
 version = "0.6.2"
+dependencies = [
+ "rayon",
+ "rnb-cpu",
+ "rnb-loader",
+]
 
 [[package]]
 name = "rnb-moe-cache-sim"

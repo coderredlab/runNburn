@@ -23,6 +23,9 @@ pub enum LoaderError {
     #[error("type mismatch for key '{key}': expected {expected}")]
     TypeMismatch { key: String, expected: String },
 
+    #[error("invalid vision projector: {0}")]
+    InvalidVisionProjector(String),
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

@@ -1,3 +1,17 @@
+mod vision;
+mod vision_encoder;
+mod vision_math;
+mod vision_preprocess;
+
+pub use vision::{inspect_qwen36_vision_projector, Qwen36VisionCapability, Qwen36VisionError};
+pub use vision_encoder::{
+    encode_qwen36_vision_intermediate, Qwen36VisionLayerSummary, Qwen36VisionOutput,
+};
+pub use vision_preprocess::{
+    prepare_qwen36_vision_intermediate, qwen36_smart_resize, Qwen36RgbImage, Qwen36TensorStats,
+    Qwen36VisionIntermediate, QWEN36_MAX_IMAGE_TOKENS, QWEN36_MIN_IMAGE_TOKENS,
+};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub experts: Vec<usize>,
