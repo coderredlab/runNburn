@@ -1567,6 +1567,9 @@ pub struct MetalBackend {
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
     attn_batch_carriers: RefCell<HashMap<(usize, usize), attn_chain::AttnBatchCarrier>>,
+    /// Batched dense FFN B-column scratch. (batch, hidden, ffn, eps_bits) 별 1회 alloc.
+    dense_ffn_batch_carriers:
+        RefCell<HashMap<(usize, usize, usize, u32), ffn_chain::DenseFfnBatchCarrier>>,
     /// Registered host weight slice identity(`raw.as_ptr() as usize`, `raw.len()`) →
     /// NoCopy buffer, page offset, and a strong source-storage lease. The lease
     /// prevents the loader mapping from being released while any cached NoCopy
@@ -1773,6 +1776,7 @@ impl MetalBackend {
                 gdn_core_carriers: RefCell::new(HashMap::new()),
                 gdn_batch_carriers: RefCell::new(HashMap::new()),
                 attn_batch_carriers: RefCell::new(HashMap::new()),
+                dense_ffn_batch_carriers: RefCell::new(HashMap::new()),
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1936,6 +1940,7 @@ impl MetalBackend {
             gdn_core_carriers: RefCell::new(HashMap::new()),
             gdn_batch_carriers: RefCell::new(HashMap::new()),
             attn_batch_carriers: RefCell::new(HashMap::new()),
+            dense_ffn_batch_carriers: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -9940,12 +9945,11 @@ impl MetalBackend {
     /// attend 하고, GDN lane i 는 lane i-1 의 conv/delta state 를 이어받아 전진한다. 이는
     /// MTP verify 시맨틱(후보 토큰 d_0..d_{B-1} 을 pos..pos+B-1 에 순차 forward)과 동일하다.
     ///
-    /// **milestone 1 (이 함수) = 정확성 우선.** lane 을 검증된 단일-토큰 `decode_chain_run`
-    /// 위에서 순차로 돌리며(lane 당 1 command buffer) state 를 threading 한다. resident weight
-    /// wrap(`self.resident`)/carrier 는 lane 간 재사용되어 weight **업로드**는 amortize 되지만,
-    /// GPU 의 weight **읽기**는 lane 마다 반복된다(진짜 amortization = B-column GEMV + device
-    /// resident cross-token state advance 는 milestone 2). `batch == 1` 은 `decode_chain_run`
-    /// 과 바이트 동일한 hot 경로를 그대로 탄다.
+    /// 적격 Qwen dense/MoE chain은 batch 1..=8을 한 command buffer에서 실행하고,
+    /// attention/GDN core와 dense/shared FFN을 B-column GEMV로 묶어 weight read를
+    /// amortize한다. 비적격 일반 호출은 검증된 단일-token `decode_chain_run`을 lane별로
+    /// 실행하며 state를 threading하고, state 수집을 요청한 비적격 verify는 명시적으로
+    /// fallback report를 반환한다.
     ///
     /// 반환: lane 당 `DecodeChainReport`(각 `output_argmax.token_id` 에 그 위치의 argmax
     /// 토큰). `out_states` 에는 마지막 lane 처리 후의 per-layer state 를 채운다.
@@ -10000,14 +10004,11 @@ impl MetalBackend {
             }
         }
 
-        // batch>1 이고 output tail 이 있으면: chain body 는 lane 별로 돌리되(output_argmax=None),
-        // 최종 출력 프로젝션(vocab weight, 프로덕션에서 가장 큰 단일 행렬 중 하나)은 B lane 을
-        // 모아 **B-column GEMV 로 weight 를 1회만 읽어** 계산한다(milestone 2 amortization 배선).
-        // batch==1 은 기존 per-lane decode_chain_run(output_argmax) 경로 그대로 → 바이트 동일.
-        // B-column GEMV 커널의 sumf[BCOL_MAX=8] 한계 — batch>8 이면 per-lane 출력으로 폴백(정확).
-        // collect 모드(MTP verify)는 batch==1 도 배치 carrier 경로로 처리한다 — full-reject
-        // (n_accepted=0 → committed=1 재실행) 시 프로덕션 stateful carrier(attn_moe/gdn)를
-        // 건드리지 않고 out_attn_kv/out_states 를 host 로 반환하기 위함(host = source of truth).
+        // batch 1..=8이고 output tail이 있으면 최종 출력 projection도 B-column GEMV로 묶는다.
+        // chain body는 아래 적격 gate를 통과하면 함께 융합하고, 일반 비적격 호출만 lane별로
+        // 실행한다. collect 모드(MTP verify)는 batch=1도 배치 carrier를 사용해 full reject
+        // commit이 production stateful carrier를 건드리지 않고 host state를 얻도록 한다.
+        // B-column 커널의 sumf[BCOL_MAX=8] 한계 때문에 batch>8은 lane별 정확 경로로 후퇴한다.
         let collect = out_attn_kv.is_some();
         let fused_lo = if collect { 1usize } else { 2 };
         let want_batched_tail = (fused_lo..=8).contains(&batch) && output_argmax.is_some();
@@ -10018,33 +10019,51 @@ impl MetalBackend {
         };
 
         let mut reports = Vec::with_capacity(batch);
-        // milestone 3/4: layer 가 모두 GdnMoeQwen | AttnMoeQwen 이고 batch 2..=8 이면 **body
-        // fusion** 경로 — layer 당 dense weight(q/k/v/o·qkv/gate/ssm_out·shared)를 B-column GEMV 로
-        // 1회만 읽어 B lane 을 한 command buffer 로 처리한다(MoE sparse expert 는 lane 별). batch==1 /
-        // 비-MoE-Qwen spec / opt-out 은 아래 검증된 per-lane 경로로 폴백(정확·불변). batched attn
-        // fusion 은 자체 f16 KV 라 ctx.kv_int8 무관하게 정확 — KVarn attn chain 만 per-lane 폴백.
+        // Qwen dense/MoE full chain을 batch 1..=8에서 **body fusion**한다. attention/GDN core와
+        // dense FFN 또는 MoE shared FFN의 weight를 B-column GEMV로 한 번만 읽는다. MoE sparse
+        // expert만 routing 발산 때문에 lane별로 남는다. opt-out 또는 KVarn attention은 아래
+        // 검증된 per-lane 경로로 폴백한다.
         let fused_ran = {
-            let all_moe_qwen = !specs.is_empty()
-                && specs.iter().all(|s| {
-                    matches!(
-                        s,
-                        ChainLayerSpecRef::GdnMoeQwen(_) | ChainLayerSpecRef::AttnMoeQwen(_)
-                    )
+            let bcol_quant = |quant: u8| quant <= 4;
+            let all_qwen_chain = !specs.is_empty()
+                && specs.iter().all(|s| match s {
+                    ChainLayerSpecRef::Gdn(s) => [
+                        s.qkv_q,
+                        s.gate_q,
+                        s.alpha_q,
+                        s.beta_q,
+                        s.ssm_out_q,
+                        s.ffn_gate_q,
+                        s.ffn_up_q,
+                        s.ffn_down_q,
+                    ]
+                    .into_iter()
+                    .all(bcol_quant),
+                    ChainLayerSpecRef::GdnMoeQwen(s) => {
+                        [s.qkv_q, s.gate_q, s.alpha_q, s.beta_q, s.ssm_out_q]
+                            .into_iter()
+                            .all(bcol_quant)
+                    }
+                    ChainLayerSpecRef::Attn(_) => true,
+                    ChainLayerSpecRef::AttnMoeQwen(s) => {
+                        [s.q_q, s.k_q, s.v_q, s.o_q].into_iter().all(bcol_quant)
+                    }
                 });
-            let has_attn = specs
-                .iter()
-                .any(|s| matches!(s, ChainLayerSpecRef::AttnMoeQwen(_)));
-            // batched attn 은 자체 f16 KvResident(new_f16) + f16 커널(kv_append_at/attn_decode_at)
-            // + host F16 kv_cache prior 로 처리 → ctx.kv_int8 과 무관하게 항상 f16-정확. 따라서
-            // 게이트는 KVarn 만 배제(KVarn attn 은 배치 미지원 → per-lane 폴백).
+            let has_attn = specs.iter().any(|s| {
+                matches!(
+                    s,
+                    ChainLayerSpecRef::Attn(_) | ChainLayerSpecRef::AttnMoeQwen(_)
+                )
+            });
+            // batched attn은 자체 f16 KvResident + host f16 prior를 사용한다. KVarn만 배제한다.
             let attn_fusable = !has_attn
                 || specs.iter().all(|s| match s {
                     ChainLayerSpecRef::AttnMoeQwen(a) => a.kvarn.is_none(),
                     _ => true,
                 });
             let enabled = std::env::var_os("RNB_METAL_BATCH_FUSED").map_or(true, |v| v != "0");
-            if all_moe_qwen && attn_fusable && (fused_lo..=8).contains(&batch) && enabled {
-                self.decode_chain_run_batched_moe_fused(
+            if all_qwen_chain && attn_fusable && (fused_lo..=8).contains(&batch) && enabled {
+                self.decode_chain_run_batched_fused(
                     hidden,
                     batch,
                     hidden_dim,
@@ -10058,6 +10077,13 @@ impl MetalBackend {
                 false
             }
         };
+        if collect && !fused_ran {
+            reports.resize(
+                batch,
+                DecodeChainReport::fallback("batched fused chain ineligible"),
+            );
+            return reports;
+        }
         if !fused_ran {
             for lane in 0..batch {
                 // 현재 threaded state 를 lane-local buffer 로 snapshot — per-lane spec 이 이걸
@@ -10127,9 +10153,9 @@ impl MetalBackend {
         reports
     }
 
-    /// B lane(2..=8) 배치 디코드 체인. `batch == 1` 은 `decode_chain_run` 과 바이트 동일 hot
-    /// 경로. 모든 layer 가 GdnMoeQwen|AttnMoeQwen 이고(+attn 은 f16 KV·non-KVarn) fused
-    /// single-command-buffer body(dense weight 1회 읽기)로 처리, 그 외엔 검증된 per-lane 폴백.
+    /// B lane(2..=8) 배치 디코드 체인. `batch == 1`은 `decode_chain_run`과 바이트 동일 hot
+    /// 경로. Qwen dense/MoE full chain(+attention은 f16 KV·non-KVarn)을 fused
+    /// single-command-buffer body로 처리하고, 그 외엔 검증된 per-lane 경로로 폴백한다.
     /// `out_states` 에 마지막 lane 처리 후 per-layer state 를 채운다.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
@@ -10153,14 +10179,11 @@ impl MetalBackend {
         )
     }
 
-    /// `decode_chain_run_batched` 의 MTP verify 변형: 위와 동일하게 실행하되, 각 AttnMoeQwen
-    /// layer 가 이번 pass 에서 device append 한 window(모든 lane, slot `base_pos..base_pos+batch`)의
-    /// **post-rope f16 bits** K/V 를 `out_attn_kv`(layer 순서; attn=Some, 그 외 None)에 채운다.
-    /// 반환 K/V 는 slot-major contiguous `[batch*kv_dim]`(slot i 는 `[i*kv_dim..]`). 엔진은
-    /// accept-n 커밋에서 앞 n slot 을 host kv_cache 에 append 한다(host = source of truth,
-    /// 다음 라운드 prior 를 정확히 공급). **f16 KV + non-KVarn + batch 2..=8(fused 경로) 전제** —
-    /// fallback 경로면 attn 항목은 None 으로 남는다(MTP 는 fused 경로만 사용). partial-accept 는
-    /// 엔진이 `batch = committed` 로 재실행해 그 pass 의 K/V(= committed window)를 받는다.
+    /// `decode_chain_run_batched`의 MTP verify 변형. 각 dense/MoE attention layer가 이번
+    /// pass에서 device append한 window의 post-rope f16 K/V를 `out_attn_kv`에 채운다.
+    /// 반환 K/V는 slot-major contiguous `[batch*kv_dim]`; 엔진은 accept-n 커밋에서 앞 n slot만
+    /// host KV cache에 append한다. f16 KV + non-KVarn + batch 1..=8 fused 경로 전제이며,
+    /// fallback이면 attention 항목은 None으로 남는다.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     pub fn decode_chain_run_batched_collect_attn_kv(
@@ -10186,12 +10209,9 @@ impl MetalBackend {
         )
     }
 
-    /// MTP verify accept-n 커밋(partial): 직전 `decode_chain_run_batched_collect_attn_kv`
-    /// (또는 batched) forward 가 device 에 보존한 prefix state 에서, **n lane 처리 후**(=committed
-    /// n 토큰)의 GDN conv/delta state 를 재실행 없이 readback 한다(layer 순서; GdnMoeQwen=Some,
-    /// 그 외 None). 엔진은 이를 host ssm_state 에 써서 partial-accept 재실행을 제거한다.
-    /// `n == batch` 는 forward out_states(prefix-B)와 동일. carrier 는 (layer,batch) 로 보존되어
-    /// 다음 forward 전까지 유효.
+    /// MTP verify accept-n 커밋(partial): 직전 batched forward가 device에 보존한 prefix에서
+    /// n lane 처리 후의 dense/MoE GDN conv/delta state를 재실행 없이 readback한다.
+    /// `n == batch`는 forward 최종 state와 같고 carrier는 다음 forward 전까지 유효하다.
     #[cfg(target_os = "macos")]
     pub fn decode_chain_run_batched_gdn_prefix(
         &self,
@@ -10203,6 +10223,9 @@ impl MetalBackend {
         specs
             .iter()
             .map(|s| match s {
+                ChainLayerSpecRef::Gdn(g) => carriers
+                    .get(&(g.layer, batch))
+                    .map(|c| c.readback_prefix_states(n)),
                 ChainLayerSpecRef::GdnMoeQwen(g) => carriers
                     .get(&(g.layer, batch))
                     .map(|c| c.readback_prefix_states(n)),
@@ -10211,22 +10234,15 @@ impl MetalBackend {
             .collect()
     }
 
-    /// milestone 3/4 body fusion: 모든 layer 가 `GdnMoeQwen` 또는 `AttnMoeQwen` 인 chain 을
-    /// B lane 에 대해 **layer 당 dense weight 1회 읽기**로 한 command buffer 에 처리한다.
-    ///   - GDN core(qkv/gate/alpha/beta/ssm_out): B-column GEMV(`gdn_core_chain_encode_bcol`,
-    ///     conv rolling buffer + device delta 순차).
-    ///   - ATTN core(q/k/v/o): B-column GEMV(`attn_core_chain_encode_bcol`) + per-lane
-    ///     split/qk-norm/rope/kv-append/attn/gate. lane i 는 pos=base_pos+i, KV slot base_pos+i 를
-    ///     device append 후 `[0..base_pos+i]` attend(같은 cb barrier 로 lane i+1 이 lane i 를 봄).
-    ///   - MoE(`encode_batched_moe_fused`): router+sparse expert 는 lane 별 순차(routing 발산이라
-    ///     per-lane), shared expert(dense)는 B-column GEMV 로 weight 1회 읽기 amortize.
-    /// GDN conv/delta state 는 chain 양끝 host sync(진입 upload, commit 후 readback → out_states);
-    /// ATTN KV 는 device f16 resident(prior upload → device append)이며 out_states 는 None(host
-    /// KVarn/f16 cache 가 source of truth). 결과는 lane 별 검증된 single-token decode 와 동일
-    /// (reduction 순서 차 rel<3e-3). f16 KV + non-KVarn 전제(gate 에서 보장).
+    /// Qwen dense/MoE full chain을 B lane에 대해 layer당 dense weight 1회 읽기로 한 command
+    /// buffer에서 처리한다.
+    /// - GDN core는 rolling conv + device delta state를 lane 순서로 전진한다.
+    /// - attention core는 lane별 KV slot을 append하고 직전 lane까지 포함해 attend한다.
+    /// - dense FFN은 gate/up/down 전체를 B-column으로, MoE는 shared FFN만 B-column으로 처리한다.
+    /// GDN prefix와 attention K/V window는 accept-n host commit용으로 readback한다.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
-    fn decode_chain_run_batched_moe_fused(
+    fn decode_chain_run_batched_fused(
         &self,
         hidden: &mut [f32],
         batch: usize,
@@ -10268,8 +10284,109 @@ impl MetalBackend {
         let enc = compute::chain_compute_encoder(ctx, &cmd);
 
         let mut attn_layers = 0usize;
+        let mut dense_layers = 0usize;
         for spec in specs {
             match spec {
+                ChainLayerSpecRef::Gdn(s) => {
+                    dense_layers += 1;
+                    let (qkv_w, qkv_off) = wrap(s.qkv_raw);
+                    let (gate_w, gate_off) = wrap(s.gate_raw);
+                    let (alpha_w, alpha_off) = wrap(s.alpha_raw);
+                    let (beta_w, beta_off) = wrap(s.beta_raw);
+                    let (ssm_out_w, ssm_out_off) = wrap(s.ssm_out_raw);
+                    let (ffn_gate_w, ffn_gate_off) = wrap(s.ffn_gate_raw);
+                    let (ffn_up_w, ffn_up_off) = wrap(s.ffn_up_raw);
+                    let (ffn_down_w, ffn_down_off) = wrap(s.ffn_down_raw);
+                    let qkv_off_buf = constant_u32(qkv_off);
+                    let gate_off_buf = constant_u32(gate_off);
+                    let alpha_off_buf = constant_u32(alpha_off);
+                    let beta_off_buf = constant_u32(beta_off);
+                    let ssm_out_off_buf = constant_u32(ssm_out_off);
+                    let ffn_gate_off_buf = constant_u32(ffn_gate_off);
+                    let ffn_up_off_buf = constant_u32(ffn_up_off);
+                    let ffn_down_off_buf = constant_u32(ffn_down_off);
+                    let attn_norm_w_buf = constant_f32(s.attn_norm_weight);
+                    let dt_bias_w_buf = constant_f32(s.dt_bias_weight);
+                    let ssm_a_w_buf = constant_f32(s.ssm_a_weight);
+                    let conv1d_w_buf = constant_f32(s.conv1d_weight);
+                    let ssm_norm_w_buf = constant_f32(s.ssm_norm_weight);
+                    let ffn_norm_w_buf = constant_f32(s.ffn_norm_weight);
+
+                    {
+                        let mut carriers = self.gdn_batch_carriers.borrow_mut();
+                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
+                            gdn_chain::GdnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.conv_channels,
+                                s.conv_kernel,
+                                s.z_dim,
+                                s.num_v_heads,
+                                s.num_k_heads,
+                                s.head_k_dim,
+                                s.head_v_dim,
+                                s.eps,
+                            )
+                        });
+                        carrier.upload_states(s.conv_state, s.delta_state);
+                        gdn_chain::gdn_core_chain_encode_bcol(
+                            ctx,
+                            &enc,
+                            carrier,
+                            &shared_hidden,
+                            &attn_norm_w_buf,
+                            &qkv_w,
+                            &qkv_off_buf,
+                            &gate_w,
+                            &gate_off_buf,
+                            &alpha_w,
+                            &alpha_off_buf,
+                            &beta_w,
+                            &beta_off_buf,
+                            &dt_bias_w_buf,
+                            &ssm_a_w_buf,
+                            &conv1d_w_buf,
+                            &ssm_norm_w_buf,
+                            &ssm_out_w,
+                            &ssm_out_off_buf,
+                            s.qkv_q,
+                            s.gate_q,
+                            s.alpha_q,
+                            s.beta_q,
+                            s.ssm_out_q,
+                        );
+                    }
+                    {
+                        let mut carriers = self.dense_ffn_batch_carriers.borrow_mut();
+                        let key = (batch, s.hidden_dim, s.ffn_dim, s.eps.to_bits());
+                        let carrier = carriers.entry(key).or_insert_with(|| {
+                            ffn_chain::DenseFfnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.ffn_dim,
+                                s.eps,
+                            )
+                        });
+                        ffn_chain::dense_ffn_chain_encode_bcol(
+                            ctx,
+                            &enc,
+                            carrier,
+                            &shared_hidden,
+                            &ffn_norm_w_buf,
+                            &ffn_gate_w,
+                            &ffn_gate_off_buf,
+                            &ffn_up_w,
+                            &ffn_up_off_buf,
+                            &ffn_down_w,
+                            &ffn_down_off_buf,
+                            s.ffn_gate_q,
+                            s.ffn_up_q,
+                            s.ffn_down_q,
+                        );
+                    }
+                }
                 ChainLayerSpecRef::GdnMoeQwen(s) => {
                     let (qkv_w, qkv_off) = wrap(s.qkv_raw);
                     let (gate_w, gate_off) = wrap(s.gate_raw);
@@ -10360,6 +10477,102 @@ impl MetalBackend {
                         s.eps,
                     );
                 }
+                ChainLayerSpecRef::Attn(s) => {
+                    attn_layers += 1;
+                    dense_layers += 1;
+                    let (q_w, q_off) = wrap(s.q_raw);
+                    let (k_w, k_off) = wrap(s.k_raw);
+                    let (v_w, v_off) = wrap(s.v_raw);
+                    let (o_w, o_off) = wrap(s.o_raw);
+                    let (ffn_gate_w, ffn_gate_off) = wrap(s.ffn_gate_raw);
+                    let (ffn_up_w, ffn_up_off) = wrap(s.ffn_up_raw);
+                    let (ffn_down_w, ffn_down_off) = wrap(s.ffn_down_raw);
+                    let q_off_buf = constant_u32(q_off);
+                    let k_off_buf = constant_u32(k_off);
+                    let v_off_buf = constant_u32(v_off);
+                    let o_off_buf = constant_u32(o_off);
+                    let ffn_gate_off_buf = constant_u32(ffn_gate_off);
+                    let ffn_up_off_buf = constant_u32(ffn_up_off);
+                    let ffn_down_off_buf = constant_u32(ffn_down_off);
+                    let norm_w_buf = constant_f32(s.norm_weight);
+                    let q_norm_w_buf = constant_f32(s.q_norm_weight);
+                    let k_norm_w_buf = constant_f32(s.k_norm_weight);
+                    let ffn_norm_w_buf = constant_f32(s.ffn_norm_weight);
+
+                    {
+                        let mut carriers = self.attn_batch_carriers.borrow_mut();
+                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
+                            attn_chain::AttnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.q_dim,
+                                s.q_out_dim,
+                                s.kv_dim,
+                                s.head_dim,
+                                s.num_heads,
+                                s.num_kv_heads,
+                                s.n_rot,
+                                s.capacity,
+                                s.eps,
+                                s.theta,
+                                s.scale,
+                            )
+                        });
+                        carrier.upload_prior(s.prior_k, s.prior_v, s.pos);
+                        attn_chain::attn_core_chain_encode_bcol(
+                            ctx,
+                            &enc,
+                            carrier,
+                            &shared_hidden,
+                            &norm_w_buf,
+                            &q_w,
+                            &q_off_buf,
+                            &k_w,
+                            &k_off_buf,
+                            &v_w,
+                            &v_off_buf,
+                            &q_norm_w_buf,
+                            &k_norm_w_buf,
+                            &o_w,
+                            &o_off_buf,
+                            0,
+                            0,
+                            if s.v_is_q6k { 2 } else { 0 },
+                            0,
+                            s.pos,
+                        );
+                    }
+                    {
+                        let mut carriers = self.dense_ffn_batch_carriers.borrow_mut();
+                        let key = (batch, s.hidden_dim, s.ffn_dim, s.eps.to_bits());
+                        let carrier = carriers.entry(key).or_insert_with(|| {
+                            ffn_chain::DenseFfnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.ffn_dim,
+                                s.eps,
+                            )
+                        });
+                        ffn_chain::dense_ffn_chain_encode_bcol(
+                            ctx,
+                            &enc,
+                            carrier,
+                            &shared_hidden,
+                            &ffn_norm_w_buf,
+                            &ffn_gate_w,
+                            &ffn_gate_off_buf,
+                            &ffn_up_w,
+                            &ffn_up_off_buf,
+                            &ffn_down_w,
+                            &ffn_down_off_buf,
+                            0,
+                            0,
+                            if s.ffn_down_is_q6k { 2 } else { 0 },
+                        );
+                    }
+                }
                 ChainLayerSpecRef::AttnMoeQwen(s) => {
                     attn_layers += 1;
                     let (q_w, q_off) = wrap(s.q_raw);
@@ -10446,7 +10659,6 @@ impl MetalBackend {
                         s.eps,
                     );
                 }
-                _ => unreachable!("fused path gated on GdnMoeQwen|AttnMoeQwen"),
             }
         }
 
@@ -10461,14 +10673,19 @@ impl MetalBackend {
             let carriers = self.gdn_batch_carriers.borrow();
             for (spec, out) in specs.iter().zip(out_states.iter_mut()) {
                 match spec {
+                    ChainLayerSpecRef::Gdn(s) => {
+                        let carrier = carriers
+                            .get(&(s.layer, batch))
+                            .expect("fused dense gdn batch carrier after encode");
+                        *out = Some(carrier.readback_states());
+                    }
                     ChainLayerSpecRef::GdnMoeQwen(s) => {
                         let carrier = carriers
                             .get(&(s.layer, batch))
-                            .expect("fused gdn batch carrier after encode");
+                            .expect("fused MoE gdn batch carrier after encode");
                         *out = Some(carrier.readback_states());
                     }
-                    ChainLayerSpecRef::AttnMoeQwen(_) => *out = None,
-                    _ => unreachable!("fused path gated on GdnMoeQwen|AttnMoeQwen"),
+                    ChainLayerSpecRef::Attn(_) | ChainLayerSpecRef::AttnMoeQwen(_) => *out = None,
                 }
             }
         }
@@ -10481,10 +10698,16 @@ impl MetalBackend {
             let carriers = self.attn_batch_carriers.borrow();
             for (spec, slot) in specs.iter().zip(out_kv.iter_mut()) {
                 match spec {
+                    ChainLayerSpecRef::Attn(s) => {
+                        let carrier = carriers
+                            .get(&(s.layer, batch))
+                            .expect("fused dense attn batch carrier after encode");
+                        *slot = Some(carrier.readback_kv_slots(s.pos, batch));
+                    }
                     ChainLayerSpecRef::AttnMoeQwen(s) => {
                         let carrier = carriers
                             .get(&(s.layer, batch))
-                            .expect("fused attn batch carrier after encode");
+                            .expect("fused MoE attn batch carrier after encode");
                         *slot = Some(carrier.readback_kv_slots(s.pos, batch));
                     }
                     _ => *slot = None,
@@ -10492,7 +10715,15 @@ impl MetalBackend {
             }
         }
 
-        let moe_layers = specs.len();
+        let moe_layers = specs
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    ChainLayerSpecRef::GdnMoeQwen(_) | ChainLayerSpecRef::AttnMoeQwen(_)
+                )
+            })
+            .count();
         for _ in 0..batch {
             reports.push(DecodeChainReport {
                 did_run: true,
@@ -10504,11 +10735,14 @@ impl MetalBackend {
         }
         if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
             eprintln!(
-                "[batch-fused] did_run=true layers={} (attn={} gdn={}) batch={} \
-                 dense_weight_reads_per_layer=1 moe_shared=bcol-fused moe_sparse=per-lane",
-                moe_layers,
+                "[batch-fused] did_run=true layers={} (attn={} gdn={} dense={} moe={}) batch={} \
+                 dense_weight_reads_per_layer=1 dense_ffn=bcol-fused \
+                 moe_shared=bcol-fused moe_sparse=per-lane",
+                specs.len(),
                 attn_layers,
-                moe_layers - attn_layers,
+                specs.len() - attn_layers,
+                dense_layers,
+                moe_layers,
                 batch
             );
         }
@@ -18422,11 +18656,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..out_rows {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: out_rows,
             cols: hidden_dim,
@@ -18583,6 +18817,100 @@ kernel void q4k_ro_vec4(
             );
         }
     }
+    /// Dense Qwen GDN의 배치 융합 경로가 순차 단일 토큰 실행과 hidden 및 최종
+    /// conv/delta state까지 일치하는지 검증한다. MoE fixture의 결정적 core weight와
+    /// shared expert weight를 dense FFN weight로 재사용해 새 B-column FFN을 직접 거친다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn qwen_dense_gdn_decode_chain_batched_matches_sequential_single_token_runs() {
+        fn assert_close(a: &[f32], b: &[f32], label: &str) {
+            assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                let abs = (*x - *y).abs();
+                let rel = abs / y.abs().max(1e-6);
+                assert!(
+                    rel < 1e-3 || abs < 1e-4,
+                    "{label} mismatch i={i} a={x} b={y} abs={abs} rel={rel}"
+                );
+            }
+        }
+
+        let probe = MetalBackend::new();
+        if probe.ctx.is_none() {
+            return;
+        }
+
+        let fixture = tests_fixture::qwen_moe_gdn_decode_chain_fixture();
+        let options = DecodeChainOptions {
+            collect_timing: false,
+            delta_resident: false,
+        };
+        let hidden_dim = fixture.hidden.len();
+        let emb_a = fixture.hidden.clone();
+        let emb_b = fixture
+            .hidden
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| value * 0.5 + ((i % 5) as f32 - 2.0) * 0.0007)
+            .collect::<Vec<_>>();
+        let dense_spec = fixture.dense_layer0_spec();
+
+        let sequential = MetalBackend::new();
+        let mut conv = dense_spec.conv_state.to_vec();
+        let mut delta = dense_spec.delta_state.to_vec();
+        let mut expected_hidden = Vec::with_capacity(2);
+        for embedding in [&emb_a, &emb_b] {
+            let mut spec = dense_spec;
+            spec.conv_state = &conv;
+            spec.delta_state = &delta;
+            let mut row = embedding.clone();
+            let mut states = vec![None];
+            let report = sequential.decode_chain_run(
+                &mut row,
+                &[ChainLayerSpecRef::Gdn(spec)],
+                &mut states,
+                options,
+                None,
+            );
+            assert!(report.did_run);
+            assert_eq!(report.qwen_moe_layers, 0);
+            (conv, delta) = states[0].take().expect("sequential dense GDN state");
+            expected_hidden.push(row);
+        }
+
+        let batched = MetalBackend::new();
+        let mut actual_hidden = Vec::with_capacity(2 * hidden_dim);
+        actual_hidden.extend_from_slice(&emb_a);
+        actual_hidden.extend_from_slice(&emb_b);
+        let mut actual_states = vec![None];
+        let reports = batched.decode_chain_run_batched(
+            &mut actual_hidden,
+            2,
+            &[ChainLayerSpecRef::Gdn(dense_spec)],
+            &mut actual_states,
+            options,
+            None,
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|report| report.did_run));
+        assert!(reports.iter().all(|report| report.qwen_moe_layers == 0));
+        assert_close(
+            &actual_hidden[..hidden_dim],
+            &expected_hidden[0],
+            "dense batch lane0 hidden",
+        );
+        assert_close(
+            &actual_hidden[hidden_dim..],
+            &expected_hidden[1],
+            "dense batch lane1 hidden",
+        );
+        let (actual_conv, actual_delta) =
+            actual_states[0].as_ref().expect("batched dense GDN state");
+        assert_close(actual_conv, &conv, "dense batch final conv");
+        assert_close(actual_delta, &delta, "dense batch final delta");
+    }
 
     /// milestone 4 배치 디코드 체인 oracle(attn): `decode_chain_run_batched` 의 fused 경로가
     /// AttnMoeQwen layer 를 batch=2 구별 토큰(진짜 시퀀스 pos, pos+1)으로 처리한 결과가
@@ -18633,11 +18961,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..out_rows {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: out_rows,
             cols: hidden_dim,
@@ -18761,11 +19089,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..out_rows {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: out_rows,
             cols: hidden_dim,
@@ -18914,11 +19242,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..out_rows {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: out_rows,
             cols: hidden_dim,
@@ -19035,11 +19363,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..8 {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: 8,
             cols: hidden_dim,
@@ -19147,11 +19475,11 @@ kernel void q4k_ro_vec4(
             for _ in 0..8 {
                 v.extend_from_slice(&block);
             }
-            v
+            tests_fixture::registered_bytes(v)
         };
         let argmax_spec = || DecodeOutputArgmaxSpecRef {
             norm_weight: &out_norm,
-            output_raw: &out_raw,
+            output_raw: out_raw.as_bytes().expect("registered output bytes"),
             output_quant: 0,
             rows: 8,
             cols: hidden_dim,

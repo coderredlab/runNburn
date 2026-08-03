@@ -539,6 +539,150 @@ impl FfnCarrier {
     }
 }
 
+/// Batched verify 전용 dense FFN scratch. 동일 shape와 batch에서 layer 간 재사용하며
+/// norm/gate/up/down을 `[batch * dim]`으로 유지해 세 projection weight를 각각 한 번만 읽는다.
+pub(crate) struct DenseFfnBatchCarrier {
+    batch: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    normed_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    up_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    down_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    batch_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    silu_total_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+impl DenseFfnBatchCarrier {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        batch: usize,
+        hidden_dim: usize,
+        ffn_dim: usize,
+        eps: f32,
+    ) -> Self {
+        Self {
+            batch,
+            hidden_dim,
+            ffn_dim,
+            normed_all: empty_f32_buf(ctx, batch * hidden_dim),
+            gate_all: empty_f32_buf(ctx, batch * ffn_dim),
+            up_all: empty_f32_buf(ctx, batch * ffn_dim),
+            down_all: empty_f32_buf(ctx, batch * hidden_dim),
+            hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            ffn_dim_buf: u32_buf(ctx, ffn_dim as u32),
+            batch_buf: u32_buf(ctx, batch as u32),
+            eps_buf: f32_buf(ctx, eps),
+            silu_total_buf: u32_buf(ctx, (batch * ffn_dim) as u32),
+        }
+    }
+}
+
+/// Dense SwiGLU FFN을 B-column으로 인코드한다. RMSNorm과 residual은 lane-local이지만
+/// gate/up/down GEMV는 B열을 함께 처리해 각 weight를 한 번만 읽는다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dense_ffn_chain_encode_bcol(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &DenseFfnBatchCarrier,
+    shared_hidden: &ProtocolObject<dyn MTLBuffer>,
+    norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_quant: u8,
+    up_quant: u8,
+    down_quant: u8,
+) {
+    let f32_bytes = std::mem::size_of::<f32>();
+    for lane in 0..carrier.batch {
+        let hidden_offset = lane * carrier.hidden_dim * f32_bytes;
+        encode_rms_norm_io_offset(
+            ctx,
+            enc,
+            shared_hidden,
+            hidden_offset,
+            norm_w_buf,
+            &carrier.normed_all,
+            hidden_offset,
+            &carrier.hidden_dim_buf,
+            &carrier.eps_buf,
+        );
+    }
+    crate::compute::chain_barrier(ctx, enc);
+
+    crate::compute::encode_gemv_quant_bcol(
+        ctx,
+        enc,
+        gate_quant,
+        gate_w_buf,
+        &carrier.normed_all,
+        &carrier.gate_all,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        gate_off_buf,
+        &carrier.batch_buf,
+        carrier.ffn_dim,
+    );
+    crate::compute::encode_gemv_quant_bcol(
+        ctx,
+        enc,
+        up_quant,
+        up_w_buf,
+        &carrier.normed_all,
+        &carrier.up_all,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        up_off_buf,
+        &carrier.batch_buf,
+        carrier.ffn_dim,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+    encode_silu_mul(
+        ctx,
+        enc,
+        &carrier.gate_all,
+        &carrier.up_all,
+        &carrier.silu_total_buf,
+        carrier.batch * carrier.ffn_dim,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+    crate::compute::encode_gemv_quant_bcol(
+        ctx,
+        enc,
+        down_quant,
+        down_w_buf,
+        &carrier.gate_all,
+        &carrier.down_all,
+        &carrier.hidden_dim_buf,
+        &carrier.ffn_dim_buf,
+        down_off_buf,
+        &carrier.batch_buf,
+        carrier.hidden_dim,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+
+    for lane in 0..carrier.batch {
+        let hidden_offset = lane * carrier.hidden_dim * f32_bytes;
+        encode_residual_add_at(
+            ctx,
+            enc,
+            shared_hidden,
+            hidden_offset,
+            &carrier.down_all,
+            hidden_offset,
+            carrier.hidden_dim,
+        );
+    }
+    crate::compute::chain_barrier(ctx, enc);
+}
+
 /// FFN chain 한 token 실행. weight buffer/offset(NoCopy resident)은 caller 가 준비.
 /// gate/up: N=ffn_dim, K=hidden_dim. down: N=hidden_dim, K=ffn_dim.
 /// carrier 의 device buffer 를 재사용하며, 단일 command buffer 단일 encoder 로 ①~⑥.

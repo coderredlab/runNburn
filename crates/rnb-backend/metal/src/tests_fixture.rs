@@ -251,19 +251,19 @@ pub struct QwenMoeGdnDecodeChainFixture {
     conv1d: Vec<f32>,
     ssm_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
-    qkv_raw: Vec<u8>,
-    gate_raw: Vec<u8>,
-    alpha_raw: Vec<u8>,
-    beta_raw: Vec<u8>,
-    ssm_out_raw: Vec<u8>,
-    router_w: Vec<f32>,
-    gate_exps_raw: Vec<u8>,
-    up_exps_raw: Vec<u8>,
-    down_exps_raw: Vec<u8>,
+    qkv_raw: rnb_core::tensor::Tensor,
+    gate_raw: rnb_core::tensor::Tensor,
+    alpha_raw: rnb_core::tensor::Tensor,
+    beta_raw: rnb_core::tensor::Tensor,
+    ssm_out_raw: rnb_core::tensor::Tensor,
+    router_w: rnb_core::tensor::Tensor,
+    gate_exps_raw: rnb_core::tensor::Tensor,
+    up_exps_raw: rnb_core::tensor::Tensor,
+    down_exps_raw: rnb_core::tensor::Tensor,
     shared_input_scale: Vec<f32>,
-    shared_gate_raw: Vec<u8>,
-    shared_up_raw: Vec<u8>,
-    shared_down_raw: Vec<u8>,
+    shared_gate_raw: rnb_core::tensor::Tensor,
+    shared_up_raw: rnb_core::tensor::Tensor,
+    shared_down_raw: rnb_core::tensor::Tensor,
 }
 
 #[cfg(target_os = "macos")]
@@ -287,6 +287,57 @@ impl QwenMoeGdnDecodeChainFixture {
     pub fn layer1_spec(&self) -> crate::GdnMoeQwenChainSpecRef<'_> {
         self.spec(1)
     }
+    pub fn dense_layer0_spec(&self) -> crate::GdnChainSpecRef<'_> {
+        crate::GdnChainSpecRef {
+            layer: 0,
+            conv_state: &self.conv_state,
+            delta_state: &self.delta_state,
+            attn_norm_weight: &self.attn_norm,
+            dt_bias_weight: &self.dt_bias,
+            ssm_a_weight: &self.ssm_a,
+            conv1d_weight: &self.conv1d,
+            ssm_norm_weight: &self.ssm_norm,
+            ffn_norm_weight: &self.ffn_norm,
+            qkv_raw: self.qkv_raw.as_bytes().expect("registered qkv bytes"),
+            gate_raw: self.gate_raw.as_bytes().expect("registered gate bytes"),
+            alpha_raw: self.alpha_raw.as_bytes().expect("registered alpha bytes"),
+            beta_raw: self.beta_raw.as_bytes().expect("registered beta bytes"),
+            ssm_out_raw: self
+                .ssm_out_raw
+                .as_bytes()
+                .expect("registered ssm output bytes"),
+            ffn_gate_raw: self
+                .shared_gate_raw
+                .as_bytes()
+                .expect("registered shared gate bytes"),
+            ffn_up_raw: self
+                .shared_up_raw
+                .as_bytes()
+                .expect("registered shared up bytes"),
+            ffn_down_raw: self
+                .shared_down_raw
+                .as_bytes()
+                .expect("registered shared down bytes"),
+            qkv_q: 0,
+            gate_q: 0,
+            alpha_q: 4,
+            beta_q: 4,
+            ssm_out_q: 4,
+            ffn_gate_q: 0,
+            ffn_up_q: 0,
+            ffn_down_q: 2,
+            hidden_dim: Self::HIDDEN_DIM,
+            conv_channels: Self::CONV_CHANNELS,
+            conv_kernel: Self::CONV_KERNEL,
+            z_dim: Self::Z_DIM,
+            num_v_heads: Self::NUM_V_HEADS,
+            num_k_heads: Self::NUM_K_HEADS,
+            head_k_dim: Self::HEAD_K_DIM,
+            head_v_dim: Self::HEAD_V_DIM,
+            ffn_dim: Self::N_FF,
+            eps: 1e-6,
+        }
+    }
 
     fn spec(&self, layer: usize) -> crate::GdnMoeQwenChainSpecRef<'_> {
         crate::GdnMoeQwenChainSpecRef {
@@ -300,22 +351,43 @@ impl QwenMoeGdnDecodeChainFixture {
             conv1d_weight: &self.conv1d,
             ssm_norm_weight: &self.ssm_norm,
             ffn_norm_weight: &self.ffn_norm,
-            qkv_raw: &self.qkv_raw,
-            gate_raw: &self.gate_raw,
-            alpha_raw: &self.alpha_raw,
-            beta_raw: &self.beta_raw,
-            ssm_out_raw: &self.ssm_out_raw,
-            router_w: &self.router_w,
-            gate_exps_raw: &self.gate_exps_raw,
+            qkv_raw: self.qkv_raw.as_bytes().expect("registered qkv bytes"),
+            gate_raw: self.gate_raw.as_bytes().expect("registered gate bytes"),
+            alpha_raw: self.alpha_raw.as_bytes().expect("registered alpha bytes"),
+            beta_raw: self.beta_raw.as_bytes().expect("registered beta bytes"),
+            ssm_out_raw: self
+                .ssm_out_raw
+                .as_bytes()
+                .expect("registered ssm output bytes"),
+            router_w: registered_f32_slice(&self.router_w),
+            gate_exps_raw: self
+                .gate_exps_raw
+                .as_bytes()
+                .expect("registered expert gate bytes"),
             gate_expert_bytes: Self::N_FF * 144,
-            up_exps_raw: &self.up_exps_raw,
+            up_exps_raw: self
+                .up_exps_raw
+                .as_bytes()
+                .expect("registered expert up bytes"),
             up_expert_bytes: Self::N_FF * 144,
-            down_exps_raw: &self.down_exps_raw,
+            down_exps_raw: self
+                .down_exps_raw
+                .as_bytes()
+                .expect("registered expert down bytes"),
             down_expert_bytes: Self::HIDDEN_DIM * 210,
             shared_input_scale: &self.shared_input_scale,
-            shared_gate_raw: &self.shared_gate_raw,
-            shared_up_raw: &self.shared_up_raw,
-            shared_down_raw: &self.shared_down_raw,
+            shared_gate_raw: self
+                .shared_gate_raw
+                .as_bytes()
+                .expect("registered shared gate bytes"),
+            shared_up_raw: self
+                .shared_up_raw
+                .as_bytes()
+                .expect("registered shared up bytes"),
+            shared_down_raw: self
+                .shared_down_raw
+                .as_bytes()
+                .expect("registered shared down bytes"),
             qkv_q: 0,
             gate_q: 0,
             alpha_q: 4,
@@ -352,6 +424,32 @@ fn f32_raw(values: &[f32]) -> Vec<u8> {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn registered_bytes(bytes: Vec<u8>) -> rnb_core::tensor::Tensor {
+    let len = bytes.len();
+    let tensor = rnb_core::tensor::Tensor::from_vec(bytes, &[len]);
+    tensor.register_host_storage();
+    tensor
+}
+#[cfg(target_os = "macos")]
+fn registered_f32(values: Vec<f32>) -> rnb_core::tensor::Tensor {
+    let len = values.len();
+    let tensor = rnb_core::tensor::Tensor::from_vec(values, &[len]);
+    tensor.register_host_storage();
+    tensor
+}
+
+#[cfg(target_os = "macos")]
+fn registered_f32_slice(tensor: &rnb_core::tensor::Tensor) -> &[f32] {
+    let bytes = tensor.as_bytes().expect("registered f32 tensor bytes");
+    assert_eq!(bytes.len() % std::mem::size_of::<f32>(), 0);
+    unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr().cast::<f32>(),
+            bytes.len() / std::mem::size_of::<f32>(),
+        )
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -391,32 +489,38 @@ pub fn qwen_moe_gdn_decode_chain_fixture() -> QwenMoeGdnDecodeChainFixture {
         ],
         ssm_norm: ones_head,
         ffn_norm: ones_hidden,
-        qkv_raw: repeat_block(&q4, QwenMoeGdnDecodeChainFixture::CONV_CHANNELS),
-        gate_raw: repeat_block(&q4, QwenMoeGdnDecodeChainFixture::Z_DIM),
-        alpha_raw: f32_raw(&f32_row_hidden),
-        beta_raw: f32_raw(&f32_row_hidden),
-        ssm_out_raw: f32_raw(&f32_ssm_out),
-        router_w: vec![
+        qkv_raw: registered_bytes(repeat_block(
+            &q4,
+            QwenMoeGdnDecodeChainFixture::CONV_CHANNELS,
+        )),
+        gate_raw: registered_bytes(repeat_block(&q4, QwenMoeGdnDecodeChainFixture::Z_DIM)),
+        alpha_raw: registered_bytes(f32_raw(&f32_row_hidden)),
+        beta_raw: registered_bytes(f32_raw(&f32_row_hidden)),
+        ssm_out_raw: registered_bytes(f32_raw(&f32_ssm_out)),
+        router_w: registered_f32(vec![
             0.001;
             QwenMoeGdnDecodeChainFixture::N_EXPERT
                 * QwenMoeGdnDecodeChainFixture::HIDDEN_DIM
-        ],
-        gate_exps_raw: repeat_block(
+        ]),
+        gate_exps_raw: registered_bytes(repeat_block(
             &q4,
             QwenMoeGdnDecodeChainFixture::N_EXPERT * QwenMoeGdnDecodeChainFixture::N_FF,
-        ),
-        up_exps_raw: repeat_block(
+        )),
+        up_exps_raw: registered_bytes(repeat_block(
             &q4,
             QwenMoeGdnDecodeChainFixture::N_EXPERT * QwenMoeGdnDecodeChainFixture::N_FF,
-        ),
-        down_exps_raw: repeat_block(
+        )),
+        down_exps_raw: registered_bytes(repeat_block(
             &q6,
             QwenMoeGdnDecodeChainFixture::N_EXPERT * QwenMoeGdnDecodeChainFixture::HIDDEN_DIM,
-        ),
+        )),
         shared_input_scale: vec![1.0; QwenMoeGdnDecodeChainFixture::HIDDEN_DIM],
-        shared_gate_raw: repeat_block(&q4, QwenMoeGdnDecodeChainFixture::N_FF),
-        shared_up_raw: repeat_block(&q4, QwenMoeGdnDecodeChainFixture::N_FF),
-        shared_down_raw: repeat_block(&q6, QwenMoeGdnDecodeChainFixture::HIDDEN_DIM),
+        shared_gate_raw: registered_bytes(repeat_block(&q4, QwenMoeGdnDecodeChainFixture::N_FF)),
+        shared_up_raw: registered_bytes(repeat_block(&q4, QwenMoeGdnDecodeChainFixture::N_FF)),
+        shared_down_raw: registered_bytes(repeat_block(
+            &q6,
+            QwenMoeGdnDecodeChainFixture::HIDDEN_DIM,
+        )),
     }
 }
 
@@ -431,18 +535,18 @@ pub struct QwenMoeAttnDecodeChainFixture {
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
-    q_raw: Vec<u8>,
-    k_raw: Vec<u8>,
-    v_raw: Vec<u8>,
-    o_raw: Vec<u8>,
-    router_w: Vec<f32>,
-    gate_exps_raw: Vec<u8>,
-    up_exps_raw: Vec<u8>,
-    down_exps_raw: Vec<u8>,
+    q_raw: rnb_core::tensor::Tensor,
+    k_raw: rnb_core::tensor::Tensor,
+    v_raw: rnb_core::tensor::Tensor,
+    o_raw: rnb_core::tensor::Tensor,
+    router_w: rnb_core::tensor::Tensor,
+    gate_exps_raw: rnb_core::tensor::Tensor,
+    up_exps_raw: rnb_core::tensor::Tensor,
+    down_exps_raw: rnb_core::tensor::Tensor,
     shared_input_scale: Vec<f32>,
-    shared_gate_raw: Vec<u8>,
-    shared_up_raw: Vec<u8>,
-    shared_down_raw: Vec<u8>,
+    shared_gate_raw: rnb_core::tensor::Tensor,
+    shared_up_raw: rnb_core::tensor::Tensor,
+    shared_down_raw: rnb_core::tensor::Tensor,
     prior_k: Vec<u16>,
     prior_v: Vec<u16>,
 }
@@ -471,21 +575,39 @@ impl QwenMoeAttnDecodeChainFixture {
             q_norm_weight: &self.q_norm,
             k_norm_weight: &self.k_norm,
             ffn_norm_weight: &self.ffn_norm,
-            q_raw: &self.q_raw,
-            k_raw: &self.k_raw,
-            v_raw: &self.v_raw,
-            o_raw: &self.o_raw,
-            router_w: &self.router_w,
-            gate_exps_raw: &self.gate_exps_raw,
+            q_raw: self.q_raw.as_bytes().expect("registered q bytes"),
+            k_raw: self.k_raw.as_bytes().expect("registered k bytes"),
+            v_raw: self.v_raw.as_bytes().expect("registered v bytes"),
+            o_raw: self.o_raw.as_bytes().expect("registered output bytes"),
+            router_w: registered_f32_slice(&self.router_w),
+            gate_exps_raw: self
+                .gate_exps_raw
+                .as_bytes()
+                .expect("registered expert gate bytes"),
             gate_expert_bytes: Self::N_FF * 144,
-            up_exps_raw: &self.up_exps_raw,
+            up_exps_raw: self
+                .up_exps_raw
+                .as_bytes()
+                .expect("registered expert up bytes"),
             up_expert_bytes: Self::N_FF * 144,
-            down_exps_raw: &self.down_exps_raw,
+            down_exps_raw: self
+                .down_exps_raw
+                .as_bytes()
+                .expect("registered expert down bytes"),
             down_expert_bytes: Self::HIDDEN_DIM * 210,
             shared_input_scale: &self.shared_input_scale,
-            shared_gate_raw: &self.shared_gate_raw,
-            shared_up_raw: &self.shared_up_raw,
-            shared_down_raw: &self.shared_down_raw,
+            shared_gate_raw: self
+                .shared_gate_raw
+                .as_bytes()
+                .expect("registered shared gate bytes"),
+            shared_up_raw: self
+                .shared_up_raw
+                .as_bytes()
+                .expect("registered shared up bytes"),
+            shared_down_raw: self
+                .shared_down_raw
+                .as_bytes()
+                .expect("registered shared down bytes"),
             q_q: 0,
             k_q: 0,
             v_q: 0,
@@ -552,18 +674,18 @@ pub fn qwen_moe_attn_decode_chain_fixture() -> QwenMoeAttnDecodeChainFixture {
         q_norm: vec![1.0; F::HEAD_DIM],
         k_norm: vec![1.0; F::HEAD_DIM],
         ffn_norm: vec![1.0; F::HIDDEN_DIM],
-        q_raw: repeat_block(&q4, F::Q_OUT_DIM),
-        k_raw: repeat_block(&q4, F::KV_DIM),
-        v_raw: repeat_block(&q4, F::KV_DIM),
-        o_raw: repeat_block(&q4, F::HIDDEN_DIM),
-        router_w: vec![0.001; F::N_EXPERT * F::HIDDEN_DIM],
-        gate_exps_raw: repeat_block(&q4, F::N_EXPERT * F::N_FF),
-        up_exps_raw: repeat_block(&q4, F::N_EXPERT * F::N_FF),
-        down_exps_raw: repeat_block(&q6, F::N_EXPERT * F::HIDDEN_DIM),
+        q_raw: registered_bytes(repeat_block(&q4, F::Q_OUT_DIM)),
+        k_raw: registered_bytes(repeat_block(&q4, F::KV_DIM)),
+        v_raw: registered_bytes(repeat_block(&q4, F::KV_DIM)),
+        o_raw: registered_bytes(repeat_block(&q4, F::HIDDEN_DIM)),
+        router_w: registered_f32(vec![0.001; F::N_EXPERT * F::HIDDEN_DIM]),
+        gate_exps_raw: registered_bytes(repeat_block(&q4, F::N_EXPERT * F::N_FF)),
+        up_exps_raw: registered_bytes(repeat_block(&q4, F::N_EXPERT * F::N_FF)),
+        down_exps_raw: registered_bytes(repeat_block(&q6, F::N_EXPERT * F::HIDDEN_DIM)),
         shared_input_scale: vec![1.0; F::HIDDEN_DIM],
-        shared_gate_raw: repeat_block(&q4, F::N_FF),
-        shared_up_raw: repeat_block(&q4, F::N_FF),
-        shared_down_raw: repeat_block(&q6, F::HIDDEN_DIM),
+        shared_gate_raw: registered_bytes(repeat_block(&q4, F::N_FF)),
+        shared_up_raw: registered_bytes(repeat_block(&q4, F::N_FF)),
+        shared_down_raw: registered_bytes(repeat_block(&q6, F::HIDDEN_DIM)),
         prior_k,
         prior_v,
     }
