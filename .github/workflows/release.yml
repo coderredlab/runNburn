@@ -197,6 +197,10 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Configure MSVC environment
+        if: matrix.backend == 'cuda-sm86'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install CUDA compiler
         if: matrix.backend == 'cuda-sm86'
         uses: Jimver/cuda-toolkit@v0.2.35
