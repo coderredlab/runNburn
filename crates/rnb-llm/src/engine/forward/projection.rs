@@ -74,6 +74,56 @@ pub(in crate::engine::forward) fn atn_proj_metal(
     Ok(None)
 }
 
+fn gemma4_atn_kv_dual_policy(architecture: ModelArchitecture, value: Option<&str>) -> bool {
+    matches!(architecture, ModelArchitecture::Gemma4)
+        && value
+            .map(|value| {
+                !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn atn_kv_dual_metal(
+    architecture: ModelArchitecture,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    input: &Tensor,
+    seq_len: usize,
+) -> crate::error::Result<Option<(Tensor, Tensor)>> {
+    let value = crate::engine::policy::env_string("RNB_METAL_PREFILL_ATN_KV_DUAL");
+    if !gemma4_atn_kv_dual_policy(architecture, value.as_deref()) {
+        return Ok(None);
+    }
+    let slice = kernels::tensor_as_f32_slice(input);
+    let hidden_dim = slice.len() / seq_len;
+    let Some((k, v)) = backend_runtime::metal_prefill_gdn_f32_dual_proj_if_supported(
+        k_weight, v_weight, slice, seq_len, hidden_dim,
+    )?
+    else {
+        return Ok(None);
+    };
+    let n_out = k.len() / seq_len;
+    Ok(Some((
+        Tensor::from_vec(k, &[seq_len, n_out]),
+        Tensor::from_vec(v, &[seq_len, n_out]),
+    )))
+}
+
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+fn atn_kv_dual_metal(
+    _architecture: ModelArchitecture,
+    _k_weight: &QuantizedWeight,
+    _v_weight: &QuantizedWeight,
+    _input: &Tensor,
+    _seq_len: usize,
+) -> crate::error::Result<Option<(Tensor, Tensor)>> {
+    Ok(None)
+}
+
 /// pm70: dense Qwen gated attention prefill full-layer Metal carrier.
 /// attn core의 gated attention output을 host로 읽지 않고 o_proj+FFN까지 device에서 이어 간다.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -989,26 +1039,37 @@ pub(super) fn project_prefill_attention(
         } else {
             w.q_weight.gemv(&normed)?
         };
-        let k = if gemma4_reuse_q_only {
-            None
-        } else if qk_f32_override {
-            Some(w.k_weight.gemv_full_dequant_f32(&normed)?)
-        } else if let Some(t) = atn_proj_metal("k_proj", layer_idx, &w.k_weight, &normed, seq_len)?
-        {
-            Some(t)
+        let dual_kv = if !gemma4_reuse_q_only && !w.v_proj_missing && !qk_f32_override {
+            atn_kv_dual_metal(architecture, &w.k_weight, &w.v_weight, &normed, seq_len)?
         } else {
-            Some(w.k_weight.gemv(&normed)?)
+            None
         };
-        let v = if gemma4_reuse_q_only {
-            None
-        } else if w.v_proj_missing {
-            // Gemma4 full-attn layers may omit V projection, matching K reuse semantics.
-            k.clone()
-        } else if let Some(t) = atn_proj_metal("v_proj", layer_idx, &w.v_weight, &normed, seq_len)?
-        {
-            Some(t)
+        let (k, v) = if let Some((k, v)) = dual_kv {
+            (Some(k), Some(v))
         } else {
-            Some(w.v_weight.gemv(&normed)?)
+            let k = if gemma4_reuse_q_only {
+                None
+            } else if qk_f32_override {
+                Some(w.k_weight.gemv_full_dequant_f32(&normed)?)
+            } else if let Some(t) =
+                atn_proj_metal("k_proj", layer_idx, &w.k_weight, &normed, seq_len)?
+            {
+                Some(t)
+            } else {
+                Some(w.k_weight.gemv(&normed)?)
+            };
+            let v = if gemma4_reuse_q_only {
+                None
+            } else if w.v_proj_missing {
+                k.clone()
+            } else if let Some(t) =
+                atn_proj_metal("v_proj", layer_idx, &w.v_weight, &normed, seq_len)?
+            {
+                Some(t)
+            } else {
+                Some(w.v_weight.gemv(&normed)?)
+            };
+            (k, v)
         };
         (q_full, k, v)
     };
@@ -1155,4 +1216,23 @@ pub(super) fn project_prefill_attention(
         attn_gate,
         cached_kv_f16: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_kv_dual_defaults_on_with_falsey_opt_out() {
+        assert!(gemma4_atn_kv_dual_policy(ModelArchitecture::Gemma4, None));
+        assert!(gemma4_atn_kv_dual_policy(
+            ModelArchitecture::Gemma4,
+            Some("1")
+        ));
+        assert!(!gemma4_atn_kv_dual_policy(
+            ModelArchitecture::Gemma4,
+            Some("false")
+        ));
+        assert!(!gemma4_atn_kv_dual_policy(ModelArchitecture::Qwen35, None));
+    }
 }
