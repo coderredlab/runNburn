@@ -17,8 +17,8 @@ pub(crate) struct BatchedVerifyCommit {
     pub(crate) batch: usize,
     /// run layer 순서의 model layer index.
     layer_indices: Vec<usize>,
-    /// GDN prefix state: gdn_prefix[n-1][layer] = n lane 처리 후 conv/delta(GdnMoeQwen=Some, 그
-    /// 외 None). 재실행 없이 carrier 에서 readback(병목2). commit 은 [committed-1] 사용.
+    /// GDN prefix state: gdn_prefix[n-1][layer] = n lane 처리 후 conv/delta(dense/MoE GDN만
+    /// Some). 재실행 없이 carrier에서 readback하며 commit은 `[committed-1]`을 쓴다.
     gdn_prefix: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
     /// attn layer = Some((k,v))(slot-major [batch*kv_dim] post-rope f16 bits), 그 외 None.
     out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>>,
@@ -342,16 +342,142 @@ impl Engine {
         })
     }
 
-    /// milestone 5(MTP): non-KVarn(f16 KV) 이어야 배치 fused attn 경로가 성립한다.
-    /// attn layer 중 하나라도 KVarn 이면 배치 verify 를 쓰지 않는다.
+    /// Qwen dense/MoE 배치 decode-chain의 전체 모델 적격 조건. 정책과 실행 경로가 같은 gate를
+    /// 공유해 미지원 quant/KV layout을 auto-enable하거나 생성 중간에 발견하지 않게 한다.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    pub(crate) fn batched_decode_chain_kv_ready(&self) -> bool {
+    pub(crate) fn batched_decode_chain_ready(&self) -> bool {
+        if !matches!(
+            self.architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ) {
+            return false;
+        }
         let Some(weights) = self.weights.as_ref() else {
             return false;
         };
+        if use_token_embedding_as_output()
+            || self.metadata.final_logit_softcapping != 0.0
+            || weights.output.cols != self.metadata.hidden_dim
+            || !matches!(
+                weights.output.ggml_type,
+                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+            )
+            || weights.output.data.as_bytes().is_none()
+            || weights.output_norm.numel() != self.metadata.hidden_dim
+        {
+            return false;
+        }
+
+        let bcol_quant = |quant| {
+            matches!(
+                quant,
+                rnb_loader::GGMLType::Q4_K
+                    | rnb_loader::GGMLType::Q5_K
+                    | rnb_loader::GGMLType::Q6_K
+                    | rnb_loader::GGMLType::Q8_0
+                    | rnb_loader::GGMLType::F32
+            )
+        };
+        let attn_quant = |quant| {
+            matches!(
+                quant,
+                rnb_loader::GGMLType::Q4_K
+                    | rnb_loader::GGMLType::Q5_K
+                    | rnb_loader::GGMLType::Q6_K
+                    | rnb_loader::GGMLType::Q8_0
+            )
+        };
+
         for (li, layer) in weights.layers.iter().enumerate() {
-            if matches!(layer, LayerType::Attention(_)) && self.kv_cache.layer_uses_kvarn(li) {
-                return false;
+            match layer {
+                LayerType::GatedDeltaNet(w) => {
+                    if !(models::qwen::gdn_carrier_eligible(w)
+                        || qwen_moe_decode_chain_candidate(
+                            w.shared_expert_moe.is_some(),
+                            w.ffn_gate_up_fused.is_some(),
+                            true,
+                        ))
+                    {
+                        return false;
+                    }
+                    let core = [
+                        &w.qkv_weight,
+                        &w.gate_weight,
+                        &w.ssm_alpha,
+                        &w.ssm_beta,
+                        &w.ssm_out,
+                    ];
+                    if core.iter().any(|weight| {
+                        !bcol_quant(weight.ggml_type) || weight.backend_view().is_none()
+                    }) {
+                        return false;
+                    }
+                    if w.shared_expert_moe.is_none() {
+                        let ffn = [&w.ffn_gate_weight, &w.ffn_up_weight, &w.ffn_down_weight];
+                        if ffn.iter().any(|weight| {
+                            !bcol_quant(weight.ggml_type) || weight.backend_view().is_none()
+                        }) {
+                            return false;
+                        }
+                    }
+                }
+                LayerType::Attention(w) => {
+                    if shared_kv_source_layer(&self.metadata, self.architecture, li).is_some()
+                        || self.kv_cache.layer_uses_kvarn(li)
+                    {
+                        return false;
+                    }
+                    let layer_kv_override = self
+                        .metadata
+                        .head_count_kv_per_layer
+                        .as_ref()
+                        .and_then(|v| v.get(li).copied());
+                    let Ok(layout) = resolve_attention_layout(&self.metadata, w, layer_kv_override)
+                    else {
+                        return false;
+                    };
+                    let dense = attn_carrier_eligible(w, layout.has_gated_attn, true, 0, 0, false);
+                    let moe = qwen_attn_moe_chain_eligible(
+                        w,
+                        layout.has_gated_attn,
+                        true,
+                        0,
+                        0,
+                        false,
+                        true,
+                    );
+                    if !dense && !moe {
+                        return false;
+                    }
+                    let projections = [&w.q_weight, &w.k_weight, &w.v_weight, &w.o_weight];
+                    if projections.iter().any(|weight| {
+                        !attn_quant(weight.ggml_type) || weight.backend_view().is_none()
+                    }) {
+                        return false;
+                    }
+                    if dense {
+                        if w.q_weight.ggml_type != rnb_loader::GGMLType::Q4_K
+                            || w.k_weight.ggml_type != rnb_loader::GGMLType::Q4_K
+                            || w.o_weight.ggml_type != rnb_loader::GGMLType::Q4_K
+                            || !matches!(
+                                w.v_weight.ggml_type,
+                                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+                            )
+                            || w.ffn_gate_weight.ggml_type != rnb_loader::GGMLType::Q4_K
+                            || w.ffn_up_weight.ggml_type != rnb_loader::GGMLType::Q4_K
+                            || !matches!(
+                                w.ffn_down_weight.ggml_type,
+                                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+                            )
+                            || w.ffn_gate_weight.backend_view().is_none()
+                            || w.ffn_up_weight.backend_view().is_none()
+                            || w.ffn_down_weight.backend_view().is_none()
+                        {
+                            return false;
+                        }
+                    }
+                }
+                _ => return false,
             }
         }
         true
@@ -458,7 +584,15 @@ impl Engine {
                         .as_ref()
                         .and_then(|v| v.get(li).copied());
                     let layout = resolve_attention_layout(metadata, w, layer_kv_override)?;
-                    if !qwen_attn_moe_chain_eligible(
+                    let dense_attn = attn_carrier_eligible(
+                        w,
+                        layout.has_gated_attn,
+                        true,
+                        base_pos,
+                        base_pos,
+                        false,
+                    );
+                    let moe_attn = qwen_attn_moe_chain_eligible(
                         w,
                         layout.has_gated_attn,
                         true,
@@ -466,7 +600,8 @@ impl Engine {
                         base_pos,
                         false,
                         true,
-                    ) {
+                    );
+                    if !dense_attn && !moe_attn {
                         return Ok(None);
                     }
                     let (carrier_rope_dim, carrier_rope_theta, _) =
@@ -587,6 +722,12 @@ impl Engine {
         commit: &BatchedVerifyCommit,
         committed: usize,
     ) -> crate::error::Result<()> {
+        if committed == 0 || committed > commit.batch {
+            return Err(crate::error::LlmError::Forward(format!(
+                "invalid batched verify commit {committed}/{}",
+                commit.batch
+            )));
+        }
         let base_pos = commit.base_pos;
         let gdn_state: &[Option<(Vec<f32>, Vec<f32>)>] = commit
             .gdn_prefix
@@ -620,7 +761,7 @@ impl Engine {
         }
         self.kv_cache
             .set_len((base_pos + committed).min(self.kv_cache.max_seq_len));
-        Ok(())
+        self.sync_sequence_cursor_to_kv_len()
     }
 
     fn forward_decode_impl(

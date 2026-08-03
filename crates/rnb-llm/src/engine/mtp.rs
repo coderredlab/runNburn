@@ -563,6 +563,18 @@ fn current_mtp_auto_resource_hint() -> Option<MtpAutoResourceHint> {
         None
     }
 }
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn dense_qwen35_metal_batch_auto_eligible(
+    architecture: ModelArchitecture,
+    metadata: &ModelMetadata,
+    has_mtp_runtime: bool,
+    batched_decode_chain_ready: bool,
+) -> bool {
+    architecture == ModelArchitecture::Qwen35
+        && has_mtp_runtime
+        && mtp_dense_decode_work_units(metadata) >= mtp_dense_decode_work_threshold(metadata)
+        && batched_decode_chain_ready
+}
 
 fn mtp_auto_policy_for_model(
     architecture: ModelArchitecture,
@@ -822,14 +834,30 @@ impl Engine {
                 reason: "deepseek4-dspark-explicit-only",
             };
         }
-        mtp_auto_policy_for_model(
+        let policy = mtp_auto_policy_for_model(
             self.architecture,
             &self.metadata,
             self.mtp_runtime_ready(),
             self.mtp_device_verify_supported_by_weights(),
             self.mtp_vulkan_fullpath_verify_supported(),
             current_mtp_auto_resource_hint(),
-        )
+        );
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if dense_qwen35_metal_batch_auto_eligible(
+            self.architecture,
+            &self.metadata,
+            self.mtp_runtime_ready(),
+            self.batched_decode_chain_ready(),
+        ) {
+            return MtpAutoPolicy {
+                enabled: true,
+                spec_k: 1,
+                device_verify: false,
+                reason: "dense-qwen35-metal-batch-decode-chain-auto",
+                ..policy
+            };
+        }
+        policy
     }
 
     pub(crate) fn mtp_device_verify_requested(&self) -> bool {
@@ -1964,6 +1992,41 @@ mod tests {
         assert_eq!(policy.spec_k, 1);
         assert!(policy.device_verify);
         assert_eq!(policy.reason, "dense-qwen35-device-verify-auto");
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[test]
+    fn dense_qwen35_metal_batch_auto_requires_full_chain_and_runtime() {
+        let eligible = policy_metadata(4096, 40);
+        assert!(dense_qwen35_metal_batch_auto_eligible(
+            ModelArchitecture::Qwen35,
+            &eligible,
+            true,
+            true,
+        ));
+        assert!(!dense_qwen35_metal_batch_auto_eligible(
+            ModelArchitecture::Qwen35MoE,
+            &eligible,
+            true,
+            true,
+        ));
+        assert!(!dense_qwen35_metal_batch_auto_eligible(
+            ModelArchitecture::Qwen35,
+            &eligible,
+            false,
+            true,
+        ));
+        assert!(!dense_qwen35_metal_batch_auto_eligible(
+            ModelArchitecture::Qwen35,
+            &eligible,
+            true,
+            false,
+        ));
+        assert!(!dense_qwen35_metal_batch_auto_eligible(
+            ModelArchitecture::Qwen35,
+            &policy_metadata(1536, 28),
+            true,
+            true,
+        ));
     }
 
     #[test]

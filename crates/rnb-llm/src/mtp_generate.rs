@@ -201,9 +201,8 @@ enum MtpVerifyExecution {
     BatchPrefill,
     DeviceResident,
     VulkanFullpath,
-    /// milestone 5: Qwen35MoE+Metal+f16KV — verify window 을 `decode_chain_run_batched` 로
-    /// B lane fused forward(dense weight 1회 read/amortize). verify 는 pure(프로덕션 state
-    /// 미접촉), 커밋은 host kv_cache append + GDN ssm_state write 로만(checkpoint/restore 불요).
+    /// Qwen35 dense/MoE + Metal + f16 KV verify window을 full-chain B-column forward로 처리한다.
+    /// Forward는 pure이고 accept-n만 host KV/GDN state에 커밋한다.
     BatchDecodeChain,
 }
 
@@ -223,16 +222,18 @@ fn mtp_verify_execution(
     }
 }
 
-/// milestone 5 게이트: Qwen35MoE + Metal + f16 KV(non-KVarn) 이면 배치 decode-chain verify 를
-/// 쓴다. `RNB_MTP_BATCH_DECODE_CHAIN=0` 로 opt-out. 그 외 아키텍처/백엔드는 기존 verify 경로.
+/// Qwen35 dense/MoE + Metal + f16 KV(non-KVarn) full chain이면 배치 decode-chain verify를
+/// 쓴다. `RNB_MTP_BATCH_DECODE_CHAIN=0`으로 opt-out한다.
 fn mtp_batch_decode_chain_allowed(engine: &Engine, architecture: rnb_loader::Architecture) -> bool {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
         if !crate::runtime::mtp_batch_decode_chain_enabled() {
             return false;
         }
-        matches!(architecture, rnb_loader::Architecture::Qwen35MoE)
-            && engine.batched_decode_chain_kv_ready()
+        matches!(
+            architecture,
+            rnb_loader::Architecture::Qwen35 | rnb_loader::Architecture::Qwen35MoE
+        ) && engine.batched_decode_chain_ready()
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
@@ -895,10 +896,9 @@ fn generate_stream_mtp_with_tokens(
             )));
         }
 
-        // milestone 5: Qwen35MoE + Metal + f16 KV — 배치 decode-chain verify. verify 는 pure
-        // (프로덕션 state 미접촉), 커밋은 host kv_cache append + GDN ssm_state write 로만 → full
-        // checkpoint/restore 불필요. full-accept 는 verify pass state 를 그대로 커밋, partial 은
-        // committed lane 을 한 번 더 fused forward 해 committed-lane state 로 커밋한다.
+        // Qwen35 dense/MoE + Metal + f16 KV 배치 decode-chain verify. Forward는 프로덕션
+        // state를 건드리지 않고 K/V window와 모든 GDN prefix state를 보존한다. accept-n 확정 뒤
+        // host KV cache와 GDN state만 부분 커밋하므로 checkpoint/restore나 재실행이 없다.
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         if verify_execution == MtpVerifyExecution::BatchDecodeChain {
             let mut verify_input = Vec::with_capacity(draft_k + 1);
@@ -977,15 +977,12 @@ fn generate_stream_mtp_with_tokens(
             let committed = 1 + n_accepted;
             let ending = stopped || tokens_remaining == 0;
             let phase_start = Instant::now();
-            // 커밋: committed lane 의 attn K/V + GDN prefix-committed state 를 host 로 반영(재실행
-            // 없이 verify pass 가 carrier 에 보존한 prefix state 사용, 병목2). 종료 라운드는 skip.
+            // committed lane의 attention K/V와 GDN prefix state를 host에 반영한다. 종료
+            // 라운드는 다음 decode가 없으므로 커밋을 생략한다.
             if !ending {
                 engine.commit_batched_verify(&commit, committed)?;
             }
-            // drafter MTP state 에 committed 토큰 관측 — 배치 경로는 draft-retain(accept 된
-            // draft 의 이미 계산된 KV 유지, restore+re-observe 재실행 회피)이 올바른 machinery.
-            // 검증상 lossless(baseline greedy 와 토큰 동일). Metal fast_retain 기본 off 여도 이
-            // 경로는 retain 을 쓴다.
+            // Drafter는 target verify가 만든 committed hidden prefix를 retain한다.
             let committed_hidden = window.mtp_hidden_prefix_rows(committed)?;
             engine.mtp_retain_draft_after_spec(
                 mtp_checkpoint.as_ref(),
