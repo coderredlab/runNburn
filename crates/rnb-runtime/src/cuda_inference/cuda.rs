@@ -29,10 +29,10 @@ pub use gdn::{
     NemotronPrefillWorkspaceSummary,
 };
 pub use glm_moe::{
-    clear_moe_expert_slice_cache, glm_moe_decode_shared_expert_q5k_q6k,
-    glm_moe_decode_sparse_experts_iq2xxs_iq3xxs, glm_moe_direct_file_prefill_enabled,
-    glm_moe_prefill_shared_expert_iq, glm_moe_prefill_sparse_experts_iq_by_token,
-    glm_register_stream_region_sequence, moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu,
+    glm_moe_decode_shared_expert_q5k_q6k, glm_moe_decode_sparse_experts_iq2xxs_iq3xxs,
+    glm_moe_direct_file_prefill_enabled, glm_moe_prefill_shared_expert_iq,
+    glm_moe_prefill_sparse_experts_iq_by_token, glm_register_stream_region_sequence,
+    moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu,
     mxfp4_sparse_experts_by_token_clamped_swiglu, sparse_experts_by_token_clamped_swiglu_resident,
 };
 pub use output::{
@@ -821,6 +821,7 @@ fn dequant_type(ggml_type: GGMLType) -> DequantType {
 pub fn reset_state_for_engine_init() -> Result<()> {
     backend::clear_moe_layer_cache().map_err(|err| err)?;
     backend::clear_q4k_cache().map_err(|err| err)?;
+    backend::clear_moe_expert_slice_cache().map_err(|err| err)?;
     backend::reset_delta_state_cache().map_err(|err| err)
 }
 

@@ -113,8 +113,8 @@ pub fn sparse_experts_by_token_clamped_swiglu_resident(
     gate: &[&[u8]],
     up: &[&[u8]],
     down: &[&[u8]],
-    gate_quant: u32,
-    down_quant: u32,
+    gate_quant: GGMLType,
+    down_quant: GGMLType,
     route_weights: &[f32],
     token_ids: &[u32],
     token_count: usize,
@@ -127,8 +127,8 @@ pub fn sparse_experts_by_token_clamped_swiglu_resident(
         gate,
         up,
         down,
-        gate_quant,
-        down_quant,
+        gate_quant as u32,
+        down_quant as u32,
         route_weights,
         token_ids,
         token_count,
@@ -138,11 +138,6 @@ pub fn sparse_experts_by_token_clamped_swiglu_resident(
         activation_limit,
     )
     .map_err(|err| format!("CUDA resident sparse clamped SwiGLU MoE failed: {err}"))
-}
-
-pub fn clear_moe_expert_slice_cache() -> Result<()> {
-    backend::clear_moe_expert_slice_cache()
-        .map_err(|err| format!("clearing CUDA MoE expert slice cache failed: {err}"))
 }
 
 pub fn glm_moe_decode_shared_expert_q5k_q6k(

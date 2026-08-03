@@ -597,18 +597,6 @@ fn compute_sparse_experts_cuda_batch(
     output.map_err(LlmError::Forward)
 }
 
-#[cfg(feature = "cuda")]
-fn ggml_quant_code(quant: GGMLType) -> Result<u32> {
-    match quant {
-        GGMLType::IQ2_XXS => Ok(16),
-        GGMLType::IQ3_XXS => Ok(18),
-        GGMLType::MXFP4 => Ok(39),
-        other => Err(LlmError::Forward(format!(
-            "unsupported resident sparse expert quant {other:?}"
-        ))),
-    }
-}
-
 /// Deterministic selected-expert forward through the CUDA resident slice
 /// cache. `Ok(None)` means the cache is unavailable; callers must fall back
 /// consistently for decode and verify so both stay on identical arithmetic.
@@ -653,8 +641,8 @@ fn compute_sparse_experts_cuda_resident(
         &gate_slots,
         &up_slots,
         &down_slots,
-        ggml_quant_code(moe.gate_quant)?,
-        ggml_quant_code(moe.down_quant)?,
+        moe.gate_quant,
+        moe.down_quant,
         &route_weights,
         &token_ids,
         routes.len(),
