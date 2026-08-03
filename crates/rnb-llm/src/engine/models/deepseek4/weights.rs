@@ -1,4 +1,5 @@
 use super::state::DeepSeek4State;
+use super::state::DeepSeek4StateCheckpoint;
 use crate::engine::models::shared_expert_moe::{
     load_shared_expert_moe_layer, SharedExpertMoELayerWeights,
 };
@@ -22,6 +23,14 @@ pub(in crate::engine) struct DeepSeek4Weights {
 impl DeepSeek4Weights {
     pub(in crate::engine) fn clear_state(&mut self) {
         self.state.clear();
+    }
+
+    pub(in crate::engine) fn checkpoint_state(&self) -> DeepSeek4StateCheckpoint {
+        self.state.checkpoint()
+    }
+
+    pub(in crate::engine) fn restore_state(&mut self, checkpoint: &DeepSeek4StateCheckpoint) {
+        self.state.restore(checkpoint);
     }
     pub(in crate::engine) fn set_sparse_moe_cuda_enabled(&mut self, enabled: bool) {
         for layer in &mut self.layers {

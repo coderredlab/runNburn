@@ -42,6 +42,13 @@ pub(crate) struct VulkanFullpathVerifyCommit {
     sequence_state: super::gpu_runtime::FullPathSequenceStateSnapshot,
 }
 
+#[derive(Clone)]
+pub(crate) struct DeepSeek4VerifyCheckpoint {
+    target_state: super::models::deepseek4::DeepSeek4StateCheckpoint,
+    kv_len: usize,
+    last_hidden: Vec<f32>,
+}
+
 impl Engine {
     pub fn architecture(&self) -> rnb_loader::Architecture {
         self.architecture
@@ -1784,6 +1791,11 @@ impl Engine {
             ));
         }
         let expected_position = self.kv_cache.current_len();
+        let target_layers = if self.mtp_is_dspark_runtime() && self.mtp_spec_requested() {
+            self.mtp_dspark_target_layers()
+        } else {
+            Vec::new()
+        };
         let mut weights = self.weights.take().ok_or_else(|| {
             crate::error::LlmError::Forward("DeepSeek4 weights are unavailable".to_string())
         })?;
@@ -1800,19 +1812,140 @@ impl Engine {
                 &weights.output,
                 tokens,
                 expected_position,
+                &target_layers,
+                false,
             )
         };
         self.weights = Some(weights);
-        match result {
-            Ok((logits, final_hidden)) => {
+        let result = match result {
+            Ok(output) => (|| {
                 self.kv_cache.set_len(expected_position + tokens.len());
-                self.last_layer_hidden_cached = final_hidden;
-                Ok(logits)
-            }
+                self.last_layer_hidden_cached = output.final_hidden_rows;
+                if !output.extracted_features.is_empty() {
+                    self.mtp_dspark_observe_target_batch(
+                        &output.extracted_features,
+                        tokens.len(),
+                        expected_position,
+                    )?;
+                }
+                Ok(output.logits)
+            })(),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(logits) => Ok(logits),
             Err(error) => match self.clear_sequence_state() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(crate::error::LlmError::Forward(format!(
                     "{error}; DeepSeek4 sequence-state cleanup failed: {cleanup_error}"
+                ))),
+            },
+        }
+    }
+
+    pub(crate) fn checkpoint_deepseek4_verify(
+        &self,
+    ) -> crate::error::Result<DeepSeek4VerifyCheckpoint> {
+        let model = self
+            .weights
+            .as_ref()
+            .and_then(|weights| weights.deepseek4.as_ref())
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "DeepSeek4 checkpoint requires loaded target weights".to_string(),
+                )
+            })?;
+        Ok(DeepSeek4VerifyCheckpoint {
+            target_state: model.checkpoint_state(),
+            kv_len: self.kv_cache.current_len(),
+            last_hidden: self.last_layer_hidden_cached.clone(),
+        })
+    }
+
+    pub(crate) fn restore_deepseek4_verify(
+        &mut self,
+        checkpoint: &DeepSeek4VerifyCheckpoint,
+    ) -> crate::error::Result<()> {
+        let model = self
+            .weights
+            .as_mut()
+            .and_then(|weights| weights.deepseek4.as_mut())
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "DeepSeek4 restore requires loaded target weights".to_string(),
+                )
+            })?;
+        model.restore_state(&checkpoint.target_state);
+        self.kv_cache.set_len(checkpoint.kv_len);
+        self.last_layer_hidden_cached
+            .clone_from(&checkpoint.last_hidden);
+        self.sync_sequence_cursor_to_kv_len()
+    }
+
+    pub(crate) fn forward_deepseek4_verify_batch(
+        &mut self,
+        tokens: &[u32],
+    ) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
+        if tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "DeepSeek4 verify requires at least one token".to_string(),
+            ));
+        }
+        let expected_position = self.kv_cache.current_len();
+        let target_layers = self.mtp_dspark_target_layers();
+        let mut weights = self.weights.take().ok_or_else(|| {
+            crate::error::LlmError::Forward("DeepSeek4 weights are unavailable".to_string())
+        })?;
+        let result = {
+            let model = weights.deepseek4.as_mut().ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "DeepSeek4 architecture has no DeepSeek4 weight bundle".to_string(),
+                )
+            })?;
+            super::models::deepseek4::forward_tokens(
+                model,
+                &weights.token_embd,
+                &weights.output_norm,
+                &weights.output,
+                tokens,
+                expected_position,
+                &target_layers,
+                true,
+            )
+        };
+        self.weights = Some(weights);
+        let result = match result {
+            Ok(output) => (|| {
+                self.kv_cache.set_len(expected_position + tokens.len());
+                let hidden_dim = self.metadata.hidden_dim;
+                self.last_layer_hidden_cached.clone_from_slice(
+                    &output.final_hidden_rows[output.final_hidden_rows.len() - hidden_dim..],
+                );
+                self.mtp_dspark_observe_target_batch(
+                    &output.extracted_features,
+                    tokens.len(),
+                    expected_position,
+                )?;
+                let predictions = output
+                    .logits
+                    .chunks_exact(self.metadata.vocab_size)
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                            .map_or(0, |(index, _)| index as u32)
+                    })
+                    .collect();
+                Ok((predictions, output.final_hidden_rows))
+            })(),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) => match self.clear_sequence_state() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(crate::error::LlmError::Forward(format!(
+                    "{error}; DeepSeek4 verify cleanup failed: {cleanup_error}"
                 ))),
             },
         }

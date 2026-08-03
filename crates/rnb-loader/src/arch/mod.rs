@@ -30,6 +30,7 @@ pub enum Architecture {
     Hy3,
     GlmDsa,
     DeepSeek4,
+    DFlash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +173,11 @@ pub struct DeepSeek4Metadata {
     pub rope_original_context_length: usize,
     pub rope_yarn_beta_fast: f32,
     pub rope_yarn_beta_slow: f32,
+    /// DFlash/DSpark sidecar-only metadata. `target_layers` uses the GGUF
+    /// layer-input numbering, so `num_layers` denotes the final trunk output.
+    pub dspark_block_size: Option<usize>,
+    pub dspark_target_layers: Vec<usize>,
+    pub dspark_mask_token_id: Option<u32>,
 }
 
 pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architecture, LoaderError> {
@@ -189,6 +195,7 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
         "hy_v3" => Ok(Architecture::Hy3),
         "glm-dsa" => Ok(Architecture::GlmDsa),
         "deepseek4" => Ok(Architecture::DeepSeek4),
+        "dflash" => Ok(Architecture::DFlash),
         other => Err(LoaderError::UnsupportedArchitecture(other.to_string())),
     }
 }
@@ -270,6 +277,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         Architecture::Hy3 => "hy_v3",
         Architecture::GlmDsa => "glm-dsa",
         Architecture::DeepSeek4 => "deepseek4",
+        Architecture::DFlash => "dflash",
     };
     let prefix = if get_u32(metadata, &format!("{arch_str}.embedding_length")).is_ok() {
         arch_str
@@ -309,6 +317,12 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         nextn_predict_layers,
     });
     let num_heads = get_u32(metadata, &format!("{prefix}.attention.head_count"))? as usize;
+    if num_heads == 0 {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!("{prefix}.attention.head_count must be positive"),
+        });
+    }
     // attention.head_count_kv accepts either a scalar or a per-layer array.
     let head_count_kv_key = format!("{prefix}.attention.head_count_kv");
     let (head_count_kv_per_layer, num_kv_heads) = match get_u32_array(metadata, &head_count_kv_key)
@@ -372,7 +386,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     } else {
         None
     };
-    let deepseek4 = if arch == Architecture::DeepSeek4 {
+    let deepseek4 = if matches!(arch, Architecture::DeepSeek4 | Architecture::DFlash) {
         let compress_ratios =
             get_u32_array(metadata, &format!("{prefix}.attention.compress_ratios"))?
                 .into_iter()
@@ -443,6 +457,21 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
                 metadata,
                 &format!("{prefix}.rope.scaling.yarn_beta_slow"),
             )?,
+            dspark_block_size: (arch == Architecture::DFlash)
+                .then(|| get_u32(metadata, &format!("{prefix}.block_size")))
+                .transpose()?
+                .map(|value| value as usize),
+            dspark_target_layers: if arch == Architecture::DFlash {
+                get_u32_array(metadata, &format!("{prefix}.target_layers"))?
+                    .into_iter()
+                    .map(|value| value as usize)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            dspark_mask_token_id: (arch == Architecture::DFlash)
+                .then(|| get_u32(metadata, "tokenizer.ggml.mask_token_id"))
+                .transpose()?,
         })
     } else {
         None
@@ -527,7 +556,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         get_u32_opt(metadata, &format!("{prefix}.expert_gating_func"))?.unwrap_or(0);
     let expert_weights_norm =
         get_bool_opt(metadata, &format!("{prefix}.expert_weights_norm"))?.unwrap_or(false);
-    if arch == Architecture::DeepSeek4 && expert_gating_func != 4 {
+    if matches!(arch, Architecture::DeepSeek4 | Architecture::DFlash) && expert_gating_func != 4 {
         return Err(LoaderError::ParseError {
             offset: 0,
             msg: format!(
@@ -627,6 +656,12 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         ("tokenizer.ggml.unknown_token_id", unknown_id),
         ("tokenizer.ggml.separator_token_id", separator_id),
         ("tokenizer.ggml.padding_token_id", padding_id),
+        (
+            "tokenizer.ggml.mask_token_id",
+            deepseek4
+                .as_ref()
+                .and_then(|metadata| metadata.dspark_mask_token_id),
+        ),
     ] {
         if id.is_some_and(|id| id as usize >= effective_vocab_size) {
             return Err(LoaderError::ParseError {
@@ -862,7 +897,9 @@ pub fn build_graph(meta: &ModelMetadata) -> Result<Graph, LoaderError> {
         | Architecture::NemotronHMoE
         | Architecture::Hy3
         | Architecture::GlmDsa => Ok(llama::build_llama_graph(meta)),
-        Architecture::DeepSeek4 => Ok(deepseek4::build_deepseek4_graph(meta)),
+        Architecture::DeepSeek4 | Architecture::DFlash => {
+            Ok(deepseek4::build_deepseek4_graph(meta))
+        }
         // Gemma4 shares the structural graph builder with Gemma for now; the actual Gemma4-specific
         // forward semantics (ISWA, PLE, KV sharing, f_attention_scale=1.0) live in the engine path
         // and are layered on top. Graph-level split will come if/when builder-level differences
@@ -1644,6 +1681,63 @@ mod tests {
         assert_eq!(deepseek4.indexer.top_k, 512);
         assert_eq!(deepseek4.hyper_connection_count, 4);
         assert_eq!(deepseek4.hash_layer_count, 1);
+
+        let mut dflash_meta = meta
+            .clone()
+            .into_iter()
+            .map(|(key, value)| (key.replacen("deepseek4.", "dflash.", 1), value))
+            .collect::<Vec<_>>();
+        dflash_meta
+            .iter_mut()
+            .find(|(key, _)| key == "general.architecture")
+            .unwrap()
+            .1 = GGUFValue::String("dflash".to_string());
+        dflash_meta.extend([
+            ("dflash.vocab_size".to_string(), GGUFValue::U32(151936)),
+            ("dflash.block_size".to_string(), GGUFValue::U32(5)),
+            (
+                "dflash.target_layers".to_string(),
+                GGUFValue::Array(vec![
+                    GGUFValue::I32(41),
+                    GGUFValue::I32(42),
+                    GGUFValue::I32(43),
+                ]),
+            ),
+            (
+                "tokenizer.ggml.mask_token_id".to_string(),
+                GGUFValue::U32(128799),
+            ),
+        ]);
+        let metadata = extract_metadata(&dflash_meta).unwrap();
+        assert_eq!(metadata.architecture, Architecture::DFlash);
+        let dflash = metadata.deepseek4.expect("DFlash metadata");
+        assert_eq!(dflash.dspark_block_size, Some(5));
+        assert_eq!(dflash.dspark_target_layers, vec![41, 42, 43]);
+        assert_eq!(dflash.dspark_mask_token_id, Some(128799));
+
+        let mut invalid_mask = dflash_meta.clone();
+        invalid_mask
+            .iter_mut()
+            .find(|(key, _)| key == "tokenizer.ggml.mask_token_id")
+            .unwrap()
+            .1 = GGUFValue::U32(151936);
+        assert!(matches!(
+            extract_metadata(&invalid_mask),
+            Err(LoaderError::ParseError { msg, .. })
+                if msg.contains("mask_token_id") && msg.contains("outside vocabulary")
+        ));
+
+        let mut invalid_heads = meta;
+        invalid_heads
+            .iter_mut()
+            .find(|(key, _)| key == "deepseek4.attention.head_count")
+            .unwrap()
+            .1 = GGUFValue::U32(0);
+        assert!(matches!(
+            extract_metadata(&invalid_heads),
+            Err(LoaderError::ParseError { msg, .. })
+                if msg.contains("attention.head_count must be positive")
+        ));
     }
 
     #[test]

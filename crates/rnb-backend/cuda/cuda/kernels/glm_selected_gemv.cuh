@@ -86,6 +86,119 @@ __device__ __forceinline__ float rnb_iq3_xxs_value(
     return (sign_bits & (1u << lane)) != 0u ? -scale * magnitude : scale * magnitude;
 }
 
+__device__ __forceinline__ float rnb_mxfp4_scale(unsigned encoded) {
+    const unsigned bits = encoded < 2u
+        ? (0x00200000u << encoded)
+        : ((encoded - 1u) << 23u);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float rnb_mxfp4_value(
+    const unsigned char* superblock,
+    unsigned index) {
+    const unsigned block_index = index >> 5u;
+    const unsigned local = index & 31u;
+    const unsigned char* block = superblock + block_index * 17u;
+    const unsigned packed = block[1u + (local & 15u)];
+    const unsigned q = local < 16u ? packed & 0x0fu : packed >> 4u;
+    const float values[16] = {
+        0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+        0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
+    };
+    return rnb_mxfp4_scale(block[0]) * values[q];
+}
+
+extern "C" __global__ void rnb_mxfp4_selected_gate_up_gemv_by_token(
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    const unsigned char* const* __restrict__ gate_weights,
+    const unsigned char* const* __restrict__ up_weights,
+    const float* __restrict__ input,
+    const unsigned* __restrict__ token_ids,
+    unsigned rows,
+    unsigned superblocks_per_row) {
+    const unsigned row = blockIdx.x;
+    const unsigned slot = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || tid >= 256u) {
+        return;
+    }
+    __shared__ float partial_gate[256];
+    __shared__ float partial_up[256];
+    const unsigned token = token_ids[slot];
+    const float* token_input = input + token * superblocks_per_row * 256u;
+    const unsigned row_bytes = superblocks_per_row * 136u;
+    const unsigned char* gate_row = gate_weights[slot] + row * row_bytes;
+    const unsigned char* up_row = up_weights[slot] + row * row_bytes;
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (unsigned block = 0; block < superblocks_per_row; ++block) {
+        const float x = token_input[block * 256u + tid];
+        gate_acc += rnb_mxfp4_value(gate_row + block * 136u, tid) * x;
+        up_acc += rnb_mxfp4_value(up_row + block * 136u, tid) * x;
+    }
+    partial_gate[tid] = gate_acc;
+    partial_up[tid] = up_acc;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial_gate[tid] += partial_gate[tid + stride];
+            partial_up[tid] += partial_up[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        const unsigned out_index = slot * rows + row;
+        gate_out[out_index] = partial_gate[0];
+        up_out[out_index] = partial_up[0];
+    }
+}
+
+extern "C" __global__ void rnb_mxfp4_selected_down_activated_rowreduce_by_token(
+    float* __restrict__ out,
+    const unsigned char* const* __restrict__ weights,
+    const float* __restrict__ activated,
+    const float* __restrict__ unused_up,
+    const float* __restrict__ route,
+    unsigned rows,
+    unsigned slots_per_token,
+    unsigned token_count,
+    unsigned superblocks_per_row) {
+    (void)unused_up;
+    const unsigned row = blockIdx.x;
+    const unsigned token = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || token >= token_count || tid >= 256u) {
+        return;
+    }
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    const unsigned row_bytes = superblocks_per_row * 136u;
+    const unsigned first_slot = token * slots_per_token;
+    for (unsigned local_slot = 0; local_slot < slots_per_token; ++local_slot) {
+        const unsigned slot = first_slot + local_slot;
+        const unsigned char* row_ptr = weights[slot] + row * row_bytes;
+        const float* expert_input = activated + slot * superblocks_per_row * 256u;
+        float expert_acc = 0.0f;
+        for (unsigned block = 0; block < superblocks_per_row; ++block) {
+            expert_acc += rnb_mxfp4_value(row_ptr + block * 136u, tid)
+                * expert_input[block * 256u + tid];
+        }
+        acc += expert_acc * route[slot];
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        out[token * rows + row] = partial[0];
+    }
+}
+
 extern "C" __global__ void rnb_iq2_xxs_selected_gate_up_gemv(
     float* __restrict__ gate_out,
     float* __restrict__ up_out,

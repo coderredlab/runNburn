@@ -517,7 +517,7 @@ fn forward_attention_core_projected(
     Ok(attention_output)
 }
 
-fn project_attention_output(
+pub(super) fn project_attention_output(
     attention_output: &[f32],
     weights: &AttentionWeights,
     config: &DeepSeek4Config,

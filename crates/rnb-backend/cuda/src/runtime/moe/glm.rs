@@ -361,6 +361,11 @@ impl CudaState {
                 "rnb_q2k_selected_gate_up_gemv_by_token",
                 "rnb_q2k_selected_gate_up_gemv_by_token_grouped_warp4",
             ),
+            39 => (
+                136usize,
+                "rnb_mxfp4_selected_gate_up_gemv_by_token",
+                "rnb_mxfp4_selected_gate_up_gemv_by_token",
+            ),
             other => {
                 return Err(format!(
                     "unsupported GLM batched sparse gate/up quant code {other}"
@@ -382,6 +387,11 @@ impl CudaState {
                 110usize,
                 "rnb_q3k_selected_down_silu_rowreduce_by_token",
                 "rnb_q3k_selected_down_accum_by_token_grouped_warp4",
+            ),
+            39 => (
+                136usize,
+                "rnb_mxfp4_selected_down_activated_rowreduce_by_token",
+                "rnb_mxfp4_selected_down_activated_rowreduce_by_token",
             ),
             other => {
                 return Err(format!(
@@ -419,8 +429,9 @@ impl CudaState {
             }
         }
 
-        let grouped_slots = (activation_limit.is_some()
-            || tuning::glm_expert_grouped_enabled(token_count, slots))
+        let grouped_slots = (gate_quant != 39
+            && (activation_limit.is_some()
+                || tuning::glm_expert_grouped_enabled(token_count, slots)))
         .then(|| {
             group_glm_slots(
                 gate_weights,
@@ -606,6 +617,13 @@ impl CudaState {
                 gate_dev,
                 up_dev,
             )?;
+            if gate_quant == 39 {
+                if let Some(limit) = activation_limit {
+                    self.launch_swiglu_clamped(gate_dev, up_dev, limit, slots * n_ff)?;
+                } else {
+                    self.launch_silu_mul(gate_dev, up_dev, slots * n_ff)?;
+                }
+            }
         } else {
             self.launch_selected_glm_iq_gate_up_gemv_by_token_group4(
                 grouped_gate_kernel,

@@ -174,6 +174,37 @@ pub fn glm_sparse_experts_iq_by_token(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn mxfp4_sparse_experts_by_token_clamped_swiglu(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    route_weights: &[f32],
+    token_ids: &[u32],
+    token_count: usize,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    activation_limit: f32,
+) -> Result<Vec<f32>, String> {
+    sparse_experts_iq_by_token_impl(
+        gate_weights,
+        up_weights,
+        down_weights,
+        39,
+        39,
+        None,
+        false,
+        Some(activation_limit),
+        route_weights,
+        token_ids,
+        token_count,
+        n_ff,
+        n_embd,
+        input,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu(
     gate_weights: &[&[u8]],
     up_weights: &[&[u8]],
@@ -221,6 +252,11 @@ fn sparse_experts_iq_by_token_impl(
     n_embd: usize,
     input: &[f32],
 ) -> Result<Vec<f32>, String> {
+    if (gate_quant == 39) != (down_quant == 39) {
+        return Err(format!(
+            "MXFP4 sparse MoE requires gate/up and down quant code 39 together, got gate={gate_quant} down={down_quant}"
+        ));
+    }
     let slot_count = gate_weights.len();
     if token_count == 0 || slot_count == 0 || slot_count % token_count != 0 {
         return Err(format!(

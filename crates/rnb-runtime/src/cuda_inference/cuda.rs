@@ -33,6 +33,7 @@ pub use glm_moe::{
     glm_moe_direct_file_prefill_enabled, glm_moe_prefill_shared_expert_iq,
     glm_moe_prefill_sparse_experts_iq_by_token, glm_register_stream_region_sequence,
     moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu,
+    mxfp4_sparse_experts_by_token_clamped_swiglu,
 };
 pub use output::{
     output_logits_enabled, prefill_output_logits, prewarm_output_weight, try_output_argmax_token,

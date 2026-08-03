@@ -17,6 +17,32 @@ use crate::kv_cache::{KVCache, KvCacheFormat};
 use crate::tokenizer::Tokenizer;
 use rnb_loader::Architecture as ModelArchitecture;
 
+fn tokenizer_contract_matches(
+    target: &rnb_loader::TokenizerData,
+    draft: &rnb_loader::TokenizerData,
+) -> bool {
+    target.vocab_size == draft.vocab_size
+        && target.tokens == draft.tokens
+        && target
+            .scores
+            .iter()
+            .map(|score| score.to_bits())
+            .eq(draft.scores.iter().map(|score| score.to_bits()))
+        && target.token_types == draft.token_types
+        && target.merges == draft.merges
+        && target.added_tokens == draft.added_tokens
+        && target.bos_id == draft.bos_id
+        && target.eos_id == draft.eos_id
+        && target.eot_id == draft.eot_id
+        && target.unknown_id == draft.unknown_id
+        && target.separator_id == draft.separator_id
+        && target.model == draft.model
+        && target.pre == draft.pre
+        && target.add_bos_token == draft.add_bos_token
+        && target.add_eos_token == draft.add_eos_token
+        && target.add_sep_token == draft.add_sep_token
+        && target.add_space_prefix == draft.add_space_prefix
+}
 fn maybe_enable_q4k_prefill_f16_gemm_for_dense_attention(_all_layers_attention: bool) {}
 
 #[cfg(test)]
@@ -680,26 +706,55 @@ impl Engine {
             if !engine.mtp_runtime_ready()
                 && crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none()
             {
-                let drafter_path = crate::engine::policy::env_string("RNB_DRAFTER_MODEL")
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| crate::auto_drafter::find_sibling_drafter(path));
+                let drafter_paths = crate::engine::policy::env_string("RNB_DRAFTER_MODEL")
+                    .map(|path| vec![std::path::PathBuf::from(path)])
+                    .unwrap_or_else(|| crate::auto_drafter::find_sibling_drafter_candidates(path));
 
-                if let Some(ref drafter_path) = drafter_path {
-                    match rnb_mtp::drafter::load_drafter(drafter_path) {
-                        Ok(drafter) => match engine.attach_external_drafter(drafter) {
-                            Ok(()) => eprintln!(
-                                "[INFO] external drafter attached from {}",
+                for drafter_path in &drafter_paths {
+                    let attach_result = match rnb_loader::detect_model_architecture(drafter_path) {
+                        Ok(ModelArchitecture::DFlash) => rnb_loader::load_model(drafter_path)
+                            .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))
+                            .and_then(|sidecar| {
+                                if !tokenizer_contract_matches(
+                                    &model.metadata.tokenizer,
+                                    &sidecar.metadata.tokenizer,
+                                ) {
+                                    return Err(crate::error::LlmError::ModelLoad(
+                                        "DSpark tokenizer contract does not match target GGUF"
+                                            .to_string(),
+                                    ));
+                                }
+                                let runtime = super::weight_loading::load_dspark_runtime(
+                                    &sidecar,
+                                    sparse_moe_cuda_enabled,
+                                )?;
+                                engine.attach_dspark_runtime(runtime)
+                            })
+                            .map(|()| "DeepSeek4 DSpark"),
+                        Ok(_) => rnb_mtp::drafter::load_drafter(drafter_path)
+                            .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))
+                            .and_then(|drafter| engine.attach_external_drafter(drafter))
+                            .map(|()| "external drafter"),
+                        Err(error) => Err(crate::error::LlmError::ModelLoad(error.to_string())),
+                    };
+
+                    match attach_result {
+                        Ok(kind) => {
+                            eprintln!(
+                                "[INFO] {kind} attached automatically from {}",
                                 drafter_path.display()
-                            ),
-                            Err(e) => eprintln!("[WARN] external drafter attach failed: {e}"),
-                        },
-                        Err(e) => eprintln!(
-                            "[WARN] failed to load drafter from {}: {}",
-                            drafter_path.display(),
-                            e
+                            );
+                            break;
+                        }
+                        Err(error) => eprintln!(
+                            "[WARN] drafter candidate {} rejected: {error}",
+                            drafter_path.display()
                         ),
                     }
-                } else if crate::engine::policy::env_string("RNB_MTP").is_some() {
+                }
+                if drafter_paths.is_empty()
+                    && crate::engine::policy::env_string("RNB_MTP").is_some()
+                {
                     eprintln!("[INFO] no sibling drafter found, MTP disabled");
                 }
             }

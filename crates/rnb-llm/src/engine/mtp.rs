@@ -88,6 +88,7 @@ pub(crate) struct InModelMtpCheckpoint {
 pub(crate) enum EngineMtpRuntime {
     InModel(InModelMtpRuntime),
     External(crate::external_drafter::ExternalDrafterRuntime),
+    Dspark(super::models::deepseek4::DsparkRuntime),
 }
 
 #[derive(Clone)]
@@ -95,12 +96,14 @@ pub(crate) enum EngineMtpCheckpoint {
     InModel(InModelMtpCheckpoint),
     /// External drafter 는 decode 경계 간 stateless — checkpoint 불필요.
     External,
+    Dspark(super::models::deepseek4::DsparkSequenceState),
 }
 
 #[derive(Clone)]
 pub(crate) enum EngineMtpSequenceState {
     InModel(InModelMtpSequenceState),
     External(crate::external_drafter::ExternalDrafterSequenceState),
+    Dspark(super::models::deepseek4::DsparkSequenceState),
 }
 
 #[derive(Clone)]
@@ -117,6 +120,7 @@ impl EngineMtpSequenceState {
         match self {
             Self::InModel(state) => state.heap_byte_size(),
             Self::External(state) => state.heap_byte_size(),
+            Self::Dspark(state) => state.heap_byte_size(),
         }
     }
 }
@@ -160,6 +164,7 @@ impl EngineMtpRuntime {
         match self {
             EngineMtpRuntime::InModel(r) => EngineMtpCheckpoint::InModel(r.checkpoint()),
             EngineMtpRuntime::External(_) => EngineMtpCheckpoint::External,
+            EngineMtpRuntime::Dspark(r) => EngineMtpCheckpoint::Dspark(r.capture_sequence_state()),
         }
     }
 
@@ -167,6 +172,9 @@ impl EngineMtpRuntime {
         match (self, ckpt) {
             (EngineMtpRuntime::InModel(r), EngineMtpCheckpoint::InModel(c)) => r.restore(c),
             (EngineMtpRuntime::External(_), EngineMtpCheckpoint::External) => {}
+            (EngineMtpRuntime::Dspark(r), EngineMtpCheckpoint::Dspark(c)) => r
+                .restore_sequence_state(c)
+                .expect("DSpark checkpoint must match its runtime"),
             _ => panic!("EngineMtpRuntime / EngineMtpCheckpoint variant mismatch"),
         }
     }
@@ -176,7 +184,7 @@ impl EngineMtpRuntime {
             EngineMtpRuntime::InModel(runtime) => {
                 runtime.kv_cache.ssm_states.iter().all(Option::is_none)
             }
-            EngineMtpRuntime::External(_) => true,
+            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => true,
         }
     }
 
@@ -188,6 +196,7 @@ impl EngineMtpRuntime {
                 &runtime.recent_hidden_rows,
             ),
             EngineMtpRuntime::External(runtime) => runtime.sequence_state_heap_byte_size_estimate(),
+            EngineMtpRuntime::Dspark(runtime) => runtime.sequence_state_heap_byte_size_estimate(),
         }
     }
 
@@ -198,6 +207,9 @@ impl EngineMtpRuntime {
             }
             EngineMtpRuntime::External(runtime) => {
                 EngineMtpSequenceState::External(runtime.capture_sequence_state())
+            }
+            EngineMtpRuntime::Dspark(runtime) => {
+                EngineMtpSequenceState::Dspark(runtime.capture_sequence_state())
             }
         }
     }
@@ -212,6 +224,9 @@ impl EngineMtpRuntime {
                     .restore_sequence_state(state)
                     .map_err(LlmError::Forward)
             }
+            (EngineMtpRuntime::Dspark(runtime), EngineMtpSequenceState::Dspark(state)) => {
+                runtime.restore_sequence_state(state)
+            }
             _ => Err(LlmError::Forward(
                 "MTP sequence snapshot runtime variant mismatch".to_string(),
             )),
@@ -222,6 +237,7 @@ impl EngineMtpRuntime {
         match self {
             EngineMtpRuntime::InModel(r) => r.clear_sequence_state(),
             EngineMtpRuntime::External(r) => r.shift_for_accept(0),
+            EngineMtpRuntime::Dspark(r) => r.clear(),
         }
     }
 
@@ -229,7 +245,7 @@ impl EngineMtpRuntime {
     pub(super) fn in_model_weights(&self) -> Option<&MtpLayerWeights> {
         match self {
             EngineMtpRuntime::InModel(runtime) => Some(&runtime.weights),
-            EngineMtpRuntime::External(_) => None,
+            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => None,
         }
     }
 
@@ -239,7 +255,7 @@ impl EngineMtpRuntime {
     ) -> Option<&super::layer_weights::SharedExpertMoELayerWeights> {
         match self {
             EngineMtpRuntime::InModel(runtime) => runtime.weights.block.shared_expert_moe.as_ref(),
-            EngineMtpRuntime::External(_) => None,
+            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => None,
         }
     }
 
@@ -261,9 +277,29 @@ impl EngineMtpRuntime {
         }
     }
 
-    /// External variant 여부. 두 variant 모두 "ready" 판정에 활용.
+    pub(crate) fn as_dspark_mut(&mut self) -> Option<&mut super::models::deepseek4::DsparkRuntime> {
+        if let EngineMtpRuntime::Dspark(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_dspark(&self) -> Option<&super::models::deepseek4::DsparkRuntime> {
+        if let EngineMtpRuntime::Dspark(r) = self {
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    /// External Gemma drafter variant 여부.
     pub(crate) fn is_external(&self) -> bool {
         matches!(self, EngineMtpRuntime::External(_))
+    }
+
+    pub(crate) fn is_dspark(&self) -> bool {
+        matches!(self, EngineMtpRuntime::Dspark(_))
     }
 }
 
@@ -528,6 +564,14 @@ fn current_mtp_auto_resource_hint() -> Option<MtpAutoResourceHint> {
     }
 }
 
+fn dspark_cuda_auto_enabled(
+    cuda_feature: bool,
+    sparse_moe_cuda_enabled: bool,
+    resource: Option<MtpAutoResourceHint>,
+) -> bool {
+    cuda_feature && sparse_moe_cuda_enabled && resource.is_some()
+}
+
 fn mtp_auto_policy_for_model(
     architecture: ModelArchitecture,
     metadata: &ModelMetadata,
@@ -691,17 +735,11 @@ impl Engine {
     pub fn mtp_runtime_ready(&self) -> bool {
         match self.mtp_runtime.as_ref() {
             Some(EngineMtpRuntime::InModel(_)) => self.mtp.is_some(),
-            Some(EngineMtpRuntime::External(_)) => true,
+            Some(EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_)) => true,
             None => false,
         }
     }
 
-    /// External drafter (Gemma 4 assistant 모델) 를 engine 에 연결한다.
-    ///
-    /// 체크:
-    /// 1. target 이 Gemma 4 아키텍처인지 (`ModelArchitecture::Gemma4`).
-    /// 2. drafter backbone_hidden == target hidden_dim.
-    /// 3. drafter 가 SWA 레이어를 가지면 target 도 sliding_window_pattern 이 있어야 한다.
     pub fn attach_external_drafter(&mut self, drafter: rnb_mtp::drafter::Drafter) -> Result<()> {
         use rnb_loader::Architecture as ModelArchitecture;
 
@@ -711,7 +749,6 @@ impl Engine {
                 self.architecture,
             )));
         }
-
         let target_hidden = self.metadata.hidden_dim;
         if drafter.backbone_hidden != target_hidden {
             return Err(LlmError::Forward(format!(
@@ -719,8 +756,7 @@ impl Engine {
                 drafter.backbone_hidden, target_hidden,
             )));
         }
-
-        let has_swa_layer = drafter.layers.iter().any(|l| l.is_sliding_window);
+        let has_swa_layer = drafter.layers.iter().any(|layer| layer.is_sliding_window);
         let target_has_swa = !self.metadata.sliding_window_pattern.is_empty();
         if has_swa_layer && !target_has_swa {
             return Err(LlmError::Forward(
@@ -728,13 +764,6 @@ impl Engine {
             ));
         }
 
-        // cu47 Phase 1: drafter Q4_K weight 의 device cache prewarm.
-        // 매 forward call 의 weight reupload 제거 (cu46 의 ε 원인 일부).
-        // env 비활성 또는 cuda 비활성 시 noop. ABAB 4-run mc78_chat_essay_ko
-        // (193 decode tokens) generate median Δ -0.06% ε — drafter weight 가
-        // 작아서 backend runtime의 자체 cache가 이미 충분, 외부 prewarm 효과 ε.
-        // Phase 2 (hidden state device buffer + forward entry/exit roundtrip)
-        // 가 진짜 lever.
         #[cfg(feature = "cuda")]
         {
             if crate::engine::policy::drafter_cuda_enabled() {
@@ -745,8 +774,8 @@ impl Engine {
                     Some(&drafter.token_embd),
                 ) {
                     Ok(_n) => {}
-                    Err(e) => {
-                        eprintln!("[cu47] drafter cuda prewarm failed: {e:?} — fallback host")
+                    Err(error) => {
+                        eprintln!("[cu47] drafter cuda prewarm failed: {error:?} — fallback host")
                     }
                 }
             }
@@ -755,6 +784,15 @@ impl Engine {
         let runtime =
             crate::external_drafter::ExternalDrafterRuntime::new(std::sync::Arc::new(drafter));
         self.mtp_runtime = Some(EngineMtpRuntime::External(runtime));
+        Ok(())
+    }
+
+    pub(super) fn attach_dspark_runtime(
+        &mut self,
+        runtime: super::models::deepseek4::DsparkRuntime,
+    ) -> Result<()> {
+        runtime.validate_target(self.architecture, &self.metadata)?;
+        self.mtp_runtime = Some(EngineMtpRuntime::Dspark(runtime));
         Ok(())
     }
 
@@ -777,6 +815,35 @@ impl Engine {
     }
 
     pub fn mtp_auto_policy(&self) -> MtpAutoPolicy {
+        if let Some(dspark) = self
+            .mtp_runtime
+            .as_ref()
+            .and_then(EngineMtpRuntime::as_dspark)
+        {
+            let resource = current_mtp_auto_resource_hint();
+            let enabled = dspark_cuda_auto_enabled(
+                cfg!(feature = "cuda"),
+                dspark.sparse_moe_cuda_enabled(),
+                resource,
+            );
+            let reason = if !cfg!(feature = "cuda") {
+                "deepseek4-dspark-cuda-only"
+            } else if !dspark.sparse_moe_cuda_enabled() {
+                "deepseek4-dspark-cuda-policy-disabled"
+            } else if resource.is_none() {
+                "cuda-resource-info-unavailable"
+            } else {
+                "deepseek4-dspark-cuda-auto"
+            };
+            return MtpAutoPolicy {
+                enabled,
+                spec_k: dspark.block_size(),
+                device_verify: false,
+                min_free_vram_mib: 0,
+                resource,
+                reason,
+            };
+        }
         mtp_auto_policy_for_model(
             self.architecture,
             &self.metadata,
@@ -810,11 +877,6 @@ impl Engine {
         token_embd_supported && output_supported
     }
 
-    /// pm118: `RNB_MTP` 미설정과 `auto` 는 모델별 auto policy `enabled` 로
-    /// 위임한다 (채택된 최적화는 무-env 기본 ON — GLM+Metal batch verify 등,
-    /// policy 가 no-mtp-runtime/아키텍처/자원 조건으로 안전 gate). 명시
-    /// falsey 는 off, 그 외 명시값은 기존처럼 강제 on. auto 판정은 엔진당
-    /// 1회 캐시 (`mtp_auto_requested_cache`).
     pub(crate) fn mtp_spec_requested(&self) -> bool {
         match super::policy::env_string("RNB_MTP") {
             None => *self
@@ -843,31 +905,72 @@ impl Engine {
         })
     }
 
-    /// pm118: MTP 라운드당 draft 수 — `RNB_MTP` 가 명시 truthy 로 강제된 경우만
-    /// caller 요청값을 쓰고, 미설정/auto 진입은 모델별 auto policy `spec_k`
-    /// (GLM nextn 1층 k=1 등) 를 쓴다.
     pub(crate) fn mtp_effective_spec_k(&self, requested: usize) -> usize {
-        let explicit_force = self.mtp_explicitly_forced();
-        if explicit_force {
+        if self.mtp_explicitly_forced() {
             requested.max(1)
         } else {
             self.mtp_auto_policy().spec_k.max(1)
         }
     }
 
-    // ── mc78 Task 12 — External drafter 접근자 (mtp_generate.rs 용) ─────────
-
-    /// External runtime 이 존재하는지 여부. `mtp_runtime` 필드가 `pub(super)` 라
-    /// crate root 레벨 `mtp_generate.rs` 에서 직접 접근 불가 → 여기서 위임.
     pub(crate) fn mtp_is_external_runtime(&self) -> bool {
         self.mtp_runtime
             .as_ref()
-            .map(|r| r.is_external())
-            .unwrap_or(false)
+            .is_some_and(EngineMtpRuntime::is_external)
     }
 
-    /// External drafter runtime 의 `&mut ExternalDrafterRuntime` 반환.
-    /// InModel runtime 이거나 없으면 `None`.
+    pub(crate) fn mtp_is_dspark_runtime(&self) -> bool {
+        self.mtp_runtime
+            .as_ref()
+            .is_some_and(EngineMtpRuntime::is_dspark)
+    }
+
+    pub(super) fn mtp_dspark_target_layers(&self) -> Vec<usize> {
+        self.mtp_runtime
+            .as_ref()
+            .and_then(EngineMtpRuntime::as_dspark)
+            .map(|runtime| runtime.target_layers().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn mtp_dspark_observe_target_batch(
+        &mut self,
+        features: &[f32],
+        token_count: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        let Some(runtime) = self
+            .mtp_runtime
+            .as_mut()
+            .and_then(EngineMtpRuntime::as_dspark_mut)
+        else {
+            return Ok(());
+        };
+        runtime.observe_target_batch(features, token_count, start_position)
+    }
+
+    pub(crate) fn mtp_dspark_draft(
+        &mut self,
+        anchor_token: u32,
+    ) -> Result<super::models::deepseek4::DsparkDraft> {
+        let mut runtime = self
+            .mtp_runtime
+            .take()
+            .ok_or_else(|| LlmError::Forward("DSpark runtime is unavailable".to_string()))?;
+        let result = {
+            let dspark = runtime
+                .as_dspark_mut()
+                .ok_or_else(|| LlmError::Forward("loaded MTP runtime is not DSpark".to_string()))?;
+            let weights = self
+                .weights
+                .as_ref()
+                .ok_or_else(|| LlmError::Forward("target weights are unavailable".to_string()))?;
+            dspark.draft(anchor_token, &weights.token_embd, &weights.output)
+        };
+        self.mtp_runtime = Some(runtime);
+        result
+    }
+
     pub(crate) fn mtp_external_runtime_mut(
         &mut self,
     ) -> Option<&mut crate::external_drafter::ExternalDrafterRuntime> {
@@ -1802,6 +1905,15 @@ mod tests {
             total_vram_mib,
             free_vram_mib,
         }
+    }
+
+    #[test]
+    fn dspark_auto_requires_runtime_cuda_resource_and_policy() {
+        let resource = Some(policy_resource(24 * 1024, 8 * 1024));
+        assert!(dspark_cuda_auto_enabled(true, true, resource));
+        assert!(!dspark_cuda_auto_enabled(true, true, None));
+        assert!(!dspark_cuda_auto_enabled(true, false, resource));
+        assert!(!dspark_cuda_auto_enabled(false, true, resource));
     }
 
     #[test]

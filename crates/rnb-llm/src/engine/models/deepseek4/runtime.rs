@@ -11,6 +11,12 @@ use super::math::{hyper_head, hyper_post, hyper_pre, rms_norm};
 use super::moe::{forward_moe, forward_moe_batch};
 use super::weights::DeepSeek4Weights;
 
+pub(in crate::engine) struct DeepSeek4ForwardOutput {
+    pub(in crate::engine) logits: Vec<f32>,
+    pub(in crate::engine) final_hidden_rows: Vec<f32>,
+    pub(in crate::engine) extracted_features: Vec<f32>,
+}
+
 pub(in crate::engine) fn forward_tokens(
     model: &mut DeepSeek4Weights,
     token_embedding: &QuantizedWeight,
@@ -18,13 +24,26 @@ pub(in crate::engine) fn forward_tokens(
     output: &QuantizedWeight,
     tokens: &[u32],
     expected_position: usize,
-) -> Result<(Vec<f32>, Vec<f32>)> {
+    target_layers: &[usize],
+    all_logits: bool,
+) -> Result<DeepSeek4ForwardOutput> {
     ensure_state_position(model.state.position, expected_position)?;
     if tokens.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(DeepSeek4ForwardOutput {
+            logits: Vec::new(),
+            final_hidden_rows: Vec::new(),
+            extracted_features: Vec::new(),
+        });
     }
     if tokens.len() == 1 {
-        return forward_single_token(model, token_embedding, output_norm, output, tokens[0]);
+        return forward_single_token(
+            model,
+            token_embedding,
+            output_norm,
+            output,
+            tokens[0],
+            target_layers,
+        );
     }
     let config = &model.config;
     let seq_len = tokens.len();
@@ -41,8 +60,19 @@ pub(in crate::engine) fn forward_tokens(
             hidden[start..start + config.hidden_dim].copy_from_slice(embedding);
         }
     }
+    let mut layer_features = vec![None; target_layers.len()];
 
-    for (layer, attention_state) in model.layers.iter().zip(&mut model.state.layers) {
+    for (layer_index, (layer, attention_state)) in
+        model.layers.iter().zip(&mut model.state.layers).enumerate()
+    {
+        capture_dspark_inputs(
+            layer_index,
+            &hidden,
+            seq_len,
+            config,
+            target_layers,
+            &mut layer_features,
+        );
         let attention_batch_tokens =
             if crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_requested() {
                 attention_prefill_batch_scratch_bytes_per_token(&layer.attention, config)
@@ -145,19 +175,40 @@ pub(in crate::engine) fn forward_tokens(
         }
         hidden = next_hidden;
     }
-
-    let last_hidden = &hidden[(seq_len - 1) * row_width..seq_len * row_width];
-    let mut final_hidden = hyper_head(
-        last_hidden,
-        &model.output_hc_function,
-        &model.output_hc_scale,
-        &model.output_hc_base,
+    capture_dspark_inputs(
+        model.layers.len(),
+        &hidden,
+        seq_len,
         config,
+        target_layers,
+        &mut layer_features,
     );
-    final_hidden = rms_norm(&final_hidden, output_norm, config.norm_eps);
-    let logits = output.gemv_vec(&final_hidden)?;
+
+    let hidden_rows = if all_logits {
+        hidden.as_slice()
+    } else {
+        &hidden[(seq_len - 1) * row_width..seq_len * row_width]
+    };
+    let mut final_hidden_rows =
+        Vec::with_capacity((if all_logits { seq_len } else { 1 }) * config.hidden_dim);
+    for hidden_row in hidden_rows.chunks_exact(row_width) {
+        let collapsed = hyper_head(
+            hidden_row,
+            &model.output_hc_function,
+            &model.output_hc_scale,
+            &model.output_hc_base,
+            config,
+        );
+        final_hidden_rows.extend(rms_norm(&collapsed, output_norm, config.norm_eps));
+    }
+    let logits = output.gemv_vec(&final_hidden_rows)?;
+    let extracted_features = transpose_dspark_inputs(layer_features, seq_len, config.hidden_dim)?;
     model.state.position += seq_len;
-    Ok((logits, final_hidden))
+    Ok(DeepSeek4ForwardOutput {
+        logits,
+        final_hidden_rows,
+        extracted_features,
+    })
 }
 
 fn forward_single_token(
@@ -166,7 +217,8 @@ fn forward_single_token(
     output_norm: &Tensor,
     output: &QuantizedWeight,
     token: u32,
-) -> Result<(Vec<f32>, Vec<f32>)> {
+    target_layers: &[usize],
+) -> Result<DeepSeek4ForwardOutput> {
     let position = model.state.position;
     let embedding = token_embedding.gather(&[token])?;
     let embedding = kernels::tensor_as_f32_slice(&embedding);
@@ -174,7 +226,18 @@ fn forward_single_token(
     for _ in 0..model.config.hc_count {
         hidden.extend_from_slice(embedding);
     }
-    for (layer, attention_state) in model.layers.iter().zip(&mut model.state.layers) {
+    let mut layer_features = vec![None; target_layers.len()];
+    for (layer_index, (layer, attention_state)) in
+        model.layers.iter().zip(&mut model.state.layers).enumerate()
+    {
+        capture_dspark_inputs(
+            layer_index,
+            &hidden,
+            1,
+            &model.config,
+            target_layers,
+            &mut layer_features,
+        );
         let residual = hidden;
         let mix = hyper_pre(&residual, &layer.attn_hc, &model.config);
         let attn_input = rms_norm(&mix.branch, &layer.attn_norm, model.config.norm_eps);
@@ -193,17 +256,93 @@ fn forward_single_token(
         let ffn_output = forward_moe(&ffn_input, token, &layer.moe, &model.config)?;
         hidden = hyper_post(&ffn_output, &residual, mix, &model.config);
     }
-    let mut final_hidden = hyper_head(
+    capture_dspark_inputs(
+        model.layers.len(),
+        &hidden,
+        1,
+        &model.config,
+        target_layers,
+        &mut layer_features,
+    );
+    let collapsed = hyper_head(
         &hidden,
         &model.output_hc_function,
         &model.output_hc_scale,
         &model.output_hc_base,
         &model.config,
     );
-    final_hidden = rms_norm(&final_hidden, output_norm, model.config.norm_eps);
-    let logits = output.gemv_vec(&final_hidden)?;
+    let final_hidden_rows = rms_norm(&collapsed, output_norm, model.config.norm_eps);
+    let logits = output.gemv_vec(&final_hidden_rows)?;
+    let extracted_features = transpose_dspark_inputs(layer_features, 1, model.config.hidden_dim)?;
     model.state.position += 1;
-    Ok((logits, final_hidden))
+    Ok(DeepSeek4ForwardOutput {
+        logits,
+        final_hidden_rows,
+        extracted_features,
+    })
+}
+
+fn capture_dspark_inputs(
+    layer_index: usize,
+    hidden: &[f32],
+    seq_len: usize,
+    config: &super::weights::DeepSeek4Config,
+    target_layers: &[usize],
+    layer_features: &mut [Option<Vec<f32>>],
+) {
+    for (slot, &target_layer) in target_layers.iter().enumerate() {
+        if target_layer == layer_index {
+            layer_features[slot] = Some(hc_mean_rows(hidden, seq_len, config));
+        }
+    }
+}
+
+fn hc_mean_rows(
+    hidden: &[f32],
+    seq_len: usize,
+    config: &super::weights::DeepSeek4Config,
+) -> Vec<f32> {
+    let row_width = config.hc_count * config.hidden_dim;
+    let mut means = vec![0.0f32; seq_len * config.hidden_dim];
+    let scale = 1.0 / config.hc_count as f32;
+    for (input_row, output_row) in hidden
+        .chunks_exact(row_width)
+        .zip(means.chunks_exact_mut(config.hidden_dim))
+    {
+        for copy in input_row.chunks_exact(config.hidden_dim) {
+            for (output, value) in output_row.iter_mut().zip(copy) {
+                *output += value * scale;
+            }
+        }
+    }
+    means
+}
+
+fn transpose_dspark_inputs(
+    layer_features: Vec<Option<Vec<f32>>>,
+    seq_len: usize,
+    hidden_dim: usize,
+) -> Result<Vec<f32>> {
+    if layer_features.is_empty() {
+        return Ok(Vec::new());
+    }
+    if layer_features.iter().any(Option::is_none) {
+        return Err(LlmError::Forward(
+            "DSpark target layer feature was not captured".to_string(),
+        ));
+    }
+    let layer_features = layer_features
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<_>>();
+    let mut features = Vec::with_capacity(seq_len * layer_features.len() * hidden_dim);
+    for token in 0..seq_len {
+        let start = token * hidden_dim;
+        for layer in &layer_features {
+            features.extend_from_slice(&layer[start..start + hidden_dim]);
+        }
+    }
+    Ok(features)
 }
 
 fn ensure_state_position(actual: usize, expected: usize) -> Result<()> {

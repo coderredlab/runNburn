@@ -11,6 +11,18 @@ use quantized::load_quantized_weight;
 use rnb_loader::{Architecture as ModelArchitecture, LoadedModel, ModelLayerKind};
 use tensor_values::load_f32_weight;
 
+pub(super) fn load_dspark_runtime(
+    model: &LoadedModel,
+    sparse_moe_cuda_enabled: bool,
+) -> crate::error::Result<deepseek4::DsparkRuntime> {
+    deepseek4::DsparkRuntime::load(
+        model,
+        sparse_moe_cuda_enabled,
+        tensor_values::load_f32_weight,
+        quantized::load_quantized_weight,
+    )
+}
+
 pub(super) fn load_model_weights(
     model: &LoadedModel,
     num_layers: usize,

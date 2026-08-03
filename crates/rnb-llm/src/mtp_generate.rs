@@ -148,6 +148,10 @@ fn mtp_effective_k(
     }
 }
 
+fn mtp_initial_token_budget(max_tokens: usize) -> Option<usize> {
+    (max_tokens > 0).then_some(max_tokens)
+}
+
 fn mtp_batch_effective_k(requested_k: usize, tokens_remaining: usize) -> usize {
     requested_k.max(1).min(tokens_remaining)
 }
@@ -620,6 +624,16 @@ fn generate_stream_mtp_with_tokens(
         .as_ref()
         .map_or_else(Instant::now, |prompt| prompt.started_at);
 
+    if engine.mtp_is_dspark_runtime() {
+        return generate_with_dspark(
+            engine,
+            prompt_tokens,
+            resume_from,
+            prefilled,
+            params,
+            callback,
+        );
+    }
     if engine.mtp_is_external_runtime() {
         return generate_with_external_drafter(
             engine,
@@ -1681,6 +1695,233 @@ fn generate_stream_mtp_with_tokens(
 /// 4. EOS/stop token/max_tokens 도달 시 종료.
 ///
 /// Greedy only: `mtp_greedy_verify_allowed` 가 이미 외부에서 체크됐다.
+fn generate_with_dspark(
+    engine: &mut Engine,
+    prompt_tokens: &[u32],
+    resume_from: Option<usize>,
+    prefilled: Option<MtpPrefilledPrompt>,
+    params: &GenerateParams,
+    mut callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let start = prefilled
+        .as_ref()
+        .map_or_else(Instant::now, |prompt| prompt.started_at);
+    let eos = engine.tokenizer.vocab.special.eos;
+    let prompt_len = prefilled
+        .as_ref()
+        .map_or(prompt_tokens.len(), |prompt| prompt.physical_prompt_len);
+    let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
+        (prefilled.logits, elapsed_ms(start))
+    } else {
+        let forward_tokens = if let Some(resume_from) = resume_from {
+            prompt_tokens.get(resume_from..).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "DSpark resume offset {resume_from} exceeds prompt length {prompt_len}"
+                ))
+            })?
+        } else {
+            engine.clear_sequence_state()?;
+            prompt_tokens
+        };
+        if forward_tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "DSpark resume requires at least one uncached prompt token".to_string(),
+            ));
+        }
+        let prefill_start = Instant::now();
+        let logits = engine.forward_prompt(forward_tokens)?;
+        (logits, elapsed_ms(prefill_start))
+    };
+
+    let mut rng = SmallRng::from_entropy();
+    let mut sampler = SamplerChain::from_params(params);
+    let mut generated_tokens = Vec::new();
+    let mut generated_text = GeneratedTextStream::new();
+    let Some(mut tokens_remaining) = mtp_initial_token_budget(params.max_tokens) else {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    };
+    let first_token = next_token_from_current_logits(
+        engine,
+        &mut logits,
+        &mut sampler,
+        &generated_tokens,
+        &mut rng,
+        params,
+    )?;
+    if params.should_stop(first_token, eos) {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    }
+    generated_tokens.push(first_token);
+    if !generated_text.push(&engine.tokenizer, first_token, &mut callback) {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            generated_tokens.len(),
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    }
+    tokens_remaining = tokens_remaining.saturating_sub(1);
+    let mut current_token = first_token;
+    let mut stats = MtpStats {
+        rounds: 0,
+        drafted: 0,
+        accepted: 0,
+        carried: 0,
+        target_verify_steps: 0,
+        target_verify_invocations: 0,
+    };
+    let mut phase = MtpPhaseTimings::default();
+    let decode_loop_start = Instant::now();
+
+    while tokens_remaining > 0 {
+        crate::generate::check_generation_cancellation()?;
+        let draft_start = Instant::now();
+        let draft = engine.mtp_dspark_draft(current_token)?;
+        phase.draft_ms += elapsed_ms(draft_start);
+        let effective_n = draft
+            .tokens
+            .len()
+            .min(params.spec_k.max(1))
+            .min(tokens_remaining);
+        if effective_n == 0 {
+            break;
+        }
+        let drafts = &draft.tokens[..effective_n];
+        stats.rounds += 1;
+        stats.drafted += effective_n;
+
+        let checkpoint_start = Instant::now();
+        let target_checkpoint = engine.checkpoint_deepseek4_verify()?;
+        let dspark_checkpoint = engine.mtp_checkpoint();
+        phase.checkpoint_ms += elapsed_ms(checkpoint_start);
+        let mut verify_tokens = Vec::with_capacity(effective_n + 1);
+        verify_tokens.push(current_token);
+        verify_tokens.extend_from_slice(drafts);
+        let verify_start = Instant::now();
+        let (mut predictions, output_hidden_rows) =
+            engine.forward_deepseek4_verify_batch(&verify_tokens)?;
+        phase.verify_ms += elapsed_ms(verify_start);
+        stats.add_target_verify(predictions.len(), 1);
+        if predictions.len() != verify_tokens.len() {
+            return Err(crate::error::LlmError::Forward(format!(
+                "DSpark verify returned {} predictions for {} tokens",
+                predictions.len(),
+                verify_tokens.len()
+            )));
+        }
+        if params.ignore_eos {
+            let hidden_dim = engine.metadata.hidden_dim;
+            for (index, prediction) in predictions.iter_mut().enumerate() {
+                let start = index * hidden_dim;
+                let hidden = output_hidden_rows
+                    .get(start..start + hidden_dim)
+                    .ok_or_else(|| {
+                        crate::error::LlmError::Forward(format!(
+                            "DSpark verify hidden row missing at index {index}"
+                        ))
+                    })?;
+                *prediction =
+                    replace_ignored_eos_output_target(engine, params, *prediction, hidden, eos)?;
+            }
+        }
+
+        let accepted = drafts
+            .iter()
+            .zip(&predictions)
+            .take_while(|(draft, target)| draft == target)
+            .count();
+        if crate::runtime::mtp_trace_enabled() {
+            let draft_pieces = drafts
+                .iter()
+                .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
+                .collect::<Vec<_>>();
+            let target_pieces = predictions
+                .iter()
+                .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[MTP/dspark-trace] anchor={current_token} draft={draft_pieces:?} confidence={:?} target={target_pieces:?} accepted={accepted}",
+                &draft.confidences[..effective_n],
+            );
+        }
+        stats.accepted += accepted;
+        let correction = predictions[accepted];
+        let mut emitted = 0usize;
+        let mut stopped = false;
+        for &token in drafts.iter().take(accepted) {
+            if params.should_stop(token, eos) {
+                stopped = true;
+                break;
+            }
+            generated_tokens.push(token);
+            emitted += 1;
+            if !generated_text.push(&engine.tokenizer, token, &mut callback) {
+                tokens_remaining = tokens_remaining.saturating_sub(1);
+                stopped = true;
+                break;
+            }
+            tokens_remaining = tokens_remaining.saturating_sub(1);
+            if tokens_remaining == 0 {
+                stopped = true;
+                break;
+            }
+        }
+
+        let verified_tokens = verify_tokens.len();
+        let committed_tokens = 1 + emitted;
+        if committed_tokens != verified_tokens {
+            let retain_start = Instant::now();
+            engine.restore_deepseek4_verify(&target_checkpoint)?;
+            engine.mtp_restore_checkpoint(dspark_checkpoint.as_ref());
+            engine.forward(&verify_tokens[..committed_tokens])?;
+            phase.retain_ms += elapsed_ms(retain_start);
+            stats.add_target_replay_invocations(1);
+        }
+        if stopped || tokens_remaining == 0 {
+            break;
+        }
+        if params.should_stop(correction, eos) {
+            break;
+        }
+        generated_tokens.push(correction);
+        if !generated_text.push(&engine.tokenizer, correction, &mut callback) {
+            break;
+        }
+        tokens_remaining = tokens_remaining.saturating_sub(1);
+        current_token = correction;
+    }
+
+    if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
+        eprintln!("[MTP/dspark] {}", stats.report());
+        eprintln!("{}", phase.report(stats.rounds));
+        eprintln!(
+            "  [MTP/dspark] wall_split prompt_prefill={:.1}ms decode_loop={:.1}ms",
+            prompt_prefill_ms,
+            elapsed_ms(decode_loop_start),
+        );
+    }
+    Ok(GenerateResult::new(
+        generated_text.finish(&mut callback),
+        generated_tokens.len(),
+        prompt_len,
+        start.elapsed().as_secs_f32(),
+        generated_tokens,
+    ))
+}
+
 fn generate_with_external_drafter(
     engine: &mut Engine,
     prompt_tokens: &[u32],
@@ -2166,6 +2407,12 @@ mod tests {
 
         params.repetition_penalty = 1.1;
         assert!(!mtp_greedy_verify_allowed(&params));
+    }
+
+    #[test]
+    fn mtp_zero_token_budget_skips_initial_sample() {
+        assert_eq!(mtp_initial_token_budget(0), None);
+        assert_eq!(mtp_initial_token_budget(1), Some(1));
     }
 
     #[test]

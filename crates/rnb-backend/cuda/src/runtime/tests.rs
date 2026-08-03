@@ -9,6 +9,8 @@ use rnb_backend_api::{
 };
 use rnb_memory::{ExpertBundleCacheStats, ExpertBundleObservationReceipt};
 
+#[path = "tests/dspark.rs"]
+mod dspark_tests;
 #[path = "tests/mtp_verify.rs"]
 mod mtp_verify_tests;
 

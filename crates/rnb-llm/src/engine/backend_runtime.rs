@@ -166,6 +166,7 @@ pub(super) use glm_moe::{
 pub(super) use glm_moe::{
     glm_moe_prefill_sparse_experts_iq_by_token,
     moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu,
+    mxfp4_sparse_experts_by_token_clamped_swiglu,
 };
 #[cfg(feature = "cuda")]
 pub(super) use gpu_gdn::ssm_prefill_delta_net_snapshots;

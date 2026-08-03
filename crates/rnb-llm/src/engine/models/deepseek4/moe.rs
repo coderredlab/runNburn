@@ -445,9 +445,12 @@ fn routed_cuda_layout_supported(
     expert_ffn_dim: usize,
 ) -> bool {
     prefer_sparse_moe_cuda
-        && gate_quant == GGMLType::IQ2_XXS
-        && up_quant == GGMLType::IQ2_XXS
-        && down_quant == GGMLType::IQ3_XXS
+        && ((gate_quant == GGMLType::IQ2_XXS
+            && up_quant == GGMLType::IQ2_XXS
+            && down_quant == GGMLType::IQ3_XXS)
+            || (gate_quant == GGMLType::MXFP4
+                && up_quant == GGMLType::MXFP4
+                && down_quant == GGMLType::MXFP4))
         && hidden_dim % 256 == 0
         && expert_ffn_dim % 256 == 0
 }
@@ -486,19 +489,34 @@ fn compute_sparse_experts_cuda_batch(
             token_ids.push(token as u32);
         }
     }
-    crate::engine::backend_runtime::moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu(
-        &gate_slots,
-        &up_slots,
-        &down_slots,
-        &route_weights,
-        &token_ids,
-        routes.len(),
-        config.expert_ffn_dim,
-        config.hidden_dim,
-        inputs,
-        weights.routed_clamp,
-    )
-    .map_err(LlmError::Forward)
+    let output = if moe.gate_quant == GGMLType::MXFP4 {
+        crate::engine::backend_runtime::mxfp4_sparse_experts_by_token_clamped_swiglu(
+            &gate_slots,
+            &up_slots,
+            &down_slots,
+            &route_weights,
+            &token_ids,
+            routes.len(),
+            config.expert_ffn_dim,
+            config.hidden_dim,
+            inputs,
+            weights.routed_clamp,
+        )
+    } else {
+        crate::engine::backend_runtime::moe_prefill_sparse_experts_iq2xxs_iq3xxs_clamped_swiglu(
+            &gate_slots,
+            &up_slots,
+            &down_slots,
+            &route_weights,
+            &token_ids,
+            routes.len(),
+            config.expert_ffn_dim,
+            config.hidden_dim,
+            inputs,
+            weights.routed_clamp,
+        )
+    };
+    output.map_err(LlmError::Forward)
 }
 
 fn compute_sparse_expert(
