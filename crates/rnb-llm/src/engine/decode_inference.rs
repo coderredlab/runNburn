@@ -49,6 +49,11 @@ fn multimodal_decode_position(
     ))
 }
 
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+fn batched_decode_chain_position_supported(cursor: Option<SequenceCursor>) -> bool {
+    cursor.is_none()
+}
+
 impl Engine {
     pub(crate) fn scratch_checkpoint(&self) -> Option<crate::engine::ScratchBuffers> {
         self.scratch.clone()
@@ -346,6 +351,9 @@ impl Engine {
     /// 공유해 미지원 quant/KV layout을 auto-enable하거나 생성 중간에 발견하지 않게 한다.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     pub(crate) fn batched_decode_chain_ready(&self) -> bool {
+        if !batched_decode_chain_position_supported(self.sequence_cursor) {
+            return false;
+        }
         if !matches!(
             self.architecture,
             ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
@@ -500,6 +508,9 @@ impl Engine {
             BatchedVerifyCommit,
         )>,
     > {
+        if !batched_decode_chain_position_supported(self.sequence_cursor) {
+            return Ok(None);
+        }
         let metadata = &self.metadata;
         let architecture = self.architecture;
         let Some(weights) = self.weights.as_ref() else {
@@ -2198,6 +2209,21 @@ mod tests {
                 .unwrap(),
             (7, false)
         );
+    }
+
+    #[test]
+    fn multimodal_sequence_disables_batched_decode_chain() {
+        let cursor = super::SequenceCursor {
+            physical_rows: 10,
+            logical_position: 7,
+            token_count: 4,
+            image_fingerprint: [0; 32],
+        };
+
+        assert!(!super::batched_decode_chain_position_supported(Some(
+            cursor
+        )));
+        assert!(super::batched_decode_chain_position_supported(None));
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
