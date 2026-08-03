@@ -16,17 +16,45 @@ fn metal_decode_route_supported(expert_slots: usize, route_weight_slots: usize) 
     (1..=8).contains(&expert_slots) && expert_slots == route_weight_slots
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MoeBatchMode {
+    /// Large-batch prefill: grouped CUDA path with temp uploads.
+    Prefill,
+    /// Speculative verify: deterministic resident CUDA path, host fallback.
+    Verify,
+    /// DSpark draft trunk: resident CUDA path, then prefill-style fallback.
+    Draft,
+}
+
 pub(super) fn forward_moe(
     input: &[f32],
     token_id: u32,
+    layer_idx: usize,
     weights: &DeepSeek4MoeWeights,
     config: &DeepSeek4Config,
 ) -> Result<Vec<f32>> {
     let (experts, route_weights) = route(input, token_id, weights, config);
+    crate::engine::moe_trace::record_selection(layer_idx, &experts);
     if let Some(output) =
         forward_moe_metal_decode(input, &experts, &route_weights, weights, config)?
     {
         return Ok(output);
+    }
+    #[cfg(feature = "cuda")]
+    if routed_cuda_supported(weights, config) {
+        let routes = [(experts.clone(), route_weights.clone())];
+        if let Some(sparse) = compute_sparse_experts_cuda_resident(input, &routes, weights, config)?
+        {
+            let shared = &weights.weights;
+            let mut shared_gate = shared.shared_gate.gemv_vec(input)?;
+            let mut shared_up = shared.shared_up.gemv_vec(input)?;
+            swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
+            let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
+            for (dst, value) in output.iter_mut().zip(sparse) {
+                *dst += value;
+            }
+            return Ok(output);
+        }
     }
     let sparse_outputs: Vec<Vec<f32>> = experts
         .par_iter()
@@ -156,6 +184,40 @@ pub(super) fn forward_moe_batch(
     weights: &DeepSeek4MoeWeights,
     config: &DeepSeek4Config,
 ) -> Result<Vec<f32>> {
+    forward_moe_batch_impl(inputs, token_ids, weights, config, MoeBatchMode::Prefill)
+}
+
+pub(super) fn forward_moe_verify_batch(
+    inputs: &[f32],
+    token_ids: &[u32],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Vec<f32>> {
+    // Verify must match tokenwise decode bit-for-bit. Both share the
+    // deterministic resident CUDA path (per-token slot-ordered kernels);
+    // when the resident cache is unavailable both fall back to host
+    // arithmetic with the same per-token reduction order.
+    forward_moe_batch_impl(inputs, token_ids, weights, config, MoeBatchMode::Verify)
+}
+
+pub(super) fn forward_moe_draft_batch(
+    inputs: &[f32],
+    token_ids: &[u32],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Vec<f32>> {
+    forward_moe_batch_impl(inputs, token_ids, weights, config, MoeBatchMode::Draft)
+}
+
+fn forward_moe_batch_impl(
+    inputs: &[f32],
+    token_ids: &[u32],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+    mode: MoeBatchMode,
+) -> Result<Vec<f32>> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = mode;
     let seq_len = token_ids.len();
     debug_assert_eq!(inputs.len(), seq_len * config.hidden_dim);
     let routes: Vec<(Vec<usize>, Vec<f32>)> = inputs
@@ -166,16 +228,32 @@ pub(super) fn forward_moe_batch(
 
     #[cfg(feature = "cuda")]
     if routed_cuda_supported(weights, config) {
-        let sparse = compute_sparse_experts_cuda_batch(inputs, &routes, weights, config)?;
-        let shared = &weights.weights;
-        let mut shared_gate = shared.shared_gate.gemv_vec(inputs)?;
-        let mut shared_up = shared.shared_up.gemv_vec(inputs)?;
-        swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
-        let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
-        for (dst, sparse) in output.iter_mut().zip(sparse) {
-            *dst += sparse;
+        let sparse = match mode {
+            MoeBatchMode::Verify | MoeBatchMode::Draft => {
+                compute_sparse_experts_cuda_resident(inputs, &routes, weights, config)?
+            }
+            MoeBatchMode::Prefill => None,
+        };
+        let sparse = match (sparse, mode) {
+            (Some(sparse), _) => Some(sparse),
+            // Verify must stay on the same arithmetic as tokenwise decode;
+            // without the resident cache both drop to the host path below.
+            (None, MoeBatchMode::Verify) => None,
+            (None, MoeBatchMode::Prefill | MoeBatchMode::Draft) => Some(
+                compute_sparse_experts_cuda_batch(inputs, &routes, weights, config)?,
+            ),
+        };
+        if let Some(sparse) = sparse {
+            let shared = &weights.weights;
+            let mut shared_gate = shared.shared_gate.gemv_vec(inputs)?;
+            let mut shared_up = shared.shared_up.gemv_vec(inputs)?;
+            swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
+            let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
+            for (dst, sparse) in output.iter_mut().zip(sparse) {
+                *dst += sparse;
+            }
+            return Ok(output);
         }
-        return Ok(output);
     }
 
     if let Some(output) = forward_moe_metal_batch(inputs, &routes, weights, config)? {
@@ -517,6 +595,75 @@ fn compute_sparse_experts_cuda_batch(
         )
     };
     output.map_err(LlmError::Forward)
+}
+
+#[cfg(feature = "cuda")]
+fn ggml_quant_code(quant: GGMLType) -> Result<u32> {
+    match quant {
+        GGMLType::IQ2_XXS => Ok(16),
+        GGMLType::IQ3_XXS => Ok(18),
+        GGMLType::MXFP4 => Ok(39),
+        other => Err(LlmError::Forward(format!(
+            "unsupported resident sparse expert quant {other:?}"
+        ))),
+    }
+}
+
+/// Deterministic selected-expert forward through the CUDA resident slice
+/// cache. `Ok(None)` means the cache is unavailable; callers must fall back
+/// consistently for decode and verify so both stay on identical arithmetic.
+#[cfg(feature = "cuda")]
+fn compute_sparse_experts_cuda_resident(
+    inputs: &[f32],
+    routes: &[(Vec<usize>, Vec<f32>)],
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> Result<Option<Vec<f32>>> {
+    let moe = &weights.weights;
+    let gate_expert_bytes =
+        config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.gate_quant);
+    let up_expert_bytes = config.expert_ffn_dim * bytes_per_row(config.hidden_dim, moe.up_quant);
+    let down_expert_bytes =
+        config.hidden_dim * bytes_per_row(config.expert_ffn_dim, moe.down_quant);
+    let gate_bytes = moe.gate_exps_bytes().expect("DeepSeek4 gate expert bytes");
+    let up_bytes = moe.up_exps_bytes().expect("DeepSeek4 up expert bytes");
+    let down_bytes = moe.down_exps_bytes().expect("DeepSeek4 down expert bytes");
+    let slot_count = routes.len() * config.expert_used_count;
+    let mut gate_slots = Vec::with_capacity(slot_count);
+    let mut up_slots = Vec::with_capacity(slot_count);
+    let mut down_slots = Vec::with_capacity(slot_count);
+    let mut route_weights = Vec::with_capacity(slot_count);
+    let mut token_ids = Vec::with_capacity(slot_count);
+    for (token, (experts, weights)) in routes.iter().enumerate() {
+        if experts.len() != config.expert_used_count {
+            return Ok(None);
+        }
+        for (&expert, &route_weight) in experts.iter().zip(weights) {
+            let gate_start = expert * gate_expert_bytes;
+            let up_start = expert * up_expert_bytes;
+            let down_start = expert * down_expert_bytes;
+            gate_slots.push(&gate_bytes[gate_start..gate_start + gate_expert_bytes]);
+            up_slots.push(&up_bytes[up_start..up_start + up_expert_bytes]);
+            down_slots.push(&down_bytes[down_start..down_start + down_expert_bytes]);
+            route_weights.push(route_weight);
+            token_ids.push(token as u32);
+        }
+    }
+    crate::engine::backend_runtime::sparse_experts_by_token_clamped_swiglu_resident(
+        &gate_slots,
+        &up_slots,
+        &down_slots,
+        ggml_quant_code(moe.gate_quant)?,
+        ggml_quant_code(moe.down_quant)?,
+        &route_weights,
+        &token_ids,
+        routes.len(),
+        config.expert_ffn_dim,
+        config.hidden_dim,
+        inputs,
+        weights.routed_clamp,
+    )
+    .map_err(LlmError::Forward)
 }
 
 fn compute_sparse_expert(

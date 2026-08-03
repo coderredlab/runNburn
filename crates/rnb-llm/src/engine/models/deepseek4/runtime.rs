@@ -8,13 +8,15 @@ use super::attention::{
     forward_attention_batch_if_supported,
 };
 use super::math::{hyper_head, hyper_post, hyper_pre, rms_norm};
-use super::moe::{forward_moe, forward_moe_batch};
+use super::moe::{forward_moe, forward_moe_batch, forward_moe_verify_batch};
+use super::state::DeepSeek4StateCheckpoint;
 use super::weights::DeepSeek4Weights;
 
 pub(in crate::engine) struct DeepSeek4ForwardOutput {
     pub(in crate::engine) logits: Vec<f32>,
     pub(in crate::engine) final_hidden_rows: Vec<f32>,
     pub(in crate::engine) extracted_features: Vec<f32>,
+    pub(in crate::engine) verify_state_prefixes: Vec<DeepSeek4StateCheckpoint>,
 }
 
 pub(in crate::engine) fn forward_tokens(
@@ -33,17 +35,22 @@ pub(in crate::engine) fn forward_tokens(
             logits: Vec::new(),
             final_hidden_rows: Vec::new(),
             extracted_features: Vec::new(),
+            verify_state_prefixes: Vec::new(),
         });
     }
     if tokens.len() == 1 {
-        return forward_single_token(
+        let mut output = forward_single_token(
             model,
             token_embedding,
             output_norm,
             output,
             tokens[0],
             target_layers,
-        );
+        )?;
+        if all_logits {
+            output.verify_state_prefixes.push(model.state.checkpoint());
+        }
+        return Ok(output);
     }
     let config = &model.config;
     let seq_len = tokens.len();
@@ -61,6 +68,8 @@ pub(in crate::engine) fn forward_tokens(
         }
     }
     let mut layer_features = vec![None; target_layers.len()];
+    let mut verify_state_layers =
+        all_logits.then(|| vec![Vec::with_capacity(model.layers.len()); seq_len]);
 
     for (layer_index, (layer, attention_state)) in
         model.layers.iter().zip(&mut model.state.layers).enumerate()
@@ -73,19 +82,21 @@ pub(in crate::engine) fn forward_tokens(
             target_layers,
             &mut layer_features,
         );
-        let attention_batch_tokens =
-            if crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_requested() {
-                attention_prefill_batch_scratch_bytes_per_token(&layer.attention, config)
-                    .map(|scratch_bytes_per_token| {
-                        crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_tokens(
-                            seq_len,
-                            scratch_bytes_per_token,
-                        )
-                    })
-                    .unwrap_or(1)
-            } else {
-                1
-            };
+        let attention_batch_tokens = if all_logits {
+            1
+        } else if crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_requested(
+        ) {
+            attention_prefill_batch_scratch_bytes_per_token(&layer.attention, config)
+                .map(|scratch_bytes_per_token| {
+                    crate::engine::backend_runtime::metal_deepseek4_attention_prefill_batch_tokens(
+                        seq_len,
+                        scratch_bytes_per_token,
+                    )
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
         let attention_hidden = if attention_batch_tokens >= 2 {
             let mut next_hidden = Vec::with_capacity(hidden.len());
             let mut chunk_start_token = 0;
@@ -151,6 +162,9 @@ pub(in crate::engine) fn forward_tokens(
                     attention_state,
                     config,
                 )?;
+                if let Some(prefix_layers) = verify_state_layers.as_mut() {
+                    prefix_layers[token].push(attention_state.checkpoint());
+                }
                 next_hidden.extend(hyper_post(&attn_output, residual, mix, config));
             }
             next_hidden
@@ -164,7 +178,11 @@ pub(in crate::engine) fn forward_tokens(
             ffn_inputs.extend(rms_norm(&mix.branch, &layer.ffn_norm, config.norm_eps));
             mixes.push(mix);
         }
-        let ffn_outputs = forward_moe_batch(&ffn_inputs, tokens, &layer.moe, config)?;
+        let ffn_outputs = if all_logits {
+            forward_moe_verify_batch(&ffn_inputs, tokens, &layer.moe, config)?
+        } else {
+            forward_moe_batch(&ffn_inputs, tokens, &layer.moe, config)?
+        };
         let mut next_hidden = Vec::with_capacity(hidden.len());
         for ((residual, mix), ffn_output) in hidden
             .chunks_exact(row_width)
@@ -203,11 +221,26 @@ pub(in crate::engine) fn forward_tokens(
     }
     let logits = output.gemv_vec(&final_hidden_rows)?;
     let extracted_features = transpose_dspark_inputs(layer_features, seq_len, config.hidden_dim)?;
+    let verify_state_prefixes = verify_state_layers
+        .map(|prefix_layers| {
+            prefix_layers
+                .into_iter()
+                .enumerate()
+                .map(|(token, layers)| {
+                    DeepSeek4StateCheckpoint::from_layer_checkpoints(
+                        start_position + token + 1,
+                        layers,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     model.state.position += seq_len;
     Ok(DeepSeek4ForwardOutput {
         logits,
         final_hidden_rows,
         extracted_features,
+        verify_state_prefixes,
     })
 }
 
@@ -253,7 +286,7 @@ fn forward_single_token(
         let residual = hidden;
         let mix = hyper_pre(&residual, &layer.ffn_hc, &model.config);
         let ffn_input = rms_norm(&mix.branch, &layer.ffn_norm, model.config.norm_eps);
-        let ffn_output = forward_moe(&ffn_input, token, &layer.moe, &model.config)?;
+        let ffn_output = forward_moe(&ffn_input, token, layer_index, &layer.moe, &model.config)?;
         hidden = hyper_post(&ffn_output, &residual, mix, &model.config);
     }
     capture_dspark_inputs(
@@ -279,6 +312,7 @@ fn forward_single_token(
         logits,
         final_hidden_rows,
         extracted_features,
+        verify_state_prefixes: Vec::new(),
     })
 }
 

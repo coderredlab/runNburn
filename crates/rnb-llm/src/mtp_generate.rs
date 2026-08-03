@@ -1686,6 +1686,21 @@ fn generate_stream_mtp_with_tokens(
 // mc78 Task 12 — External drafter draft → verify → commit loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+const DSPARK_DRAFT_CONFIDENCE_FLOOR: f32 = 0.5;
+
+fn dspark_confident_prefix_len(confidences: &[f32], max_tokens: usize) -> usize {
+    let available = confidences.len().min(max_tokens);
+    if available == 0 {
+        return 0;
+    }
+    confidences
+        .iter()
+        .take(available)
+        .take_while(|&&confidence| confidence >= DSPARK_DRAFT_CONFIDENCE_FLOOR)
+        .count()
+        .max(1)
+}
+
 /// External drafter (Gemma 4 assistant 모델) 를 이용한 speculative generate.
 ///
 /// 알고리즘:
@@ -1791,11 +1806,12 @@ fn generate_with_dspark(
         let draft_start = Instant::now();
         let draft = engine.mtp_dspark_draft(current_token)?;
         phase.draft_ms += elapsed_ms(draft_start);
-        let effective_n = draft
+        let draft_limit = draft
             .tokens
             .len()
             .min(params.spec_k.max(1))
             .min(tokens_remaining);
+        let effective_n = dspark_confident_prefix_len(&draft.confidences, draft_limit);
         if effective_n == 0 {
             break;
         }
@@ -1811,22 +1827,22 @@ fn generate_with_dspark(
         verify_tokens.push(current_token);
         verify_tokens.extend_from_slice(drafts);
         let verify_start = Instant::now();
-        let (mut predictions, output_hidden_rows) =
-            engine.forward_deepseek4_verify_batch(&verify_tokens)?;
+        let mut verify = engine.forward_deepseek4_verify_batch(&verify_tokens)?;
         phase.verify_ms += elapsed_ms(verify_start);
-        stats.add_target_verify(predictions.len(), 1);
-        if predictions.len() != verify_tokens.len() {
+        stats.add_target_verify(verify.predictions.len(), 1);
+        if verify.predictions.len() != verify_tokens.len() {
             return Err(crate::error::LlmError::Forward(format!(
                 "DSpark verify returned {} predictions for {} tokens",
-                predictions.len(),
+                verify.predictions.len(),
                 verify_tokens.len()
             )));
         }
         if params.ignore_eos {
             let hidden_dim = engine.metadata.hidden_dim;
-            for (index, prediction) in predictions.iter_mut().enumerate() {
+            for (index, prediction) in verify.predictions.iter_mut().enumerate() {
                 let start = index * hidden_dim;
-                let hidden = output_hidden_rows
+                let hidden = verify
+                    .output_hidden_rows
                     .get(start..start + hidden_dim)
                     .ok_or_else(|| {
                         crate::error::LlmError::Forward(format!(
@@ -1840,7 +1856,7 @@ fn generate_with_dspark(
 
         let accepted = drafts
             .iter()
-            .zip(&predictions)
+            .zip(&verify.predictions)
             .take_while(|(draft, target)| draft == target)
             .count();
         if crate::runtime::mtp_trace_enabled() {
@@ -1848,7 +1864,8 @@ fn generate_with_dspark(
                 .iter()
                 .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
                 .collect::<Vec<_>>();
-            let target_pieces = predictions
+            let target_pieces = verify
+                .predictions
                 .iter()
                 .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
                 .collect::<Vec<_>>();
@@ -1858,7 +1875,7 @@ fn generate_with_dspark(
             );
         }
         stats.accepted += accepted;
-        let correction = predictions[accepted];
+        let correction = verify.predictions[accepted];
         let mut emitted = 0usize;
         let mut stopped = false;
         for &token in drafts.iter().take(accepted) {
@@ -1884,11 +1901,14 @@ fn generate_with_dspark(
         let committed_tokens = 1 + emitted;
         if committed_tokens != verified_tokens {
             let retain_start = Instant::now();
-            engine.restore_deepseek4_verify(&target_checkpoint)?;
-            engine.mtp_restore_checkpoint(dspark_checkpoint.as_ref());
-            engine.forward(&verify_tokens[..committed_tokens])?;
+            engine.commit_deepseek4_verify_prefix(&target_checkpoint, &verify, committed_tokens)?;
+            engine.mtp_commit_dspark_verify_prefix(
+                dspark_checkpoint.as_ref(),
+                &verify.extracted_features,
+                committed_tokens,
+                target_checkpoint.kv_len,
+            )?;
             phase.retain_ms += elapsed_ms(retain_start);
-            stats.add_target_replay_invocations(1);
         }
         if stopped || tokens_remaining == 0 {
             break;
@@ -2413,6 +2433,19 @@ mod tests {
     fn mtp_zero_token_budget_skips_initial_sample() {
         assert_eq!(mtp_initial_token_budget(0), None);
         assert_eq!(mtp_initial_token_budget(1), Some(1));
+    }
+
+    #[test]
+    fn dspark_confidence_keeps_only_more_likely_than_not_prefix() {
+        assert_eq!(dspark_confident_prefix_len(&[0.9, 0.8, 0.4, 0.95], 4), 2);
+        assert_eq!(dspark_confident_prefix_len(&[0.9, 0.8, 0.7], 2), 2);
+    }
+
+    #[test]
+    fn dspark_confidence_still_verifies_one_low_confidence_token() {
+        assert_eq!(dspark_confident_prefix_len(&[0.2, 0.9], 2), 1);
+        assert_eq!(dspark_confident_prefix_len(&[], 2), 0);
+        assert_eq!(dspark_confident_prefix_len(&[0.9], 0), 0);
     }
 
     #[test]

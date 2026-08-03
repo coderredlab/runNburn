@@ -16,7 +16,7 @@ struct CompressorCheckpoint {
 }
 
 #[derive(Clone)]
-struct AttentionCheckpoint {
+pub(super) struct AttentionCheckpoint {
     window: VecDeque<Vec<f32>>,
     compressor: Option<CompressorCheckpoint>,
     indexer_compressor: Option<CompressorCheckpoint>,
@@ -26,6 +26,15 @@ struct AttentionCheckpoint {
 pub(crate) struct DeepSeek4StateCheckpoint {
     position: usize,
     layers: Vec<AttentionCheckpoint>,
+}
+
+impl DeepSeek4StateCheckpoint {
+    pub(super) fn from_layer_checkpoints(
+        position: usize,
+        layers: Vec<AttentionCheckpoint>,
+    ) -> Self {
+        Self { position, layers }
+    }
 }
 
 impl CompressorState {
@@ -87,7 +96,7 @@ impl AttentionState {
         }
     }
 
-    fn checkpoint(&self) -> AttentionCheckpoint {
+    pub(super) fn checkpoint(&self) -> AttentionCheckpoint {
         AttentionCheckpoint {
             window: self.window.clone(),
             compressor: self.compressor.as_ref().map(CompressorState::checkpoint),
@@ -154,5 +163,46 @@ impl DeepSeek4State {
         for (state, saved) in self.layers.iter_mut().zip(&checkpoint.layers) {
             state.restore(saved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_checkpoint_restores_each_attention_layer_without_replay() {
+        let mut state = DeepSeek4State::new(&[0, 4]);
+        state.position = 7;
+        state.layers[0].window.push_back(vec![1.0, 2.0]);
+        state.layers[1].window.push_back(vec![3.0, 4.0]);
+        let compressor = state.layers[1].compressor.as_mut().unwrap();
+        compressor.current_values.push(vec![5.0]);
+        compressor.current_scores.push(vec![6.0]);
+        compressor.compressed.push(vec![7.0]);
+        let prefix = DeepSeek4StateCheckpoint::from_layer_checkpoints(
+            state.position,
+            state
+                .layers
+                .iter()
+                .map(AttentionState::checkpoint)
+                .collect(),
+        );
+
+        state.position = 9;
+        state.layers[0].window.push_back(vec![8.0, 9.0]);
+        let compressor = state.layers[1].compressor.as_mut().unwrap();
+        compressor.current_values.push(vec![10.0]);
+        compressor.current_scores.push(vec![11.0]);
+        compressor.compressed.push(vec![12.0]);
+        state.restore(&prefix);
+
+        assert_eq!(state.position, 7);
+        assert_eq!(state.layers[0].window.len(), 1);
+        assert_eq!(state.layers[0].window[0], vec![1.0, 2.0]);
+        let compressor = state.layers[1].compressor.as_ref().unwrap();
+        assert_eq!(compressor.current_values, vec![vec![5.0]]);
+        assert_eq!(compressor.current_scores, vec![vec![6.0]]);
+        assert_eq!(compressor.compressed, vec![vec![7.0]]);
     }
 }

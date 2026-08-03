@@ -12,7 +12,7 @@ use super::attention::project_attention_output;
 use super::math::{
     apply_rope, hyper_head, hyper_post, hyper_pre, rms_norm, rms_unit_inplace, tensor_f32,
 };
-use super::moe::forward_moe_batch;
+use super::moe::forward_moe_draft_batch;
 use super::weights::{
     load_deepseek4_weights, DeepSeek4Config, DeepSeek4Weights, F32WeightLoader,
     QuantizedWeightLoader,
@@ -51,7 +51,6 @@ pub(crate) struct DsparkRuntime {
     target_layers: Vec<usize>,
     block_size: usize,
     mask_token_id: u32,
-    sparse_moe_cuda_enabled: bool,
     committed_keys: Vec<VecDeque<Vec<f32>>>,
     position: usize,
 }
@@ -110,7 +109,6 @@ impl DsparkRuntime {
             block_size,
             mask_token_id,
             committed_keys,
-            sparse_moe_cuda_enabled,
             position: 0,
         })
     }
@@ -156,10 +154,6 @@ impl DsparkRuntime {
 
     pub(in crate::engine) fn block_size(&self) -> usize {
         self.block_size
-    }
-
-    pub(in crate::engine) fn sparse_moe_cuda_enabled(&self) -> bool {
-        self.sparse_moe_cuda_enabled
     }
 
     pub(in crate::engine) fn clear(&mut self) {
@@ -319,7 +313,7 @@ impl DsparkRuntime {
                 mixes.push(mix);
             }
             let ffn_outputs =
-                forward_moe_batch(&ffn_inputs, &token_ids, &layer.moe, &self.model.config)?;
+                forward_moe_draft_batch(&ffn_inputs, &token_ids, &layer.moe, &self.model.config)?;
             let mut after_ffn = Vec::with_capacity(hidden.len());
             for ((residual, mix), output) in hidden
                 .chunks_exact(row_width)

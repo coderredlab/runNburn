@@ -25,10 +25,6 @@ impl DeepSeek4Weights {
         self.state.clear();
     }
 
-    pub(in crate::engine) fn checkpoint_state(&self) -> DeepSeek4StateCheckpoint {
-        self.state.checkpoint()
-    }
-
     pub(in crate::engine) fn restore_state(&mut self, checkpoint: &DeepSeek4StateCheckpoint) {
         self.state.restore(checkpoint);
     }

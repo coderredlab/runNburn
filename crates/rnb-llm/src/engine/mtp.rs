@@ -564,14 +564,6 @@ fn current_mtp_auto_resource_hint() -> Option<MtpAutoResourceHint> {
     }
 }
 
-fn dspark_cuda_auto_enabled(
-    cuda_feature: bool,
-    sparse_moe_cuda_enabled: bool,
-    resource: Option<MtpAutoResourceHint>,
-) -> bool {
-    cuda_feature && sparse_moe_cuda_enabled && resource.is_some()
-}
-
 fn mtp_auto_policy_for_model(
     architecture: ModelArchitecture,
     metadata: &ModelMetadata,
@@ -821,27 +813,13 @@ impl Engine {
             .and_then(EngineMtpRuntime::as_dspark)
         {
             let resource = current_mtp_auto_resource_hint();
-            let enabled = dspark_cuda_auto_enabled(
-                cfg!(feature = "cuda"),
-                dspark.sparse_moe_cuda_enabled(),
-                resource,
-            );
-            let reason = if !cfg!(feature = "cuda") {
-                "deepseek4-dspark-cuda-only"
-            } else if !dspark.sparse_moe_cuda_enabled() {
-                "deepseek4-dspark-cuda-policy-disabled"
-            } else if resource.is_none() {
-                "cuda-resource-info-unavailable"
-            } else {
-                "deepseek4-dspark-cuda-auto"
-            };
             return MtpAutoPolicy {
-                enabled,
+                enabled: false,
                 spec_k: dspark.block_size(),
                 device_verify: false,
                 min_free_vram_mib: 0,
                 resource,
-                reason,
+                reason: "deepseek4-dspark-explicit-only",
             };
         }
         mtp_auto_policy_for_model(
@@ -986,6 +964,36 @@ impl Engine {
             return;
         };
         runtime.restore(checkpoint);
+    }
+
+    pub(crate) fn mtp_commit_dspark_verify_prefix(
+        &mut self,
+        checkpoint: Option<&EngineMtpCheckpoint>,
+        extracted_features: &[f32],
+        token_count: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        self.mtp_restore_checkpoint(checkpoint);
+        let feature_dim = self
+            .mtp_dspark_target_layers()
+            .len()
+            .checked_mul(self.metadata.hidden_dim)
+            .ok_or_else(|| LlmError::Forward("DSpark feature width overflow".to_string()))?;
+        if feature_dim == 0 {
+            return Err(LlmError::Forward(
+                "DSpark prefix commit has no target feature layers".to_string(),
+            ));
+        }
+        let feature_len = token_count.checked_mul(feature_dim).ok_or_else(|| {
+            LlmError::Forward("DSpark prefix feature length overflow".to_string())
+        })?;
+        let prefix_features = extracted_features.get(..feature_len).ok_or_else(|| {
+            LlmError::Forward(format!(
+                "DSpark prefix commit needs {feature_len} features, got {}",
+                extracted_features.len()
+            ))
+        })?;
+        self.mtp_dspark_observe_target_batch(prefix_features, token_count, start_position)
     }
 
     pub(crate) fn mtp_clear_sequence_state(&mut self) {
@@ -1905,15 +1913,6 @@ mod tests {
             total_vram_mib,
             free_vram_mib,
         }
-    }
-
-    #[test]
-    fn dspark_auto_requires_runtime_cuda_resource_and_policy() {
-        let resource = Some(policy_resource(24 * 1024, 8 * 1024));
-        assert!(dspark_cuda_auto_enabled(true, true, resource));
-        assert!(!dspark_cuda_auto_enabled(true, true, None));
-        assert!(!dspark_cuda_auto_enabled(true, false, resource));
-        assert!(!dspark_cuda_auto_enabled(false, true, resource));
     }
 
     #[test]

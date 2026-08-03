@@ -42,11 +42,16 @@ pub(crate) struct VulkanFullpathVerifyCommit {
     sequence_state: super::gpu_runtime::FullPathSequenceStateSnapshot,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct DeepSeek4VerifyCheckpoint {
-    target_state: super::models::deepseek4::DeepSeek4StateCheckpoint,
-    kv_len: usize,
-    last_hidden: Vec<f32>,
+    pub(crate) kv_len: usize,
+}
+
+pub(crate) struct DeepSeek4VerifyBatch {
+    pub(crate) predictions: Vec<u32>,
+    pub(crate) output_hidden_rows: Vec<f32>,
+    pub(crate) extracted_features: Vec<f32>,
+    pub(crate) target_prefix_states: Vec<super::models::deepseek4::DeepSeek4StateCheckpoint>,
 }
 
 impl Engine {
@@ -1846,46 +1851,25 @@ impl Engine {
     pub(crate) fn checkpoint_deepseek4_verify(
         &self,
     ) -> crate::error::Result<DeepSeek4VerifyCheckpoint> {
-        let model = self
+        let loaded = self
             .weights
             .as_ref()
             .and_then(|weights| weights.deepseek4.as_ref())
-            .ok_or_else(|| {
-                crate::error::LlmError::Forward(
-                    "DeepSeek4 checkpoint requires loaded target weights".to_string(),
-                )
-            })?;
+            .is_some();
+        if !loaded {
+            return Err(crate::error::LlmError::Forward(
+                "DeepSeek4 checkpoint requires loaded target weights".to_string(),
+            ));
+        }
         Ok(DeepSeek4VerifyCheckpoint {
-            target_state: model.checkpoint_state(),
             kv_len: self.kv_cache.current_len(),
-            last_hidden: self.last_layer_hidden_cached.clone(),
         })
-    }
-
-    pub(crate) fn restore_deepseek4_verify(
-        &mut self,
-        checkpoint: &DeepSeek4VerifyCheckpoint,
-    ) -> crate::error::Result<()> {
-        let model = self
-            .weights
-            .as_mut()
-            .and_then(|weights| weights.deepseek4.as_mut())
-            .ok_or_else(|| {
-                crate::error::LlmError::Forward(
-                    "DeepSeek4 restore requires loaded target weights".to_string(),
-                )
-            })?;
-        model.restore_state(&checkpoint.target_state);
-        self.kv_cache.set_len(checkpoint.kv_len);
-        self.last_layer_hidden_cached
-            .clone_from(&checkpoint.last_hidden);
-        self.sync_sequence_cursor_to_kv_len()
     }
 
     pub(crate) fn forward_deepseek4_verify_batch(
         &mut self,
         tokens: &[u32],
-    ) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
+    ) -> crate::error::Result<DeepSeek4VerifyBatch> {
         if tokens.is_empty() {
             return Err(crate::error::LlmError::Forward(
                 "DeepSeek4 verify requires at least one token".to_string(),
@@ -1916,6 +1900,13 @@ impl Engine {
         self.weights = Some(weights);
         let result = match result {
             Ok(output) => (|| {
+                if output.verify_state_prefixes.len() != tokens.len() {
+                    return Err(crate::error::LlmError::Forward(format!(
+                        "DeepSeek4 verify produced {} prefix states for {} tokens",
+                        output.verify_state_prefixes.len(),
+                        tokens.len()
+                    )));
+                }
                 self.kv_cache.set_len(expected_position + tokens.len());
                 let hidden_dim = self.metadata.hidden_dim;
                 self.last_layer_hidden_cached.clone_from_slice(
@@ -1936,7 +1927,12 @@ impl Engine {
                             .map_or(0, |(index, _)| index as u32)
                     })
                     .collect();
-                Ok((predictions, output.final_hidden_rows))
+                Ok(DeepSeek4VerifyBatch {
+                    predictions,
+                    output_hidden_rows: output.final_hidden_rows,
+                    extracted_features: output.extracted_features,
+                    target_prefix_states: output.verify_state_prefixes,
+                })
             })(),
             Err(error) => Err(error),
         };
@@ -1949,6 +1945,55 @@ impl Engine {
                 ))),
             },
         }
+    }
+
+    pub(crate) fn commit_deepseek4_verify_prefix(
+        &mut self,
+        checkpoint: &DeepSeek4VerifyCheckpoint,
+        verify: &DeepSeek4VerifyBatch,
+        committed_tokens: usize,
+    ) -> crate::error::Result<()> {
+        let prefix_index = committed_tokens.checked_sub(1).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "DeepSeek4 verify prefix commit requires at least one token".to_string(),
+            )
+        })?;
+        let target_state = verify
+            .target_prefix_states
+            .get(prefix_index)
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "DeepSeek4 verify prefix {committed_tokens} exceeds {} captured states",
+                    verify.target_prefix_states.len()
+                ))
+            })?;
+        let hidden_dim = self.metadata.hidden_dim;
+        let hidden_start = prefix_index.checked_mul(hidden_dim).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "DeepSeek4 verify prefix hidden offset overflow".to_string(),
+            )
+        })?;
+        let hidden = verify
+            .output_hidden_rows
+            .get(hidden_start..hidden_start + hidden_dim)
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "DeepSeek4 verify prefix {committed_tokens} has no hidden row"
+                ))
+            })?;
+        let model = self
+            .weights
+            .as_mut()
+            .and_then(|weights| weights.deepseek4.as_mut())
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "DeepSeek4 prefix commit requires loaded target weights".to_string(),
+                )
+            })?;
+        model.restore_state(target_state);
+        self.kv_cache.set_len(checkpoint.kv_len + committed_tokens);
+        self.last_layer_hidden_cached.clone_from_slice(hidden);
+        self.sync_sequence_cursor_to_kv_len()
     }
 
     pub fn forward(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {

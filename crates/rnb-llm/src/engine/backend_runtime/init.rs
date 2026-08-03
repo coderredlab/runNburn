@@ -19,6 +19,7 @@ fn clear_mediatek_cache_for_engine_init() {}
 #[cfg(feature = "cuda")]
 pub(in crate::engine) fn reset_backend_state_for_engine_init() -> crate::error::Result<()> {
     cuda_runtime::reset_state_for_engine_init().map_err(crate::error::LlmError::Forward)?;
+    cuda_runtime::clear_moe_expert_slice_cache().map_err(crate::error::LlmError::Forward)?;
     clear_mediatek_cache_for_engine_init();
     Ok(())
 }
