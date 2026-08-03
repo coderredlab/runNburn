@@ -20,6 +20,10 @@ pub(in crate::runtime) struct MoeSliceCache {
     resident_bytes: usize,
     /// Resolved once from env + device memory info; `Some(0)` = disabled.
     budget_bytes: Option<usize>,
+    /// Deferred shrink target when an OOM clamp could not evict enough
+    /// because every entry was in use by the clamping call; applied at the
+    /// start of the next call before any entry is marked used.
+    pending_shrink: Option<usize>,
     lookups: u64,
     hits: u64,
     admissions: u64,
@@ -62,14 +66,12 @@ fn parse_moe_slice_cache_env() -> MoeSliceCacheEnv {
 }
 
 /// Reserve kept free for other tenants and transient per-run workspaces
-/// (prefill temp slabs, logits uploads, verify scratch). Proportional to
-/// device capacity, mirroring the quant-resident reserve; measured on
-/// RTX 3090 the leaner total/8 variant pinned the cache against the VRAM
-/// wall and pushed every other path into OOM-retry churn.
+/// (prefill temp slabs, logits uploads, verify scratch). Delegates to the
+/// shared quant-resident reserve policy so the device keeps one
+/// capacity-proportional reserve definition instead of a second constant.
 fn moe_slice_cache_reserve_bytes(total_bytes: usize) -> usize {
-    let ratio = total_bytes.saturating_mul(35) / 100;
-    let floor = (total_bytes / 4).clamp(1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-    ratio.max(floor)
+    super::quant_resident::quant_resident_reserve_mib(total_bytes / (1024 * 1024))
+        .saturating_mul(1024 * 1024)
 }
 
 fn moe_slice_cache_budget_bytes(env: MoeSliceCacheEnv, free: usize, total: usize) -> usize {
@@ -118,6 +120,14 @@ impl CudaState {
         };
         if budget == 0 {
             return Ok(None);
+        }
+        // Apply a shrink deferred from an OOM clamp; no entry carries the
+        // upcoming epoch yet, so the whole cache is evictable here.
+        if let Some(target) = self.moe_slice_cache.pending_shrink.take() {
+            if self.moe_slice_cache.resident_bytes > target {
+                let shrink_epoch = self.moe_slice_cache.epoch.wrapping_add(1);
+                self.shrink_moe_slice_cache_to(target, shrink_epoch)?;
+            }
         }
 
         // Unique slices in first-appearance order.
@@ -183,11 +193,17 @@ impl CudaState {
                         }
                         Err(_) => {
                             // Device is tighter than the resolved budget.
-                            // Shrink to 3/4 of what we actually hold so the
-                            // other tenants stop OOM-retrying on every call.
+                            // Back off to 3/4 of what we actually hold so
+                            // the other tenants stop OOM-retrying. Entries
+                            // used by this call are protected, so defer the
+                            // remainder to the next call when the whole
+                            // cache is evictable again.
                             let target = self.moe_slice_cache.resident_bytes.saturating_mul(3) / 4;
                             self.moe_slice_cache.budget_bytes = Some(target);
                             self.shrink_moe_slice_cache_to(target, epoch)?;
+                            if self.moe_slice_cache.resident_bytes > target {
+                                self.moe_slice_cache.pending_shrink = Some(target);
+                            }
                         }
                     }
                 }
@@ -237,7 +253,12 @@ impl CudaState {
         let mut temp_ptrs: HashMap<(usize, usize), u64> = HashMap::new();
         if !temp_overflow.is_empty() {
             let total: usize = temp_overflow.iter().map(|(_, len)| len).sum();
-            let slab = self.compute_temp_slab_ptr(total)?;
+            // Even the shared temp slab can fail under extreme pressure;
+            // the cache is then unavailable and the caller must take its
+            // host path instead of failing the whole forward.
+            let Ok(slab) = self.compute_temp_slab_ptr(total) else {
+                return Ok(None);
+            };
             let mut offset = 0usize;
             for (index, len) in temp_overflow {
                 let (key, weights) = order[index];
@@ -345,6 +366,40 @@ impl CudaState {
                 .resident_bytes
                 .saturating_sub(entry.len);
             self.moe_slice_cache.evictions += 1;
+        }
+        Ok(())
+    }
+
+    /// Total device bytes held by the cache including recycled buffers on
+    /// the free lists — this is what unified reclaim accounting sees.
+    pub(in crate::runtime) fn moe_slice_cache_held_bytes(&self) -> usize {
+        let free_list_bytes: usize = self
+            .moe_slice_cache
+            .free_lists
+            .iter()
+            .map(|(len, ptrs)| len.saturating_mul(ptrs.len()))
+            .sum();
+        self.moe_slice_cache
+            .resident_bytes
+            .saturating_add(free_list_bytes)
+    }
+
+    /// Release at least `bytes` from the cache for transient allocations.
+    /// Entries handed out in the current call epoch stay protected; the
+    /// lowered budget prevents immediate regrowth into the reclaimed room.
+    pub(in crate::runtime) fn shrink_moe_slice_cache_for_reclaim(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if self.moe_slice_cache.entries.is_empty() && self.moe_slice_cache.free_lists.is_empty() {
+            return Ok(());
+        }
+        let target = self.moe_slice_cache.resident_bytes.saturating_sub(bytes);
+        self.moe_slice_cache.budget_bytes = Some(target);
+        let epoch = self.moe_slice_cache.epoch;
+        self.shrink_moe_slice_cache_to(target, epoch)?;
+        if self.moe_slice_cache.resident_bytes > target {
+            self.moe_slice_cache.pending_shrink = Some(target);
         }
         Ok(())
     }

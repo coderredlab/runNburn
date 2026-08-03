@@ -87,7 +87,7 @@ pub(crate) fn quant_resident_budget_plan(
     })
 }
 
-fn quant_resident_reserve_mib(total_mib: usize) -> usize {
+pub(super) fn quant_resident_reserve_mib(total_mib: usize) -> usize {
     let ratio = total_mib.saturating_mul(35) / 100;
     let floor = (total_mib / 4).clamp(1024, 4096);
     ratio.max(floor)

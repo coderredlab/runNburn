@@ -8634,6 +8634,103 @@ fn cuda_sparse_iq2xxs_iq3xxs_clamped_swiglu_matches_cpu_reference() {
 }
 
 #[test]
+fn cuda_moe_slice_cache_resident_path_is_cache_state_and_batch_invariant() {
+    let _guard = runtime_test_lock();
+    if let Err(error) = CudaState::open() {
+        eprintln!("skipping resident MoE slice cache CUDA test: {error}");
+        return;
+    }
+    // Fixed generous budget so the first pass admits everything.
+    let _budget = EnvVarGuard::set("RNB_CUDA_MOE_EXPERT_CACHE_MB", "64");
+    clear_moe_expert_slice_cache().expect("reset moe slice cache");
+
+    let token_count = 8usize;
+    let selected = 4usize;
+    let expert_count = token_count * selected;
+    let n_ff = 256usize;
+    let n_embd = 256usize;
+    let activation_limit = 0.5f32;
+    let route = (0..expert_count)
+        .map(|slot| 0.25 + (slot % 4) as f32 * 0.125)
+        .collect::<Vec<_>>();
+    let input = (0..token_count * n_embd)
+        .map(|index| 100.0 + (index % 29) as f32 * 0.25)
+        .collect::<Vec<_>>();
+    let gate = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_ff, n_embd, 66, expert * 3))
+        .collect::<Vec<_>>();
+    let up = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_ff, n_embd, 66, expert * 3 + 1))
+        .collect::<Vec<_>>();
+    let down = (0..expert_count)
+        .map(|expert| synthetic_iq_weights(n_embd, n_ff, 98, expert * 3 + 2))
+        .collect::<Vec<_>>();
+    let gate_slots = gate.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let up_slots = up.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let down_slots = down.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let token_ids = (0..expert_count)
+        .map(|slot| (slot / selected) as u32)
+        .collect::<Vec<_>>();
+
+    let run_batch = || {
+        sparse_experts_by_token_clamped_swiglu_resident(
+            &gate_slots,
+            &up_slots,
+            &down_slots,
+            16,
+            18,
+            &route,
+            &token_ids,
+            token_count,
+            n_ff,
+            n_embd,
+            &input,
+            activation_limit,
+        )
+        .expect("resident sparse dispatch")
+        .expect("resident cache enabled")
+    };
+
+    // Cold (all misses) vs warm (all hits) must be bitwise identical.
+    let cold = run_batch();
+    let warm = run_batch();
+    assert_eq!(cold, warm, "cache hit state changed resident output");
+
+    // Contract 2: verify-style batch equals per-token decode-style calls.
+    for token in 0..token_count {
+        let single = sparse_experts_by_token_clamped_swiglu_resident(
+            &gate_slots[token * selected..(token + 1) * selected],
+            &up_slots[token * selected..(token + 1) * selected],
+            &down_slots[token * selected..(token + 1) * selected],
+            16,
+            18,
+            &route[token * selected..(token + 1) * selected],
+            &vec![0u32; selected],
+            1,
+            n_ff,
+            n_embd,
+            &input[token * n_embd..(token + 1) * n_embd],
+            activation_limit,
+        )
+        .expect("resident single-token dispatch")
+        .expect("resident cache enabled");
+        assert_eq!(
+            single,
+            cold[token * n_embd..(token + 1) * n_embd].to_vec(),
+            "single-token decode diverged from batch verify for token {token}"
+        );
+    }
+
+    // Contract 1 under pressure: a budget too small for the working set
+    // forces steal/temp-overflow admission and must not change values.
+    clear_moe_expert_slice_cache().expect("reset moe slice cache");
+    let _tiny = EnvVarGuard::set("RNB_CUDA_MOE_EXPERT_CACHE_MB", "1");
+    let pressured = run_batch();
+    assert_eq!(cold, pressured, "cache pressure changed resident output");
+    clear_moe_expert_slice_cache().expect("reset moe slice cache");
+}
+
+#[test]
 fn cuda_glm_sparse_iq2s_iq4xs_by_token_matches_cpu_reference() {
     use rnb_cpu::gemm::dequant::{dequantize_bytes_to_f32, DequantType};
 

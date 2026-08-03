@@ -52,6 +52,7 @@ impl CudaState {
             .saturating_add(self.resident_q4_packed_bytes)
             .saturating_add(self.resident_q6_packed_bytes)
             .saturating_add(self.resident_moe_layer_bytes)
+            .saturating_add(self.moe_slice_cache_held_bytes())
     }
 
     pub(in crate::runtime) fn selected_moe_transient_admission_allowed(
@@ -122,7 +123,12 @@ impl CudaState {
             self.evict_resident_moe_layers_until(moe_reclaim_bytes, resident_bytes_before)?;
         }
         let (free_after_moe, _) = unsafe { self.api.mem_get_info() }?;
-        if reclaim_bytes(free_after_moe) > 0 {
+        let slice_reclaim_bytes = reclaim_bytes(free_after_moe);
+        if slice_reclaim_bytes > 0 {
+            self.shrink_moe_slice_cache_for_reclaim(slice_reclaim_bytes)?;
+        }
+        let (free_after_slice, _) = unsafe { self.api.mem_get_info() }?;
+        if reclaim_bytes(free_after_slice) > 0 {
             let _ = self.offload_non_pinned_resident_q4k()?;
         }
 
