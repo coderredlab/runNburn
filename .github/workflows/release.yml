@@ -207,7 +207,7 @@ jobs:
         with:
           cuda: "13.2.0"
           method: network
-          sub-packages: '["nvcc", "cudart", "cccl", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
           log-file-suffix: windows-cuda-sm86.log
 
       - name: Verify CUDA compiler
