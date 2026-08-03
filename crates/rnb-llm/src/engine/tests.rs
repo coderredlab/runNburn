@@ -290,6 +290,42 @@ fn device_verify_final_state_commit_updates_gdn_conv_state_and_len() {
 }
 
 #[test]
+fn verify_prefix_restore_rolls_back_multimodal_sequence_cursor() {
+    let mut engine = make_mock_engine(8);
+    engine.sequence_cursor = Some(crate::multimodal::SequenceCursor {
+        physical_rows: 10,
+        logical_position: 7,
+        token_count: 4,
+        image_fingerprint: [0; 32],
+    });
+    engine.kv_cache.set_len(13);
+    engine
+        .sync_sequence_cursor_to_kv_len()
+        .expect("advance multimodal cursor through verify window");
+
+    engine
+        .restore_verify_window_prefix_state(
+            10,
+            &verify_window::VerifyWindowPrefixState {
+                prefix_tokens: 2,
+                layers: Vec::new(),
+            },
+        )
+        .expect("restore committed verify prefix");
+
+    assert_eq!(engine.kv_cache.current_len(), 12);
+    assert_eq!(
+        engine.sequence_cursor,
+        Some(crate::multimodal::SequenceCursor {
+            physical_rows: 12,
+            logical_position: 9,
+            token_count: 6,
+            image_fingerprint: [0; 32],
+        })
+    );
+}
+
+#[test]
 fn device_verify_final_state_commit_writes_attention_kv_range() {
     let mut engine = make_mock_engine(8);
     let kv_rows = engine.metadata.num_kv_heads * engine.metadata.head_dim;

@@ -1098,7 +1098,7 @@ impl Engine {
         {
             self.finalize_resident_sequence_state_after_restore(restored_resident)?;
         }
-        Ok(())
+        self.sync_sequence_cursor_to_kv_len()
     }
 
     #[cfg(any(feature = "cuda", test))]
