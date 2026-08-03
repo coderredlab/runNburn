@@ -39,8 +39,19 @@ fn main() {
     );
 }
 
+fn nvcc() -> std::process::Command {
+    let command = std::process::Command::new("nvcc");
+    #[cfg(windows)]
+    let command = {
+        let mut command = command;
+        command.arg("-Xcompiler=/Zc:preprocessor");
+        command
+    };
+    command
+}
+
 fn compile_ptx(arch: &str, source: &str, ptx: &std::path::Path) {
-    let status = std::process::Command::new("nvcc")
+    let status = nvcc()
         .args(["-ptx", "-O3", "-std=c++17", "-arch", &arch, source, "-o"])
         .arg(ptx)
         .status()
@@ -51,7 +62,7 @@ fn compile_ptx(arch: &str, source: &str, ptx: &std::path::Path) {
 }
 
 fn compile_cubin(arch: &str, source: &str, cubin: &std::path::Path) {
-    let status = std::process::Command::new("nvcc")
+    let status = nvcc()
         .args(["-cubin", "-O3", "-std=c++17", "-arch", arch, source, "-o"])
         .arg(cubin)
         .status()
