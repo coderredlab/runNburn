@@ -978,11 +978,9 @@ fn generate_stream_mtp_with_tokens(
             let committed = 1 + n_accepted;
             let ending = stopped || tokens_remaining == 0;
             let phase_start = Instant::now();
-            // committed lane의 attention K/V와 GDN prefix state를 host에 반영한다. 종료
-            // 라운드는 다음 decode가 없으므로 커밋을 생략한다.
-            if !ending {
-                engine.commit_batched_verify(&commit, committed)?;
-            }
+            // Target와 drafter의 durable state는 종료 라운드에서도 같은 committed prefix를
+            // 가리켜야 한다. 그렇지 않으면 capture/restore 후 target만 해당 토큰을 재처리한다.
+            engine.commit_batched_verify(&commit, committed)?;
             // Drafter는 target verify가 만든 committed hidden prefix를 retain한다.
             let committed_hidden = window.mtp_hidden_prefix_rows(committed)?;
             engine.mtp_retain_draft_after_spec(
