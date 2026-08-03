@@ -325,8 +325,15 @@ pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> Vec<f32>
     } else {
         None
     };
+    let metal_argmax = if cuda_argmax.is_none() {
+        super::metal::drafter_q8_0_argmax(&drafter.token_embd, x_norm)
+            .unwrap_or_else(|error| panic!("Metal drafter lm_head failed: {error}"))
+    } else {
+        None
+    };
     let (token, value) = cuda_argmax
         .map(|(token, value)| (token as usize, value))
+        .or(metal_argmax)
         .unwrap_or_else(|| q8_0_argmax_cpu(&drafter.token_embd, x_norm));
 
     let mut logits = vec![f32::NEG_INFINITY; vocab_size];

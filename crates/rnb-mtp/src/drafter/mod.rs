@@ -27,6 +27,7 @@ pub mod calibrate;
 pub(crate) mod cuda;
 pub(crate) mod dequant;
 pub mod loader;
+pub(crate) mod metal;
 pub mod shared_kv;
 pub mod types;
 pub mod vq_head;

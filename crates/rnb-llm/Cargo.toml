@@ -9,7 +9,7 @@ cpu = ["rnb-runtime/cpu"]
 vulkan = ["rnb-runtime/vulkan"]
 cuda = ["rnb-runtime/cuda", "rnb-mtp/cuda"]
 opencl = ["rnb-runtime/opencl"]
-metal = ["rnb-runtime/metal"]
+metal = ["rnb-runtime/metal", "rnb-mtp/metal"]
 mediatek = ["rnb-runtime/mediatek"]
 
 [dependencies]

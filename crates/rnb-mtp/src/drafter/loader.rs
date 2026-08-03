@@ -7,6 +7,7 @@
 
 use super::types::{Drafter, DrafterLayer, TensorView};
 use memmap2::Mmap;
+use rnb_core::tensor::{DType, Storage, Tensor};
 use rnb_loader::arch::{extract_metadata, Architecture};
 use rnb_loader::gguf::parser::GGUFFile;
 use rnb_loader::gguf::types::{GGMLType, TensorInfo};
@@ -57,9 +58,16 @@ pub enum DrafterLoadError {
 pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mmap = Arc::new(mmap);
+    let mmap_len = mmap.len();
+    let mmap = Arc::new(Storage::Mmap(mmap));
+    Tensor::from_mmap(Arc::clone(&mmap), 0, &[mmap_len], DType::U8)
+        .map_err(|error| DrafterLoadError::Parse(error.to_string()))?;
 
-    let gguf = GGUFFile::parse(&mmap[..]).map_err(|e| DrafterLoadError::Parse(e.to_string()))?;
+    let gguf = GGUFFile::parse(
+        mmap.as_slice()
+            .expect("drafter mmap storage must be host-visible"),
+    )
+    .map_err(|e| DrafterLoadError::Parse(e.to_string()))?;
     let metadata =
         extract_metadata(&gguf.metadata).map_err(|e| DrafterLoadError::Metadata(e.to_string()))?;
 
@@ -85,7 +93,6 @@ pub fn load_drafter(path: &Path) -> Result<Drafter, DrafterLoadError> {
         .map(|t| (t.name.as_str(), t))
         .collect();
     let data_start = gguf.data_start;
-    let mmap_len = mmap.len();
 
     // Helper: build a TensorView for a named tensor with expected shape + dtype.
     let take_tensor = |name: &str,

@@ -207,6 +207,7 @@ mod policy_tests {
         std::env::remove_var("RNB_MTP_SHADOW_PRECOMPUTE");
         std::env::remove_var("RNB_MTP_RUNWAY_MAX_EXTRA");
         std::env::remove_var("RNB_SPEC_MTP_SEQUENTIAL_MULTI");
+        std::env::remove_var("RNB_MTP_DRAFTER_METAL");
 
         assert!(!mtp_output_argmax_enabled());
         assert_eq!(mtp_output_argmax_override(), None);
@@ -226,6 +227,7 @@ mod policy_tests {
         assert!(!mtp_shadow_precompute_enabled());
         assert_eq!(mtp_runway_max_extra(), None);
         assert!(!spec_mtp_sequential_multi_enabled());
+        assert!(drafter_metal_enabled());
 
         std::env::set_var("RNB_MTP_OUTPUT_ARGMAX", "1");
         std::env::set_var("RNB_MTP_DECODE_BLOCK", "0");
@@ -263,6 +265,8 @@ mod policy_tests {
         assert!(!mtp_draft_only_enabled());
         std::env::set_var("RNB_MTP_SHADOW_PRECOMPUTE", "false");
         assert!(!mtp_shadow_precompute_enabled());
+        std::env::set_var("RNB_MTP_DRAFTER_METAL", "0");
+        assert!(!drafter_metal_enabled());
 
         std::env::remove_var("RNB_MTP_OUTPUT_ARGMAX");
         std::env::remove_var("RNB_MTP_DECODE_BLOCK");
@@ -273,6 +277,7 @@ mod policy_tests {
         std::env::remove_var("RNB_MTP_SHADOW_PRECOMPUTE");
         std::env::remove_var("RNB_MTP_RUNWAY_MAX_EXTRA");
         std::env::remove_var("RNB_SPEC_MTP_SEQUENTIAL_MULTI");
+        std::env::remove_var("RNB_MTP_DRAFTER_METAL");
     }
 
     #[test]

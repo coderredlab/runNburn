@@ -121,7 +121,10 @@ pub fn drafter_forward(
             2 * drafter.backbone_hidden,
         )
         .unwrap_or(false);
-    if !pre_cuda_ok {
+    let pre_metal_ok = !pre_cuda_ok
+        && super::metal::drafter_q8_0_gemv(&drafter.pre_projection, inputs_embeds, &mut hidden)
+            .unwrap_or_else(|error| panic!("Metal drafter pre-projection failed: {error}"));
+    if !pre_cuda_ok && !pre_metal_ok {
         let pre_proj_w = dequant_to_f32(&drafter.pre_projection);
         matvec(
             &pre_proj_w,
@@ -243,7 +246,14 @@ pub fn drafter_forward(
             drafter.hidden,
         )
         .unwrap_or(false);
-    if !post_cuda_ok {
+    let post_metal_ok = !post_cuda_ok
+        && super::metal::drafter_q8_0_gemv(
+            &drafter.post_projection,
+            &last_hidden,
+            &mut projected_hidden,
+        )
+        .unwrap_or_else(|error| panic!("Metal drafter post-projection failed: {error}"));
+    if !post_cuda_ok && !post_metal_ok {
         let post_proj_w = dequant_to_f32(&drafter.post_projection);
         matvec(
             &post_proj_w,
@@ -325,7 +335,10 @@ fn decoder_layer_forward(
     let q_cuda_ok = rnb_runtime::policy::drafter_cuda_enabled()
         && super::cuda::drafter_attn_q_cuda(&layer.attn_q, hidden, &mut q, q_dim, hidden_size)
             .unwrap_or(false);
-    if !q_cuda_ok {
+    let q_metal_ok = !q_cuda_ok
+        && super::metal::drafter_q8_0_gemv(&layer.attn_q, hidden, &mut q)
+            .unwrap_or_else(|error| panic!("Metal drafter attention Q failed: {error}"));
+    if !q_cuda_ok && !q_metal_ok {
         let attn_q_w = dequant_to_f32(&layer.attn_q);
         matvec(&attn_q_w, q_dim, hidden_size, hidden, &mut q);
     }
@@ -435,7 +448,10 @@ fn decoder_layer_forward(
             q_dim,
         )
         .unwrap_or(false);
-    if !o_cuda_ok {
+    let o_metal_ok = !o_cuda_ok
+        && super::metal::drafter_q8_0_gemv(&layer.attn_output, &attn_out, &mut attn_proj)
+            .unwrap_or_else(|error| panic!("Metal drafter attention output failed: {error}"));
+    if !o_cuda_ok && !o_metal_ok {
         let out_proj_w = dequant_to_f32(&layer.attn_output);
         matvec(&out_proj_w, hidden_size, q_dim, &attn_out, &mut attn_proj);
     }
@@ -496,14 +512,22 @@ fn decoder_layer_forward(
         .unwrap_or(false);
 
     if !cuda_ok {
-        let gate_w = dequant_to_f32(&layer.ffn_gate);
-        let up_w = dequant_to_f32(&layer.ffn_up);
-        let down_w = dequant_to_f32(&layer.ffn_down);
-
         let mut gate = vec![0.0f32; ffn_dim];
         let mut up = vec![0.0f32; ffn_dim];
-        matvec(&gate_w, ffn_dim, hidden_size, hidden, &mut gate);
-        matvec(&up_w, ffn_dim, hidden_size, hidden, &mut up);
+        let gate_up_metal_ok = super::metal::drafter_q8_0_dual_gemv(
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            hidden,
+            &mut gate,
+            &mut up,
+        )
+        .unwrap_or_else(|error| panic!("Metal drafter FFN gate/up failed: {error}"));
+        if !gate_up_metal_ok {
+            let gate_w = dequant_to_f32(&layer.ffn_gate);
+            let up_w = dequant_to_f32(&layer.ffn_up);
+            matvec(&gate_w, ffn_dim, hidden_size, hidden, &mut gate);
+            matvec(&up_w, ffn_dim, hidden_size, hidden, &mut up);
+        }
 
         // SwiGLU: silu(gate) * up
         for j in 0..ffn_dim {
@@ -512,7 +536,12 @@ fn decoder_layer_forward(
             gate[j] = silu * up[j];
         }
 
-        matvec(&down_w, hidden_size, ffn_dim, &gate, &mut ffn_out);
+        let down_metal_ok = super::metal::drafter_q8_0_gemv(&layer.ffn_down, &gate, &mut ffn_out)
+            .unwrap_or_else(|error| panic!("Metal drafter FFN down failed: {error}"));
+        if !down_metal_ok {
+            let down_w = dequant_to_f32(&layer.ffn_down);
+            matvec(&down_w, hidden_size, ffn_dim, &gate, &mut ffn_out);
+        }
     }
 
     // post_feedforward_layernorm + residual

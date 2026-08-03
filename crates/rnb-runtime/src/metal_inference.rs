@@ -1242,6 +1242,29 @@ pub fn metal_deepseek4_q8_multi_gemv_if_supported(
         backend.deepseek4_q8_multi_gemv(weights, inputs, layout)
     })))
 }
+
+pub fn metal_drafter_q8_0_multi_gemv_if_supported(
+    weights: &[&[u8]],
+    inputs: &[&[f32]],
+    layout: &[(usize, usize)],
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if !crate::policy::drafter_metal_enabled()
+        || weights.len() != layout.len()
+        || inputs.len() != layout.len()
+        || layout.is_empty()
+    {
+        return Ok(None);
+    }
+    for ((raw, input), &(rows, cols)) in weights.iter().zip(inputs).zip(layout) {
+        let expected = rows.saturating_mul(cols / 32).saturating_mul(34);
+        if rows == 0 || cols == 0 || cols % 32 != 0 || input.len() != cols || raw.len() < expected {
+            return Ok(None);
+        }
+    }
+    Ok(Some(METAL.with(|backend| {
+        backend.deepseek4_q8_multi_gemv(weights, inputs, layout)
+    })))
+}
 pub fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
     quants: &[GGMLType],
     weights: &[&[u8]],

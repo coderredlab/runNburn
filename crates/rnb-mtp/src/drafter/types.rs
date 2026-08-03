@@ -13,6 +13,7 @@
 //! "Tensor 목록" 섹션 참조.
 
 use memmap2::Mmap;
+use rnb_core::tensor::Storage;
 use rnb_cpu::quantize::blocks::BlockQ6_K;
 use rnb_cpu::quantize::dequant::dequantize_q6_k;
 use rnb_loader::gguf::types::GGMLType;
@@ -36,19 +37,34 @@ pub struct VQCodebook {
 /// Zero-copy quantized tensor view (GGUF mmap 안의 한 슬라이스).
 ///
 /// `shape` 는 row-major (GGUF parser 가 reverse 해서 정규화한 형태).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TensorView {
-    pub mmap: Arc<Mmap>,
+    pub mmap: Arc<Storage>,
     pub offset: usize,
     pub len: usize,
     pub ggml_type: GGMLType,
     pub shape: Vec<usize>,
 }
 
+impl std::fmt::Debug for TensorView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorView")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .field("ggml_type", &self.ggml_type)
+            .field("shape", &self.shape)
+            .finish()
+    }
+}
+
 impl TensorView {
-    /// Raw bytes view. Mmap 은 `Arc` 가 살아있는 동안 유효.
+    /// Raw bytes view. Registered storage stays alive while any view exists.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.mmap[self.offset..self.offset + self.len]
+        let bytes = self
+            .mmap
+            .as_slice()
+            .expect("drafter tensor storage must be host-visible");
+        &bytes[self.offset..self.offset + self.len]
     }
 }
 

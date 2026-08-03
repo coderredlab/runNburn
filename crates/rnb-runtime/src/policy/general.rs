@@ -147,6 +147,10 @@ pub fn drafter_cuda_enabled() -> bool {
     env_flag_default_on("RNB_MTP_DRAFTER_CUDA")
 }
 
+pub fn drafter_metal_enabled() -> bool {
+    env_flag_default_on("RNB_MTP_DRAFTER_METAL")
+}
+
 pub fn mtp_spec_requested() -> bool {
     env_string("RNB_MTP").is_some_and(|value| value != "0")
 }
