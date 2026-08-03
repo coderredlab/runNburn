@@ -1168,14 +1168,7 @@ impl Engine {
         let committed_len = committed_tokens.checked_mul(hidden_dim).ok_or_else(|| {
             LlmError::Forward("MTP retain hidden row length overflow".to_string())
         })?;
-        if hidden_rows.len() < committed_len {
-            return Err(LlmError::Forward(format!(
-                "MTP retain hidden rows mismatch: got {}, need at least {}",
-                hidden_rows.len(),
-                committed_len
-            )));
-        }
-        let last_hidden_start = committed_len - hidden_dim;
+        let last_hidden = committed_last_hidden_row(hidden_rows, hidden_dim, committed_tokens)?;
 
         Ok(Some(MtpDraftRetainPlan {
             checkpoint_kv_len: checkpoint.kv_len,
@@ -1184,7 +1177,7 @@ impl Engine {
             next_pos_tokens: retained_draft_next_pos_tokens(drafted_tokens, committed_tokens),
             committed_tokens,
             committed_len,
-            last_hidden: hidden_rows[last_hidden_start..committed_len].to_vec(),
+            last_hidden,
         }))
     }
 
@@ -1333,7 +1326,9 @@ fn committed_last_hidden_row(
             "MTP retain requires at least one committed token".to_string(),
         ));
     }
-    let expected = committed_tokens * hidden_dim;
+    let expected = committed_tokens
+        .checked_mul(hidden_dim)
+        .ok_or_else(|| LlmError::Forward("MTP retain hidden row length overflow".to_string()))?;
     if hidden_rows.len() < expected {
         return Err(LlmError::Forward(format!(
             "MTP retain hidden rows mismatch: got {}, need at least {}",
@@ -1341,8 +1336,8 @@ fn committed_last_hidden_row(
             expected
         )));
     }
-    let start = (committed_tokens - 1) * hidden_dim;
-    Ok(hidden_rows[start..start + hidden_dim].to_vec())
+    let start = expected - hidden_dim;
+    Ok(hidden_rows[start..expected].to_vec())
 }
 
 fn observe_target_batch(
