@@ -193,34 +193,79 @@ pub(crate) struct VulkanLib {
     pub reset_fences: unsafe extern "C" fn(VkDevice, u32, *const VkFence) -> VkResult,
 }
 
+#[cfg(not(windows))]
 extern "C" {
     fn dlopen(filename: *const u8, flags: i32) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> i32;
 }
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(filename: *const u8) -> *mut c_void;
+    fn GetProcAddress(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
+    fn FreeLibrary(handle: *mut c_void) -> i32;
+}
+
 const RTLD_NOW: i32 = 2;
 
+#[cfg(windows)]
+fn vulkan_library_candidates() -> [&'static [u8]; 1] {
+    [b"vulkan-1.dll\0"]
+}
+
+#[cfg(not(windows))]
 fn vulkan_library_candidates() -> [&'static [u8]; 2] {
     [b"libvulkan.so\0", b"libvulkan.so.1\0"]
+}
+
+#[cfg(windows)]
+unsafe fn platform_open(filename: *const u8) -> *mut c_void {
+    LoadLibraryA(filename)
+}
+
+#[cfg(not(windows))]
+unsafe fn platform_open(filename: *const u8) -> *mut c_void {
+    dlopen(filename, RTLD_NOW)
+}
+
+#[cfg(windows)]
+unsafe fn platform_symbol(handle: *mut c_void, symbol: *const u8) -> *mut c_void {
+    GetProcAddress(handle, symbol)
+}
+
+#[cfg(not(windows))]
+unsafe fn platform_symbol(handle: *mut c_void, symbol: *const u8) -> *mut c_void {
+    dlsym(handle, symbol)
+}
+
+#[cfg(windows)]
+unsafe fn platform_close(handle: *mut c_void) {
+    let _ = FreeLibrary(handle);
+}
+
+#[cfg(not(windows))]
+unsafe fn platform_close(handle: *mut c_void) {
+    let _ = dlclose(handle);
 }
 
 impl VulkanLib {
     pub(crate) unsafe fn load() -> Result<Self, String> {
         let mut lib = std::ptr::null_mut();
         for candidate in vulkan_library_candidates() {
-            lib = dlopen(candidate.as_ptr(), RTLD_NOW);
+            lib = platform_open(candidate.as_ptr());
             if !lib.is_null() {
                 break;
             }
         }
         if lib.is_null() {
-            return Err("failed to load libvulkan.so or libvulkan.so.1".into());
+            return Err("failed to load Vulkan loader library".into());
         }
 
         macro_rules! load_fn {
             ($lib:expr, $name:literal) => {{
-                let sym = dlsym($lib, concat!($name, "\0").as_ptr());
+                let sym = platform_symbol($lib, concat!($name, "\0").as_ptr());
                 if sym.is_null() {
                     return Err(format!("missing symbol: {}", $name));
                 }
@@ -298,18 +343,25 @@ impl VulkanLib {
 mod tests {
     use super::vulkan_library_candidates;
 
+    #[cfg(not(windows))]
     #[test]
     fn test_vulkan_loader_tries_versioned_soname_after_unversioned_name() {
         let candidates = vulkan_library_candidates();
         assert_eq!(candidates[0], b"libvulkan.so\0");
         assert_eq!(candidates[1], b"libvulkan.so.1\0");
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_vulkan_loader_uses_windows_loader_name() {
+        assert_eq!(vulkan_library_candidates(), [b"vulkan-1.dll\0".as_slice()]);
+    }
 }
 
 impl Drop for VulkanLib {
     fn drop(&mut self) {
         unsafe {
-            dlclose(self._lib);
+            platform_close(self._lib);
         }
     }
 }
