@@ -43,6 +43,18 @@ fn tokenizer_contract_matches(
         && target.add_sep_token == draft.add_sep_token
         && target.add_space_prefix == draft.add_space_prefix
 }
+
+fn validate_primary_model_architecture(
+    architecture: ModelArchitecture,
+) -> crate::error::Result<()> {
+    if architecture == ModelArchitecture::DFlash {
+        return Err(crate::error::LlmError::ModelLoad(
+            "DFlash GGUF files are drafter sidecars and cannot be used as primary models; pass the DeepSeek4 target GGUF instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 fn maybe_enable_q4k_prefill_f16_gemm_for_dense_attention(_all_layers_attention: bool) {}
 
 #[cfg(test)]
@@ -245,6 +257,7 @@ impl Engine {
 
         let model = load_stage!("load_model", { rnb_loader::load_model(path) })
             .map_err(|e| crate::error::LlmError::ModelLoad(e.to_string()))?;
+        validate_primary_model_architecture(model.metadata.architecture)?;
 
         // Sum mapped tensor payloads rather than the selected path's file
         // length. A split GGUF's first shard may be a tiny metadata/tensor
@@ -1189,6 +1202,23 @@ fn hot_nemotron_order(indices: Vec<usize>) -> Vec<usize> {
 #[cfg(test)]
 mod kv_cache_default_tests {
     use super::*;
+
+    #[test]
+    fn dflash_sidecar_is_rejected_as_primary_model() {
+        let error = validate_primary_model_architecture(ModelArchitecture::DFlash)
+            .expect_err("DFlash primary model must be rejected");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::ModelLoad(message)
+                if message.contains("drafter sidecars")
+        ));
+    }
+
+    #[test]
+    fn deepseek4_target_is_accepted_as_primary_model() {
+        validate_primary_model_architecture(ModelArchitecture::DeepSeek4)
+            .expect("DeepSeek4 target model");
+    }
 
     #[test]
     fn native_cpu_defaults_to_k4v4_g128() {
