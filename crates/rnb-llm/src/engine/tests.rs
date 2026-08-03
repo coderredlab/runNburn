@@ -55,7 +55,7 @@ fn load_profile_report_keeps_stage_ms_breakdown() {
     assert!(report.contains("build_tokenizer_ms=0.500"));
 }
 
-fn make_mock_engine(vocab_size: usize) -> Engine {
+pub(super) fn make_mock_engine(vocab_size: usize) -> Engine {
     let tokens: Vec<String> = (0..vocab_size).map(|i| format!("tok{}", i)).collect();
     let special = SpecialTokens {
         bos: 1,

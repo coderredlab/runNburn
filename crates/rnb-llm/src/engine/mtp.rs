@@ -81,6 +81,16 @@ pub(crate) struct InModelMtpCheckpoint {
     last_hidden: Option<Vec<f32>>,
 }
 
+pub(crate) struct MtpDraftRetainPlan {
+    checkpoint_kv_len: usize,
+    checkpoint_next_pos: usize,
+    keep_blocks: usize,
+    next_pos_tokens: usize,
+    committed_tokens: usize,
+    committed_len: usize,
+    last_hidden: Vec<f32>,
+}
+
 // ---------------------------------------------------------------------------
 // EngineMtpRuntime enum — InModel (nextn) 또는 External drafter 중 하나.
 // ---------------------------------------------------------------------------
@@ -1128,16 +1138,15 @@ impl Engine {
         }
     }
 
-    pub(crate) fn mtp_retain_draft_after_spec(
-        &mut self,
+    pub(crate) fn mtp_prepare_draft_retain_after_spec(
+        &self,
         checkpoint: Option<&EngineMtpCheckpoint>,
-        _verify_tokens: &[u32],
         committed_tokens: usize,
         drafted_tokens: usize,
         hidden_rows: &[f32],
-    ) -> Result<()> {
+    ) -> Result<Option<MtpDraftRetainPlan>> {
         if !self.mtp_spec_requested() || committed_tokens == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let checkpoint = match checkpoint {
             Some(EngineMtpCheckpoint::InModel(c)) => c,
@@ -1147,38 +1156,81 @@ impl Engine {
                 ))
             }
         };
-        let Some(mut runtime) = self.mtp_runtime.take() else {
-            return Err(LlmError::Forward(
-                "RNB_MTP=1 but model has no loaded MTP runtime".to_string(),
-            ));
+        let runtime = self.mtp_runtime.as_ref().ok_or_else(|| {
+            LlmError::Forward("RNB_MTP=1 but model has no loaded MTP runtime".to_string())
+        })?;
+        let hidden_dim = match runtime {
+            EngineMtpRuntime::InModel(inner) => inner.metadata.hidden_dim,
+            // External drafter (mc78): retain is a no-op. External path
+            // manages its own draft state in generate_with_external_drafter.
+            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => return Ok(None),
         };
-        let result = (|| {
-            let Some(inner) = runtime.as_in_model_mut() else {
-                // External drafter (mc78): retain is a no-op. External path
-                // manages its own draft state in generate_with_external_drafter.
-                return Ok(());
-            };
-            let hidden_dim = inner.metadata.hidden_dim;
-            let last_hidden = committed_last_hidden_row(hidden_rows, hidden_dim, committed_tokens)?;
-            let keep_blocks = retained_draft_kv_tokens(drafted_tokens, committed_tokens);
-            inner
-                .kv_cache
-                .set_len((checkpoint.kv_len + keep_blocks).min(inner.kv_cache.max_seq_len));
-            let next_pos_tokens = retained_draft_next_pos_tokens(drafted_tokens, committed_tokens);
-            inner.next_pos =
-                (checkpoint.next_pos + next_pos_tokens).min(inner.kv_cache.max_seq_len);
+        let committed_len = committed_tokens.checked_mul(hidden_dim).ok_or_else(|| {
+            LlmError::Forward("MTP retain hidden row length overflow".to_string())
+        })?;
+        if hidden_rows.len() < committed_len {
+            return Err(LlmError::Forward(format!(
+                "MTP retain hidden rows mismatch: got {}, need at least {}",
+                hidden_rows.len(),
+                committed_len
+            )));
+        }
+        let last_hidden_start = committed_len - hidden_dim;
 
-            let committed_len = committed_tokens * hidden_dim;
-            inner.recent_hidden_rows.clear();
-            inner
-                .recent_hidden_rows
-                .extend_from_slice(&hidden_rows[..committed_len]);
-            inner.recent_hidden_count = committed_tokens;
-            inner.last_hidden = Some(last_hidden);
-            Ok(())
-        })();
-        self.mtp_runtime = Some(runtime);
-        result
+        Ok(Some(MtpDraftRetainPlan {
+            checkpoint_kv_len: checkpoint.kv_len,
+            checkpoint_next_pos: checkpoint.next_pos,
+            keep_blocks: retained_draft_kv_tokens(drafted_tokens, committed_tokens),
+            next_pos_tokens: retained_draft_next_pos_tokens(drafted_tokens, committed_tokens),
+            committed_tokens,
+            committed_len,
+            last_hidden: hidden_rows[last_hidden_start..committed_len].to_vec(),
+        }))
+    }
+
+    pub(crate) fn mtp_apply_draft_retain_after_spec(
+        &mut self,
+        plan: Option<MtpDraftRetainPlan>,
+        hidden_rows: &[f32],
+    ) {
+        let Some(plan) = plan else {
+            return;
+        };
+        let inner = self
+            .mtp_runtime
+            .as_mut()
+            .and_then(EngineMtpRuntime::as_in_model_mut)
+            .expect("prepared MTP retain plan requires its InModel runtime");
+        debug_assert!(hidden_rows.len() >= plan.committed_len);
+        inner
+            .kv_cache
+            .set_len((plan.checkpoint_kv_len + plan.keep_blocks).min(inner.kv_cache.max_seq_len));
+        inner.next_pos =
+            (plan.checkpoint_next_pos + plan.next_pos_tokens).min(inner.kv_cache.max_seq_len);
+        inner.recent_hidden_rows.clear();
+        inner
+            .recent_hidden_rows
+            .extend_from_slice(&hidden_rows[..plan.committed_len]);
+        inner.recent_hidden_count = plan.committed_tokens;
+        inner.last_hidden = Some(plan.last_hidden);
+    }
+
+    pub(crate) fn mtp_retain_draft_after_spec(
+        &mut self,
+        checkpoint: Option<&EngineMtpCheckpoint>,
+        _verify_tokens: &[u32],
+        committed_tokens: usize,
+        drafted_tokens: usize,
+        hidden_rows: &[f32],
+    ) -> Result<()> {
+        let plan = self.mtp_prepare_draft_retain_after_spec(
+            checkpoint,
+            committed_tokens,
+            drafted_tokens,
+            hidden_rows,
+        )?;
+        self.mtp_apply_draft_retain_after_spec(plan, hidden_rows);
+        Ok(())
     }
 
     pub(crate) fn mtp_observe_target_batch(

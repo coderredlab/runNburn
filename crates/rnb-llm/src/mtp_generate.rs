@@ -994,17 +994,16 @@ fn generate_stream_mtp_with_tokens(
             let ending = stopped || tokens_remaining == 0;
             let phase_start = Instant::now();
             // Target와 drafter의 durable state는 종료 라운드에서도 같은 committed prefix를
-            // 가리켜야 한다. 그렇지 않으면 capture/restore 후 target만 해당 토큰을 재처리한다.
-            engine.commit_batched_verify(&commit, committed)?;
-            // Drafter는 target verify가 만든 committed hidden prefix를 retain한다.
+            // 가리켜야 한다. Drafter retain을 먼저 검증해 target commit 뒤 실패할 여지를 없앤다.
             let committed_hidden = window.mtp_hidden_prefix_rows(committed)?;
-            engine.mtp_retain_draft_after_spec(
+            let draft_retain = engine.mtp_prepare_draft_retain_after_spec(
                 mtp_checkpoint.as_ref(),
-                &verify_input,
                 committed,
                 draft_k,
                 committed_hidden,
             )?;
+            engine.commit_batched_verify(&commit, committed)?;
+            engine.mtp_apply_draft_retain_after_spec(draft_retain, committed_hidden);
             phase.retain_ms += elapsed_ms(phase_start);
 
             if ending {

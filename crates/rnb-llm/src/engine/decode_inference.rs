@@ -739,40 +739,112 @@ impl Engine {
                 commit.batch
             )));
         }
+        if self.sequence_cursor.is_some() {
+            return Err(crate::error::LlmError::Forward(
+                "batched verify commit does not support multimodal sequence positions".into(),
+            ));
+        }
         let base_pos = commit.base_pos;
-        let gdn_state: &[Option<(Vec<f32>, Vec<f32>)>] = commit
-            .gdn_prefix
-            .get(committed.saturating_sub(1))
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+        if base_pos != self.kv_cache.current_len() {
+            return Err(crate::error::LlmError::Forward(format!(
+                "stale batched verify commit base {base_pos}, current KV length {}",
+                self.kv_cache.current_len()
+            )));
+        }
+        let target_len = base_pos.checked_add(committed).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "batched verify committed KV length overflow".to_string(),
+            )
+        })?;
+        if target_len > self.kv_cache.max_seq_len {
+            return Err(crate::error::LlmError::Forward(format!(
+                "batched verify commit length {target_len} exceeds KV capacity {}",
+                self.kv_cache.max_seq_len
+            )));
+        }
+        let layer_count = commit.layer_indices.len();
+        if commit.out_attn_kv.len() != layer_count || commit.kv_dims.len() != layer_count {
+            return Err(crate::error::LlmError::Forward(
+                "batched verify commit layer payload count mismatch".to_string(),
+            ));
+        }
+        let gdn_state = commit.gdn_prefix.get(committed - 1).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "batched verify commit missing GDN prefix {committed}"
+            ))
+        })?;
+        if gdn_state.len() != layer_count {
+            return Err(crate::error::LlmError::Forward(
+                "batched verify commit GDN layer count mismatch".to_string(),
+            ));
+        }
+
+        // 모든 오류를 실제 state 변경 전에 검증한다. 아래 apply 구간은 infallible이어야
+        // target과 drafter durable state를 한 라운드 단위로 함께 전진시킬 수 있다.
         for (i, &layer_idx) in commit.layer_indices.iter().enumerate() {
-            if let (Some((k, v)), Some(kv_dim)) = (&commit.out_attn_kv[i], commit.kv_dims[i]) {
-                // attn: window 앞 committed slot 만 host kv_cache 에 append(post-rope f16 bits).
-                let want = committed * kv_dim;
-                if k.len() >= want && v.len() >= want {
-                    self.kv_cache.append_bits_range(
-                        layer_idx,
-                        base_pos,
-                        committed,
-                        &k[..want],
-                        &v[..want],
-                    );
+            match (&commit.out_attn_kv[i], commit.kv_dims[i]) {
+                (Some((k, v)), Some(kv_dim)) => {
+                    let want = committed.checked_mul(kv_dim).ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "batched verify attention KV length overflow".to_string(),
+                        )
+                    })?;
+                    if k.len() < want || v.len() < want {
+                        return Err(crate::error::LlmError::Forward(format!(
+                            "batched verify attention KV payload is short for layer {layer_idx}: \
+                             k={}, v={}, need={want}",
+                            k.len(),
+                            v.len()
+                        )));
+                    }
                 }
-            } else if let Some(Some((conv_new, delta_new))) = gdn_state.get(i) {
-                // GDN: prefix-committed conv/delta 를 host ssm_state 에 write.
-                if let Some(st) = self.kv_cache.get_ssm_state_mut(layer_idx) {
-                    if st.conv_state.len() == conv_new.len() {
-                        st.conv_state.copy_from_slice(conv_new);
+                (None, None) => {
+                    if let Some((conv_new, delta_new)) = &gdn_state[i] {
+                        let state = self.kv_cache.get_ssm_state(layer_idx).ok_or_else(|| {
+                            crate::error::LlmError::Forward(format!(
+                                "batched verify commit missing GDN state for layer {layer_idx}"
+                            ))
+                        })?;
+                        if state.conv_state.len() != conv_new.len()
+                            || (!delta_new.is_empty() && state.delta_state.len() != delta_new.len())
+                        {
+                            return Err(crate::error::LlmError::Forward(format!(
+                                "batched verify GDN state shape mismatch for layer {layer_idx}"
+                            )));
+                        }
                     }
-                    if !delta_new.is_empty() && st.delta_state.len() == delta_new.len() {
-                        st.delta_state.copy_from_slice(delta_new);
-                    }
+                }
+                _ => {
+                    return Err(crate::error::LlmError::Forward(format!(
+                        "batched verify attention metadata mismatch for layer {layer_idx}"
+                    )))
                 }
             }
         }
-        self.kv_cache
-            .set_len((base_pos + committed).min(self.kv_cache.max_seq_len));
-        self.sync_sequence_cursor_to_kv_len()
+
+        for (i, &layer_idx) in commit.layer_indices.iter().enumerate() {
+            if let (Some((k, v)), Some(kv_dim)) = (&commit.out_attn_kv[i], commit.kv_dims[i]) {
+                let want = committed * kv_dim;
+                self.kv_cache.append_bits_range(
+                    layer_idx,
+                    base_pos,
+                    committed,
+                    &k[..want],
+                    &v[..want],
+                );
+            } else if let Some((conv_new, delta_new)) = &gdn_state[i] {
+                let state = self
+                    .kv_cache
+                    .get_ssm_state_mut(layer_idx)
+                    .expect("validated batched verify GDN state must remain present");
+                state.conv_state.copy_from_slice(conv_new);
+                if !delta_new.is_empty() {
+                    state.delta_state.copy_from_slice(delta_new);
+                }
+            }
+        }
+        self.kv_cache.set_len(target_len);
+        Ok(())
     }
 
     fn forward_decode_impl(
@@ -2224,6 +2296,28 @@ mod tests {
             cursor
         )));
         assert!(super::batched_decode_chain_position_supported(None));
+    }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[test]
+    fn invalid_batched_verify_payload_leaves_target_state_unchanged() {
+        let mut engine = crate::engine::tests::make_mock_engine(8);
+        let kv_dim = engine.metadata.num_kv_heads * engine.metadata.head_dim;
+        let commit = super::BatchedVerifyCommit {
+            base_pos: 0,
+            batch: 2,
+            layer_indices: vec![0],
+            gdn_prefix: vec![vec![None], vec![None]],
+            out_attn_kv: vec![Some((vec![0; kv_dim], vec![0; kv_dim]))],
+            kv_dims: vec![Some(kv_dim)],
+        };
+
+        let error = engine
+            .commit_batched_verify(&commit, 2)
+            .expect_err("short K/V payload must fail before target mutation");
+
+        assert!(error.to_string().contains("payload is short"));
+        assert_eq!(engine.kv_cache.current_len(), 0);
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
