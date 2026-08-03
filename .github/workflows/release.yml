@@ -166,9 +166,24 @@ jobs:
           if-no-files-found: error
 
   windows-x86_64:
-    name: Windows x86_64 CPU
+    name: Windows x86_64 ${{ matrix.backend }}
     runs-on: windows-2025
     timeout-minutes: 60
+    env:
+      RNB_CUDA_ARCH: sm_86
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cpu
+            features: cpu
+            archive_suffix: ""
+          - backend: cuda-sm86
+            features: cpu,cuda
+            archive_suffix: -cuda-sm86
+          - backend: vulkan-experimental
+            features: cpu,vulkan
+            archive_suffix: -vulkan-experimental
 
     steps:
       - name: Check out release tag
@@ -182,6 +197,19 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install CUDA compiler
+        if: matrix.backend == 'cuda-sm86'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: network
+          sub-packages: '["nvcc", "visual_studio_integration"]'
+          log-file-suffix: windows-cuda-sm86.log
+
+      - name: Verify CUDA compiler
+        if: matrix.backend == 'cuda-sm86'
+        run: nvcc --version
+
       - name: Cache Cargo
         uses: actions/cache@v6
         with:
@@ -189,14 +217,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-x86_64-cpu-${{ hashFiles('Cargo.lock') }}
-          restore-keys: windows-x86_64-cpu-
+          key: windows-x86_64-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-x86_64-${{ matrix.backend }}-
 
       - name: Test CPU product path
+        if: matrix.backend == 'cpu'
         run: cargo test --locked -p rnb-cli --no-default-features --features cpu
 
       - name: Build release binary
-        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features "${{ matrix.features }}"
 
       - name: Smoke test binary
         run: .\target\release\runNburn.exe --help
@@ -206,7 +235,7 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG.TrimStart("v")
-          $archive = "runNburn-$version-x86_64-pc-windows-msvc.zip"
+          $archive = "runNburn-$version-x86_64-pc-windows-msvc${{ matrix.archive_suffix }}.zip"
           New-Item -ItemType Directory -Force dist/package | Out-Null
           Copy-Item target/release/runNburn.exe dist/package/
           Copy-Item LICENSE, NOTICE dist/package/
@@ -218,7 +247,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: runNburn-release-windows-x86_64-cpu
+          name: runNburn-release-windows-x86_64-${{ matrix.backend }}
           path: |
             dist/${{ steps.package.outputs.archive }}
             dist/${{ steps.package.outputs.archive }}.sha256
