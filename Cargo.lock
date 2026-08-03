@@ -1044,11 +1044,11 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rnb-backend-api"
-version = "0.12.0"
+version = "0.12.1"
 
 [[package]]
 name = "rnb-backend-cpu"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rnb-backend-api",
  "rnb-cpu",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-backend-cuda"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "half",
  "libc",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-backend-mediatek"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "libc",
  "rnb-backend-api",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-backend-metal"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "half",
  "libc",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-backend-opencl"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rnb-backend-api",
  "rnb-memory",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-backend-vulkan"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "half",
  "rnb-backend-api",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-cli"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64",
  "ctrlc",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-core"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "memmap2",
  "tempfile",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-cpu"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "approx",
  "criterion",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-dev-tools"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "half",
  "io-uring",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-ffi"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rand",
  "rnb-llm",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-llm"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "approx",
  "half",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-loader"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "memmap2",
  "rnb-core",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-memory"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-model-gemma"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rayon",
  "rnb-core",
@@ -1242,15 +1242,15 @@ dependencies = [
 
 [[package]]
 name = "rnb-model-ir"
-version = "0.12.0"
+version = "0.12.1"
 
 [[package]]
 name = "rnb-model-nemotron"
-version = "0.12.0"
+version = "0.12.1"
 
 [[package]]
 name = "rnb-model-qwen"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rayon",
  "rnb-core",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-moe-cache-sim"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rnb-memory",
  "serde",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-mtp"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "approx",
  "half",
@@ -1284,14 +1284,14 @@ dependencies = [
 
 [[package]]
 name = "rnb-platform"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "rnb-runtime"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rayon",
  "rnb-backend-api",
@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "rnb-scheduler"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "rnb-backend-api",
  "rnb-memory",
