@@ -871,7 +871,7 @@ impl KVCache {
                     key.len() == element_count && value.len() == element_count
                 }
                 (LayerCacheStorage::Kvarn(current), LayerCacheSnapshotStorage::Kvarn(saved)) => {
-                    current.layout_matches(saved) && saved.stored_len() == snapshot.current_len
+                    current.layout_matches(saved) && saved.stored_len() <= snapshot.current_len
                 }
                 _ => false,
             };
@@ -1594,6 +1594,35 @@ mod tests {
 
         assert_eq!(cache.current_len(), 8);
         assert_eq!(cache.read_up_to(0, 8).as_slices().0, vec![0; 8 * width]);
+        assert_eq!(
+            cache.read_up_to(1, 8).as_slices(),
+            (key.as_slice(), value.as_slice())
+        );
+    }
+
+    #[test]
+    fn kvarn_snapshot_restore_preserves_uninitialized_shared_kv_layers() {
+        let width = 16;
+        let mut cache = KVCache::new_per_layer_with_formats(
+            64,
+            &[1, 1],
+            &[width, width],
+            &[KvCacheFormat::KvarnK4V4G64; 2],
+        )
+        .unwrap();
+        let key = vec![half::f16::from_f32(0.5).to_bits(); 8 * width];
+        let value = vec![half::f16::from_f32(-0.25).to_bits(); 8 * width];
+        cache.append_bits_range(1, 0, 8, &key, &value);
+        let snapshot = cache.snapshot();
+
+        cache.clear();
+        cache.restore_snapshot(&snapshot).unwrap();
+
+        assert_eq!(cache.current_len(), 8);
+        let LayerCacheStorage::Kvarn(shared_layer) = &cache.layers[0].storage else {
+            panic!("expected KVarN storage");
+        };
+        assert_eq!(shared_layer.stored_len(), 0);
         assert_eq!(
             cache.read_up_to(1, 8).as_slices(),
             (key.as_slice(), value.as_slice())
