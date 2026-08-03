@@ -250,6 +250,7 @@ pub fn generate_stream(
 ) -> crate::error::Result<GenerateResult> {
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
+    validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
     engine.set_backend_argmax_excluded_token(
         params
             .ignore_eos
@@ -261,9 +262,11 @@ pub fn generate_stream(
     match select_generate_route(
         params.spec_enabled,
         engine.has_weights(),
-        engine.mtp_spec_requested()
-            && (crate::mtp_generate::mtp_greedy_verify_allowed(params)
-                || engine.mtp_explicitly_forced()),
+        mtp_generate_route_requested(
+            params,
+            engine.mtp_spec_requested(),
+            engine.mtp_explicitly_forced(),
+        ),
     ) {
         GenerateRoute::Mtp => {
             // pm118: 미설정/auto 로 진입한 MTP 는 spec_k 도 모델별 auto policy 값
@@ -321,6 +324,27 @@ fn select_generate_route(
     }
     GenerateRoute::Standard
 }
+
+fn mtp_generate_route_requested(
+    params: &GenerateParams,
+    mtp_requested: bool,
+    mtp_explicitly_forced: bool,
+) -> bool {
+    mtp_requested
+        && (crate::mtp_generate::mtp_greedy_verify_allowed(params) || mtp_explicitly_forced)
+}
+
+fn validate_forced_mtp_constraint(
+    params: &GenerateParams,
+    mtp_explicitly_forced: bool,
+) -> crate::error::Result<()> {
+    if mtp_explicitly_forced && params.constraint.is_some() {
+        return Err(crate::error::LlmError::Unsupported(
+            "forced MTP does not support structured generation constraints".to_string(),
+        ));
+    }
+    Ok(())
+}
 fn select_multimodal_generate_route(
     has_constraint: bool,
     spec_enabled: bool,
@@ -356,6 +380,7 @@ pub(crate) fn generate_stream_resuming(
 ) -> crate::error::Result<GenerateResult> {
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
+    validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
     engine.set_backend_argmax_excluded_token(
         params
             .ignore_eos
@@ -373,9 +398,11 @@ pub(crate) fn generate_stream_resuming(
         select_generate_route(
             params.spec_enabled,
             engine.has_weights(),
-            engine.mtp_spec_requested()
-                && (crate::mtp_generate::mtp_greedy_verify_allowed(params)
-                    || engine.mtp_explicitly_forced()),
+            mtp_generate_route_requested(
+                params,
+                engine.mtp_spec_requested(),
+                engine.mtp_explicitly_forced(),
+            ),
         )
     };
     let mut result = match route {
@@ -529,6 +556,7 @@ pub fn generate_stream_multimodal_resuming(
 ) -> crate::error::Result<GenerateResult> {
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
+    validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
     let start = Instant::now();
     check_generation_cancellation()?;
     if !state.is_multimodal() {
@@ -597,7 +625,11 @@ pub fn generate_stream_multimodal_resuming(
         constraint.is_some(),
         params.spec_enabled,
         engine.has_weights(),
-        engine.mtp_spec_requested(),
+        mtp_generate_route_requested(
+            params,
+            engine.mtp_spec_requested(),
+            engine.mtp_explicitly_forced(),
+        ),
     ) == GenerateRoute::Mtp
     {
         let spec_k = engine.mtp_effective_spec_k(params.spec_k);
@@ -654,6 +686,7 @@ pub fn generate_stream_multimodal(
 ) -> crate::error::Result<GenerateResult> {
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
+    validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
     let start = Instant::now();
     check_generation_cancellation()?;
     let compiled = engine.compile_multimodal_prompt(rendered_prompt, image)?;
@@ -693,7 +726,11 @@ pub fn generate_stream_multimodal(
         constraint.is_some(),
         params.spec_enabled,
         engine.has_weights(),
-        engine.mtp_spec_requested(),
+        mtp_generate_route_requested(
+            params,
+            engine.mtp_spec_requested(),
+            engine.mtp_explicitly_forced(),
+        ),
     ) == GenerateRoute::Mtp
     {
         let spec_k = engine.mtp_effective_spec_k(params.spec_k);
@@ -1189,6 +1226,42 @@ mod tests {
         );
     }
     #[test]
+    fn automatic_mtp_route_requires_greedy_sampling() {
+        let default_params = GenerateParams::default();
+        assert!(!mtp_generate_route_requested(&default_params, true, false));
+        assert!(mtp_generate_route_requested(&default_params, true, true));
+
+        let greedy_params = GenerateParams {
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            mirostat: None,
+            ..GenerateParams::default()
+        };
+        assert!(mtp_generate_route_requested(&greedy_params, true, false));
+    }
+
+    #[test]
+    fn forced_mtp_rejects_structured_constraints_before_route_fallback() {
+        let params = GenerateParams {
+            constraint: Some(crate::GenerationConstraint::Lark(
+                "start: \"ok\"".to_string(),
+            )),
+            ..GenerateParams::default()
+        };
+        let error = validate_forced_mtp_constraint(&params, true)
+            .expect_err("forced MTP must reject unsupported constraints");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::Unsupported(message)
+                if message.contains("structured generation constraints")
+        ));
+        validate_forced_mtp_constraint(&params, false)
+            .expect("automatic MTP may fall back to standard generation");
+    }
+
+    #[test]
     fn multimodal_generation_routes_loaded_mtp_runtime_to_mtp() {
         assert_eq!(
             select_multimodal_generate_route(false, false, true, true),
@@ -1206,6 +1279,16 @@ mod tests {
             select_multimodal_generate_route(true, false, true, true),
             GenerateRoute::Standard
         );
+    }
+
+    #[test]
+    fn mtp_initial_budget_observes_cancellation_after_prefill() {
+        let cancellation = GenerationCancellation::new();
+        let _scope = CancellationScope::enter(&cancellation);
+        cancellation.cancel();
+
+        let error = crate::mtp_generate::mtp_initial_generation_budget(1).unwrap_err();
+        assert!(matches!(error, crate::error::LlmError::Cancelled));
     }
 
     #[test]

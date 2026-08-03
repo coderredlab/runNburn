@@ -152,6 +152,13 @@ fn mtp_initial_token_budget(max_tokens: usize) -> Option<usize> {
     (max_tokens > 0).then_some(max_tokens)
 }
 
+pub(crate) fn mtp_initial_generation_budget(
+    max_tokens: usize,
+) -> crate::error::Result<Option<usize>> {
+    crate::generate::check_generation_cancellation()?;
+    Ok(mtp_initial_token_budget(max_tokens))
+}
+
 fn mtp_batch_effective_k(requested_k: usize, tokens_remaining: usize) -> usize {
     requested_k.max(1).min(tokens_remaining)
 }
@@ -686,7 +693,15 @@ fn generate_stream_mtp_with_tokens(
     let request_prepare_ms = elapsed_ms(request_prepare_start);
     let mut generated_tokens = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
-    let mut tokens_remaining = params.max_tokens;
+    let Some(mut tokens_remaining) = mtp_initial_generation_budget(params.max_tokens)? else {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    };
     let mut current_token = next_token_from_current_logits(
         engine,
         &mut logits,
@@ -1748,7 +1763,7 @@ fn generate_with_dspark(
     let mut sampler = SamplerChain::from_params(params);
     let mut generated_tokens = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
-    let Some(mut tokens_remaining) = mtp_initial_token_budget(params.max_tokens) else {
+    let Some(mut tokens_remaining) = mtp_initial_generation_budget(params.max_tokens)? else {
         return Ok(GenerateResult::new(
             generated_text.finish(&mut callback),
             0,
@@ -1982,11 +1997,19 @@ fn generate_with_external_drafter(
     // ── 3. 첫 token: target 단독 greedy (drafter 루프 진입 전) ─────────────
     // dummy SamplerChain (temperature=0 greedy) 으로 argmax 뽑는다.
     // `next_token_from_current_logits` 는 backend_argmax_token 이 있으면 sampler 무시.
-    let mut dummy_rng = rand::rngs::SmallRng::from_entropy();
-    let mut dummy_sampler = SamplerChain::from_params(params);
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
-    let mut tokens_remaining = params.max_tokens;
+    let Some(mut tokens_remaining) = mtp_initial_generation_budget(params.max_tokens)? else {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    };
+    let mut dummy_rng = rand::rngs::SmallRng::from_entropy();
+    let mut dummy_sampler = SamplerChain::from_params(params);
 
     let first_token = next_token_from_current_logits(
         engine,
@@ -2427,8 +2450,8 @@ mod tests {
 
     #[test]
     fn mtp_zero_token_budget_skips_initial_sample() {
-        assert_eq!(mtp_initial_token_budget(0), None);
-        assert_eq!(mtp_initial_token_budget(1), Some(1));
+        assert_eq!(mtp_initial_generation_budget(0).unwrap(), None);
+        assert_eq!(mtp_initial_generation_budget(1).unwrap(), Some(1));
     }
 
     #[test]
