@@ -159,14 +159,21 @@ fn finish_expert_major_stage(
     }
 }
 
+fn gemma_shared_sparse_overlap_policy(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 #[cfg(target_arch = "aarch64")]
 fn gemma_shared_sparse_overlap_enabled() -> bool {
-    crate::engine::policy::env_string("RNB_GEMMA4_MOE_SHARED_SPARSE_OVERLAP").is_some_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        )
-    })
+    let value = crate::engine::policy::env_string("RNB_GEMMA4_MOE_SHARED_SPARSE_OVERLAP");
+    gemma_shared_sparse_overlap_policy(value.as_deref())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -715,6 +722,19 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_sparse_overlap_defaults_on_with_falsey_opt_out() {
+        assert!(gemma_shared_sparse_overlap_policy(None));
+        assert!(gemma_shared_sparse_overlap_policy(Some("1")));
+        assert!(gemma_shared_sparse_overlap_policy(Some("true")));
+        for value in ["0", "false", "off", "no"] {
+            assert!(
+                !gemma_shared_sparse_overlap_policy(Some(value)),
+                "{value} should opt out"
+            );
+        }
+    }
 
     #[test]
     fn expert_major_slots_preserve_token_rank_and_softmax() {
