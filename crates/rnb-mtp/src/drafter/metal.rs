@@ -1,5 +1,19 @@
 use super::types::TensorView;
+#[cfg(feature = "metal")]
 use rnb_loader::gguf::types::GGMLType;
+
+pub(crate) fn or_cpu_fallback<T: Default>(operation: &'static str, result: Result<T, String>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            static WARNING: std::sync::Once = std::sync::Once::new();
+            WARNING.call_once(|| {
+                eprintln!("[WARN] Metal drafter {operation} failed, using CPU: {error}");
+            });
+            T::default()
+        }
+    }
+}
 
 #[cfg(feature = "metal")]
 fn q8_0_multi_gemv(
@@ -90,4 +104,25 @@ pub(crate) fn drafter_q8_0_argmax(
         }
     }
     Ok(Some(best))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::or_cpu_fallback;
+
+    #[test]
+    fn metal_error_selects_cpu_fallback() {
+        assert!(!or_cpu_fallback::<bool>(
+            "test projection",
+            Err("backend failure".to_string())
+        ));
+        assert!(or_cpu_fallback("test projection", Ok(true)));
+        assert_eq!(
+            or_cpu_fallback::<Option<(usize, f32)>>(
+                "test argmax",
+                Err("backend failure".to_string())
+            ),
+            None
+        );
+    }
 }

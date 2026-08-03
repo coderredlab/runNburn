@@ -326,8 +326,10 @@ pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> Vec<f32>
         None
     };
     let metal_argmax = if cuda_argmax.is_none() {
-        super::metal::drafter_q8_0_argmax(&drafter.token_embd, x_norm)
-            .unwrap_or_else(|error| panic!("Metal drafter lm_head failed: {error}"))
+        super::metal::or_cpu_fallback(
+            "lm_head",
+            super::metal::drafter_q8_0_argmax(&drafter.token_embd, x_norm),
+        )
     } else {
         None
     };
