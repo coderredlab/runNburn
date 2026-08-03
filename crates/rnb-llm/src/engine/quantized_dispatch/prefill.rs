@@ -207,10 +207,59 @@ pub(in crate::engine) fn prefill_raw_quantized_batch(
     bytes_per_row: usize,
     ggml_type: GGMLType,
 ) {
+    prefill_raw_quantized_batch_with_cuda(
+        bytes,
+        input,
+        output,
+        rows,
+        cols,
+        seq_len,
+        bytes_per_row,
+        ggml_type,
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn prefill_raw_quantized_batch_with_cuda(
+    bytes: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    seq_len: usize,
+    bytes_per_row: usize,
+    ggml_type: GGMLType,
+    allow_cuda: bool,
+) {
     #[cfg(feature = "cuda")]
-    if ggml_type == GGMLType::Q4_0 {
-        crate::engine::scalar_gemv::cuda_gemv_or_panic(
+    if allow_cuda && ggml_type == GGMLType::Q4_0 {
+        match crate::engine::scalar_gemv::try_cuda_gemv(
             bytes, input, output, rows, cols, seq_len, ggml_type,
+        ) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                static WARNING: std::sync::Once = std::sync::Once::new();
+                WARNING.call_once(|| {
+                    eprintln!("[WARN] CUDA Q4_0 GEMV failed, using CPU: {error}");
+                });
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = allow_cuda;
+
+    if ggml_type == GGMLType::Q4_0 {
+        crate::engine::scalar_gemv::gemv_host_quantized_batch(
+            bytes,
+            input,
+            output,
+            rows,
+            cols,
+            seq_len,
+            bytes_per_row,
+            ggml_type,
         );
         return;
     }
@@ -369,5 +418,35 @@ mod tests {
         assert_eq!(left_out, expected_left);
         assert_eq!(right_out, expected_right);
         assert!(quantized.q8.get().is_none());
+    }
+}
+
+#[cfg(test)]
+mod q4_0_tests {
+    use super::*;
+
+    #[test]
+    fn q4_0_explicit_cpu_route_does_not_require_cuda() {
+        let rows = 2;
+        let cols = 32;
+        let seq_len = 2;
+        let bytes_per_row = 18;
+        let bytes = vec![0u8; rows * bytes_per_row];
+        let input = vec![1.0f32; seq_len * cols];
+        let mut output = vec![f32::NAN; seq_len * rows];
+
+        prefill_raw_quantized_batch_with_cuda(
+            &bytes,
+            &input,
+            &mut output,
+            rows,
+            cols,
+            seq_len,
+            bytes_per_row,
+            GGMLType::Q4_0,
+            false,
+        );
+
+        assert_eq!(output, vec![0.0; seq_len * rows]);
     }
 }

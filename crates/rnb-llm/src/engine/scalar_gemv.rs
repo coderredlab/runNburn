@@ -84,6 +84,44 @@ pub(super) fn gemv_host_quantized_batch(
 }
 
 #[cfg(feature = "cuda")]
+pub(in crate::engine) fn try_cuda_gemv(
+    bytes: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    seq_len: usize,
+    ggml_type: GGMLType,
+) -> Result<bool, String> {
+    let result = if seq_len == 1 {
+        super::cuda_runtime::decode_gemv(ggml_type, bytes, rows, cols, input)
+    } else {
+        super::cuda_runtime::prefill_gemv(ggml_type, bytes, rows, cols, input, seq_len)
+    };
+    let Some(result) = result else {
+        return Ok(false);
+    };
+    let values = result?;
+    let required = rows
+        .checked_mul(seq_len)
+        .ok_or_else(|| "CUDA GEMV output length overflow".to_string())?;
+    if values.len() != required {
+        return Err(format!(
+            "CUDA {ggml_type:?} GEMV returned {} values, expected {required}",
+            values.len()
+        ));
+    }
+    if output.len() < required {
+        return Err(format!(
+            "CUDA {ggml_type:?} GEMV output buffer has {} values, requires {required}",
+            output.len()
+        ));
+    }
+    output[..required].copy_from_slice(&values);
+    Ok(true)
+}
+
+#[cfg(feature = "cuda")]
 pub(in crate::engine) fn cuda_gemv_or_panic(
     bytes: &[u8],
     input: &[f32],
@@ -93,33 +131,17 @@ pub(in crate::engine) fn cuda_gemv_or_panic(
     seq_len: usize,
     ggml_type: GGMLType,
 ) {
-    let result = if seq_len == 1 {
-        super::cuda_runtime::decode_gemv(ggml_type, bytes, rows, cols, input)
-    } else {
-        super::cuda_runtime::prefill_gemv(ggml_type, bytes, rows, cols, input, seq_len)
-    };
-    let values = result
-        .unwrap_or_else(|| {
+    match try_cuda_gemv(bytes, input, output, rows, cols, seq_len, ggml_type) {
+        Ok(true) => {}
+        Ok(false) => {
             panic!(
                 "CUDA {ggml_type:?} GEMV route is unavailable; CPU quantized fallback is disabled"
             )
-        })
-        .unwrap_or_else(|err| {
-            panic!("CUDA {ggml_type:?} GEMV failed; CPU quantized fallback is disabled: {err}")
-        });
-    let required = rows
-        .checked_mul(seq_len)
-        .expect("CUDA GEMV output length overflow");
-    assert_eq!(
-        values.len(),
-        required,
-        "CUDA {ggml_type:?} GEMV returned an invalid output length"
-    );
-    assert!(
-        output.len() >= required,
-        "CUDA {ggml_type:?} GEMV output buffer is too small"
-    );
-    output[..required].copy_from_slice(&values);
+        }
+        Err(error) => {
+            panic!("CUDA {ggml_type:?} GEMV failed; CPU quantized fallback is disabled: {error}")
+        }
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

@@ -59,9 +59,10 @@ fn gemma4_moe_cuda_override(raw: Option<&str>) -> Option<bool> {
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn gemma4_moe_cuda_quant_supported(gate_up: GGMLType, down: GGMLType) -> bool {
-    gate_up == GGMLType::Q4_K && matches!(down, GGMLType::Q5_1 | GGMLType::Q8_0)
+    (gate_up == GGMLType::Q4_K && matches!(down, GGMLType::Q5_1 | GGMLType::Q8_0))
+        || (gate_up == GGMLType::Q4_0 && down == GGMLType::Q4_0)
 }
 
 impl<'a> MoeLayerView<'a> {
@@ -127,7 +128,12 @@ impl<'a> MoeLayerView<'a> {
         }
 
         #[cfg(feature = "cuda")]
-        if self.gemma4_moe_cuda_enabled() {
+        let cuda_enabled = self.gemma4_moe_cuda_enabled();
+        #[cfg(feature = "cuda")]
+        if cuda_enabled
+            && self.gate_up_quant == GGMLType::Q4_K
+            && matches!(self.down_quant, GGMLType::Q5_1 | GGMLType::Q8_0)
+        {
             match self.forward_selected_cuda(h, &idx, &exps, out) {
                 Ok(()) => return,
                 Err(error) => {
@@ -137,7 +143,7 @@ impl<'a> MoeLayerView<'a> {
         }
         #[cfg(feature = "cuda")]
         if self.gate_up_quant == GGMLType::Q4_0 && self.down_quant == GGMLType::Q4_0 {
-            self.forward_selected_q4_0(h, &idx, &exps, out);
+            self.forward_selected_q4_0(h, &idx, &exps, out, cuda_enabled);
             return;
         }
 
@@ -249,8 +255,9 @@ impl<'a> MoeLayerView<'a> {
         idx: &[usize],
         expert_weights: &[f32],
         out: &mut [f32],
+        cuda_enabled: bool,
     ) {
-        use crate::engine::quantized_dispatch::prefill_raw_quantized_batch;
+        use crate::engine::quantized_dispatch::prefill_raw_quantized_batch_with_cuda;
 
         let gate_up_rows = self.n_ff * 2;
         let gate_up_bpr = gate_up_bytes_per_row(self.n_embd, self.gate_up_quant);
@@ -264,7 +271,7 @@ impl<'a> MoeLayerView<'a> {
         for (slot, &expert) in idx.iter().enumerate() {
             let gate_up_bytes =
                 &self.gate_up_bytes[expert * per_gate_up..(expert + 1) * per_gate_up];
-            prefill_raw_quantized_batch(
+            prefill_raw_quantized_batch_with_cuda(
                 gate_up_bytes,
                 h,
                 &mut gate_up,
@@ -273,12 +280,13 @@ impl<'a> MoeLayerView<'a> {
                 1,
                 gate_up_bpr,
                 self.gate_up_quant,
+                cuda_enabled,
             );
             let (gate, up) = gate_up.split_at_mut(self.n_ff);
             apply_model_gate_mul_inplace(gate, up, ModelArchitecture::Gemma4);
 
             let down_bytes = &self.down_bytes[expert * per_down..(expert + 1) * per_down];
-            prefill_raw_quantized_batch(
+            prefill_raw_quantized_batch_with_cuda(
                 down_bytes,
                 gate,
                 &mut expert_out,
@@ -287,6 +295,7 @@ impl<'a> MoeLayerView<'a> {
                 1,
                 down_bpr,
                 self.down_quant,
+                cuda_enabled,
             );
             let scale = expert_weights[slot] * self.down_scale[expert];
             for (dst, value) in out.iter_mut().zip(&expert_out) {
@@ -337,10 +346,7 @@ impl<'a> MoeLayerView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::gemma4_moe_cuda_override;
-    #[cfg(feature = "cuda")]
-    use super::gemma4_moe_cuda_quant_supported;
-    #[cfg(feature = "cuda")]
+    use super::{gemma4_moe_cuda_override, gemma4_moe_cuda_quant_supported};
     use rnb_loader::GGMLType;
 
     #[test]
@@ -376,7 +382,7 @@ mod tests {
             GGMLType::Q4_K,
             GGMLType::Q4_K
         ));
-        assert!(!gemma4_moe_cuda_quant_supported(
+        assert!(gemma4_moe_cuda_quant_supported(
             GGMLType::Q4_0,
             GGMLType::Q4_0
         ));

@@ -46,6 +46,7 @@ pub(super) use decode::{
 pub(super) use prefill::{
     prefill_dual_gemv_q8_or_f32, prefill_gate_up_vectors, prefill_gemv_vec,
     prefill_quantized_input_for_weight, prefill_raw_quantized_batch,
+    prefill_raw_quantized_batch_with_cuda,
 };
 #[cfg(target_arch = "aarch64")]
 pub(super) use prefill::{prefill_raw_dual_q4k_q8k, prefill_raw_split_q4k_q8k, quantize_raw_q8k};
