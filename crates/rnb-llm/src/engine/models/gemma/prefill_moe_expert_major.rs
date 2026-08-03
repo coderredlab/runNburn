@@ -159,7 +159,7 @@ fn finish_expert_major_stage(
     }
 }
 
-fn gemma_shared_sparse_overlap_policy(value: Option<&str>) -> bool {
+fn gemma_shared_sparse_overlap_policy(value: Option<&str>, default_enabled: bool) -> bool {
     value
         .map(|value| {
             !matches!(
@@ -167,13 +167,13 @@ fn gemma_shared_sparse_overlap_policy(value: Option<&str>) -> bool {
                 "0" | "false" | "off" | "no"
             )
         })
-        .unwrap_or(true)
+        .unwrap_or(default_enabled)
 }
 
 #[cfg(target_arch = "aarch64")]
 fn gemma_shared_sparse_overlap_enabled() -> bool {
     let value = crate::engine::policy::env_string("RNB_GEMMA4_MOE_SHARED_SPARSE_OVERLAP");
-    gemma_shared_sparse_overlap_policy(value.as_deref())
+    gemma_shared_sparse_overlap_policy(value.as_deref(), cfg!(target_os = "macos"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,13 +724,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_sparse_overlap_defaults_on_with_falsey_opt_out() {
-        assert!(gemma_shared_sparse_overlap_policy(None));
-        assert!(gemma_shared_sparse_overlap_policy(Some("1")));
-        assert!(gemma_shared_sparse_overlap_policy(Some("true")));
+    fn shared_sparse_overlap_respects_platform_default_and_env_override() {
+        assert!(gemma_shared_sparse_overlap_policy(None, true));
+        assert!(!gemma_shared_sparse_overlap_policy(None, false));
+        assert!(gemma_shared_sparse_overlap_policy(Some("1"), false));
+        assert!(gemma_shared_sparse_overlap_policy(Some("true"), false));
         for value in ["0", "false", "off", "no"] {
             assert!(
-                !gemma_shared_sparse_overlap_policy(Some(value)),
+                !gemma_shared_sparse_overlap_policy(Some(value), true),
                 "{value} should opt out"
             );
         }
