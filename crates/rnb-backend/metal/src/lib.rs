@@ -1103,6 +1103,86 @@ type PrefillGdnFullFfnCarrierKey = (
 type QwenGdnPrefillCarrierKey = (usize, usize, usize, usize, usize, usize, usize, u32);
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GdnBatchCarrierKey {
+    layer: usize,
+    batch: usize,
+    hidden_dim: usize,
+    conv_channels: usize,
+    conv_kernel: usize,
+    z_dim: usize,
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    eps_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl GdnBatchCarrierKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        layer: usize,
+        batch: usize,
+        hidden_dim: usize,
+        conv_channels: usize,
+        conv_kernel: usize,
+        z_dim: usize,
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        eps: f32,
+    ) -> Self {
+        Self {
+            layer,
+            batch,
+            hidden_dim,
+            conv_channels,
+            conv_kernel,
+            z_dim,
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            eps_bits: eps.to_bits(),
+        }
+    }
+
+    fn dense(spec: &GdnChainSpecRef<'_>, batch: usize) -> Self {
+        Self::new(
+            spec.layer,
+            batch,
+            spec.hidden_dim,
+            spec.conv_channels,
+            spec.conv_kernel,
+            spec.z_dim,
+            spec.num_v_heads,
+            spec.num_k_heads,
+            spec.head_k_dim,
+            spec.head_v_dim,
+            spec.eps,
+        )
+    }
+
+    fn qwen_moe(spec: &GdnMoeQwenChainSpecRef<'_>, batch: usize) -> Self {
+        Self::new(
+            spec.layer,
+            batch,
+            spec.hidden_dim,
+            spec.conv_channels,
+            spec.conv_kernel,
+            spec.z_dim,
+            spec.num_v_heads,
+            spec.num_k_heads,
+            spec.head_k_dim,
+            spec.head_v_dim,
+            spec.eps,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QwenAtnOTailCarrierKey {
     seq_len: usize,
@@ -1563,7 +1643,7 @@ pub struct MetalBackend {
     gdn_core_carriers: RefCell<HashMap<usize, gdn_chain::GdnCarrier>>,
     /// milestone 3: batched(B-lane) GDN core carrier. (layer, B) 별 1회 alloc, single-token
     /// `gdn_carriers` 와 분리(프로덕션 single-token 경로 불변). MTP verify body fusion 전용.
-    gdn_batch_carriers: RefCell<HashMap<(usize, usize), gdn_chain::GdnBatchCarrier>>,
+    gdn_batch_carriers: RefCell<HashMap<GdnBatchCarrierKey, gdn_chain::GdnBatchCarrier>>,
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
     attn_batch_carriers: RefCell<HashMap<(usize, usize), attn_chain::AttnBatchCarrier>>,
@@ -10224,10 +10304,10 @@ impl MetalBackend {
             .iter()
             .map(|s| match s {
                 ChainLayerSpecRef::Gdn(g) => carriers
-                    .get(&(g.layer, batch))
+                    .get(&GdnBatchCarrierKey::dense(g, batch))
                     .map(|c| c.readback_prefix_states(n)),
                 ChainLayerSpecRef::GdnMoeQwen(g) => carriers
-                    .get(&(g.layer, batch))
+                    .get(&GdnBatchCarrierKey::qwen_moe(g, batch))
                     .map(|c| c.readback_prefix_states(n)),
                 _ => None,
             })
@@ -10314,21 +10394,23 @@ impl MetalBackend {
 
                     {
                         let mut carriers = self.gdn_batch_carriers.borrow_mut();
-                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
-                            gdn_chain::GdnBatchCarrier::new(
-                                ctx,
-                                batch,
-                                s.hidden_dim,
-                                s.conv_channels,
-                                s.conv_kernel,
-                                s.z_dim,
-                                s.num_v_heads,
-                                s.num_k_heads,
-                                s.head_k_dim,
-                                s.head_v_dim,
-                                s.eps,
-                            )
-                        });
+                        let carrier = carriers
+                            .entry(GdnBatchCarrierKey::dense(s, batch))
+                            .or_insert_with(|| {
+                                gdn_chain::GdnBatchCarrier::new(
+                                    ctx,
+                                    batch,
+                                    s.hidden_dim,
+                                    s.conv_channels,
+                                    s.conv_kernel,
+                                    s.z_dim,
+                                    s.num_v_heads,
+                                    s.num_k_heads,
+                                    s.head_k_dim,
+                                    s.head_v_dim,
+                                    s.eps,
+                                )
+                            });
                         carrier.upload_states(s.conv_state, s.delta_state);
                         gdn_chain::gdn_core_chain_encode_bcol(
                             ctx,
@@ -10406,21 +10488,23 @@ impl MetalBackend {
 
                     {
                         let mut carriers = self.gdn_batch_carriers.borrow_mut();
-                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
-                            gdn_chain::GdnBatchCarrier::new(
-                                ctx,
-                                batch,
-                                s.hidden_dim,
-                                s.conv_channels,
-                                s.conv_kernel,
-                                s.z_dim,
-                                s.num_v_heads,
-                                s.num_k_heads,
-                                s.head_k_dim,
-                                s.head_v_dim,
-                                s.eps,
-                            )
-                        });
+                        let carrier = carriers
+                            .entry(GdnBatchCarrierKey::qwen_moe(s, batch))
+                            .or_insert_with(|| {
+                                gdn_chain::GdnBatchCarrier::new(
+                                    ctx,
+                                    batch,
+                                    s.hidden_dim,
+                                    s.conv_channels,
+                                    s.conv_kernel,
+                                    s.z_dim,
+                                    s.num_v_heads,
+                                    s.num_k_heads,
+                                    s.head_k_dim,
+                                    s.head_v_dim,
+                                    s.eps,
+                                )
+                            });
                         carrier.upload_states(s.conv_state, s.delta_state);
                         gdn_chain::gdn_core_chain_encode_bcol(
                             ctx,
@@ -10675,13 +10759,13 @@ impl MetalBackend {
                 match spec {
                     ChainLayerSpecRef::Gdn(s) => {
                         let carrier = carriers
-                            .get(&(s.layer, batch))
+                            .get(&GdnBatchCarrierKey::dense(s, batch))
                             .expect("fused dense gdn batch carrier after encode");
                         *out = Some(carrier.readback_states());
                     }
                     ChainLayerSpecRef::GdnMoeQwen(s) => {
                         let carrier = carriers
-                            .get(&(s.layer, batch))
+                            .get(&GdnBatchCarrierKey::qwen_moe(s, batch))
                             .expect("fused MoE gdn batch carrier after encode");
                         *out = Some(carrier.readback_states());
                     }
@@ -11087,6 +11171,23 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn gdn_batch_carrier_key_includes_model_shape_and_epsilon() {
+        let baseline = GdnBatchCarrierKey::new(3, 4, 256, 192, 4, 128, 8, 4, 32, 32, 1.0e-6);
+        assert_eq!(
+            baseline,
+            GdnBatchCarrierKey::new(3, 4, 256, 192, 4, 128, 8, 4, 32, 32, 1.0e-6)
+        );
+        assert_ne!(
+            baseline,
+            GdnBatchCarrierKey::new(3, 4, 512, 192, 4, 128, 8, 4, 32, 32, 1.0e-6)
+        );
+        assert_ne!(
+            baseline,
+            GdnBatchCarrierKey::new(3, 4, 256, 192, 4, 128, 8, 4, 32, 32, 1.0e-5)
+        );
     }
 
     #[test]
