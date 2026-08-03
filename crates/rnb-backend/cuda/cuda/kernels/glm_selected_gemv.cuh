@@ -385,6 +385,53 @@ extern "C" __global__ void rnb_iq3_xxs_selected_down_silu_rowreduce_by_token(
     }
 }
 
+extern "C" __global__ void rnb_iq3_xxs_selected_down_activated_rowreduce_by_token(
+    float* __restrict__ out,
+    const unsigned char* const* __restrict__ weights,
+    const float* __restrict__ activated,
+    const float* __restrict__ unused_up,
+    const float* __restrict__ route,
+    unsigned rows,
+    unsigned slots_per_token,
+    unsigned token_count,
+    unsigned blocks_per_row) {
+    (void)unused_up;
+    const unsigned row = blockIdx.x;
+    const unsigned token = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (row >= rows || token >= token_count || tid >= 256u) {
+        return;
+    }
+
+    __shared__ float partial[256];
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 98u;
+    const unsigned first_slot = token * slots_per_token;
+    for (unsigned local_slot = 0; local_slot < slots_per_token; ++local_slot) {
+        const unsigned slot = first_slot + local_slot;
+        const unsigned char* row_ptr = weights[slot] + row * row_bytes;
+        const float* expert_input = activated + slot * blocks_per_row * 256u;
+        float expert_acc = 0.0f;
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            expert_acc += rnb_iq3_xxs_value(row_ptr + b * 98u, tid)
+                * expert_input[b * 256u + tid];
+        }
+        acc += expert_acc * route[slot];
+    }
+
+    partial[tid] = acc;
+    __syncthreads();
+    for (unsigned stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        out[token * rows + row] = partial[0];
+    }
+}
+
 extern "C" __global__ void rnb_iq2_xxs_selected_gate_up_gemv_by_token_grouped_warp4(
     float* __restrict__ gate_out,
     float* __restrict__ up_out,

@@ -480,6 +480,7 @@ pub(super) struct CudaState {
     pub(super) host_temp_slab: Option<usize>,
     pub(super) host_temp_slab_capacity: usize,
     pub(super) direct_file_reader: rnb_memory::moe_cold_io::DirectFileReaderCache,
+    pub(super) moe_slice_cache: super::state::MoeSliceCache,
     pub(super) glm_stream_prefetch: super::moe::glm_prefetch::GlmStreamPrefetch,
     pub(super) host_xfer_slab: Option<usize>,
     pub(super) host_xfer_slab_capacity: usize,

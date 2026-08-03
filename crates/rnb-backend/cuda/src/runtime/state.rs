@@ -8,6 +8,8 @@ pub(in crate::runtime) use launchers::{
     q6k_packed_batch_kernel_plan_for_test, Q6PackedBatchKernelPlanForTest,
 };
 mod moe_cache;
+mod moe_slice_cache;
+pub(in crate::runtime) use moe_slice_cache::MoeSliceCache;
 mod nemotron_workspace;
 mod quant_resident;
 #[cfg(test)]

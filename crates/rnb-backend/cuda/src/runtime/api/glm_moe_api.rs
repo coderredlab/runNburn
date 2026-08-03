@@ -1,6 +1,61 @@
 use super::super::*;
 use rnb_core::tensor::FileBackedRegion;
 
+/// Deterministic selected-expert forward using the device-resident MoE
+/// slice cache. `Ok(None)` means the cache is unavailable (disabled or the
+/// request cannot fit); callers fall back to their temp-upload paths.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_experts_by_token_clamped_swiglu_resident(
+    gate_weights: &[&[u8]],
+    up_weights: &[&[u8]],
+    down_weights: &[&[u8]],
+    gate_quant: u32,
+    down_quant: u32,
+    route_weights: &[f32],
+    token_ids: &[u32],
+    token_count: usize,
+    n_ff: usize,
+    n_embd: usize,
+    input: &[f32],
+    activation_limit: f32,
+) -> Result<Option<Vec<f32>>, String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    let state = guard.as_mut().expect("cuda compute state initialized");
+    state.sparse_experts_by_token_resident(
+        super::super::moe::resident::ResidentSparseExpertsRequest {
+            gate_weights,
+            up_weights,
+            down_weights,
+            gate_quant,
+            down_quant,
+            route_weights,
+            token_ids,
+            token_count,
+            n_ff,
+            n_embd,
+            input,
+            activation_limit,
+        },
+    )
+}
+
+pub fn clear_moe_expert_slice_cache() -> Result<(), String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    let Some(state) = guard.as_mut() else {
+        return Ok(());
+    };
+    state.clear_moe_slice_cache()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn glm_sparse_experts_iq2xxs_iq3xxs(
     gate_weights: &[&[u8]],

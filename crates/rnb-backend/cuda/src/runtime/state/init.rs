@@ -272,6 +272,7 @@ impl CudaState {
             host_temp_slab: None,
             host_temp_slab_capacity: 0,
             direct_file_reader: rnb_memory::moe_cold_io::DirectFileReaderCache::default(),
+            moe_slice_cache: super::MoeSliceCache::default(),
             glm_stream_prefetch: super::super::moe::glm_prefetch::GlmStreamPrefetch::default(),
             host_xfer_slab: None,
             host_xfer_slab_capacity: 0,
