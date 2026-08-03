@@ -165,6 +165,65 @@ jobs:
             dist/${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
 
+  windows-x86_64:
+    name: Windows x86_64 CPU
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-x86_64-cpu-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-x86_64-cpu-
+
+      - name: Test CPU product path
+        run: cargo test --locked -p rnb-cli --no-default-features --features cpu
+
+      - name: Build release binary
+        run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu
+
+      - name: Smoke test binary
+        run: .\target\release\runNburn.exe --help
+
+      - name: Package binary
+        id: package
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart("v")
+          $archive = "runNburn-$version-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item target/release/runNburn.exe dist/package/
+          Copy-Item LICENSE, NOTICE dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/$archive"
+          $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "dist/$archive.sha256" -Value "$hash  $archive" -Encoding ascii -NoNewline
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runNburn-release-windows-x86_64-cpu
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+
   macos-metal:
     name: macOS Apple Silicon Metal
     runs-on: macos-15
@@ -310,6 +369,7 @@ jobs:
     needs:
       - linux-x86_64
       - linux-cuda-sm86
+      - windows-x86_64
       - macos-metal
       - android-aarch64
 
