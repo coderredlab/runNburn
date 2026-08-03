@@ -6783,10 +6783,41 @@ fn encode_qwen_moe_decode_route_shared(
     n_embd_buf: &ProtocolObject<dyn MTLBuffer>,
     shared_expert_id_buf: &ProtocolObject<dyn MTLBuffer>,
 ) {
+    encode_qwen_moe_decode_route_shared_at(
+        ctx,
+        enc,
+        logits,
+        input,
+        0,
+        shared_input_scale,
+        expert_ids,
+        route_weights,
+        n_expert_buf,
+        n_used_buf,
+        n_embd_buf,
+        shared_expert_id_buf,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen_moe_decode_route_shared_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    logits: &ProtocolObject<dyn MTLBuffer>,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    input_off_bytes: usize,
+    shared_input_scale: &ProtocolObject<dyn MTLBuffer>,
+    expert_ids: &ProtocolObject<dyn MTLBuffer>,
+    route_weights: &ProtocolObject<dyn MTLBuffer>,
+    n_expert_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_used_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_embd_buf: &ProtocolObject<dyn MTLBuffer>,
+    shared_expert_id_buf: &ProtocolObject<dyn MTLBuffer>,
+) {
     enc.setComputePipelineState(ctx.qwen_moe_decode_route_shared_pipeline());
     unsafe {
         enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(input), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(input), input_off_bytes, 1);
         enc.setBuffer_offset_atIndex(Some(shared_input_scale), 0, 2);
         enc.setBuffer_offset_atIndex(Some(expert_ids), 0, 3);
         enc.setBuffer_offset_atIndex(Some(route_weights), 0, 4);
@@ -6835,11 +6866,50 @@ fn encode_qwen_moe_decode_q4k_slots(
     n: usize,
     slots: usize,
 ) {
+    encode_qwen_moe_decode_q4k_slots_at(
+        ctx,
+        enc,
+        sparse_w,
+        shared_w,
+        input,
+        0,
+        out,
+        expert_ids,
+        n_buf,
+        k_buf,
+        per_expert_buf,
+        shared_expert_id_buf,
+        sparse_off_buf,
+        shared_off_buf,
+        n,
+        slots,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_qwen_moe_decode_q4k_slots_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    sparse_w: &ProtocolObject<dyn MTLBuffer>,
+    shared_w: &ProtocolObject<dyn MTLBuffer>,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    input_off_bytes: usize,
+    out: &ProtocolObject<dyn MTLBuffer>,
+    expert_ids: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    per_expert_buf: &ProtocolObject<dyn MTLBuffer>,
+    shared_expert_id_buf: &ProtocolObject<dyn MTLBuffer>,
+    sparse_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    shared_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    slots: usize,
+) {
     enc.setComputePipelineState(ctx.qwen_moe_decode_q4k_slots_pipeline());
     unsafe {
         enc.setBuffer_offset_atIndex(Some(sparse_w), 0, 0);
         enc.setBuffer_offset_atIndex(Some(shared_w), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(input), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(input), input_off_bytes, 2);
         enc.setBuffer_offset_atIndex(Some(out), 0, 3);
         enc.setBuffer_offset_atIndex(Some(expert_ids), 0, 4);
         enc.setBuffer_offset_atIndex(Some(n_buf), 0, 5);
@@ -7814,6 +7884,61 @@ pub(crate) fn qwen_moe_decode_chain_encode_route(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn qwen_moe_decode_chain_encode_route_from_normed(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &QwenMoeDecodeChainCarrier,
+    normed_dev: &ProtocolObject<dyn MTLBuffer>,
+    normed_off_bytes: usize,
+    router_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    router_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    shared_input_scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_sparse_off: u32,
+    up_sparse_off: u32,
+    down_sparse_off: u32,
+    gate_shared_off: u32,
+    up_shared_off: u32,
+    down_shared_off: u32,
+) {
+    carrier.upload_offsets(
+        gate_sparse_off,
+        up_sparse_off,
+        down_sparse_off,
+        gate_shared_off,
+        up_shared_off,
+        down_shared_off,
+    );
+    crate::compute::encode_gemv_f32_router_simd_at(
+        ctx,
+        enc,
+        router_w_buf,
+        normed_dev,
+        normed_off_bytes,
+        &carrier.router_logits_dev,
+        &carrier.n_expert_buf,
+        &carrier.n_embd_buf,
+        router_off_buf,
+        carrier.n_expert,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+    encode_qwen_moe_decode_route_shared_at(
+        ctx,
+        enc,
+        &carrier.router_logits_dev,
+        normed_dev,
+        normed_off_bytes,
+        shared_input_scale_buf,
+        &carrier.expert_ids_dev,
+        &carrier.route_weights_dev,
+        &carrier.n_expert_buf,
+        &carrier.n_used_buf,
+        &carrier.n_embd_buf,
+        &carrier.shared_expert_id_buf,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_moe_decode_chain_encode_after_route(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -8495,6 +8620,8 @@ fn qwen_moe_decode_chain_encode_after_route_sparse(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &QwenMoeDecodeChainCarrier,
+    normed_dev: &ProtocolObject<dyn MTLBuffer>,
+    normed_off_bytes: usize,
     hidden_dev: &ProtocolObject<dyn MTLBuffer>,
     gate_sparse_w: &ProtocolObject<dyn MTLBuffer>,
     up_sparse_w: &ProtocolObject<dyn MTLBuffer>,
@@ -8507,12 +8634,13 @@ fn qwen_moe_decode_chain_encode_after_route_sparse(
 ) {
     debug_assert!(matches!(down_quant, 0 | 1 | 2));
     let slots = carrier.n_used; // sparse only — shared handled by fused B-column pass
-    encode_qwen_moe_decode_q4k_slots(
+    encode_qwen_moe_decode_q4k_slots_at(
         ctx,
         enc,
         gate_sparse_w,
         gate_shared_w,
-        &carrier.normed_dev,
+        normed_dev,
+        normed_off_bytes,
         &carrier.gate_dev,
         &carrier.expert_ids_dev,
         &carrier.n_ff_buf,
@@ -8524,12 +8652,13 @@ fn qwen_moe_decode_chain_encode_after_route_sparse(
         carrier.n_ff,
         slots,
     );
-    encode_qwen_moe_decode_q4k_slots(
+    encode_qwen_moe_decode_q4k_slots_at(
         ctx,
         enc,
         up_sparse_w,
         up_shared_w,
-        &carrier.normed_dev,
+        normed_dev,
+        normed_off_bytes,
         &carrier.up_dev,
         &carrier.expert_ids_dev,
         &carrier.n_ff_buf,
@@ -8737,48 +8866,87 @@ pub(crate) fn qwen_moe_decode_chain_encode_batched_shared_fused(
     }
     crate::compute::chain_barrier(ctx, enc);
 
-    // Phase 1: lane 별 router + sparse expert. route 는 carrier.normed_dev(자체 rms_norm)로
-    // 진행(단일-토큰 경로와 바이트 동일). sparse reduce/residual 을 hidden[lane]에 누적.
+    // Phase 1: lane 별 router + sparse expert. Phase 0과 route가 같은 RMSNorm을 사용하므로
+    // all-lane norm을 재사용해 lane당 중복 norm dispatch를 제거한다. falsey override는
+    // 비교 진단용 기존 경로를 유지한다.
+    let reuse_ffn_norm = !crate::compute::env_falsey("RNB_METAL_MTP_REUSE_FFN_NORM");
     for lane in 0..batch {
         let off = lane * n_embd * f32b;
-        qwen_moe_decode_chain_encode_route(
-            ctx,
-            enc,
-            carrier,
-            shared_hidden,
-            ffn_norm_w_buf,
-            router_w_buf,
-            router_off_buf,
-            shared_input_scale_buf,
-            gate_sparse_w,
-            gate_sparse_off,
-            up_sparse_w,
-            up_sparse_off,
-            down_sparse_w,
-            down_sparse_off,
-            gate_shared_w,
-            gate_shared_off,
-            up_shared_w,
-            up_shared_off,
-            down_shared_w,
-            down_shared_off,
-            down_quant,
-            off,
-        );
-        qwen_moe_decode_chain_encode_after_route_sparse(
-            ctx,
-            enc,
-            carrier,
-            shared_hidden,
-            gate_sparse_w,
-            up_sparse_w,
-            down_sparse_w,
-            gate_shared_w,
-            up_shared_w,
-            down_shared_w,
-            down_quant,
-            off,
-        );
+        if reuse_ffn_norm {
+            qwen_moe_decode_chain_encode_route_from_normed(
+                ctx,
+                enc,
+                carrier,
+                &scratch.normed_all,
+                off,
+                router_w_buf,
+                router_off_buf,
+                shared_input_scale_buf,
+                gate_sparse_off,
+                up_sparse_off,
+                down_sparse_off,
+                gate_shared_off,
+                up_shared_off,
+                down_shared_off,
+            );
+            qwen_moe_decode_chain_encode_after_route_sparse(
+                ctx,
+                enc,
+                carrier,
+                &scratch.normed_all,
+                off,
+                shared_hidden,
+                gate_sparse_w,
+                up_sparse_w,
+                down_sparse_w,
+                gate_shared_w,
+                up_shared_w,
+                down_shared_w,
+                down_quant,
+                off,
+            );
+        } else {
+            qwen_moe_decode_chain_encode_route(
+                ctx,
+                enc,
+                carrier,
+                shared_hidden,
+                ffn_norm_w_buf,
+                router_w_buf,
+                router_off_buf,
+                shared_input_scale_buf,
+                gate_sparse_w,
+                gate_sparse_off,
+                up_sparse_w,
+                up_sparse_off,
+                down_sparse_w,
+                down_sparse_off,
+                gate_shared_w,
+                gate_shared_off,
+                up_shared_w,
+                up_shared_off,
+                down_shared_w,
+                down_shared_off,
+                down_quant,
+                off,
+            );
+            qwen_moe_decode_chain_encode_after_route_sparse(
+                ctx,
+                enc,
+                carrier,
+                &carrier.normed_dev,
+                0,
+                shared_hidden,
+                gate_sparse_w,
+                up_sparse_w,
+                down_sparse_w,
+                gate_shared_w,
+                up_shared_w,
+                down_shared_w,
+                down_quant,
+                off,
+            );
+        }
     }
 
     // Phase 2: shared expert(dense) B-column amortize. gate/up = Q8_0(shared_q8_0)|Q4_K,

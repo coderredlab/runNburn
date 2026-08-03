@@ -8115,10 +8115,28 @@ pub(crate) fn encode_gemv_f32_router_simd(
     off_buf: &ProtocolObject<dyn MTLBuffer>,
     n: usize,
 ) {
+    encode_gemv_f32_router_simd_at(
+        ctx, enc, w_buf, in_buf, 0, out_buf, n_buf, k_buf, off_buf, n,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemv_f32_router_simd_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    in_off_bytes: usize,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    off_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) {
     enc.setComputePipelineState(&ctx.f32_chain_simd_pipeline);
     unsafe {
         enc.setBuffer_offset_atIndex(Some(w_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(in_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(in_buf), in_off_bytes, 1);
         enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
         enc.setBuffer_offset_atIndex(Some(n_buf), 0, 3);
         enc.setBuffer_offset_atIndex(Some(k_buf), 0, 4);

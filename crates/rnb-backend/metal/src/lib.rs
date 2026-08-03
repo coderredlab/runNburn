@@ -18608,6 +18608,7 @@ kernel void q4k_ro_vec4(
     #[test]
     #[ignore = "requires a Metal device"]
     fn qwen_moe_decode_chain_batched_matches_sequential_single_token_runs() {
+        let _reuse_norm = EnvGuard::set("RNB_METAL_MTP_REUSE_FFN_NORM", "1");
         fn assert_close(a: &[f32], b: &[f32], label: &str, tol_abs: f32) {
             assert_eq!(a.len(), b.len(), "{label}: length mismatch");
             for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
