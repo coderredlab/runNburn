@@ -177,7 +177,8 @@ fn mtp_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> b
 }
 fn mtp_external_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> bool {
     mtp_batch_verify_default_enabled(architecture)
-        || (cfg!(feature = "cuda") && architecture == rnb_loader::Architecture::Gemma4)
+        || ((cfg!(feature = "cuda") || cfg!(all(feature = "metal", not(feature = "cuda"))))
+            && architecture == rnb_loader::Architecture::Gemma4)
 }
 
 fn mtp_batch_verify_requested(forced: bool, disabled: bool, default_enabled: bool) -> bool {
@@ -2791,14 +2792,17 @@ mod tests {
     }
 
     #[test]
-    fn mtp_batch_verify_default_off_for_unadopted_targets() {
-        // pm116: GlmDsa 는 Metal 빌드에서 채택(기본 ON) — 그 외 아키텍처는 OFF 유지.
+    fn mtp_batch_verify_defaults_match_adopted_targets() {
         assert!(!mtp_batch_verify_default_enabled(
             rnb_loader::Architecture::Qwen35MoE
         ));
         assert_eq!(
             mtp_batch_verify_default_enabled(rnb_loader::Architecture::GlmDsa),
             cfg!(all(feature = "metal", not(feature = "cuda")))
+        );
+        assert_eq!(
+            mtp_external_batch_verify_default_enabled(rnb_loader::Architecture::Gemma4),
+            cfg!(feature = "cuda") || cfg!(all(feature = "metal", not(feature = "cuda")))
         );
     }
 

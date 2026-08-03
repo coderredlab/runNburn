@@ -622,14 +622,21 @@ fn mtp_auto_policy_for_model(
     }
     if architecture == ModelArchitecture::Gemma4 {
         let selected_moe = metadata.expert_used_count > 0;
-        let spec_k = if selected_moe { 1 } else { 3 };
+        let metal_batch_auto = cfg!(all(feature = "metal", not(feature = "cuda")));
+        let spec_k = if metal_batch_auto || selected_moe {
+            1
+        } else {
+            3
+        };
         let min_free_vram_mib = mtp_device_verify_min_free_vram_mib(metadata, spec_k);
         let enough_free_vram = resource
             .as_ref()
             .is_some_and(|resource| resource.free_vram_mib >= min_free_vram_mib);
-        let enabled = cfg!(feature = "cuda") && enough_free_vram;
-        let reason = if !cfg!(feature = "cuda") {
-            "gemma4-external-cuda-only"
+        let enabled = metal_batch_auto || (cfg!(feature = "cuda") && enough_free_vram);
+        let reason = if metal_batch_auto {
+            "gemma4-external-k1-metal-batch-verify-auto"
+        } else if !cfg!(feature = "cuda") {
+            "gemma4-external-cuda-or-metal-batch-only"
         } else if resource.is_none() {
             "cuda-resource-info-unavailable"
         } else if !enough_free_vram {
@@ -2083,13 +2090,24 @@ mod tests {
             false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
         );
+        let metal_batch_auto = cfg!(all(feature = "metal", not(feature = "cuda")));
 
-        assert_eq!(dense.spec_k, 3);
+        assert_eq!(dense.spec_k, if metal_batch_auto { 1 } else { 3 });
         assert_eq!(selected_moe.spec_k, 1);
-        assert_eq!(dense.enabled, cfg!(feature = "cuda"));
-        assert_eq!(selected_moe.enabled, cfg!(feature = "cuda"));
+        assert_eq!(dense.enabled, cfg!(feature = "cuda") || metal_batch_auto);
+        assert_eq!(
+            selected_moe.enabled,
+            cfg!(feature = "cuda") || metal_batch_auto
+        );
         assert!(!dense.device_verify);
         assert!(!selected_moe.device_verify);
+        if metal_batch_auto {
+            assert_eq!(dense.reason, "gemma4-external-k1-metal-batch-verify-auto");
+            assert_eq!(
+                selected_moe.reason,
+                "gemma4-external-k1-metal-batch-verify-auto"
+            );
+        }
     }
 
     #[cfg(feature = "cuda")]
