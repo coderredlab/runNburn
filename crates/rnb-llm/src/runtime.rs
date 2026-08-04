@@ -71,6 +71,18 @@ pub(crate) fn mtp_accept_probe_enabled() -> bool {
     policy::mtp_accept_probe_enabled()
 }
 
+pub(crate) fn mtp_accept_probe_temperature() -> Option<f32> {
+    policy::mtp_accept_probe_temperature()
+}
+
+pub(crate) fn mtp_accept_probe_top_p() -> Option<f32> {
+    policy::mtp_accept_probe_top_p()
+}
+
+pub(crate) fn mtp_accept_probe_top_k() -> Option<usize> {
+    policy::mtp_accept_probe_top_k()
+}
+
 pub(crate) fn spec_force_batch_verify_enabled() -> bool {
     policy::spec_force_batch_verify_enabled()
 }

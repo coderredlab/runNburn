@@ -166,6 +166,23 @@ pub fn mtp_accept_probe_enabled() -> bool {
     env_flag("RNB_MTP_ACCEPT_PROBE")
 }
 
+/// accept probe가 p와 q에 적용할 가상 sampling plan.
+///
+/// 제품 MTP 진입은 greedy로 제한되어 있어 `temperature>0` 경로를 실제로 생성하며
+/// 계측할 수 없다. 대신 greedy로 생성하되 계측만 이 plan으로 수행해 accept 확률을
+/// 추정한다. 생성 경로가 달라 컨텍스트가 완전히 같지는 않다는 한계가 있다.
+pub fn mtp_accept_probe_temperature() -> Option<f32> {
+    env_string("RNB_MTP_ACCEPT_PROBE_TEMP").and_then(|value| value.parse().ok())
+}
+
+pub fn mtp_accept_probe_top_p() -> Option<f32> {
+    env_string("RNB_MTP_ACCEPT_PROBE_TOP_P").and_then(|value| value.parse().ok())
+}
+
+pub fn mtp_accept_probe_top_k() -> Option<usize> {
+    env_string("RNB_MTP_ACCEPT_PROBE_TOP_K").and_then(|value| value.parse().ok())
+}
+
 pub fn spec_force_batch_verify_enabled() -> bool {
     env_string("RNB_SPEC_FORCE_BATCH_VERIFY").is_some_and(|value| value == "1")
 }

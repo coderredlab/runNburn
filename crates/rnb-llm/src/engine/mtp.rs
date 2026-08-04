@@ -1946,9 +1946,10 @@ fn mtp_argmax(
         eprintln!("[MTP_DRAFT_PROB] prob={prob:.4} margin={:.3}", top1 - top2);
     }
     if let Some(sink) = probe_probs {
+        // raw logits를 그대로 넘긴다. 호출부가 draft와 target에 같은 sampling plan을
+        // 적용해야 accept 확률이 정의되므로 여기서 softmax하면 안 된다.
         sink.clear();
         sink.extend_from_slice(&logits);
-        crate::sampler::softmax_inplace(sink);
     }
     logits
         .iter()

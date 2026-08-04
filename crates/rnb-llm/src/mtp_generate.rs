@@ -846,6 +846,19 @@ fn generate_stream_mtp_with_tokens(
     let mut acceptance_probe = crate::runtime::mtp_accept_probe_enabled()
         .then(crate::mtp_sampling::AcceptanceStats::default);
     let mut probe_draft_probs: Vec<Vec<f32>> = Vec::new();
+    // 제품 MTP 진입이 greedy로 제한되어 있어 temperature>0 경로를 실제로 생성하며
+    // 계측할 수 없다. greedy로 생성하되 계측만 이 가상 plan으로 수행한다.
+    let mut probe_sampler = acceptance_probe.is_some().then(|| {
+        let plan = GenerateParams {
+            temperature: crate::runtime::mtp_accept_probe_temperature().unwrap_or(1.0),
+            top_p: crate::runtime::mtp_accept_probe_top_p().unwrap_or(1.0),
+            top_k: crate::runtime::mtp_accept_probe_top_k().unwrap_or(0),
+            ..params.clone()
+        };
+        crate::sampler::SamplerChain::from_params(&plan)
+    });
+    let mut probe_target_probs: Vec<f32> = Vec::new();
+    let mut probe_draft_row: Vec<f32> = Vec::new();
     let target_needs_sequential = mtp_target_needs_sequential(engine.architecture());
     let target_has_recurrent_state =
         crate::speculative::architecture_has_recurrent_state(engine.architecture());
@@ -1567,15 +1580,32 @@ fn generate_stream_mtp_with_tokens(
                     )
                 })?;
                 let token = crate::sampler::greedy::greedy_sample(&logits);
-                if let (Some(stats), Some(draft_row)) =
-                    (acceptance_probe.as_mut(), probe_draft_probs.get(i))
-                {
-                    crate::sampler::softmax_inplace(&mut logits);
-                    if let Some(probabilities) =
-                        crate::mtp_sampling::acceptance_probabilities(&logits, draft_row)
-                    {
+                if let (Some(stats), Some(sampler), Some(draft_logits)) = (
+                    acceptance_probe.as_mut(),
+                    probe_sampler.as_mut(),
+                    probe_draft_probs.get(i),
+                ) {
+                    // p와 q에 같은 plan을 같은 순서로 적용해야 accept 확률이 정의된다.
+                    probe_draft_row.clear();
+                    probe_draft_row.extend_from_slice(draft_logits);
+                    sampler.processed_probs_into(
+                        &mut probe_draft_row,
+                        &generated_tokens,
+                        &mut probe_target_probs,
+                    );
+                    let draft_probs = std::mem::take(&mut probe_target_probs);
+                    sampler.processed_probs_into(
+                        &mut logits,
+                        &generated_tokens,
+                        &mut probe_target_probs,
+                    );
+                    if let Some(probabilities) = crate::mtp_sampling::acceptance_probabilities(
+                        &probe_target_probs,
+                        &draft_probs,
+                    ) {
                         stats.record(probabilities);
                     }
+                    probe_draft_row = draft_probs;
                 }
                 (token, hidden_rows)
             } else {

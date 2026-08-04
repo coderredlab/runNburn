@@ -113,6 +113,26 @@ impl SamplerChain {
         softmax_inplace(&mut probs);
         sample_from_probs(&probs, rng)
     }
+
+    /// sampler processor를 적용한 뒤 정규화된 확률 분포를 `probs`에 채운다.
+    ///
+    /// `sample()`의 token-only 결과 대신 processed 분포 자체가 필요한 호출부가 쓴다.
+    /// speculative accept 확률은 draft와 target 양쪽의 processed 분포를 같은 순서의
+    /// 같은 processor로 만들어야 정의되므로, 그 계산은 이 API를 거쳐야 한다.
+    /// greedy chain은 processor가 비어 있어 raw softmax와 같다.
+    pub(crate) fn processed_probs_into(
+        &mut self,
+        logits: &mut [f32],
+        context_tokens: &[u32],
+        probs: &mut Vec<f32>,
+    ) {
+        for sampler in &mut self.samplers {
+            sampler.apply(logits, context_tokens);
+        }
+        probs.clear();
+        probs.extend_from_slice(logits);
+        softmax_inplace(probs);
+    }
 }
 
 #[cfg(test)]
