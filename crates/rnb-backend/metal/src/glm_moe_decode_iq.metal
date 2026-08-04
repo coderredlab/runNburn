@@ -267,6 +267,83 @@ kernel void glm_moe_decode_iq4xs_selected_slots(
         }
     }
 }
+// MXFP4 블록(32값, 17B): E8M0 scale 1B + low/high nibble 각 16값.
+constant float glm_mxfp4_values[16] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
+};
+
+inline float glm_mxfp4_scale(uchar encoded)
+{
+    const uint bits = encoded < 2u
+        ? (0x00200000u << (uint)encoded)
+        : (((uint)encoded - 1u) << 23u);
+    return as_type<float>(bits);
+}
+
+inline float glm_mxfp4_chunk_dot(
+    device const uchar* block,
+    thread const float* input)
+{
+    const float scale = glm_mxfp4_scale(block[0]);
+    float sum = 0.0f;
+    for (uint j = 0u; j < 16u; ++j) {
+        const uint packed = (uint)block[1u + j];
+        sum += input[j] * glm_mxfp4_values[packed & 15u];
+        sum += input[j + 16u] * glm_mxfp4_values[packed >> 4u];
+    }
+    return scale * sum;
+}
+
+kernel void glm_moe_decode_mxfp4_selected_slots(
+    device const uchar* w0    [[buffer(0)]],
+    device const uchar* w1    [[buffer(1)]],
+    device const uchar* w2    [[buffer(2)]],
+    device const uchar* w3    [[buffer(3)]],
+    device const uchar* w4    [[buffer(4)]],
+    device const uchar* w5    [[buffer(5)]],
+    device const uchar* w6    [[buffer(6)]],
+    device const uchar* w7    [[buffer(7)]],
+    device const uchar* w8    [[buffer(8)]],
+    device const float* input [[buffer(9)]],
+    device float*       out   [[buffer(10)]],
+    constant uint&      N     [[buffer(11)]],
+    constant uint&      K     [[buffer(12)]],
+    constant uint&      slots [[buffer(13)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]])
+{
+    const uint slot = group.y;
+    const uint first_row = (group.x * 4u + (uint)simdgroup) * 4u;
+    if (slot >= slots || first_row >= N) return;
+    const uint nrows = min(4u, N - first_row);
+    device const uchar* base = glm_selected_weight9(
+        slot, w0, w1, w2, w3, w4, w5, w6, w7, w8);
+    const uint blocks_per_row = K / 32u;
+    const uint row_bytes = blocks_per_row * 17u;
+    device const uchar* row0 = base + first_row * row_bytes;
+    device const float* slot_input = input + slot * K;
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint block = (uint)lane; block < blocks_per_row; block += 32u) {
+        device const float* chunk_input = slot_input + block * 32u;
+        float values[32];
+        for (uint j = 0u; j < 32u; ++j) {
+            values[j] = chunk_input[j];
+        }
+        device const uchar* quant = row0 + block * 17u;
+        for (uint row = 0u; row < nrows; ++row) {
+            sums[row] += glm_mxfp4_chunk_dot(quant + row * row_bytes, values);
+        }
+    }
+    for (uint row = 0u; row < nrows; ++row) {
+        const float total = simd_sum(sums[row]);
+        if (lane == 0u) {
+            out[slot * N + first_row + row] = total;
+        }
+    }
+}
+
 
 constant ulong glm_iq2s_grid[1024] = {
     0x0808080808080808ul, 0x080808080808082bul, 0x0808080808081919ul, 0x0808080808082b08ul,

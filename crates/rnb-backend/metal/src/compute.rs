@@ -557,6 +557,8 @@ pub struct MetalContext {
         OnceCell<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub glm_moe_decode_iq4xs_selected_slots_pipeline:
         OnceCell<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub glm_moe_decode_mxfp4_selected_slots_pipeline:
+        OnceCell<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub glm_moe_decode_iq2s_selected_slots_pipeline:
         OnceCell<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub qwen_moe_decode_q4k_table_slots_pipeline:
@@ -1050,6 +1052,16 @@ impl MetalContext {
             &self.device,
             &self.glm_moe_decode_iq4xs_selected_slots_pipeline,
             "glm_moe_decode_iq4xs_selected_slots",
+        )
+    }
+
+    pub(crate) fn glm_moe_decode_mxfp4_selected_slots_pipeline(
+        &self,
+    ) -> &Retained<ProtocolObject<dyn MTLComputePipelineState>> {
+        lazy_glm_moe_decode_pipeline(
+            &self.device,
+            &self.glm_moe_decode_mxfp4_selected_slots_pipeline,
+            "glm_moe_decode_mxfp4_selected_slots",
         )
     }
 
@@ -2144,6 +2156,7 @@ pub fn build_metal_context_with_opts(
     let glm_moe_decode_iq2xxs_selected_slots_pipeline = OnceCell::new();
     let glm_moe_decode_iq3xxs_selected_slots_pipeline = OnceCell::new();
     let glm_moe_decode_iq4xs_selected_slots_pipeline = OnceCell::new();
+    let glm_moe_decode_mxfp4_selected_slots_pipeline = OnceCell::new();
     let glm_moe_decode_iq2s_selected_slots_pipeline = OnceCell::new();
     let (
         qwen_moe_decode_q4k_table_slots_pipeline,
@@ -2399,6 +2412,7 @@ pub fn build_metal_context_with_opts(
         glm_moe_decode_iq2xxs_selected_slots_pipeline,
         glm_moe_decode_iq3xxs_selected_slots_pipeline,
         glm_moe_decode_iq4xs_selected_slots_pipeline,
+        glm_moe_decode_mxfp4_selected_slots_pipeline,
         glm_moe_decode_iq2s_selected_slots_pipeline,
         qwen_moe_decode_q4k_table_slots_pipeline,
         qwen_moe_decode_q5k_table_slots_pipeline,

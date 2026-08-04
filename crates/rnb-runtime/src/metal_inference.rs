@@ -4419,6 +4419,7 @@ pub fn metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
     out: &mut [f32],
     gate_up_iq2s: bool,
     down_is_iq4xs: bool,
+    down_is_mxfp4: bool,
     shared_gate_up_q6k: bool,
     shared_down_q8_0: bool,
     gate_up_iq3xxs: bool,
@@ -4465,6 +4466,7 @@ pub fn metal_glm_moe_decode_iq2xxs_iq3xxs_into_if_supported(
             rnb_backend_metal::GlmMoeQuantSelect {
                 gate_up_iq2s,
                 down_iq4xs: down_is_iq4xs,
+                down_mxfp4: down_is_mxfp4,
                 shared_gate_up_q6k,
                 shared_down_q8_0,
                 gate_up_iq3xxs,
@@ -4550,6 +4552,7 @@ pub fn metal_glm_moe_prefill_iq_batch_into_if_supported(
             rnb_backend_metal::GlmMoeQuantSelect {
                 gate_up_iq2s,
                 down_iq4xs: down_is_iq4xs,
+                down_mxfp4: false,
                 shared_gate_up_q6k,
                 shared_down_q8_0,
                 gate_up_iq3xxs,

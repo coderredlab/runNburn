@@ -742,6 +742,7 @@ pub(super) fn compute_sparse_fanout(
                 out,
                 view.gate_quant == GGMLType::IQ2_S,
                 view.down_quant == GGMLType::IQ4_XS,
+                false,
                 view.shared_gate_quant == GGMLType::Q6_K,
                 view.shared_down_quant == GGMLType::Q8_0,
                 view.gate_quant == GGMLType::IQ3_XXS,

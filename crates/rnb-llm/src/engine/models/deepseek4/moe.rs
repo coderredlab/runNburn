@@ -36,7 +36,7 @@ pub(super) fn forward_moe(
     let (experts, route_weights) = route(input, token_id, weights, config);
     crate::engine::moe_trace::record_selection(layer_idx, &experts);
     if let Some(output) =
-        forward_moe_metal_decode(input, &experts, &route_weights, weights, config)?
+        forward_moe_metal_decode(input, &experts, &route_weights, layer_idx, weights, config)?
     {
         return Ok(output);
     }
@@ -83,6 +83,7 @@ fn forward_moe_metal_decode(
     input: &[f32],
     experts: &[usize],
     route_weights: &[f32],
+    layer_idx: usize,
     weights: &DeepSeek4MoeWeights,
     config: &DeepSeek4Config,
 ) -> Result<Option<Vec<f32>>> {
@@ -97,7 +98,10 @@ fn forward_moe_metal_decode(
             moe.gate_quant,
             GGMLType::IQ2_XXS | GGMLType::IQ2_S | GGMLType::IQ3_XXS
         )
-        && matches!(moe.down_quant, GGMLType::IQ3_XXS | GGMLType::IQ4_XS)
+        && matches!(
+            moe.down_quant,
+            GGMLType::IQ3_XXS | GGMLType::IQ4_XS | GGMLType::MXFP4
+        )
         && moe.shared_gate.ggml_type == moe.shared_up.ggml_type
         && matches!(
             moe.shared_gate.ggml_type,
@@ -168,6 +172,7 @@ fn forward_moe_metal_decode(
         &mut output,
         moe.gate_quant == GGMLType::IQ2_S,
         moe.down_quant == GGMLType::IQ4_XS,
+        moe.down_quant == GGMLType::MXFP4,
         moe.shared_gate.ggml_type == GGMLType::Q6_K,
         moe.shared_down.ggml_type == GGMLType::Q8_0,
         moe.gate_quant == GGMLType::IQ3_XXS,

@@ -112,6 +112,8 @@ pub struct GlmMoeQuantSelect {
     pub gate_up_iq2s: bool,
     /// sparse down 이 IQ4_XS (기본 IQ3_XXS)
     pub down_iq4xs: bool,
+    /// sparse down 이 MXFP4 (IQ3_XXS/IQ4_XS 보다 우선)
+    pub down_mxfp4: bool,
     /// shared gate/up 이 Q6_K (기본 Q5_K)
     pub shared_gate_up_q6k: bool,
     /// shared down 이 Q8_0 (기본 Q6_K)

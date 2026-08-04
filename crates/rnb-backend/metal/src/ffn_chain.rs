@@ -9449,7 +9449,9 @@ pub(crate) fn glm_moe_prefill_iq_batch_dispatch(
     } else {
         ctx.glm_moe_decode_iq2xxs_selected_slots_pipeline()
     };
-    let down_pipeline = if select.down_iq4xs {
+    let down_pipeline = if select.down_mxfp4 {
+        ctx.glm_moe_decode_mxfp4_selected_slots_pipeline()
+    } else if select.down_iq4xs {
         ctx.glm_moe_decode_iq4xs_selected_slots_pipeline()
     } else {
         ctx.glm_moe_decode_iq3xxs_selected_slots_pipeline()
@@ -9770,7 +9772,9 @@ pub(crate) fn glm_moe_decode_iq2xxs_iq3xxs_dispatch(
         glm_moe_stage_cut(ctx, &mut cmd, &mut enc, 2);
     }
 
-    let down_pipeline = if select.down_iq4xs {
+    let down_pipeline = if select.down_mxfp4 {
+        ctx.glm_moe_decode_mxfp4_selected_slots_pipeline()
+    } else if select.down_iq4xs {
         ctx.glm_moe_decode_iq4xs_selected_slots_pipeline()
     } else {
         ctx.glm_moe_decode_iq3xxs_selected_slots_pipeline()
@@ -19190,6 +19194,23 @@ mod tests {
         weights
     }
 
+    fn mxfp4_fixture(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
+        let blocks_per_row = cols / 32;
+        let mut weights = vec![0u8; rows * blocks_per_row * 17];
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let base = (row * blocks_per_row + block) * 17;
+                weights[base] = 118 + ((row + block + seed) % 5) as u8;
+                for index in 0..16 {
+                    let low = (row * 7 + block * 11 + index * 13 + seed) & 15;
+                    let high = (row * 17 + block * 19 + index * 23 + seed) & 15;
+                    weights[base + 1 + index] = (low | (high << 4)) as u8;
+                }
+            }
+        }
+        weights
+    }
+
     fn iq2s_fixture(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
         let blocks_per_row = cols / 256;
         let mut weights = vec![0u8; rows * blocks_per_row * 82];
@@ -19242,6 +19263,9 @@ mod tests {
         let iq4_weights = (0..slots)
             .map(|slot| iq4xs_fixture(rows, cols, slot * 13))
             .collect::<Vec<_>>();
+        let mxfp4_weights = (0..slots)
+            .map(|slot| mxfp4_fixture(rows, cols, slot * 19))
+            .collect::<Vec<_>>();
         let iq2s_weights = (0..slots)
             .map(|slot| iq2s_fixture(rows, cols, slot * 17))
             .collect::<Vec<_>>();
@@ -19257,6 +19281,10 @@ mod tests {
             .iter()
             .map(|weight| shared_u8_buf(&ctx, weight))
             .collect::<Vec<_>>();
+        let mxfp4_buffers = mxfp4_weights
+            .iter()
+            .map(|weight| shared_u8_buf(&ctx, weight))
+            .collect::<Vec<_>>();
         let iq2s_buffers = iq2s_weights
             .iter()
             .map(|weight| shared_u8_buf(&ctx, weight))
@@ -19267,6 +19295,7 @@ mod tests {
         let iq2_out = empty_f32_buf(&ctx, rows * slots);
         let iq3_out = empty_f32_buf(&ctx, rows * slots);
         let iq4_out = empty_f32_buf(&ctx, rows * slots);
+        let mxfp4_out = empty_f32_buf(&ctx, rows * slots);
         let iq2s_out = empty_f32_buf(&ctx, rows * slots);
         let rows_buf = u32_buf(&ctx, rows as u32);
         let cols_buf = u32_buf(&ctx, cols as u32);
@@ -19314,6 +19343,19 @@ mod tests {
             slots,
         );
         encode_glm_moe_decode_iq_selected_slots(
+            ctx.glm_moe_decode_mxfp4_selected_slots_pipeline(),
+            &encoder,
+            &mxfp4_buffers,
+            &offsets,
+            &slot_input_buf,
+            &mxfp4_out,
+            &rows_buf,
+            &cols_buf,
+            &slots_buf,
+            rows,
+            slots,
+        );
+        encode_glm_moe_decode_iq_selected_slots(
             ctx.glm_moe_decode_iq2s_selected_slots_pipeline(),
             &encoder,
             &iq2s_buffers,
@@ -19333,6 +19375,7 @@ mod tests {
         let iq2_actual = readback(&iq2_out, rows * slots);
         let iq3_actual = readback(&iq3_out, rows * slots);
         let iq4_actual = readback(&iq4_out, rows * slots);
+        let mxfp4_actual = readback(&mxfp4_out, rows * slots);
         let iq2s_actual = readback(&iq2s_out, rows * slots);
         for slot in 0..slots {
             for row in 0..rows {
@@ -19360,6 +19403,16 @@ mod tests {
                     .zip(&slot_input[slot * cols..(slot + 1) * cols])
                     .map(|(w, x)| w * x)
                     .sum();
+                let mxfp4_row_bytes = cols / 32 * 17;
+                let mxfp4_dequant = rnb_cpu::gemm::dequant::dequantize_bytes_to_f32(
+                    &mxfp4_weights[slot][row * mxfp4_row_bytes..(row + 1) * mxfp4_row_bytes],
+                    rnb_cpu::gemm::dequant::DequantType::MXFP4,
+                );
+                let mxfp4_expected: f32 = mxfp4_dequant
+                    .iter()
+                    .zip(&slot_input[slot * cols..(slot + 1) * cols])
+                    .map(|(w, x)| w * x)
+                    .sum();
                 let iq2s_row_bytes = cols / 256 * 82;
                 let iq2s_dequant = rnb_cpu::gemm::dequant::dequantize_bytes_to_f32(
                     &iq2s_weights[slot][row * iq2s_row_bytes..(row + 1) * iq2s_row_bytes],
@@ -19370,6 +19423,7 @@ mod tests {
                     ("IQ2_XXS", iq2_actual[slot * rows + row], iq2_expected),
                     ("IQ3_XXS", iq3_actual[slot * rows + row], iq3_expected),
                     ("IQ4_XS", iq4_actual[slot * rows + row], iq4_expected),
+                    ("MXFP4", mxfp4_actual[slot * rows + row], mxfp4_expected),
                     ("IQ2_S", iq2s_actual[slot * rows + row], iq2s_expected),
                 ] {
                     let abs = (actual - expected).abs();
