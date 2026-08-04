@@ -6,6 +6,14 @@ mod chat_alignment;
 mod runtime_boundary;
 mod server;
 
+fn select_release_id<'a>(release_id: Option<&'a str>, package_version: &'a str) -> &'a str {
+    release_id.unwrap_or(package_version)
+}
+
+fn product_release_id() -> &'static str {
+    select_release_id(option_env!("RNB_RELEASE_ID"), env!("CARGO_PKG_VERSION"))
+}
+
 fn parse_byte_size(raw: &str) -> Result<u64, String> {
     let split = raw
         .find(|ch: char| !ch.is_ascii_digit())
@@ -37,7 +45,7 @@ fn parse_byte_size(raw: &str) -> Result<u64, String> {
 }
 
 fn print_usage(mut output: impl Write) -> io::Result<()> {
-    writeln!(output, "runNburn {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(output, "runNburn {}", product_release_id())?;
     writeln!(
         output,
         "Quantized GGUF inference for memory-constrained systems"
@@ -87,7 +95,7 @@ fn main() {
             return;
         }
         Some("-V" | "--version" | "version") => {
-            println!("runNburn {}", env!("CARGO_PKG_VERSION"));
+            println!("runNburn {}", product_release_id());
             return;
         }
         _ => {}
@@ -177,7 +185,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_byte_size;
+    use super::{parse_byte_size, select_release_id};
 
     #[test]
     fn parses_binary_and_decimal_ram_budget_sizes() {
@@ -186,5 +194,11 @@ mod tests {
         assert!(parse_byte_size("32G").is_err());
         assert!(parse_byte_size("0GiB").is_err());
         assert!(parse_byte_size("GiB").is_err());
+    }
+
+    #[test]
+    fn release_id_prefers_rolling_identity_and_falls_back_to_package_version() {
+        assert_eq!(select_release_id(Some("r18"), "0.13.0"), "r18");
+        assert_eq!(select_release_id(None, "0.13.0"), "0.13.0");
     }
 }

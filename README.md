@@ -27,6 +27,7 @@
   <a href="#backend-status">Backends</a> ·
   <a href="#models-and-file-formats">Models</a> ·
   <a href="#android-and-c-abi">Android</a> ·
+  <a href="#release-identifiers">Releases</a> ·
   <a href="#license">License</a>
 </p>
 
@@ -46,6 +47,19 @@ attach generated sidecars to make a model fit.
 > runNburn is pre-1.0 and under active development. CPU is the default path.
 > CUDA and Metal acceleration are model-aware and evolving. Vulkan, OpenCL,
 > and MediaTek paths are experimental; mobile Vulkan remains explicit opt-in.
+
+
+## Release identifiers
+
+Official rolling releases use `rN`, where `N` is the consecutive count of
+successfully published GitHub Releases. Failed or cancelled builds do not
+consume a release number. `r17` is the transition baseline corresponding to
+`v0.13.0`; the next published release is `r18`.
+
+Cargo package versions remain SemVer compatibility metadata and are not bumped
+for every rolling release. Official binaries report their rolling identity from
+`runNburn --version`; local source builds without release metadata fall back to
+the Cargo package version.
 
 ## Why runNburn
 

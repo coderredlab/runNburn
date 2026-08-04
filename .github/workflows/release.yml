@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "r*"
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v* tag to build and publish
+        description: Existing r* tag to build and publish
         required: true
         type: string
 
@@ -22,9 +22,23 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RNB_RELEASE_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  validate-release-tag:
+    name: Validate rolling release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require rN release identity
+        shell: bash
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^r[1-9][0-9]*$ ]]; then
+            echo "Release tag must match rN with N >= 1: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
   linux-x86_64:
+    needs: validate-release-tag
     name: Linux x86_64 ${{ matrix.backend }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -75,14 +89,16 @@ jobs:
         run: cargo build --locked --release -p rnb-cli --no-default-features --features "${{ matrix.features }}"
 
       - name: Smoke test binary
-        run: ./target/release/runNburn --help
+        run: |
+          ./target/release/runNburn --help
+          test "$(./target/release/runNburn --version)" = "runNburn ${RELEASE_TAG}"
 
       - name: Package binary
         id: package
         shell: bash
         run: |
-          version="${RELEASE_TAG#v}"
-          archive="runNburn-${version}-x86_64-unknown-linux-gnu${{ matrix.archive_suffix }}.tar.gz"
+          release_id="${RELEASE_TAG}"
+          archive="runNburn-${release_id}-x86_64-unknown-linux-gnu${{ matrix.archive_suffix }}.tar.gz"
           mkdir -p dist/package
           install -m 0755 target/release/runNburn dist/package/runNburn
           install -m 0644 LICENSE NOTICE dist/package/
@@ -100,6 +116,7 @@ jobs:
           if-no-files-found: error
 
   linux-cuda-sm86:
+    needs: validate-release-tag
     name: Linux x86_64 CUDA sm86
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -141,14 +158,16 @@ jobs:
         run: cargo build --locked --release -p rnb-cli --no-default-features --features cpu,cuda
 
       - name: Smoke test binary
-        run: ./target/release/runNburn --help
+        run: |
+          ./target/release/runNburn --help
+          test "$(./target/release/runNburn --version)" = "runNburn ${RELEASE_TAG}"
 
       - name: Package binary
         id: package
         shell: bash
         run: |
-          version="${RELEASE_TAG#v}"
-          archive="runNburn-${version}-x86_64-unknown-linux-gnu-cuda-sm86.tar.gz"
+          release_id="${RELEASE_TAG}"
+          archive="runNburn-${release_id}-x86_64-unknown-linux-gnu-cuda-sm86.tar.gz"
           mkdir -p dist/package
           install -m 0755 target/release/runNburn dist/package/runNburn
           install -m 0644 LICENSE NOTICE dist/package/
@@ -166,6 +185,7 @@ jobs:
           if-no-files-found: error
 
   windows-x86_64:
+    needs: validate-release-tag
     name: Windows x86_64 ${{ matrix.backend }}
     runs-on: windows-2025
     timeout-minutes: 60
@@ -232,14 +252,20 @@ jobs:
         run: cargo build --locked --release -p rnb-cli --no-default-features --features "${{ matrix.features }}"
 
       - name: Smoke test binary
-        run: .\target\release\runNburn.exe --help
+        shell: pwsh
+        run: |
+          .\target\release\runNburn.exe --help
+          $actual = .\target\release\runNburn.exe --version
+          if ($actual -ne "runNburn $env:RELEASE_TAG") {
+            throw "Unexpected release identity: $actual"
+          }
 
       - name: Package binary
         id: package
         shell: pwsh
         run: |
-          $version = $env:RELEASE_TAG.TrimStart("v")
-          $archive = "runNburn-$version-x86_64-pc-windows-msvc${{ matrix.archive_suffix }}.zip"
+          $releaseId = $env:RELEASE_TAG
+          $archive = "runNburn-$releaseId-x86_64-pc-windows-msvc${{ matrix.archive_suffix }}.zip"
           New-Item -ItemType Directory -Force dist/package | Out-Null
           Copy-Item target/release/runNburn.exe dist/package/
           Copy-Item LICENSE, NOTICE dist/package/
@@ -258,6 +284,7 @@ jobs:
           if-no-files-found: error
 
   macos-metal:
+    needs: validate-release-tag
     name: macOS Apple Silicon Metal
     runs-on: macos-15
     timeout-minutes: 60
@@ -285,14 +312,16 @@ jobs:
         run: rustup run nightly cargo build --locked --release -p rnb-cli --no-default-features --features cpu,metal
 
       - name: Smoke test binary
-        run: ./target/release/runNburn --help
+        run: |
+          ./target/release/runNburn --help
+          test "$(./target/release/runNburn --version)" = "runNburn ${RELEASE_TAG}"
 
       - name: Package binary
         id: package
         shell: bash
         run: |
-          version="${RELEASE_TAG#v}"
-          archive="runNburn-${version}-aarch64-apple-darwin-metal.tar.gz"
+          release_id="${RELEASE_TAG}"
+          archive="runNburn-${release_id}-aarch64-apple-darwin-metal.tar.gz"
           mkdir -p dist/package
           install -m 0755 target/release/runNburn dist/package/runNburn
           install -m 0644 LICENSE NOTICE dist/package/
@@ -310,6 +339,7 @@ jobs:
           if-no-files-found: error
 
   android-aarch64:
+    needs: validate-release-tag
     name: Android aarch64 ${{ matrix.backend }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -376,8 +406,8 @@ jobs:
         id: package
         shell: bash
         run: |
-          version="${RELEASE_TAG#v}"
-          archive="runNburn-${version}-aarch64-linux-android-${{ matrix.backend }}.tar.gz"
+          release_id="${RELEASE_TAG}"
+          archive="runNburn-${release_id}-aarch64-linux-android-${{ matrix.backend }}.tar.gz"
           mkdir -p dist/package/include dist/package/lib/arm64-v8a
           install -m 0644 crates/rnb-ffi/include/rnb.h dist/package/include/
           install -m 0755 target/aarch64-linux-android/release/librnb_ffi.so dist/package/lib/arm64-v8a/
