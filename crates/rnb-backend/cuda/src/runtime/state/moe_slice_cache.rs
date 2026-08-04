@@ -34,6 +34,16 @@ pub(in crate::runtime) struct MoeSliceCache {
     pub(in crate::runtime) temp_upload_bytes: u64,
     /// Wall time spent inside the miss `memcpy_htod_async` calls alone, so the
     /// trace can separate real transfer from lookup/admission bookkeeping.
+    /// Bytes uploaded through the temp slab because the cache could not admit
+    /// the slice. Tests assert this is non-zero to prove a pressure fixture
+    /// actually overflows instead of quietly fitting in the budget.
+    /// Wall time spent inside the miss `cuMemcpyHtoDAsync` calls.
+    ///
+    /// The source is pageable mmap memory, so the driver stages the copy and
+    /// the call blocks for most of the transfer; this therefore tracks the
+    /// transfer rather than a pure enqueue. It is still not a device-side
+    /// measurement, so treat the derived bandwidth as a close lower bound, not
+    /// as CUDA event timing.
     pub(in crate::runtime) upload_ns: u64,
 }
 
@@ -107,6 +117,9 @@ impl CudaState {
         up_weights: &[&[u8]],
         down_weights: &[&[u8]],
     ) -> Result<Option<(Vec<u64>, Vec<u64>, Vec<u64>)>, String> {
+        // Read the diagnostic flag once; the miss loops below would otherwise
+        // hit the process environment for every unique slice they upload.
+        let trace = crate::runtime::moe::resident::resident_phase_trace_enabled();
         let budget = match self.moe_slice_cache.budget_bytes {
             Some(budget) => budget,
             None => {
@@ -237,7 +250,7 @@ impl CudaState {
                 temp_overflow.push((index, len));
                 continue;
             };
-            let upload_start = std::time::Instant::now();
+            let upload_start = trace.then(std::time::Instant::now);
             unsafe {
                 self.api.memcpy_htod_async(
                     ptr,
@@ -246,10 +259,12 @@ impl CudaState {
                     self.stream,
                 )?;
             }
-            self.moe_slice_cache.upload_ns = self
-                .moe_slice_cache
-                .upload_ns
-                .saturating_add(upload_start.elapsed().as_nanos() as u64);
+            if let Some(start) = upload_start {
+                self.moe_slice_cache.upload_ns = self
+                    .moe_slice_cache
+                    .upload_ns
+                    .saturating_add(start.elapsed().as_nanos() as u64);
+            }
             self.moe_slice_cache.entries.insert(
                 *key,
                 MoeSliceEntry {
@@ -278,7 +293,7 @@ impl CudaState {
             let mut offset = 0usize;
             for (index, len) in temp_overflow {
                 let (key, weights) = order[index];
-                let upload_start = std::time::Instant::now();
+                let upload_start = trace.then(std::time::Instant::now);
                 unsafe {
                     self.api.memcpy_htod_async(
                         slab + offset as u64,
@@ -287,10 +302,12 @@ impl CudaState {
                         self.stream,
                     )?;
                 }
-                self.moe_slice_cache.upload_ns = self
-                    .moe_slice_cache
-                    .upload_ns
-                    .saturating_add(upload_start.elapsed().as_nanos() as u64);
+                if let Some(start) = upload_start {
+                    self.moe_slice_cache.upload_ns = self
+                        .moe_slice_cache
+                        .upload_ns
+                        .saturating_add(start.elapsed().as_nanos() as u64);
+                }
                 temp_ptrs.insert(key, slab + offset as u64);
                 self.moe_slice_cache.temp_upload_bytes = self
                     .moe_slice_cache

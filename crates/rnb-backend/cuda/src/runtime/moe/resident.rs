@@ -31,6 +31,14 @@ pub(in crate::runtime) struct ResidentSparseExpertsRequest<'a> {
 /// download that also drains the stream. Enabled by
 /// `RNB_CUDA_MOE_RESIDENT_TRACE=1`; the phase boundaries need stream
 /// synchronization, so this perturbs timing and is diagnostic only.
+/// Whether the resident MoE phase trace is on.
+///
+/// The slice cache samples its own upload timers off this so a diagnostic
+/// opt-in costs nothing on the decode hot path.
+pub(in crate::runtime) fn resident_phase_trace_enabled() -> bool {
+    phase_trace::enabled()
+}
+
 mod phase_trace {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,7 +85,7 @@ mod phase_trace {
             0.0
         };
         eprintln!(
-            "[cuda-moe-resident] calls={calls} resolve={:.1}ms (xfer={:.1}ms bookkeep={:.1}ms) stage={:.1}ms kernels={:.1}ms download={:.1}ms upload={:.2}GiB xfer_h2d={xfer_gbps:.2}GB/s",
+            "[cuda-moe-resident] calls={calls} resolve={:.1}ms (xfer={:.1}ms bookkeep={:.1}ms) stage={:.1}ms kernels={:.1}ms download={:.1}ms upload={:.2}GiB host_xfer_h2d={xfer_gbps:.2}GB/s",
             ms(resolve),
             ms(upload),
             ms(resolve.saturating_sub(upload)),
