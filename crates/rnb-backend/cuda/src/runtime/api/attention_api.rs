@@ -1207,3 +1207,167 @@ pub fn attention_decode_kvarn_to_device(
         .expect("cuda compute state initialized")
         .attention_decode_kvarn_to_device(request, output_dev_target)
 }
+
+/// DeepSeek4 attention output projection: `output_groups` block-diagonal Q8_0
+/// GEMVs feeding one Q8_0 GEMV.
+///
+/// Callers used to run each group through the host-slice GEMV API, so a single
+/// layer paid `groups + 1` input uploads and result downloads to move a few
+/// kilobytes each. The intermediate low-rank vector is pure concatenation with
+/// no host work in between, so the whole projection can stay on the device and
+/// only the final hidden row needs to come back.
+///
+/// The scratch choice matters: `compute_input`/`compute_output` are the natural
+/// endpoints, and the low-rank intermediate deliberately lives in
+/// `compute_mid_a` because the Q8_0 GEMV itself stages through
+/// `compute_temp_slab` and resolves weights through `compute_weights`. Reusing
+/// either of those here would recreate the cu107 aliasing failure.
+pub fn deepseek4_q8_output_projection(
+    group_weights: &[&[u8]],
+    output_b_weights: &[u8],
+    rows_per_group: usize,
+    cols_per_group: usize,
+    hidden_dim: usize,
+    attention_output: &[f32],
+) -> Result<Option<Vec<f32>>, String> {
+    if !crate::tuning::deepseek4_output_projection_fused_enabled() {
+        return Ok(None);
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .deepseek4_q8_output_projection(
+            group_weights,
+            output_b_weights,
+            rows_per_group,
+            cols_per_group,
+            hidden_dim,
+            attention_output,
+        )
+}
+
+impl CudaState {
+    fn deepseek4_q8_output_projection(
+        &mut self,
+        group_weights: &[&[u8]],
+        output_b_weights: &[u8],
+        rows_per_group: usize,
+        cols_per_group: usize,
+        hidden_dim: usize,
+        attention_output: &[f32],
+    ) -> Result<Option<Vec<f32>>, String> {
+        let groups = group_weights.len();
+        if groups == 0 {
+            return Err("DeepSeek4 output projection needs at least one group".to_string());
+        }
+        if cols_per_group % 32 != 0 {
+            return Err(format!(
+                "DeepSeek4 output projection cols_per_group must be a multiple of 32, got {cols_per_group}"
+            ));
+        }
+        let low_rank_len = groups
+            .checked_mul(rows_per_group)
+            .ok_or_else(|| "DeepSeek4 output projection low-rank length overflow".to_string())?;
+        if low_rank_len % 32 != 0 {
+            return Err(format!(
+                "DeepSeek4 output projection low-rank length must be a multiple of 32, got {low_rank_len}"
+            ));
+        }
+        let expected_input = groups
+            .checked_mul(cols_per_group)
+            .ok_or_else(|| "DeepSeek4 output projection input length overflow".to_string())?;
+        if attention_output.len() != expected_input {
+            return Err(format!(
+                "DeepSeek4 output projection input len mismatch: got {}, expected {expected_input}",
+                attention_output.len()
+            ));
+        }
+
+        // Q8_0 stores 32 values per 34-byte block. The kernels index
+        // `rows * blocks_per_row` blocks unconditionally, so an undersized
+        // slice would read past the mapping.
+        const Q8_0_BLOCK_BYTES: usize = 34;
+        let group_row_bytes = cols_per_group / 32 * Q8_0_BLOCK_BYTES;
+        let expected_group_bytes = rows_per_group
+            .checked_mul(group_row_bytes)
+            .ok_or_else(|| "DeepSeek4 output projection group byte overflow".to_string())?;
+        for (index, weights) in group_weights.iter().enumerate() {
+            if weights.len() != expected_group_bytes {
+                return Err(format!(
+                    "DeepSeek4 output projection group {index} byte mismatch: got {}, expected {expected_group_bytes}",
+                    weights.len()
+                ));
+            }
+        }
+        let expected_output_b_bytes = hidden_dim
+            .checked_mul(low_rank_len / 32 * Q8_0_BLOCK_BYTES)
+            .ok_or_else(|| "DeepSeek4 output projection output_b byte overflow".to_string())?;
+        if output_b_weights.len() != expected_output_b_bytes {
+            return Err(format!(
+                "DeepSeek4 output projection output_b byte mismatch: got {}, expected {expected_output_b_bytes}",
+                output_b_weights.len()
+            ));
+        }
+
+        let f32_bytes = std::mem::size_of::<f32>();
+        let input_bytes = expected_input * f32_bytes;
+        let input_dev = self.compute_input_ptr(input_bytes)?;
+        unsafe {
+            self.api.memcpy_htod_async(
+                input_dev,
+                attention_output.as_ptr().cast(),
+                input_bytes,
+                self.stream,
+            )?;
+        }
+
+        let low_rank_dev = self.compute_mid_a_ptr(low_rank_len * f32_bytes)?;
+        let group_input_bytes = (cols_per_group * f32_bytes) as u64;
+        let group_output_bytes = (rows_per_group * f32_bytes) as u64;
+        for (index, weights) in group_weights.iter().enumerate() {
+            let weights_dev =
+                self.resident_q8_gemv_weights_ptr(weights, rows_per_group, cols_per_group)?;
+            let index = index as u64;
+            self.launch_basic_quant_gemv_dev(
+                "rnb_q8_0_gemv",
+                weights_dev,
+                rows_per_group,
+                cols_per_group / 32,
+                input_dev + index * group_input_bytes,
+                low_rank_dev + index * group_output_bytes,
+            )?;
+        }
+
+        let output_bytes = hidden_dim * f32_bytes;
+        let output_dev = self.compute_output_ptr(output_bytes)?;
+        let output_b_dev =
+            self.resident_q8_gemv_weights_ptr(output_b_weights, hidden_dim, low_rank_len)?;
+        self.launch_basic_quant_gemv_dev(
+            "rnb_q8_0_gemv",
+            output_b_dev,
+            hidden_dim,
+            low_rank_len / 32,
+            low_rank_dev,
+            output_dev,
+        )?;
+
+        let mut output = vec![0.0f32; hidden_dim];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                output.as_mut_ptr().cast(),
+                output_dev,
+                output_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+        Ok(Some(output))
+    }
+}

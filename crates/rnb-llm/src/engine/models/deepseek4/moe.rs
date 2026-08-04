@@ -38,7 +38,10 @@ pub(super) fn forward_moe(
     let (experts, route_weights) = route(input, token_id, weights, config);
     crate::engine::moe_trace::record_selection(layer_idx, &experts);
     if let Some(start) = route_start {
-        crate::engine::moe_profile::record_moe_profile("deepseek4:decode:moe:route", start.elapsed());
+        crate::engine::moe_profile::record_moe_profile(
+            "deepseek4:decode:moe:route",
+            start.elapsed(),
+        );
     }
     if let Some(output) =
         forward_moe_metal_decode(input, &experts, &route_weights, layer_idx, weights, config)?
@@ -575,10 +578,7 @@ fn routed_cuda_layout_supported(
 /// MXFP4 down) that the grouped prefill kernels reject but this path serves,
 /// keeping decode and speculative verify on CUDA instead of the host loop.
 #[cfg(feature = "cuda")]
-fn routed_cuda_resident_supported(
-    weights: &DeepSeek4MoeWeights,
-    config: &DeepSeek4Config,
-) -> bool {
+fn routed_cuda_resident_supported(weights: &DeepSeek4MoeWeights, config: &DeepSeek4Config) -> bool {
     let moe = &weights.weights;
     routed_cuda_resident_layout_supported(
         weights.prefer_sparse_moe_cuda,

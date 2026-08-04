@@ -43,10 +43,7 @@ mod phase_trace {
     static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn enabled() -> bool {
-        std::env::var("RNB_CUDA_MOE_RESIDENT_TRACE")
-            .ok()
-            .as_deref()
-            == Some("1")
+        std::env::var("RNB_CUDA_MOE_RESIDENT_TRACE").ok().as_deref() == Some("1")
     }
 
     pub(super) fn record(
@@ -219,8 +216,8 @@ impl CudaState {
         self.set_current()?;
         let trace = phase_trace::enabled();
         let mut mark = std::time::Instant::now();
-        let upload_before = self.moe_slice_cache.resident_upload_bytes
-            + self.moe_slice_cache.temp_upload_bytes;
+        let upload_before =
+            self.moe_slice_cache.resident_upload_bytes + self.moe_slice_cache.temp_upload_bytes;
         let upload_ns_before = self.moe_slice_cache.upload_ns;
         let Some((gate_ptrs, up_ptrs, down_ptrs)) =
             self.moe_slice_resident_ptrs_3(gate_weights, up_weights, down_weights)?

@@ -4887,3 +4887,65 @@ mod device_prefill_trace_tests {
         assert_eq!(bytes.d2h_bytes, 0);
     }
 }
+
+/// Runs the DeepSeek4 attention output projection as one device-resident
+/// sequence instead of `groups + 1` separate host-slice GEMVs.
+///
+/// Every group shares the same contiguous Q8_0 tensor and the low-rank
+/// intermediate never needs host inspection, so keeping it on the device turns
+/// `2 * (groups + 1)` transfers into one upload and one download. Returns
+/// `Ok(None)` whenever the layout is not the uniform Q8_0 block-diagonal shape
+/// the fused path assumes, so callers fall back to the per-group loop.
+pub(in crate::engine) fn cuda_deepseek4_q8_output_projection_if_supported(
+    output_a_groups: &[QuantizedWeight],
+    output_b: &QuantizedWeight,
+    attention_output: &[f32],
+) -> crate::error::Result<Option<Vec<f32>>> {
+    #[cfg(feature = "cuda")]
+    {
+        let Some((first, rest)) = output_a_groups.split_first() else {
+            return Ok(None);
+        };
+        if first.ggml_type != GGMLType::Q8_0 || output_b.ggml_type != GGMLType::Q8_0 {
+            return Ok(None);
+        }
+        if rest.iter().any(|weight| {
+            weight.ggml_type != GGMLType::Q8_0
+                || weight.rows != first.rows
+                || weight.cols != first.cols
+        }) {
+            return Ok(None);
+        }
+        let low_rank_len = output_a_groups.len() * first.rows;
+        if output_b.cols != low_rank_len || first.cols % 32 != 0 || low_rank_len % 32 != 0 {
+            return Ok(None);
+        }
+        if attention_output.len() != output_a_groups.len() * first.cols {
+            return Ok(None);
+        }
+        let Some(group_raw) = output_a_groups
+            .iter()
+            .map(|weight| weight.data.as_bytes())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(output_b_raw) = output_b.data.as_bytes() else {
+            return Ok(None);
+        };
+        return cuda_runtime::deepseek4_q8_output_projection(
+            &group_raw,
+            output_b_raw,
+            first.rows,
+            first.cols,
+            output_b.rows,
+            attention_output,
+        )
+        .map_err(crate::error::LlmError::Forward);
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (output_a_groups, output_b, attention_output);
+        Ok(None)
+    }
+}

@@ -816,6 +816,12 @@ pub fn prefill_temp_host_register_min_bytes() -> usize {
         .unwrap_or(1024 * 1024)
 }
 
+/// Fuse the DeepSeek4 attention output projection into one device-resident
+/// sequence. Diagnostic opt-out for A/B against the per-group host GEMV loop.
+pub fn deepseek4_output_projection_fused_enabled() -> bool {
+    env_bool("RNB_CUDA_DEEPSEEK4_OUTPUT_FUSED", true)
+}
+
 pub fn prefill_down_copy_overlap_enabled() -> bool {
     env_bool("RNB_CUDA_PREFILL_DOWN_COPY_OVERLAP", false)
 }

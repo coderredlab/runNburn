@@ -693,6 +693,25 @@ pub fn attention_decode_kvarn_to_device(
         .map_err(|err| format!("CUDA attention_decode_kvarn_to_device failed: {err}"))
 }
 
+pub fn deepseek4_q8_output_projection(
+    group_weights: &[&[u8]],
+    output_b_weights: &[u8],
+    rows_per_group: usize,
+    cols_per_group: usize,
+    hidden_dim: usize,
+    attention_output: &[f32],
+) -> Result<Option<Vec<f32>>> {
+    backend::deepseek4_q8_output_projection(
+        group_weights,
+        output_b_weights,
+        rows_per_group,
+        cols_per_group,
+        hidden_dim,
+        attention_output,
+    )
+    .map_err(|err| format!("CUDA deepseek4_q8_output_projection failed: {err}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn attention_decode_cached_to_device_len_device(
     layer_index: usize,

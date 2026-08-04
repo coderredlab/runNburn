@@ -1,4 +1,5 @@
 use crate::engine::backend_runtime::{
+    cuda_deepseek4_q8_output_projection_if_supported,
     metal_deepseek4_attention_prefill_compressor_fused_requested,
     metal_deepseek4_attention_prefill_index_batch_requested,
     metal_deepseek4_attention_prefill_output_batch_requested,
@@ -587,6 +588,14 @@ pub(super) fn project_attention_output(
             return Ok(output.swap_remove(0));
         }
         return weights.output_b.gemv_vec(&low_rank);
+    }
+
+    if let Some(output) = cuda_deepseek4_q8_output_projection_if_supported(
+        &weights.output_a_groups,
+        &weights.output_b,
+        attention_output,
+    )? {
+        return Ok(output);
     }
 
     let mut low_rank = Vec::with_capacity(config.output_groups * config.output_lora_rank);

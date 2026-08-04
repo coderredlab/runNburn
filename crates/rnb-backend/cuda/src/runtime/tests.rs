@@ -27209,3 +27209,120 @@ fn cuda_h2d_pinned_vs_pageable_bandwidth() {
         pageable_s / pinned_s
     );
 }
+
+/// The fused DeepSeek4 output projection must be bit-identical to the
+/// per-group `q8_0_gemv` path it replaces.
+///
+/// Tolerance against a CPU reference is not enough: the first implementation
+/// used the batch Q8_0 kernel, whose reduction order differs from
+/// `rnb_q8_0_gemv`, and greedy decoding drifted after ~100 tokens even though
+/// every value was within a loose epsilon. Non-unit FP16 block scales and
+/// non-integer inputs keep the arithmetic inexact so an order change actually
+/// shows up, and the comparison is on raw bits.
+#[test]
+fn cuda_deepseek4_q8_output_projection_is_bitwise_identical_to_per_group_gemv() {
+    let _guard = runtime_test_lock();
+    if CudaState::open().is_err() {
+        eprintln!("skipping DeepSeek4 output projection parity test: no CUDA device");
+        return;
+    }
+
+    const GROUPS: usize = 4;
+    const ROWS_PER_GROUP: usize = 64;
+    const COLS_PER_GROUP: usize = 128;
+    let low_rank_len = GROUPS * ROWS_PER_GROUP;
+    let hidden_dim = 96usize;
+
+    // Minimal f32 -> f16 bit conversion for normal magnitudes.
+    fn f16_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let mantissa = ((bits >> 13) & 0x3ff) as u16;
+        assert!(
+            (1..=30).contains(&exponent),
+            "scale out of f16 normal range"
+        );
+        sign | ((exponent as u16) << 10) | mantissa
+    }
+
+    let q8_matrix = |rows: usize, cols: usize, seed: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(rows * cols / 32 * 34);
+        for r in 0..rows {
+            for block in 0..cols / 32 {
+                // Distinct non-unit scales per block so partial sums differ in
+                // magnitude and summation order changes the low bits.
+                let scale = 0.0125f32 * (1.0 + ((r * 7 + block * 3 + seed) % 13) as f32 * 0.37);
+                out.extend_from_slice(&f16_bits(scale).to_le_bytes());
+                for lane in 0..32 {
+                    let q = ((r * 31 + block * 17 + lane * 11 + seed) % 251) as i32 - 125;
+                    out.push(q as i8 as u8);
+                }
+            }
+        }
+        out
+    };
+
+    let group_bytes = (0..GROUPS)
+        .map(|g| q8_matrix(ROWS_PER_GROUP, COLS_PER_GROUP, g * 29 + 3))
+        .collect::<Vec<_>>();
+    let output_b_bytes = q8_matrix(hidden_dim, low_rank_len, 181);
+    let attention_output = (0..GROUPS * COLS_PER_GROUP)
+        .map(|i| ((i % 23) as f32 * 0.3137 - 3.7).sin() * 1.618)
+        .collect::<Vec<f32>>();
+
+    // Baseline: exactly what `project_attention_output` did before fusing,
+    // group GEMVs through the public Q8_0 entry then one more for output B.
+    let mut expected_low_rank = Vec::with_capacity(low_rank_len);
+    for (group, bytes) in group_bytes.iter().enumerate() {
+        let input = &attention_output[group * COLS_PER_GROUP..(group + 1) * COLS_PER_GROUP];
+        expected_low_rank.extend(
+            crate::runtime::q8_0_gemv(bytes, ROWS_PER_GROUP, COLS_PER_GROUP, input)
+                .expect("baseline group gemv"),
+        );
+    }
+    let expected = crate::runtime::q8_0_gemv(
+        &output_b_bytes,
+        hidden_dim,
+        low_rank_len,
+        &expected_low_rank,
+    )
+    .expect("baseline output_b gemv");
+
+    let group_refs = group_bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let actual = crate::runtime::deepseek4_q8_output_projection(
+        &group_refs,
+        &output_b_bytes,
+        ROWS_PER_GROUP,
+        COLS_PER_GROUP,
+        hidden_dim,
+        &attention_output,
+    )
+    .expect("fused projection")
+    .expect("fused projection enabled by default");
+
+    assert_eq!(actual.len(), expected.len());
+    for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "row {i} diverged from the per-group path: got {got}, expected {want}"
+        );
+    }
+}
+
+/// Undersized weights must be rejected before any kernel reads them.
+#[test]
+fn cuda_deepseek4_q8_output_projection_rejects_short_weights() {
+    let _guard = runtime_test_lock();
+    if CudaState::open().is_err() {
+        eprintln!("skipping DeepSeek4 output projection guard test: no CUDA device");
+        return;
+    }
+    let short = vec![0u8; 34];
+    let groups = [short.as_slice(), short.as_slice()];
+    let err =
+        crate::runtime::deepseek4_q8_output_projection(&groups, &short, 64, 128, 96, &[0.0; 256])
+            .expect_err("undersized group weights must be rejected");
+    assert!(err.contains("byte mismatch"), "unexpected error: {err}");
+}

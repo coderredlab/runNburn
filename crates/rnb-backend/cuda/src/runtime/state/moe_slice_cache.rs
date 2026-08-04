@@ -259,8 +259,10 @@ impl CudaState {
                 },
             );
             self.moe_slice_cache.admissions += 1;
-            self.moe_slice_cache.resident_upload_bytes =
-                self.moe_slice_cache.resident_upload_bytes.saturating_add(len as u64);
+            self.moe_slice_cache.resident_upload_bytes = self
+                .moe_slice_cache
+                .resident_upload_bytes
+                .saturating_add(len as u64);
         }
 
         // Overflow slices share one temp slab upload for this call.
@@ -290,8 +292,10 @@ impl CudaState {
                     .upload_ns
                     .saturating_add(upload_start.elapsed().as_nanos() as u64);
                 temp_ptrs.insert(key, slab + offset as u64);
-                self.moe_slice_cache.temp_upload_bytes =
-                    self.moe_slice_cache.temp_upload_bytes.saturating_add(len as u64);
+                self.moe_slice_cache.temp_upload_bytes = self
+                    .moe_slice_cache
+                    .temp_upload_bytes
+                    .saturating_add(len as u64);
                 offset += len;
             }
         }

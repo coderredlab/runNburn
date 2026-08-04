@@ -554,6 +554,42 @@ impl CudaState {
                 self.stream,
             )?;
         }
+        self.launch_basic_quant_gemv_dev(
+            kernel,
+            weights_dev,
+            rows,
+            blocks_per_row,
+            input_dev,
+            output_dev,
+        )?;
+        let mut output = vec![0.0f32; rows];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                output.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+        Ok(output)
+    }
+
+    /// Kernel selection and launch shared by `q5_basic_gemv` and any caller that
+    /// already has its operands on the device.
+    ///
+    /// Reduction order decides the low bits of the result, so a device-resident
+    /// caller must go through this to stay bit-identical with the host-slice
+    /// GEMV it replaces rather than reaching for a batch kernel.
+    pub(in crate::runtime) fn launch_basic_quant_gemv_dev(
+        &mut self,
+        kernel: &'static str,
+        weights_dev: u64,
+        rows: usize,
+        blocks_per_row: usize,
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
         let mut input_arg = input_dev;
@@ -588,18 +624,21 @@ impl CudaState {
             ],
             grid,
             block,
-        )?;
-        let mut output = vec![0.0f32; rows];
-        unsafe {
-            self.api.memcpy_dtoh_async(
-                output.as_mut_ptr().cast::<libc::c_void>(),
-                output_dev,
-                output_bytes,
-                self.stream,
-            )?;
+        )
+    }
+
+    /// Same weight-pointer resolution `q5_basic_gemv` uses for Q8_0: prefer the
+    /// resident Q8 quant cache, then the generic resident upload.
+    pub(in crate::runtime) fn resident_q8_gemv_weights_ptr(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<u64, String> {
+        match self.resident_q8_quant.get(&q8_f32_key(weights, rows, cols)) {
+            Some(entry) => Ok(entry.ptr),
+            None => self.resident_q4k_weights_ptr(weights),
         }
-        self.stream_synchronize()?;
-        Ok(output)
     }
 
     pub(super) fn iq4_xs_gemv(

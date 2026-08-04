@@ -63,14 +63,8 @@ pub(super) use cuda_basic::{
     mtp_output_argmax_token_cuda, prefill_gemv_cuda, prefill_output_argmax_token_cuda,
     prefill_output_logits_cuda, CudaForwardRopeMode,
 };
-#[cfg(all(feature = "cuda", test))]
-pub(super) use cuda_basic::{cuda_relu_sqr_f32_inplace, cuda_sigmoid_f32_inplace};
-#[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{
-    decode_attention_cached_to_device_if_supported, decode_attention_hd256_if_supported,
-    decode_attention_kvarn_into_if_supported, decode_attention_kvarn_to_device_if_supported,
-};
-pub(super) use cuda_basic::{
+    cuda_deepseek4_q8_output_projection_if_supported,
     dense_q4k_attention_output_gelu_ffn_batch_norm_residual_if_supported,
     gdn_prefill_quantized_projection, gdn_prefill_quantized_projection_q,
     gemma4_ple_q4k_batch_norm_residual_if_supported, nemotron_q5_decode_moe_shared_sparse,
@@ -87,6 +81,13 @@ pub(super) use cuda_basic::{
     prewarm_dense_q4_packed_gate_up_weights, prewarm_dense_q6_packed_down_weights,
     prewarm_prefill_q4_f32_projection_weights, try_delta_restore_step_if_supported,
     try_delta_step_if_supported, upload_gemma_ple_base,
+};
+#[cfg(all(feature = "cuda", test))]
+pub(super) use cuda_basic::{cuda_relu_sqr_f32_inplace, cuda_sigmoid_f32_inplace};
+#[cfg(feature = "cuda")]
+pub(super) use cuda_basic::{
+    decode_attention_cached_to_device_if_supported, decode_attention_hd256_if_supported,
+    decode_attention_kvarn_into_if_supported, decode_attention_kvarn_to_device_if_supported,
 };
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)]
