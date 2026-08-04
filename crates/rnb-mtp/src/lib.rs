@@ -9,7 +9,6 @@
 //! - `rnb-llm` 이 generation control flow / sampler / KV cache 소유 (spec 정책)
 //! - `rnb-mtp` 는 MTP 의 specific helper:
 //!   - drafter weight loader
-//!   - parallel verify (target.forward 의 N+1 token vs drafter 의 N token 비교)
 //!   - drafter ↔ target KV cache 공유 infrastructure
 //!
 //! # Dependency
@@ -30,7 +29,6 @@
 
 pub mod drafter;
 pub mod kv_share;
-pub mod verify;
 
 pub use drafter::{SharedKvLayer, SharedKvStates};
 
@@ -39,8 +37,6 @@ pub use drafter::{SharedKvLayer, SharedKvStates};
 pub enum MtpError {
     #[error("drafter weight load failed: {0}")]
     DrafterLoad(String),
-    #[error("verify shape mismatch: {0}")]
-    VerifyShape(String),
     #[error("kv cache share misconfigured: {0}")]
     KvShare(String),
 }

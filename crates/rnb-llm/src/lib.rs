@@ -8,6 +8,7 @@ pub mod external_drafter;
 pub mod generate;
 pub mod kv_cache;
 mod mtp_generate;
+mod mtp_sampling;
 pub mod multimodal;
 mod runtime;
 pub mod sampler;

@@ -124,6 +124,32 @@ pub(crate) fn mtp_greedy_verify_allowed(params: &GenerateParams) -> bool {
         && params.mirostat.is_none()
 }
 
+/// 한 round에서 조회한 target 예측을 draft와 나란히 찍는 trace 문자열.
+///
+/// `observed_targets`는 실제로 조회한 위치까지만 담기므로, reject나 stop으로 끊긴
+/// round는 그 지점까지만 출력된다.
+fn mtp_round_trace(engine: &Engine, draft_tokens: &[u32], observed_targets: &[u32]) -> String {
+    observed_targets
+        .iter()
+        .enumerate()
+        .map(|(i, &target_token)| {
+            let draft_token = draft_tokens[i];
+            format!(
+                "{}:{}{}{}",
+                i,
+                engine.tokenizer.decode_token(target_token),
+                if target_token == draft_token {
+                    "=draft:"
+                } else {
+                    "!=draft:"
+                },
+                engine.tokenizer.decode_token(draft_token),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn mtp_target_needs_sequential(architecture: rnb_loader::Architecture) -> bool {
     matches!(
         architecture,
@@ -834,6 +860,9 @@ fn generate_stream_mtp_with_tokens(
     let verified_runway_max_extra = crate::runtime::mtp_runway_max_extra();
     let mut verified_runway: Option<MtpVerifiedRunway> = None;
     let mut verified_runway_confidence = 0usize;
+    // 각 round의 target 예측을 순서대로 담는 재사용 버퍼. trace 재구성에만 쓰이며
+    // round마다 clear한다.
+    let mut observed_targets: Vec<u32> = Vec::new();
 
     while tokens_remaining > 0 {
         crate::generate::check_generation_cancellation()?;
@@ -945,60 +974,40 @@ fn generate_stream_mtp_with_tokens(
             trace_mtp_sequence_state(engine, "batch-decode-chain-forward");
             stats.add_target_verify(window.len(), 1);
 
-            let mut n_accepted = 0usize;
-            let mut stopped = false;
-            let mut next_forced_token = None;
-            let mut target_trace = trace_mtp.then(Vec::new);
-
+            observed_targets.clear();
+            let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..draft_k {
                 let target_token = *window.target_tokens.get(i).ok_or_else(|| {
                     crate::error::LlmError::Forward(format!(
                         "MTP batched verify missing target token at {i}"
                     ))
                 })?;
-                if let Some(trace) = target_trace.as_mut() {
-                    let draft_token = draft_tokens[i];
-                    trace.push(format!(
-                        "{}:{}{}{}",
-                        i,
-                        engine.tokenizer.decode_token(target_token),
-                        if target_token == draft_tokens[i] {
-                            "=draft:"
-                        } else {
-                            "!=draft:"
-                        },
-                        engine.tokenizer.decode_token(draft_token),
-                    ));
+                observed_targets.push(target_token);
+                match round.observe(i, draft_tokens[i], target_token, draft_k, params, eos) {
+                    crate::mtp_sampling::RoundAction::Reject
+                    | crate::mtp_sampling::RoundAction::Stop => break,
+                    crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                    crate::mtp_sampling::RoundAction::Emit => {}
                 }
-                if target_token != draft_tokens[i] {
-                    next_forced_token = Some(target_token);
-                    break;
-                }
-                if params.should_stop(draft_tokens[i], eos) {
-                    stopped = true;
-                    break;
-                }
-                n_accepted += 1;
-                stats.accepted += 1;
                 generated_tokens.push(draft_tokens[i]);
-                if !generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback) {
-                    stopped = true;
-                    tokens_remaining -= 1;
-                    break;
-                }
-                tokens_remaining -= 1;
-                if tokens_remaining == 0 {
+                let keep_going =
+                    generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback);
+                if !round.after_emit(keep_going, &mut tokens_remaining) {
                     break;
                 }
             }
+            let n_accepted = round.accepted();
+            let stopped = round.stopped();
+            let next_forced_token = round.mismatch_target();
+            stats.accepted += n_accepted;
             phase.verify_ms += elapsed_ms(phase_start);
 
-            if let Some(trace) = target_trace {
+            if trace_mtp {
                 eprintln!(
                     "[MTP_TRACE] round={} accepted={} targets=[{}]",
                     stats.rounds,
                     n_accepted,
-                    trace.join(", ")
+                    mtp_round_trace(engine, &draft_tokens, &observed_targets)
                 );
             }
 
@@ -1053,62 +1062,40 @@ fn generate_stream_mtp_with_tokens(
             trace_mtp_sequence_state(engine, "vulkan-fullpath-forward");
             stats.add_target_verify(window.len(), 1);
 
-            let mut n_accepted = 0usize;
-            let mut stopped = false;
-            let mut next_forced_token = None;
-            let mut target_trace = trace_mtp.then(Vec::new);
+            observed_targets.clear();
+            let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..draft_k {
                 let target_token = *window.target_tokens.get(i).ok_or_else(|| {
                     crate::error::LlmError::Forward(format!(
                         "Vulkan fullpath MTP verify missing target token at {i}"
                     ))
                 })?;
-                if let Some(trace) = target_trace.as_mut() {
-                    let draft_token = draft_tokens[i];
-                    trace.push(format!(
-                        "{}:{}{}{}",
-                        i,
-                        engine.tokenizer.decode_token(target_token),
-                        if target_token == draft_token {
-                            "=draft:"
-                        } else {
-                            "!=draft:"
-                        },
-                        engine.tokenizer.decode_token(draft_token),
-                    ));
+                observed_targets.push(target_token);
+                match round.observe(i, draft_tokens[i], target_token, k, params, eos) {
+                    crate::mtp_sampling::RoundAction::Reject
+                    | crate::mtp_sampling::RoundAction::Stop => break,
+                    crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                    crate::mtp_sampling::RoundAction::Emit => {}
                 }
-                if target_token != draft_tokens[i] {
-                    next_forced_token = Some(target_token);
+                generated_tokens.push(draft_tokens[i]);
+                let keep_going =
+                    generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback);
+                if !round.after_emit(keep_going, &mut tokens_remaining) {
                     break;
-                }
-                if params.should_stop(draft_tokens[i], eos) {
-                    stopped = true;
-                    break;
-                }
-
-                n_accepted += 1;
-                stats.accepted += 1;
-                if i < k {
-                    generated_tokens.push(draft_tokens[i]);
-                    if !generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback) {
-                        stopped = true;
-                        tokens_remaining -= 1;
-                        break;
-                    }
-                    tokens_remaining -= 1;
-                    if tokens_remaining == 0 {
-                        break;
-                    }
                 }
             }
+            let n_accepted = round.accepted();
+            let stopped = round.stopped();
+            let next_forced_token = round.mismatch_target();
+            stats.accepted += n_accepted;
             phase.verify_ms += elapsed_ms(phase_start);
 
-            if let Some(trace) = target_trace {
+            if trace_mtp {
                 eprintln!(
                     "[MTP_TRACE] round={} accepted={} targets=[{}]",
                     stats.rounds,
                     n_accepted,
-                    trace.join(", ")
+                    mtp_round_trace(engine, &draft_tokens, &observed_targets)
                 );
             }
 
@@ -1219,66 +1206,40 @@ fn generate_stream_mtp_with_tokens(
             trace_mtp_sequence_state(engine, "batch-forward");
             stats.add_target_verify(window.len(), 1);
 
-            let mut n_accepted = 0usize;
-            let mut stopped = false;
-            let mut next_forced_token = None;
-            let mut target_trace = trace_mtp.then(Vec::new);
-
+            observed_targets.clear();
+            let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..draft_k {
                 let target_token = *window.target_tokens.get(i).ok_or_else(|| {
                     crate::error::LlmError::Forward(format!(
                         "MTP batch verify missing target token at {i}"
                     ))
                 })?;
-                if let Some(trace) = target_trace.as_mut() {
-                    let draft_token = draft_tokens[i];
-                    trace.push(format!(
-                        "{}:{}{}{}",
-                        i,
-                        engine.tokenizer.decode_token(target_token),
-                        if target_token == draft_tokens[i] {
-                            "=draft:"
-                        } else {
-                            "!=draft:"
-                        },
-                        engine.tokenizer.decode_token(draft_token),
-                    ));
+                observed_targets.push(target_token);
+                match round.observe(i, draft_tokens[i], target_token, k, params, eos) {
+                    crate::mtp_sampling::RoundAction::Reject
+                    | crate::mtp_sampling::RoundAction::Stop => break,
+                    crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                    crate::mtp_sampling::RoundAction::Emit => {}
                 }
-
-                if target_token != draft_tokens[i] {
-                    next_forced_token = Some(target_token);
+                generated_tokens.push(draft_tokens[i]);
+                let keep_going =
+                    generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback);
+                if !round.after_emit(keep_going, &mut tokens_remaining) {
                     break;
-                }
-
-                if params.should_stop(draft_tokens[i], eos) {
-                    stopped = true;
-                    break;
-                }
-
-                n_accepted += 1;
-                stats.accepted += 1;
-                if i < k {
-                    generated_tokens.push(draft_tokens[i]);
-                    if !generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback) {
-                        stopped = true;
-                        tokens_remaining -= 1;
-                        break;
-                    }
-
-                    tokens_remaining -= 1;
-                    if tokens_remaining == 0 {
-                        break;
-                    }
                 }
             }
+            let n_accepted = round.accepted();
+            let stopped = round.stopped();
+            let next_forced_token = round.mismatch_target();
+            stats.accepted += n_accepted;
             phase.verify_ms += elapsed_ms(phase_start);
 
-            if let Some(trace) = target_trace {
+            if trace_mtp {
                 eprintln!(
                     "[MTP_TRACE] round={} accepted={} targets=[{}]",
                     stats.rounds,
                     n_accepted,
-                    trace.join(", ")
+                    mtp_round_trace(engine, &draft_tokens, &observed_targets)
                 );
             }
 
@@ -1573,11 +1534,9 @@ fn generate_stream_mtp_with_tokens(
         verify_input.push(current_token);
         verify_input.extend_from_slice(&draft_tokens);
 
-        let mut n_accepted = 0usize;
-        let mut stopped = false;
-        let mut next_forced_token = None;
         let mut observed_hidden_rows = Vec::new();
-        let mut target_trace = trace_mtp.then(Vec::new);
+        observed_targets.clear();
+        let mut round = crate::mtp_sampling::GreedyRound::new();
 
         let phase_start = Instant::now();
         for i in 0..k {
@@ -1588,48 +1547,24 @@ fn generate_stream_mtp_with_tokens(
             trace_mtp_sequence_state(engine, "sequential-forward");
             stats.add_target_verify(1, 1);
             observed_hidden_rows.extend_from_slice(&hidden_rows);
+            observed_targets.push(target_token);
 
-            if let Some(trace) = target_trace.as_mut() {
-                let draft_token = draft_tokens[i];
-                trace.push(format!(
-                    "{}:{}{}{}",
-                    i,
-                    engine.tokenizer.decode_token(target_token),
-                    if target_token == draft_tokens[i] {
-                        "=draft:"
-                    } else {
-                        "!=draft:"
-                    },
-                    engine.tokenizer.decode_token(draft_token),
-                ));
+            match round.observe(i, draft_tokens[i], target_token, k, params, eos) {
+                crate::mtp_sampling::RoundAction::Reject
+                | crate::mtp_sampling::RoundAction::Stop => break,
+                crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                crate::mtp_sampling::RoundAction::Emit => {}
             }
-
-            if target_token != draft_tokens[i] {
-                next_forced_token = Some(target_token);
-                break;
-            }
-
-            if params.should_stop(draft_tokens[i], eos) {
-                stopped = true;
-                break;
-            }
-
             generated_tokens.push(draft_tokens[i]);
-            if !generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback) {
-                stopped = true;
-                n_accepted += 1;
-                stats.accepted += 1;
-                tokens_remaining -= 1;
-                break;
-            }
-
-            n_accepted += 1;
-            stats.accepted += 1;
-            tokens_remaining -= 1;
-            if tokens_remaining == 0 {
+            let keep_going = generated_text.push(&engine.tokenizer, draft_tokens[i], &mut callback);
+            if !round.after_emit(keep_going, &mut tokens_remaining) {
                 break;
             }
         }
+        let n_accepted = round.accepted();
+        let stopped = round.stopped();
+        let mut next_forced_token = round.mismatch_target();
+        stats.accepted += n_accepted;
 
         if !stopped && tokens_remaining > 0 && n_accepted == k {
             let (target_token, hidden_rows) =
@@ -1643,12 +1578,12 @@ fn generate_stream_mtp_with_tokens(
         }
         phase.verify_ms += elapsed_ms(phase_start);
 
-        if let Some(trace) = target_trace {
+        if trace_mtp {
             eprintln!(
                 "[MTP_TRACE] round={} accepted={} targets=[{}]",
                 stats.rounds,
                 n_accepted,
-                trace.join(", ")
+                mtp_round_trace(engine, &draft_tokens, &observed_targets)
             );
         }
 
@@ -1878,11 +1813,7 @@ fn generate_with_dspark(
             }
         }
 
-        let accepted = drafts
-            .iter()
-            .zip(&verify.predictions)
-            .take_while(|(draft, target)| draft == target)
-            .count();
+        let accepted = crate::mtp_sampling::greedy_matched_prefix(drafts, &verify.predictions);
         if crate::runtime::mtp_trace_enabled() {
             let draft_pieces = drafts
                 .iter()
@@ -1900,26 +1831,22 @@ fn generate_with_dspark(
         }
         stats.accepted += accepted;
         let correction = verify.predictions[accepted];
-        let mut emitted = 0usize;
-        let mut stopped = false;
-        for &token in drafts.iter().take(accepted) {
-            if params.should_stop(token, eos) {
-                stopped = true;
-                break;
+        let mut round = crate::mtp_sampling::GreedyRound::new();
+        for i in 0..accepted {
+            match round.observe(i, drafts[i], verify.predictions[i], accepted, params, eos) {
+                crate::mtp_sampling::RoundAction::Reject
+                | crate::mtp_sampling::RoundAction::Stop => break,
+                crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                crate::mtp_sampling::RoundAction::Emit => {}
             }
-            generated_tokens.push(token);
-            emitted += 1;
-            if !generated_text.push(&engine.tokenizer, token, &mut callback) {
-                tokens_remaining = tokens_remaining.saturating_sub(1);
-                stopped = true;
-                break;
-            }
-            tokens_remaining = tokens_remaining.saturating_sub(1);
-            if tokens_remaining == 0 {
-                stopped = true;
+            generated_tokens.push(drafts[i]);
+            let keep_going = generated_text.push(&engine.tokenizer, drafts[i], &mut callback);
+            if !round.after_emit(keep_going, &mut tokens_remaining) {
                 break;
             }
         }
+        let emitted = round.emitted();
+        let stopped = round.stopped();
 
         let verified_tokens = verify_tokens.len();
         let committed_tokens = 1 + emitted;
@@ -2219,18 +2146,17 @@ fn generate_with_external_drafter(
             replace_ignored_eos_targets(engine, params, &mut window, eos)?;
             stats.add_target_verify(window.len(), 1);
 
-            for i in 0..effective_n {
-                let target_tok = *window.target_tokens.get(i).ok_or_else(|| {
-                    crate::error::LlmError::Forward(format!(
-                        "external device verify missing target token at {i}"
-                    ))
-                })?;
-                if target_tok != drafts_used[i] {
-                    target_token = Some(target_tok);
-                    break;
-                }
-                accepted_draft_tokens += 1;
-                stats.accepted += 1;
+            let targets = window.target_tokens.get(..effective_n).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "external device verify missing target token at {}",
+                    window.target_tokens.len()
+                ))
+            })?;
+            accepted_draft_tokens =
+                crate::mtp_sampling::greedy_matched_prefix(drafts_used, targets);
+            stats.accepted += accepted_draft_tokens;
+            if accepted_draft_tokens < effective_n {
+                target_token = Some(targets[accepted_draft_tokens]);
             }
             if accepted_draft_tokens == effective_n {
                 target_token = Some(*window.target_tokens.get(effective_n).ok_or_else(|| {
@@ -2275,23 +2201,25 @@ fn generate_with_external_drafter(
             }
             // target_preds.len() == verify_seq.len() == effective_n + 1
             // target_preds[i] = 모델이 verify_seq[i] 를 소비한 뒤 예측한 다음 토큰
-            let outcome =
-                rnb_mtp::verify::verify_greedy(drafts_used, &target_preds[..effective_n + 1])
-                    .map_err(|e| {
-                        crate::error::LlmError::Forward(format!(
-                            "external drafter verify_greedy: {e:?}"
-                        ))
-                    })?;
+            if target_preds.len() != effective_n + 1 {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "external batch verify returned {} predictions for {} draft tokens",
+                    target_preds.len(),
+                    effective_n
+                )));
+            }
+            accepted_draft_tokens =
+                crate::mtp_sampling::greedy_matched_prefix(drafts_used, &target_preds);
 
-            let new_kv_position = position_before_verify + outcome.accepted_draft_tokens as u32 + 1;
+            let new_kv_position = position_before_verify + accepted_draft_tokens as u32 + 1;
             engine.commit_kv_through(new_kv_position)?;
             external_batch_output_hidden_rows = Some(output_hidden_rows);
 
-            accepted_draft_tokens = outcome.accepted_draft_tokens;
-            stats.accepted += outcome.accepted_draft_tokens;
+            stats.accepted += accepted_draft_tokens;
             stats.add_target_verify(1, 1);
-            target_token = Some(outcome.target_token);
+            target_token = Some(target_preds[accepted_draft_tokens]);
         } else {
+            let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..effective_n {
                 let (target_tok, _) =
                     engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[i])?;
@@ -2303,29 +2231,23 @@ fn generate_with_external_drafter(
                     eos,
                 )?;
                 stats.add_target_verify(1, 1);
-                if target_tok != drafts_used[i] {
-                    target_token = Some(target_tok);
-                    break;
+                match round.observe(i, drafts_used[i], target_tok, effective_n, params, eos) {
+                    crate::mtp_sampling::RoundAction::Reject
+                    | crate::mtp_sampling::RoundAction::Stop => break,
+                    crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                    crate::mtp_sampling::RoundAction::Emit => {}
                 }
-                accepted_draft_tokens += 1;
-                stats.accepted += 1;
-                let tok = drafts_used[i];
-                if params.should_stop(tok, eos) {
-                    stopped = true;
-                    break;
-                }
-                generated_tokens.push(tok);
-                if !generated_text.push(&engine.tokenizer, tok, &mut callback) {
-                    stopped = true;
-                    tokens_remaining -= 1;
-                    break;
-                }
-                tokens_remaining -= 1;
-                if tokens_remaining == 0 {
-                    stopped = true;
+                generated_tokens.push(drafts_used[i]);
+                let keep_going =
+                    generated_text.push(&engine.tokenizer, drafts_used[i], &mut callback);
+                if !round.after_emit(keep_going, &mut tokens_remaining) {
                     break;
                 }
             }
+            accepted_draft_tokens = round.accepted();
+            stats.accepted += accepted_draft_tokens;
+            target_token = round.mismatch_target();
+            stopped = round.stopped() || tokens_remaining == 0;
 
             if !stopped && tokens_remaining > 0 && accepted_draft_tokens == effective_n {
                 let (target_tok, _) =
@@ -2347,25 +2269,23 @@ fn generate_with_external_drafter(
 
         if external_device_verify || external_batch_verify {
             // 5f. accept 된 draft 토큰 emit.
+            let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..accepted_draft_tokens {
                 let tok = drafts_used[i];
-                if params.should_stop(tok, eos) {
-                    stopped = true;
-                    break;
+                match round.observe(i, tok, tok, accepted_draft_tokens, params, eos) {
+                    crate::mtp_sampling::RoundAction::Reject
+                    | crate::mtp_sampling::RoundAction::Stop => break,
+                    crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                    crate::mtp_sampling::RoundAction::Emit => {}
                 }
                 generated_tokens.push(tok);
-                emitted_draft_tokens += 1;
-                if !generated_text.push(&engine.tokenizer, tok, &mut callback) {
-                    stopped = true;
-                    tokens_remaining -= 1;
-                    break;
-                }
-                tokens_remaining -= 1;
-                if tokens_remaining == 0 {
-                    stopped = true;
+                let keep_going = generated_text.push(&engine.tokenizer, tok, &mut callback);
+                if !round.after_emit(keep_going, &mut tokens_remaining) {
                     break;
                 }
             }
+            emitted_draft_tokens = round.emitted();
+            stopped = round.stopped() || tokens_remaining == 0;
         }
 
         // 5g. target correction token emit (accept 가 끝났고 아직 여유 있을 때).
