@@ -723,6 +723,57 @@ impl Engine {
         Ok(Some((window, commit)))
     }
 
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    pub(crate) fn prepare_batched_verify_last_hidden(
+        &self,
+        hidden_rows: &[f32],
+        committed: usize,
+    ) -> crate::error::Result<Vec<f32>> {
+        if committed == 0 {
+            return Err(crate::error::LlmError::Forward(
+                "batched verify must commit at least one hidden row".to_string(),
+            ));
+        }
+        let hidden_dim = self.metadata.hidden_dim;
+        let end = committed.checked_mul(hidden_dim).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "batched verify committed hidden row length overflow".to_string(),
+            )
+        })?;
+        let start = end.checked_sub(hidden_dim).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "batched verify committed hidden row offset overflow".to_string(),
+            )
+        })?;
+        let row = hidden_rows.get(start..end).ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "batched verify hidden rows too short: committed={committed}, values={}, hidden_dim={hidden_dim}",
+                hidden_rows.len()
+            ))
+        })?;
+        let weights = self.weights.as_ref().ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "batched verify requires loaded output norm weights".to_string(),
+            )
+        })?;
+        let output_norm = kernels::tensor_as_f32_slice(&weights.output_norm);
+        if output_norm.len() != hidden_dim {
+            return Err(crate::error::LlmError::Forward(format!(
+                "batched verify output norm length mismatch: got {}, expected {hidden_dim}",
+                output_norm.len()
+            )));
+        }
+        let mut normalized = vec![0.0; hidden_dim];
+        apply_model_norm_into(
+            row,
+            output_norm,
+            self.metadata.norm_eps,
+            &mut normalized,
+            self.architecture,
+        );
+        Ok(normalized)
+    }
+
     /// milestone 5(MTP): 배치 verify 의 accept-n 커밋. `committed`(=1+n_accepted) lane 만큼 host
     /// state 를 전진 — attn window K/V 앞 committed slot 을 host kv_cache append, GDN prefix-committed
     /// conv/delta 를 ssm_state write, current_len=base_pos+committed. GDN prefix state 는 forward 가
@@ -732,11 +783,19 @@ impl Engine {
         &mut self,
         commit: &BatchedVerifyCommit,
         committed: usize,
+        last_hidden: Vec<f32>,
     ) -> crate::error::Result<()> {
         if committed == 0 || committed > commit.batch {
             return Err(crate::error::LlmError::Forward(format!(
                 "invalid batched verify commit {committed}/{}",
                 commit.batch
+            )));
+        }
+        if last_hidden.len() != self.metadata.hidden_dim {
+            return Err(crate::error::LlmError::Forward(format!(
+                "batched verify last hidden length mismatch: got {}, expected {}",
+                last_hidden.len(),
+                self.metadata.hidden_dim
             )));
         }
         if self.sequence_cursor.is_some() {
@@ -844,6 +903,7 @@ impl Engine {
             }
         }
         self.kv_cache.set_len(target_len);
+        self.last_layer_hidden_cached = last_hidden;
         Ok(())
     }
 
@@ -2313,11 +2373,35 @@ mod tests {
         };
 
         let error = engine
-            .commit_batched_verify(&commit, 2)
+            .commit_batched_verify(&commit, 2, vec![0.0; engine.metadata.hidden_dim])
             .expect_err("short K/V payload must fail before target mutation");
 
         assert!(error.to_string().contains("payload is short"));
         assert_eq!(engine.kv_cache.current_len(), 0);
+    }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[test]
+    fn batched_verify_commit_updates_target_last_hidden_with_kv() {
+        let mut engine = crate::engine::tests::make_mock_engine(8);
+        let hidden_dim = engine.metadata.hidden_dim;
+        let kv_dim = engine.metadata.num_kv_heads * engine.metadata.head_dim;
+        let commit = super::BatchedVerifyCommit {
+            base_pos: 0,
+            batch: 2,
+            layer_indices: vec![0],
+            gdn_prefix: vec![vec![None], vec![None]],
+            out_attn_kv: vec![Some((vec![0; 2 * kv_dim], vec![0; 2 * kv_dim]))],
+            kv_dims: vec![Some(kv_dim)],
+        };
+        let last_hidden = (0..hidden_dim).map(|i| i as f32 + 1.0).collect::<Vec<_>>();
+
+        engine
+            .commit_batched_verify(&commit, 2, last_hidden.clone())
+            .expect("valid batched verify commit");
+
+        assert_eq!(engine.kv_cache.current_len(), 2);
+        assert_eq!(engine.last_layer_hidden(), last_hidden);
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

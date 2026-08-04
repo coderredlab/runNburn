@@ -996,13 +996,15 @@ fn generate_stream_mtp_with_tokens(
             // Target와 drafter의 durable state는 종료 라운드에서도 같은 committed prefix를
             // 가리켜야 한다. Drafter retain을 먼저 검증해 target commit 뒤 실패할 여지를 없앤다.
             let committed_hidden = window.mtp_hidden_prefix_rows(committed)?;
+            let target_last_hidden =
+                engine.prepare_batched_verify_last_hidden(committed_hidden, committed)?;
             let draft_retain = engine.mtp_prepare_draft_retain_after_spec(
                 mtp_checkpoint.as_ref(),
                 committed,
                 draft_k,
                 committed_hidden,
             )?;
-            engine.commit_batched_verify(&commit, committed)?;
+            engine.commit_batched_verify(&commit, committed, target_last_hidden)?;
             engine.mtp_apply_draft_retain_after_spec(draft_retain, committed_hidden);
             phase.retain_ms += elapsed_ms(phase_start);
 
