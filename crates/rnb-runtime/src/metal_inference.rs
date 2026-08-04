@@ -1243,6 +1243,69 @@ pub fn metal_deepseek4_q8_multi_gemv_if_supported(
     })))
 }
 
+pub fn metal_deepseek4_q8_output_chain_if_supported(
+    projection_quants: &[GGMLType],
+    projection_weights: &[&[u8]],
+    inputs: &[&[f32]],
+    projection_layout: &[(usize, usize)],
+    final_quant: GGMLType,
+    final_weight: &[u8],
+    final_layout: (usize, usize),
+) -> Result<Option<Vec<f32>>> {
+    if !metal_deepseek4_attention_decode_requested()
+        || env_falsey("RNB_METAL_DEEPSEEK4_ATTN_OUTPUT_CHAIN")
+        || projection_quants.len() != projection_layout.len()
+        || projection_weights.len() != projection_layout.len()
+        || inputs.len() != projection_layout.len()
+        || projection_layout.is_empty()
+    {
+        return Ok(None);
+    }
+    for (((&quant, raw), input), &(rows, cols)) in projection_quants
+        .iter()
+        .zip(projection_weights)
+        .zip(inputs)
+        .zip(projection_layout)
+    {
+        let expected = rows.saturating_mul(cols / 32).saturating_mul(34);
+        if quant != GGMLType::Q8_0
+            || rows == 0
+            || cols == 0
+            || cols % 32 != 0
+            || input.len() != cols
+            || raw.len() < expected
+        {
+            return Ok(None);
+        }
+    }
+    let (final_rows, final_cols) = final_layout;
+    let expected_final = final_rows
+        .saturating_mul(final_cols / 32)
+        .saturating_mul(34);
+    if final_quant != GGMLType::Q8_0
+        || final_rows == 0
+        || final_cols == 0
+        || final_cols % 32 != 0
+        || projection_layout
+            .iter()
+            .map(|&(rows, _)| rows)
+            .sum::<usize>()
+            != final_cols
+        || final_weight.len() < expected_final
+    {
+        return Ok(None);
+    }
+    Ok(Some(METAL.with(|backend| {
+        backend.deepseek4_q8_output_chain(
+            projection_weights,
+            inputs,
+            projection_layout,
+            final_weight,
+            final_layout,
+        )
+    })))
+}
+
 pub fn metal_drafter_q8_0_multi_gemv_if_supported(
     weights: &[&[u8]],
     inputs: &[&[f32]],

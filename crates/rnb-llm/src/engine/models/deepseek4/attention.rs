@@ -3,7 +3,8 @@ use crate::engine::backend_runtime::{
     metal_deepseek4_attention_prefill_index_batch_requested,
     metal_deepseek4_attention_prefill_output_batch_requested,
     metal_deepseek4_prefill_q8_multi_gemm_if_supported, metal_deepseek4_q8_multi_gemv_if_supported,
-    metal_deepseek4_q_front_if_supported, metal_prefill_gdn_proj_into_if_supported,
+    metal_deepseek4_q8_output_chain_if_supported, metal_deepseek4_q_front_if_supported,
+    metal_prefill_gdn_proj_into_if_supported,
 };
 use crate::engine::dense_dispatch::gemv_f32;
 use crate::engine::quantized_weight_types::QuantizedWeight;
@@ -16,6 +17,7 @@ use super::math::{
     rms_unit_inplace, tensor_f32,
 };
 use super::state::{AttentionState, CompressorState};
+
 use super::weights::{AttentionWeights, CompressorWeights, DeepSeek4Config, IndexerWeights};
 
 pub(super) fn forward_attention(
@@ -531,6 +533,13 @@ pub(super) fn project_attention_output(
             &attention_output[start..start + group_input_len]
         })
         .collect::<Vec<_>>();
+    if let Some(output) = metal_deepseek4_q8_output_chain_if_supported(
+        &group_weights,
+        &group_inputs,
+        &weights.output_b,
+    )? {
+        return Ok(output);
+    }
     if let Some(group_outputs) =
         metal_deepseek4_q8_multi_gemv_if_supported(&group_weights, &group_inputs)?
     {

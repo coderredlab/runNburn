@@ -253,6 +253,143 @@ impl Q8MultiGemvCarrier {
     }
 }
 
+pub(crate) struct Q8OutputChainCarrier {
+    projection_layout: Vec<(usize, usize)>,
+    input_offsets: Vec<usize>,
+    intermediate_offsets: Vec<usize>,
+    input: Retained<ProtocolObject<dyn MTLBuffer>>,
+    intermediate: Retained<ProtocolObject<dyn MTLBuffer>>,
+    final_output: Retained<ProtocolObject<dyn MTLBuffer>>,
+    projection_n: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    projection_k: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    final_rows: usize,
+    final_n: Retained<ProtocolObject<dyn MTLBuffer>>,
+    final_k: Retained<ProtocolObject<dyn MTLBuffer>>,
+    zero_offset: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+impl Q8OutputChainCarrier {
+    pub(crate) fn new(
+        ctx: &compute::MetalContext,
+        projection_layout: &[(usize, usize)],
+        final_layout: (usize, usize),
+    ) -> Self {
+        let mut input_elements = 0usize;
+        let mut intermediate_elements = 0usize;
+        let mut input_offsets = Vec::with_capacity(projection_layout.len());
+        let mut intermediate_offsets = Vec::with_capacity(projection_layout.len());
+        let mut projection_n = Vec::with_capacity(projection_layout.len());
+        let mut projection_k = Vec::with_capacity(projection_layout.len());
+        for &(rows, cols) in projection_layout {
+            input_offsets.push(input_elements * std::mem::size_of::<f32>());
+            intermediate_offsets.push(intermediate_elements * std::mem::size_of::<f32>());
+            input_elements += cols;
+            intermediate_elements += rows;
+            projection_n.push(ffn_chain::u32_buf(ctx, rows as u32));
+            projection_k.push(ffn_chain::u32_buf(ctx, cols as u32));
+        }
+        let (final_rows, final_cols) = final_layout;
+        assert_eq!(
+            intermediate_elements, final_cols,
+            "DeepSeek4 output chain intermediate length"
+        );
+        Self {
+            projection_layout: projection_layout.to_vec(),
+            input_offsets,
+            intermediate_offsets,
+            input: ffn_chain::empty_f32_buf(ctx, input_elements),
+            intermediate: ffn_chain::private_f32_buf(ctx, intermediate_elements),
+            final_output: ffn_chain::empty_f32_buf(ctx, final_rows),
+            projection_n,
+            projection_k,
+            final_rows,
+            final_n: ffn_chain::u32_buf(ctx, final_rows as u32),
+            final_k: ffn_chain::u32_buf(ctx, final_cols as u32),
+            zero_offset: ffn_chain::u32_buf(ctx, 0),
+        }
+    }
+
+    fn upload_inputs(&self, inputs: &[&[f32]]) {
+        for ((&(_, cols), &offset), input) in self
+            .projection_layout
+            .iter()
+            .zip(&self.input_offsets)
+            .zip(inputs)
+        {
+            assert_eq!(input.len(), cols);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr(),
+                    self.input.contents().as_ptr().add(offset) as *mut f32,
+                    cols,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn dispatch(
+        &self,
+        ctx: &compute::MetalContext,
+        projection_weights: &[(Retained<ProtocolObject<dyn MTLBuffer>>, usize)],
+        final_weight: &(Retained<ProtocolObject<dyn MTLBuffer>>, usize),
+        inputs: &[&[f32]],
+    ) -> Vec<f32> {
+        assert_eq!(projection_weights.len(), self.projection_layout.len());
+        assert_eq!(inputs.len(), self.projection_layout.len());
+        self.upload_inputs(inputs);
+
+        let command = ctx.queue.commandBuffer().expect("command buffer");
+        let encoder = command.computeCommandEncoder().expect("compute encoder");
+        for (index, (((weight, &input_offset), &output_offset), &(rows, _))) in projection_weights
+            .iter()
+            .zip(&self.input_offsets)
+            .zip(&self.intermediate_offsets)
+            .zip(&self.projection_layout)
+            .enumerate()
+        {
+            compute::encode_gemv_q8_0_at(
+                ctx,
+                &encoder,
+                &weight.0,
+                weight.1,
+                &self.input,
+                input_offset,
+                &self.intermediate,
+                output_offset,
+                &self.projection_n[index],
+                &self.projection_k[index],
+                &self.zero_offset,
+                rows,
+            );
+        }
+        compute::encode_gemv_q8_0_at(
+            ctx,
+            &encoder,
+            &final_weight.0,
+            final_weight.1,
+            &self.intermediate,
+            0,
+            &self.final_output,
+            0,
+            &self.final_n,
+            &self.final_k,
+            &self.zero_offset,
+            self.final_rows,
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+
+        unsafe {
+            std::slice::from_raw_parts(
+                self.final_output.contents().as_ptr() as *const f32,
+                self.final_rows,
+            )
+            .to_vec()
+        }
+    }
+}
+
 pub(crate) struct PrefillQ8MultiCarrier {
     capacity_seq_len: usize,
     hidden_dim: usize,
@@ -448,6 +585,57 @@ impl MetalBackend {
         carrier.dispatch(ctx, &wrapped, inputs)
     }
 
+    pub fn deepseek4_q8_output_chain(
+        &self,
+        projection_weights: &[&[u8]],
+        inputs: &[&[f32]],
+        projection_layout: &[(usize, usize)],
+        final_weight: &[u8],
+        final_layout: (usize, usize),
+    ) -> Vec<f32> {
+        let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
+        assert_eq!(projection_weights.len(), projection_layout.len());
+        assert_eq!(inputs.len(), projection_layout.len());
+        assert_eq!(
+            projection_layout
+                .iter()
+                .map(|&(rows, _)| rows)
+                .sum::<usize>(),
+            final_layout.1
+        );
+        self.ensure_weight_residency(ctx);
+        let residency_enabled = self.weight_residency_enabled();
+        let wrap = |raw: &[u8]| {
+            let key = resident_key(raw);
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
+                .entry(key)
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
+            if residency_enabled {
+                if let Some(lru) = self.weight_residency.borrow_mut().as_mut() {
+                    lru.touch(key, &entry.0);
+                }
+            }
+            (entry.0.clone(), entry.1 as usize)
+        };
+        let projection_weights = projection_weights
+            .iter()
+            .map(|&raw| wrap(raw))
+            .collect::<Vec<_>>();
+        let final_weight = wrap(final_weight);
+        if residency_enabled {
+            if let Some(lru) = self.weight_residency.borrow_mut().as_mut() {
+                lru.commit_if_dirty();
+            }
+        }
+        let key = (projection_layout.to_vec(), final_layout);
+        let mut carriers = self.deepseek4_q8_output_chain_carriers.borrow_mut();
+        let carrier = carriers
+            .entry(key)
+            .or_insert_with(|| Q8OutputChainCarrier::new(ctx, projection_layout, final_layout));
+        carrier.dispatch(ctx, &projection_weights, &final_weight, inputs)
+    }
+
     pub fn deepseek4_prefill_q8_multi_gemm(
         &self,
         weights: &[&[u8]],
@@ -585,6 +773,79 @@ mod tests {
             max_output_error < 1.0e-4,
             "max output error {max_output_error}"
         );
+    }
+
+    #[test]
+    fn q8_output_chain_keeps_low_rank_projection_private() {
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            return;
+        }
+
+        let projection_layout = [(32, 32), (32, 32)];
+        let final_layout = (37, 64);
+        let projection_a = crate::tests_fixture::scaled_q8_0_matrix(32, 32, 17);
+        let projection_b = crate::tests_fixture::scaled_q8_0_matrix(32, 32, 23);
+        let final_weight =
+            crate::tests_fixture::scaled_q8_0_matrix(final_layout.0, final_layout.1, 31);
+        let projection_a =
+            rnb_core::tensor::Tensor::from_slice(&projection_a, &[projection_a.len()]);
+        let projection_b =
+            rnb_core::tensor::Tensor::from_slice(&projection_b, &[projection_b.len()]);
+        let final_weight =
+            rnb_core::tensor::Tensor::from_slice(&final_weight, &[final_weight.len()]);
+        projection_a.register_host_storage();
+        projection_b.register_host_storage();
+        final_weight.register_host_storage();
+        let input_a = (0..32)
+            .map(|index| ((index * 13 % 47) as f32 - 23.0) / 19.0)
+            .collect::<Vec<_>>();
+        let input_b = (0..32)
+            .map(|index| ((index * 29 % 53) as f32 - 26.0) / 23.0)
+            .collect::<Vec<_>>();
+        let projection_bytes = [
+            projection_a.as_bytes().expect("projection A bytes"),
+            projection_b.as_bytes().expect("projection B bytes"),
+        ];
+        let inputs = [input_a.as_slice(), input_b.as_slice()];
+
+        let actual = backend.deepseek4_q8_output_chain(
+            &projection_bytes,
+            &inputs,
+            &projection_layout,
+            final_weight.as_bytes().expect("final weight bytes"),
+            final_layout,
+        );
+
+        let project = |raw: &[u8], input: &[f32]| {
+            raw.chunks_exact(34)
+                .map(|row| {
+                    crate::tests_fixture::q8_0_dequant(row)
+                        .iter()
+                        .zip(input)
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut intermediate = project(
+            projection_a.as_bytes().expect("projection A bytes"),
+            &input_a,
+        );
+        intermediate.extend(project(
+            projection_b.as_bytes().expect("projection B bytes"),
+            &input_b,
+        ));
+        let expected = project(
+            final_weight.as_bytes().expect("final weight bytes"),
+            &intermediate,
+        );
+        let max_error = actual
+            .iter()
+            .zip(expected)
+            .map(|(&actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error < 1.0e-3, "max output-chain error {max_error}");
     }
 
     #[test]

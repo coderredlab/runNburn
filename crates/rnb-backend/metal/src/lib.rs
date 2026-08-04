@@ -1587,6 +1587,10 @@ pub struct MetalBackend {
     /// DeepSeek4 decode phase layout → fused Q8_0 multi-projection carrier.
     deepseek4_q8_multi_carriers:
         RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::Q8MultiGemvCarrier>>,
+    /// DeepSeek4 grouped output-A projections → output-B device-resident carrier.
+    deepseek4_q8_output_chain_carriers: RefCell<
+        HashMap<(Vec<(usize, usize)>, (usize, usize)), deepseek4_decode::Q8OutputChainCarrier>,
+    >,
     /// DeepSeek4 prefill projection layout → largest reusable input/output carrier.
     deepseek4_prefill_q8_multi_carriers:
         RefCell<HashMap<Vec<(usize, usize)>, deepseek4_decode::PrefillQ8MultiCarrier>>,
@@ -1906,6 +1910,7 @@ impl MetalBackend {
                 glm_mla_carriers: RefCell::new(HashMap::new()),
                 deepseek4_q_front_carriers: RefCell::new(HashMap::new()),
                 deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
+                deepseek4_q8_output_chain_carriers: RefCell::new(HashMap::new()),
                 deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
                 weight_residency: RefCell::new(None),
                 ffn_carriers: RefCell::new(HashMap::new()),
@@ -2070,6 +2075,7 @@ impl MetalBackend {
             glm_mla_carriers: RefCell::new(HashMap::new()),
             deepseek4_q_front_carriers: RefCell::new(HashMap::new()),
             deepseek4_q8_multi_carriers: RefCell::new(HashMap::new()),
+            deepseek4_q8_output_chain_carriers: RefCell::new(HashMap::new()),
             deepseek4_prefill_q8_multi_carriers: RefCell::new(HashMap::new()),
             weight_residency: RefCell::new(None),
             ffn_carriers: RefCell::new(HashMap::new()),

@@ -3096,6 +3096,49 @@ pub(in crate::engine) fn metal_deepseek4_q8_multi_gemv_if_supported(
         Ok(None)
     }
 }
+
+pub(in crate::engine) fn metal_deepseek4_q8_output_chain_if_supported(
+    projection_weights: &[&QuantizedWeight],
+    inputs: &[&[f32]],
+    final_weight: &QuantizedWeight,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(projection_raw) = projection_weights
+            .iter()
+            .map(|weight| weight.data.as_bytes())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(final_raw) = final_weight.data.as_bytes() else {
+            return Ok(None);
+        };
+        let projection_quants = projection_weights
+            .iter()
+            .map(|weight| weight.ggml_type)
+            .collect::<Vec<_>>();
+        let projection_layout = projection_weights
+            .iter()
+            .map(|weight| (weight.rows, weight.cols))
+            .collect::<Vec<_>>();
+        return metal_runtime::metal_deepseek4_q8_output_chain_if_supported(
+            &projection_quants,
+            &projection_raw,
+            inputs,
+            &projection_layout,
+            final_weight.ggml_type,
+            final_raw,
+            (final_weight.rows, final_weight.cols),
+        )
+        .map_err(|err| crate::error::LlmError::Forward(err.to_string()));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (projection_weights, inputs, final_weight);
+        Ok(None)
+    }
+}
 pub(in crate::engine) fn metal_deepseek4_prefill_q8_multi_gemm_if_supported(
     weights: &[&QuantizedWeight],
     input: &[f32],
