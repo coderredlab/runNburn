@@ -176,6 +176,18 @@ fn mtp_fast_retain_prefix_tokens(
         .then(|| drafted_tokens.min(committed_tokens))
 }
 
+fn external_batch_committed_verify_tokens(
+    accepted_draft_tokens: usize,
+    emitted_draft_tokens: usize,
+    ending: bool,
+) -> usize {
+    1 + if ending {
+        emitted_draft_tokens
+    } else {
+        accepted_draft_tokens
+    }
+}
+
 fn mtp_batch_verify_default_enabled(architecture: rnb_loader::Architecture) -> bool {
     // pm116: GLM Metal batch verify 채택 — 기본 ON (`RNB_MTP_BATCH_VERIFY=0` opt-out).
     // verify window 를 Metal prefill 배치 경로로 태워 expert I/O 를 amortize 한다.
@@ -2197,6 +2209,7 @@ fn generate_with_external_drafter(
         let mut accepted_draft_tokens = 0usize;
         let mut target_token = None;
         let mut emitted_draft_tokens = 0usize;
+        let mut external_batch_output_hidden_rows = None;
 
         if external_device_verify {
             let verify_request =
@@ -2272,10 +2285,7 @@ fn generate_with_external_drafter(
 
             let new_kv_position = position_before_verify + outcome.accepted_draft_tokens as u32 + 1;
             engine.commit_kv_through(new_kv_position)?;
-            engine.restore_batch_verify_last_hidden(
-                &output_hidden_rows,
-                outcome.accepted_draft_tokens + 1,
-            )?;
+            external_batch_output_hidden_rows = Some(output_hidden_rows);
 
             accepted_draft_tokens = outcome.accepted_draft_tokens;
             stats.accepted += outcome.accepted_draft_tokens;
@@ -2377,13 +2387,33 @@ fn generate_with_external_drafter(
             }
         }
 
-        if stopped || tokens_remaining == 0 {
-            if external_batch_verify {
+        let ending = stopped || tokens_remaining == 0;
+        if let Some(output_hidden_rows) = external_batch_output_hidden_rows.as_deref() {
+            let committed_verify_tokens = external_batch_committed_verify_tokens(
+                accepted_draft_tokens,
+                emitted_draft_tokens,
+                ending,
+            );
+            if ending {
+                let committed_verify_tokens_u32 =
+                    u32::try_from(committed_verify_tokens).map_err(|_| {
+                        crate::error::LlmError::Forward(
+                            "external batch verify committed token count exceeds u32".to_string(),
+                        )
+                    })?;
                 let committed_kv_position = position_before_verify
-                    .saturating_add(1)
-                    .saturating_add(emitted_draft_tokens as u32);
+                    .checked_add(committed_verify_tokens_u32)
+                    .ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "external batch verify committed position overflow".to_string(),
+                        )
+                    })?;
                 engine.commit_kv_through(committed_kv_position)?;
             }
+            engine.restore_batch_verify_last_hidden(output_hidden_rows, committed_verify_tokens)?;
+        }
+
+        if ending {
             let committed_target_tokens = engine
                 .kv_cache
                 .current_len()
@@ -2981,6 +3011,13 @@ mod tests {
             mtp_hidden_prefix_rows(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 2).unwrap(),
             &[1.0, 2.0, 3.0, 4.0]
         );
+    }
+
+    #[test]
+    fn external_batch_terminal_commit_tracks_emitted_prefix() {
+        assert_eq!(external_batch_committed_verify_tokens(3, 1, true), 2);
+        assert_eq!(external_batch_committed_verify_tokens(3, 3, true), 4);
+        assert_eq!(external_batch_committed_verify_tokens(3, 1, false), 4);
     }
 
     #[test]
