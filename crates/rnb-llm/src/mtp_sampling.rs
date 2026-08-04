@@ -35,7 +35,6 @@ pub(crate) enum RoundAction {
 pub(crate) struct GreedyRound {
     accepted: usize,
     emitted: usize,
-    examined: usize,
     stopped: bool,
     mismatch_target: Option<u32>,
 }
@@ -58,8 +57,6 @@ impl GreedyRound {
         params: &GenerateParams,
         eos: u32,
     ) -> RoundAction {
-        self.examined += 1;
-
         if target_token != draft_token {
             self.mismatch_target = Some(target_token);
             return RoundAction::Reject;
@@ -114,11 +111,6 @@ impl GreedyRound {
     /// 첫 불일치 위치의 target 토큰. 다음 round의 current token이 된다.
     pub(crate) fn mismatch_target(&self) -> Option<u32> {
         self.mismatch_target
-    }
-
-    /// target 예측을 실제로 조회한 횟수.
-    pub(crate) fn examined(&self) -> usize {
-        self.examined
     }
 }
 
@@ -280,7 +272,6 @@ mod tests {
         assert_eq!(h.round.accepted(), 1);
         assert_eq!(h.round.emitted(), 1);
         assert_eq!(h.round.mismatch_target(), Some(77));
-        assert_eq!(h.round.examined(), 2);
         assert!(!h.round.stopped());
         assert_eq!(h.emitted, vec![10]);
         assert_eq!(h.remaining, 7);
