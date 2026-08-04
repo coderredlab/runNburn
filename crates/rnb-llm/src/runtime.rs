@@ -71,6 +71,10 @@ pub(crate) fn mtp_accept_probe_enabled() -> bool {
     policy::mtp_accept_probe_enabled()
 }
 
+pub(crate) fn mtp_device_verify_trace_enabled() -> bool {
+    policy::mtp_device_verify_trace_enabled()
+}
+
 pub(crate) fn mtp_accept_probe_temperature() -> Option<f32> {
     policy::mtp_accept_probe_temperature()
 }

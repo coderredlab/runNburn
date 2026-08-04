@@ -723,6 +723,7 @@ impl Engine {
                 apply_embedding_scale_inplace(&mut probe, &self.metadata, self.architecture);
                 probe[0]
             };
+            let graph_start = std::time::Instant::now();
             let mut layer_graph = build_mtp_device_verify_layer_graph(
                 weights,
                 &self.metadata,
@@ -730,6 +731,7 @@ impl Engine {
                 &mut self.kv_cache,
                 gemma_ple_base.as_ref(),
             )?;
+            let graph_ms = graph_start.elapsed().as_secs_f64() * 1000.0;
             let (rope_dim, rope_theta, proportional_rope) =
                 resolve_rope_params(&self.metadata, self.architecture, 0, self.metadata.head_dim);
             if proportional_rope {
@@ -779,6 +781,7 @@ impl Engine {
                 output_norm,
                 norm_eps: self.metadata.norm_eps,
             };
+            let kernel_start = std::time::Instant::now();
             let result =
                 crate::engine::cuda_runtime::qwen35_mtp_device_verify_window(device_request)
                     .map_err(|err| {
@@ -787,6 +790,7 @@ impl Engine {
                             self.architecture
                         ))
                     })?;
+            let kernel_ms = kernel_start.elapsed().as_secs_f64() * 1000.0;
             let result = crate::engine::verify_window::VerifyWindowResult::from_device_result_with_state_payload(
                 result.target_tokens,
                 result.mtp_hidden_rows,
@@ -795,8 +799,16 @@ impl Engine {
                 result.ssm_final_states,
                 result.attention_kv_states,
             )?;
+            let commit_start = std::time::Instant::now();
             if commit_final_states {
                 self.commit_device_verify_window_final_states(pos_start, &result)?;
+            }
+            if crate::runtime::mtp_device_verify_trace_enabled() {
+                eprintln!(
+                    "[MTP_DEVICE_VERIFY] positions={} graph={graph_ms:.1}ms kernel={kernel_ms:.1}ms commit={:.1}ms",
+                    verify_tokens.len(),
+                    commit_start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             return Ok(result);
         }

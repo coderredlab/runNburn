@@ -166,6 +166,12 @@ pub fn mtp_accept_probe_enabled() -> bool {
     env_flag("RNB_MTP_ACCEPT_PROBE")
 }
 
+/// `RNB_MTP_DEVICE_VERIFY_TRACE=1`이면 device verify round마다 layer graph 빌드,
+/// 커널 실행, state commit 시간을 분해해 출력한다.
+pub fn mtp_device_verify_trace_enabled() -> bool {
+    env_flag("RNB_MTP_DEVICE_VERIFY_TRACE")
+}
+
 /// accept probe가 p와 q에 적용할 가상 sampling plan.
 ///
 /// 제품 MTP 진입은 greedy로 제한되어 있어 `temperature>0` 경로를 실제로 생성하며
