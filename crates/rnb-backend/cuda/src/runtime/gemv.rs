@@ -1810,19 +1810,49 @@ impl CudaState {
             ));
         }
 
-        let weights_dev = self.compute_weights_ptr(std::mem::size_of_val(weights))?;
+        // Model-owned F32 weights (DeepSeek4 router, Hyper-Connection mixers)
+        // do not change between tokens, so re-uploading them per call spends
+        // hundreds of megabytes of PCIe traffic per token on matrices the
+        // device already holds. Route those through the resident cache and
+        // upload only the activation.
+        //
+        // The residency key falls back to hashing the full buffer when a slice
+        // is not backed by registered host storage, which would cost more than
+        // the copy it saves, so scratch buffers keep the direct upload.
+        let weights_bytes = unsafe {
+            std::slice::from_raw_parts(
+                weights.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(weights),
+            )
+        };
+        let resident_weights = crate::tuning::f32_gemm_resident_weights_enabled()
+            && rnb_core::tensor::host_storage_identity(weights_bytes).is_some();
+        // Scratch first: growing these named buffers can hit the OOM retry,
+        // which reclaims residency and frees non-pinned resident entries. A
+        // weight pointer resolved before that would be stale by the time the
+        // GEMM runs, which is the cu27 failure mode.
         let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
         let output_len = seq_len * rows;
         let output_bytes = output_len * std::mem::size_of::<f32>();
         let output_dev = self.compute_output_ptr(output_bytes)?;
+        // Force the lazy cuBLAS handle up front too, so that no allocation of
+        // any kind sits between resolving the weight and using it.
+        self.cublas_state_mut()?;
+        let weights_dev = if resident_weights {
+            self.resident_q4k_weights_ptr(weights_bytes)?
+        } else {
+            self.compute_weights_ptr(std::mem::size_of_val(weights))?
+        };
         let h2d_t0 = trace.then(std::time::Instant::now);
         unsafe {
-            self.api.memcpy_htod_async(
-                weights_dev,
-                weights.as_ptr().cast::<libc::c_void>(),
-                std::mem::size_of_val(weights),
-                self.stream,
-            )?;
+            if !resident_weights {
+                self.api.memcpy_htod_async(
+                    weights_dev,
+                    weights.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(weights),
+                    self.stream,
+                )?;
+            }
             self.api.memcpy_htod_async(
                 input_dev,
                 input.as_ptr().cast::<libc::c_void>(),
@@ -1877,7 +1907,7 @@ impl CudaState {
         self.stream_synchronize()?;
         if let Some(t0) = dtoh_t0 {
             eprintln!(
-                "[cuda-f32-gemm] rows={} cols={} seq={} weights_mb={:.1} input_mb={:.1} output_mb={:.1} h2d_ms={:.1} gemm_ms={:.1} dtoh_ms={:.1}",
+                "[cuda-f32-gemm] rows={} cols={} seq={} resident={resident_weights} weights_mb={:.1} input_mb={:.1} output_mb={:.1} h2d_ms={:.1} gemm_ms={:.1} dtoh_ms={:.1}",
                 rows,
                 cols,
                 seq_len,

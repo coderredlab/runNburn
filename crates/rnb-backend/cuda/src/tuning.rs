@@ -822,6 +822,12 @@ pub fn deepseek4_output_projection_fused_enabled() -> bool {
     env_bool("RNB_CUDA_DEEPSEEK4_OUTPUT_FUSED", true)
 }
 
+/// Serve model-owned F32 GEMM weights from the resident cache instead of
+/// re-uploading them per call. Diagnostic opt-out.
+pub fn f32_gemm_resident_weights_enabled() -> bool {
+    env_bool("RNB_CUDA_F32_GEMM_RESIDENT_WEIGHTS", true)
+}
+
 pub fn prefill_down_copy_overlap_enabled() -> bool {
     env_bool("RNB_CUDA_PREFILL_DOWN_COPY_OVERLAP", false)
 }
