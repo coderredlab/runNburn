@@ -1197,8 +1197,8 @@ impl Engine {
         base_kv_len: usize,
         result: &crate::engine::verify_window::VerifyWindowResult,
     ) -> crate::error::Result<()> {
-        self.kv_cache
-            .set_len((base_kv_len + result.len()).min(self.kv_cache.max_seq_len));
+        // 모든 payload를 state 변경 전에 검증한다. 검증 도중 실패하면 KV 길이도 layer
+        // 내용도 건드리지 않은 채 반환해야 호출부의 round rollback이 의미를 갖는다.
         for layer in &result.attention_kv_states {
             if layer.device_resident {
                 continue;
@@ -1230,6 +1230,37 @@ impl Engine {
                     expected_values
                 )));
             }
+        }
+        for layer in &result.ssm_final_states {
+            if layer.device_resident {
+                continue;
+            }
+            let state = self
+                .kv_cache
+                .get_ssm_state(layer.layer_idx)
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(format!(
+                        "missing SSM state for device verify final layer {}",
+                        layer.layer_idx
+                    ))
+                })?;
+            if state.conv_state.len() != layer.conv_state.len() {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "device verify final conv_state mismatch for layer {}: got {}, expected {}",
+                    layer.layer_idx,
+                    layer.conv_state.len(),
+                    state.conv_state.len()
+                )));
+            }
+        }
+
+        // 여기부터는 검증이 끝났으므로 중간에 실패하지 않는다.
+        self.kv_cache
+            .set_len((base_kv_len + result.len()).min(self.kv_cache.max_seq_len));
+        for layer in &result.attention_kv_states {
+            if layer.device_resident {
+                continue;
+            }
             self.kv_cache.replace_layer_f16_range(
                 layer.layer_idx,
                 base_kv_len,
@@ -1239,26 +1270,12 @@ impl Engine {
             );
         }
         for layer in &result.ssm_final_states {
-            let state = self
-                .kv_cache
-                .get_ssm_state_mut(layer.layer_idx)
-                .ok_or_else(|| {
-                    crate::error::LlmError::Forward(format!(
-                        "missing SSM state for device verify final layer {}",
-                        layer.layer_idx
-                    ))
-                })?;
             if layer.device_resident {
                 continue;
             }
-            if state.conv_state.len() != layer.conv_state.len() {
-                return Err(crate::error::LlmError::Forward(format!(
-                    "device verify final conv_state mismatch for layer {}: got {}, expected {}",
-                    layer.layer_idx,
-                    layer.conv_state.len(),
-                    state.conv_state.len()
-                )));
-            }
+            let Some(state) = self.kv_cache.get_ssm_state_mut(layer.layer_idx) else {
+                continue;
+            };
             state.conv_state.copy_from_slice(&layer.conv_state);
         }
         self.sync_sequence_cursor_to_kv_len()

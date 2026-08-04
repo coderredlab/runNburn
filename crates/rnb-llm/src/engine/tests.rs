@@ -290,6 +290,41 @@ fn device_verify_final_state_commit_updates_gdn_conv_state_and_len() {
 }
 
 #[test]
+fn device_verify_final_state_commit_leaves_state_untouched_when_payload_is_invalid() {
+    let mut engine = make_mock_engine(8);
+    engine.kv_cache.init_ssm_state(1, 3, 2, 1, 2, 2);
+    engine.kv_cache.set_len(4);
+    let baseline_conv_state = engine.kv_cache.get_ssm_state(1).unwrap().conv_state.clone();
+
+    // conv_state 길이가 어긋난 payload. 커밋은 KV 길이도 layer state도 건드리지 않고
+    // 실패해야 한다. 검증보다 set_len이 먼저 실행되면 current_len이 6으로 전진한다.
+    let result = verify_window::VerifyWindowResult {
+        target_tokens: vec![10, 11],
+        mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
+        hidden_dim: engine.metadata.hidden_dim,
+        prefix_state: None,
+        prefix_states: Vec::new(),
+        ssm_final_states: vec![verify_window::VerifyWindowSsmLayerFinalState {
+            layer_idx: 1,
+            conv_state: vec![0.25, 0.5],
+            device_resident: false,
+        }],
+        attention_kv_states: Vec::new(),
+    };
+
+    let err = engine
+        .commit_device_verify_window_final_states(4, &result)
+        .expect_err("mismatched conv_state must be rejected");
+
+    assert!(err.to_string().contains("conv_state mismatch"));
+    assert_eq!(engine.kv_cache.current_len(), 4);
+    assert_eq!(
+        engine.kv_cache.get_ssm_state(1).unwrap().conv_state,
+        baseline_conv_state
+    );
+}
+
+#[test]
 fn verify_prefix_restore_rolls_back_multimodal_sequence_cursor() {
     let mut engine = make_mock_engine(8);
     engine.sequence_cursor = Some(crate::multimodal::SequenceCursor {
