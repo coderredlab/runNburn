@@ -33,8 +33,16 @@ pub(super) fn forward_moe(
     weights: &DeepSeek4MoeWeights,
     config: &DeepSeek4Config,
 ) -> Result<Vec<f32>> {
+    let profile_enabled = crate::engine::moe_profile::is_enabled();
+    let route_start = profile_enabled.then(std::time::Instant::now);
     let (experts, route_weights) = route(input, token_id, weights, config);
     crate::engine::moe_trace::record_selection(layer_idx, &experts);
+    if let Some(start) = route_start {
+        crate::engine::moe_profile::record_moe_profile(
+            "deepseek4:decode:moe:route",
+            start.elapsed(),
+        );
+    }
     if let Some(output) =
         forward_moe_metal_decode(input, &experts, &route_weights, layer_idx, weights, config)?
     {
@@ -43,15 +51,29 @@ pub(super) fn forward_moe(
     #[cfg(feature = "cuda")]
     if routed_cuda_supported(weights, config) {
         let routes = [(experts.clone(), route_weights.clone())];
-        if let Some(sparse) = compute_sparse_experts_cuda_resident(input, &routes, weights, config)?
-        {
+        let sparse_start = profile_enabled.then(std::time::Instant::now);
+        let sparse_result = compute_sparse_experts_cuda_resident(input, &routes, weights, config)?;
+        if let Some(start) = sparse_start {
+            crate::engine::moe_profile::record_moe_profile(
+                "deepseek4:decode:moe:cuda_sparse",
+                start.elapsed(),
+            );
+        }
+        if let Some(sparse) = sparse_result {
             let shared = &weights.weights;
+            let shared_start = profile_enabled.then(std::time::Instant::now);
             let mut shared_gate = shared.shared_gate.gemv_vec(input)?;
             let mut shared_up = shared.shared_up.gemv_vec(input)?;
             swiglu_clamped(&mut shared_gate, &mut shared_up, weights.shared_clamp);
             let mut output = shared.shared_down.gemv_vec(&shared_gate)?;
             for (dst, value) in output.iter_mut().zip(sparse) {
                 *dst += value;
+            }
+            if let Some(start) = shared_start {
+                crate::engine::moe_profile::record_moe_profile(
+                    "deepseek4:decode:moe:shared",
+                    start.elapsed(),
+                );
             }
             return Ok(output);
         }

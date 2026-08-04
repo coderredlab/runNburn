@@ -2553,6 +2553,9 @@ fn main() {
             eprintln!(
                 "\n=== {warm_reruns} steady-state generate runs (cold first request excluded) ==="
             );
+            if std::env::var("RNB_MOE_PROFILE").is_ok() {
+                rnb_llm::engine::reset_moe_profile();
+            }
             let cold_reference_tokens = result.generated_token_ids.clone();
             let mut steady_reference_tokens: Option<Vec<u32>> = None;
             let mut steady_generate_ms = Vec::with_capacity(warm_reruns);

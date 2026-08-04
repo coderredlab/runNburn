@@ -252,6 +252,7 @@ fn forward_single_token(
     token: u32,
     target_layers: &[usize],
 ) -> Result<DeepSeek4ForwardOutput> {
+    let profile_enabled = crate::engine::moe_profile::is_enabled();
     let position = model.state.position;
     let embedding = token_embedding.gather(&[token])?;
     let embedding = kernels::tensor_as_f32_slice(&embedding);
@@ -271,6 +272,7 @@ fn forward_single_token(
             target_layers,
             &mut layer_features,
         );
+        let attn_stage_start = profile_enabled.then(std::time::Instant::now);
         let residual = hidden;
         let mix = hyper_pre(&residual, &layer.attn_hc, &model.config);
         let attn_input = rms_norm(&mix.branch, &layer.attn_norm, model.config.norm_eps);
@@ -282,12 +284,22 @@ fn forward_single_token(
             &model.config,
         )?;
         hidden = hyper_post(&attn_output, &residual, mix, &model.config);
+        if let Some(start) = attn_stage_start {
+            crate::engine::moe_profile::record_moe_profile(
+                "deepseek4:decode:attention",
+                start.elapsed(),
+            );
+        }
 
+        let moe_stage_start = profile_enabled.then(std::time::Instant::now);
         let residual = hidden;
         let mix = hyper_pre(&residual, &layer.ffn_hc, &model.config);
         let ffn_input = rms_norm(&mix.branch, &layer.ffn_norm, model.config.norm_eps);
         let ffn_output = forward_moe(&ffn_input, token, layer_index, &layer.moe, &model.config)?;
         hidden = hyper_post(&ffn_output, &residual, mix, &model.config);
+        if let Some(start) = moe_stage_start {
+            crate::engine::moe_profile::record_moe_profile("deepseek4:decode:moe", start.elapsed());
+        }
     }
     capture_dspark_inputs(
         model.layers.len(),
@@ -297,6 +309,7 @@ fn forward_single_token(
         target_layers,
         &mut layer_features,
     );
+    let out_stage_start = profile_enabled.then(std::time::Instant::now);
     let collapsed = hyper_head(
         &hidden,
         &model.output_hc_function,
@@ -307,6 +320,9 @@ fn forward_single_token(
     let final_hidden_rows = rms_norm(&collapsed, output_norm, model.config.norm_eps);
     let logits = output.gemv_vec(&final_hidden_rows)?;
     let extracted_features = transpose_dspark_inputs(layer_features, 1, model.config.hidden_dim)?;
+    if let Some(start) = out_stage_start {
+        crate::engine::moe_profile::record_moe_profile("deepseek4:decode:output", start.elapsed());
+    }
     model.state.position += 1;
     Ok(DeepSeek4ForwardOutput {
         logits,
