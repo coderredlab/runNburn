@@ -1,9 +1,16 @@
+mod accelerator_basic;
 mod cuda_basic;
 mod engine_ext;
 mod glm_moe;
 mod gpu_gdn;
 mod init;
 mod materialize;
+mod metal_decode_chain;
+mod metal_layers;
+mod metal_ops;
+mod metal_policy;
+mod metal_prefill;
+mod metal_projection;
 mod output;
 mod qwen_moe;
 mod state;
@@ -41,10 +48,11 @@ pub(super) use cuda_basic::{
     try_rms_norm_into_decode_carrier_if_supported,
 };
 
-#[cfg(feature = "metal")]
-pub(super) use cuda_basic::metal_decode_attention_kvarn_into_if_supported;
-#[cfg(not(feature = "cuda"))]
-pub(super) use cuda_basic::metal_rope_mrope_into_if_supported;
+pub(super) use accelerator_basic::{
+    decode_gemv_into_if_supported, prefill_attention_f16kv_dense_chain_if_supported,
+    prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
+    prefill_attention_f16kv_window_if_supported,
+};
 #[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{
     cuda_activation_mul_inplace, cuda_add_f32_inplace, cuda_add_rows_f32_inplace,
@@ -63,33 +71,11 @@ pub(super) use cuda_basic::{
     decode_attention_kvarn_into_if_supported, decode_attention_kvarn_to_device_if_supported,
 };
 pub(super) use cuda_basic::{
-    decode_gemv_into_if_supported,
     dense_q4k_attention_output_gelu_ffn_batch_norm_residual_if_supported,
     gdn_prefill_quantized_projection, gdn_prefill_quantized_projection_q,
-    gemma4_ple_q4k_batch_norm_residual_if_supported, metal_attn_layer_into_if_supported,
-    metal_decode_parity_counters_report, metal_decode_parity_counters_reset,
-    metal_deepseek4_attention_prefill_batch_requested,
-    metal_deepseek4_attention_prefill_batch_tokens,
-    metal_deepseek4_attention_prefill_compressor_fused_requested,
-    metal_deepseek4_attention_prefill_index_batch_requested,
-    metal_deepseek4_attention_prefill_output_batch_requested, metal_deepseek4_moe_decode_requested,
-    metal_deepseek4_moe_prefill_batch_requested,
-    metal_deepseek4_prefill_q8_multi_gemm_if_supported, metal_deepseek4_q8_multi_gemv_if_supported,
-    metal_deepseek4_q8_output_chain_if_supported, metal_deepseek4_q_front_if_supported,
-    metal_prefill_atn_full_counters_report, metal_prefill_atn_full_counters_reset,
-    metal_prefill_atn_full_expected_dense_layer, metal_prefill_atn_full_record_adapter_reject,
-    metal_prefill_atn_full_record_backend_err, metal_prefill_atn_full_record_core_hit,
-    metal_prefill_atn_full_record_full_layer_hit, metal_prefill_atn_full_record_skip,
-    metal_prefill_atn_full_timing_enabled, metal_prefill_atn_o_tail_counters_report,
-    metal_prefill_atn_o_tail_counters_reset, metal_prefill_atn_o_tail_expected_dense_layer,
-    metal_prefill_atn_o_tail_requested, metal_prefill_attn_chain_if_supported,
-    metal_prefill_delta_net_scan_into_if_supported, metal_prefill_gdn_f32_dual_proj_if_supported,
-    metal_prefill_gdn_proj_into_if_supported, nemotron_q5_decode_moe_shared_sparse,
+    gemma4_ple_q4k_batch_norm_residual_if_supported, nemotron_q5_decode_moe_shared_sparse,
     nemotron_q8_shared_q5_sparse_decode_enabled, nemotron_q8_shared_q5_sparse_decode_moe,
-    nemotron_q8_shared_q5_sparse_decode_moe_cached_layer,
-    prefill_attention_f16kv_dense_chain_if_supported, prefill_attention_f16kv_if_supported,
-    prefill_attention_f16kv_window_dense_chain_if_supported,
-    prefill_attention_f16kv_window_if_supported, prefill_attention_hd256_if_supported,
+    nemotron_q8_shared_q5_sparse_decode_moe_cached_layer, prefill_attention_hd256_if_supported,
     prefill_attention_non_causal_if_supported,
     prefill_attention_q4k_f16_q_attention_hd256_cached_f16kv_window_dense_chain_if_supported,
     prefill_attention_q4k_f16_q_attention_hd512_cached_f16kv_dense_chain_if_supported,
@@ -123,30 +109,6 @@ pub(super) use cuda_basic::{
     qwen35_prefill_attention_device_input, release_nemotron_device_route_pack,
     upload_hidden_device_output_f32, NemotronDeviceLayerOutput, NemotronDeviceRoutePack,
     NemotronDeviceRouterLogitsOutput, NemotronMamba2DeviceTrace,
-};
-#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
-pub(super) use cuda_basic::{
-    metal_attention_o_chain_into_if_supported, metal_attention_qkv_chain_into_if_supported,
-    metal_decode_attn_carrier_kv_filled, metal_decode_chain_run, metal_decode_chain_run_batched,
-    metal_decode_kv_int8_requires_carrier_error, metal_decode_legacy_attn_layer_enabled_by_policy,
-    metal_decode_legacy_carrier_enabled_by_policy, metal_decode_parity_record_expected_token,
-    metal_ffn_chain_into_if_supported, metal_gdn_core_into_if_supported,
-    metal_gdn_inproj_chain_into_if_supported, metal_gdn_layer_into_if_supported,
-    metal_gdn_moe_layer_into_if_supported, metal_prefill_atn_o_tail_record_backend_err,
-    metal_prefill_atn_o_tail_record_hit, metal_prefill_atn_o_tail_record_skip,
-    metal_prefill_atn_o_tail_timing_enabled, metal_prefill_ffn_chain_into_if_supported,
-    metal_qwen_moe_decode_chain_enabled_by_policy, ChainAttnShape, ChainLayerInput,
-    MetalDecodeChainRunReport, MetalDecodeOutputArgmax,
-};
-#[cfg(not(feature = "cuda"))]
-pub(super) use cuda_basic::{
-    metal_attn_decode_into_if_supported, metal_attn_decode_kv_resident_into_if_supported,
-};
-#[cfg(all(feature = "metal", not(feature = "cuda")))]
-pub(super) use cuda_basic::{
-    metal_prefill_atn_core_if_supported, metal_prefill_atn_full_layer_if_supported,
-    metal_prefill_atn_o_tail_if_supported, metal_prefill_atn_o_tail_record_adapter_reject,
-    metal_prefill_gdn_proj_into_if_supported_with_trace, MetalPrefillAtnCoreShape, MetalProjTrace,
 };
 #[cfg(any(not(feature = "cuda"), test))]
 pub(super) use cuda_basic::{
@@ -191,6 +153,79 @@ pub(super) use materialize::materialize_attention_kv_for_layer_if_supported;
 pub(super) use materialize::{
     materialize_attention_kv_for_layer, materialize_attention_kv_range_untracked,
     materialize_gdn_conv_state_untracked, record_batched_materialization_download,
+};
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_decode_chain::{
+    metal_decode_chain_run, metal_decode_chain_run_batched, ChainAttnShape, ChainLayerInput,
+    MetalDecodeChainRunReport, MetalDecodeOutputArgmax,
+};
+#[cfg(not(feature = "cuda"))]
+pub(super) use metal_layers::metal_attn_decode_into_if_supported;
+pub(super) use metal_layers::metal_attn_layer_into_if_supported;
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_layers::{
+    metal_decode_attn_carrier_kv_filled, metal_gdn_core_into_if_supported,
+    metal_gdn_layer_into_if_supported, metal_gdn_moe_layer_into_if_supported,
+};
+#[cfg(not(feature = "cuda"))]
+pub(super) use metal_ops::metal_attn_decode_kv_resident_into_if_supported;
+#[cfg(feature = "metal")]
+pub(super) use metal_ops::metal_decode_attention_kvarn_into_if_supported;
+#[cfg(not(feature = "cuda"))]
+pub(super) use metal_ops::metal_rope_mrope_into_if_supported;
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_ops::{
+    metal_attention_qkv_chain_into_if_supported, metal_gdn_inproj_chain_into_if_supported,
+};
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_policy::{
+    metal_decode_kv_int8_requires_carrier_error, metal_decode_legacy_attn_layer_enabled_by_policy,
+    metal_decode_legacy_carrier_enabled_by_policy, metal_decode_parity_record_expected_token,
+    metal_qwen_moe_decode_chain_enabled_by_policy,
+};
+pub(super) use metal_policy::{
+    metal_decode_parity_counters_report, metal_decode_parity_counters_reset,
+};
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(super) use metal_prefill::{
+    metal_prefill_atn_core_if_supported, metal_prefill_atn_full_layer_if_supported,
+    metal_prefill_atn_o_tail_if_supported, metal_prefill_atn_o_tail_record_adapter_reject,
+    MetalPrefillAtnCoreShape,
+};
+pub(super) use metal_prefill::{
+    metal_prefill_atn_full_counters_report, metal_prefill_atn_full_counters_reset,
+    metal_prefill_atn_full_expected_dense_layer, metal_prefill_atn_full_record_adapter_reject,
+    metal_prefill_atn_full_record_backend_err, metal_prefill_atn_full_record_core_hit,
+    metal_prefill_atn_full_record_full_layer_hit, metal_prefill_atn_full_record_skip,
+    metal_prefill_atn_full_timing_enabled, metal_prefill_atn_o_tail_counters_report,
+    metal_prefill_atn_o_tail_counters_reset, metal_prefill_atn_o_tail_expected_dense_layer,
+    metal_prefill_atn_o_tail_requested, metal_prefill_attn_chain_if_supported,
+};
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_prefill::{
+    metal_prefill_atn_o_tail_record_backend_err, metal_prefill_atn_o_tail_record_hit,
+    metal_prefill_atn_o_tail_record_skip, metal_prefill_atn_o_tail_timing_enabled,
+};
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(super) use metal_projection::{
+    metal_attention_o_chain_into_if_supported, metal_ffn_chain_into_if_supported,
+    metal_prefill_ffn_chain_into_if_supported,
+};
+pub(super) use metal_projection::{
+    metal_deepseek4_attention_prefill_batch_requested,
+    metal_deepseek4_attention_prefill_batch_tokens,
+    metal_deepseek4_attention_prefill_compressor_fused_requested,
+    metal_deepseek4_attention_prefill_index_batch_requested,
+    metal_deepseek4_attention_prefill_output_batch_requested, metal_deepseek4_moe_decode_requested,
+    metal_deepseek4_moe_prefill_batch_requested,
+    metal_deepseek4_prefill_q8_multi_gemm_if_supported, metal_deepseek4_q8_multi_gemv_if_supported,
+    metal_deepseek4_q8_output_chain_if_supported, metal_deepseek4_q_front_if_supported,
+    metal_prefill_delta_net_scan_into_if_supported, metal_prefill_gdn_f32_dual_proj_if_supported,
+    metal_prefill_gdn_proj_into_if_supported,
+};
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(super) use metal_projection::{
+    metal_prefill_gdn_proj_into_if_supported_with_trace, MetalProjTrace,
 };
 #[cfg(all(test, feature = "vulkan"))]
 pub(super) use output::ggml_to_gpu_output_quant;

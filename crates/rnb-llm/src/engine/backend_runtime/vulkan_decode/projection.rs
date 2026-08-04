@@ -39,7 +39,7 @@ pub(in crate::engine) fn try_decode_gemv_if_supported(
     }
 
     #[cfg(feature = "cuda")]
-    match super::super::cuda_basic::decode_gemv_into_if_supported(
+    match super::super::accelerator_basic::decode_gemv_into_if_supported(
         weight, input, output, label, false,
     ) {
         Ok(true) => {
