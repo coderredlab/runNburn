@@ -599,6 +599,7 @@ fn mtp_auto_policy_for_model(
     device_verify_supported: bool,
     vulkan_fullpath_verify_supported: bool,
     resource: Option<MtpAutoResourceHint>,
+    model_weight_mib: usize,
 ) -> MtpAutoPolicy {
     let dense_spec_k = 1;
     let dense_min_free_vram_mib = mtp_device_verify_min_free_vram_mib(metadata, dense_spec_k);
@@ -612,6 +613,13 @@ fn mtp_auto_policy_for_model(
     let dense_qwen35_spec_k = 4;
     let dense_qwen35_min_free_vram_mib =
         mtp_device_verify_min_free_vram_mib(metadata, dense_qwen35_spec_k);
+    // mt103: dense device verify의 이득은 모델 weight가 device에 통째로 상주할 때만
+    // 난다. 12GiB RTX 3060에 15.9GiB인 Qwen3.6 27B를 올리면 auto MTP가 2400초 안에
+    // 256 token을 끝내지 못해 target-only 0.5 tok/s 대비 5배 이상 느렸다. free VRAM은
+    // 모델 로드 뒤 값이라 기준이 될 수 없으므로 장비 total로 판정한다.
+    let dense_model_fits_resident = resource.as_ref().is_some_and(|hint| {
+        hint.total_vram_mib >= model_weight_mib.saturating_add(dense_qwen35_min_free_vram_mib)
+    });
     if !has_mtp_runtime {
         return MtpAutoPolicy {
             enabled: false,
@@ -749,6 +757,18 @@ fn mtp_auto_policy_for_model(
             resource,
             reason: "insufficient-free-vram-for-mtp-device-verify",
         },
+        // mt103: 모델 weight가 device에 통째로 상주하지 못하면 dense device verify는
+        // 크게 진다. 12GiB 3060 + 15.9GiB 27B에서 auto MTP가 target-only 0.5 tok/s의
+        // 1/5 아래였다. `!device_verify_possible`은 workspace만 보므로 이 조건이 따로
+        // 필요하다.
+        ModelArchitecture::Qwen35 if !dense_model_fits_resident => MtpAutoPolicy {
+            enabled: false,
+            spec_k: dense_spec_k,
+            device_verify: false,
+            min_free_vram_mib: dense_qwen35_min_free_vram_mib,
+            resource,
+            reason: "dense-qwen35-model-exceeds-resident-vram",
+        },
         // mt103: 한때 이 분기를 auto-off로 내렸다가 되돌렸다. device verify가 1.0 tok/s로
         // target-only 7.3의 1/7이던 원인은 batch verify 자체가 아니라 resident cache
         // 상한이었다. MTP device verify를 켜면 `q4k_resident_auto_cache_cap_mib`가 24GiB
@@ -756,7 +776,6 @@ fn mtp_auto_policy_for_model(
         // 재전송했다. 캐시 cap을 저VRAM 전용으로 좁히고 workspace reserve를 실측 1.4GiB
         // 규모로 낮춘 뒤, `dense_qwen35_spec_k`가 주는 큰 window에서 같은 워크로드가
         // 8.9 tok/s로 target-only를 1.22배 앞선다. 35B-A3B는 91.3 tok/s로 회귀가 없다.
-        // 낮은 VRAM 장비는 위 `!device_verify_possible` 분기가 계속 막는다.
         ModelArchitecture::Qwen35 => MtpAutoPolicy {
             enabled: true,
             spec_k: dense_qwen35_spec_k,
@@ -882,6 +901,8 @@ impl Engine {
             self.mtp_device_verify_supported_by_weights(),
             self.mtp_vulkan_fullpath_verify_supported(),
             current_mtp_auto_resource_hint(),
+            usize::try_from(self.host_memory_plan.mapped_weight_bytes() / (1024 * 1024))
+                .unwrap_or(usize::MAX),
         );
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         if qwen35_metal_batch_auto_eligible(
@@ -2104,6 +2125,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(policy.enabled);
@@ -2111,6 +2133,25 @@ mod tests {
         assert_eq!(policy.spec_k, 4);
         assert!(policy.device_verify);
         assert_eq!(policy.reason, "dense-qwen35-device-verify-auto");
+    }
+
+    /// 모델 weight가 장비 VRAM에 통째로 들어가지 않으면 dense는 auto-off다. 12GiB
+    /// 3060에 15.9GiB 27B를 올린 실측에서 auto MTP가 target-only의 1/5 아래였다.
+    #[test]
+    fn mtp_auto_policy_keeps_dense_qwen35_off_when_model_exceeds_vram() {
+        let policy = mtp_auto_policy_for_model(
+            ModelArchitecture::Qwen35,
+            &policy_metadata(4096, 40),
+            true,
+            true,
+            false,
+            Some(policy_resource(12 * 1024, 10 * 1024)),
+            16 * 1024,
+        );
+
+        assert!(!policy.enabled);
+        assert!(!policy.device_verify);
+        assert_eq!(policy.reason, "dense-qwen35-model-exceeds-resident-vram");
     }
 
     /// 같은 조건에서 MoE는 expert read를 공유해 4.2배 빨라지므로 auto-on을 유지한다.
@@ -2123,6 +2164,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(policy.enabled);
@@ -2181,6 +2223,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(policy.enabled);
@@ -2198,6 +2241,7 @@ mod tests {
             false,
             true,
             None,
+            0,
         );
 
         assert!(policy.enabled);
@@ -2215,6 +2259,7 @@ mod tests {
             false,
             false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
+            0,
         );
         let mut moe_metadata = policy_metadata(2560, 42);
         moe_metadata.expert_used_count = 4;
@@ -2225,6 +2270,7 @@ mod tests {
             false,
             false,
             Some(policy_resource(24 * 1024, 20 * 1024)),
+            0,
         );
         let metal_batch_auto = cfg!(all(feature = "metal", not(feature = "cuda")));
 
@@ -2258,6 +2304,7 @@ mod tests {
             false,
             false,
             Some(policy_resource(12 * 1024, min_free_vram_mib - 1)),
+            0,
         );
 
         assert!(!policy.enabled);
@@ -2277,6 +2324,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(!policy.enabled);
@@ -2293,6 +2341,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(!policy.enabled);
@@ -2309,6 +2358,7 @@ mod tests {
             true,
             false,
             None,
+            0,
         );
 
         assert!(!policy.enabled);
@@ -2325,6 +2375,7 @@ mod tests {
             true,
             false,
             Some(policy_resource(12 * 1024, 512)),
+            0,
         );
 
         assert!(!policy.enabled);
@@ -2344,6 +2395,7 @@ mod tests {
             false,
             false,
             Some(policy_resource(12 * 1024, 10 * 1024)),
+            0,
         );
 
         assert!(!policy.enabled);
