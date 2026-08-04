@@ -28,6 +28,10 @@ pub(in crate::runtime) struct MoeSliceCache {
     hits: u64,
     admissions: u64,
     evictions: u64,
+    /// Bytes pushed over PCIe for misses, split by admission route. Read by
+    /// the resident phase trace to derive effective H2D bandwidth.
+    pub(in crate::runtime) resident_upload_bytes: u64,
+    pub(in crate::runtime) temp_upload_bytes: u64,
 }
 
 struct MoeSliceEntry {
@@ -247,6 +251,8 @@ impl CudaState {
                 },
             );
             self.moe_slice_cache.admissions += 1;
+            self.moe_slice_cache.resident_upload_bytes =
+                self.moe_slice_cache.resident_upload_bytes.saturating_add(len as u64);
         }
 
         // Overflow slices share one temp slab upload for this call.
@@ -271,6 +277,8 @@ impl CudaState {
                     )?;
                 }
                 temp_ptrs.insert(key, slab + offset as u64);
+                self.moe_slice_cache.temp_upload_bytes =
+                    self.moe_slice_cache.temp_upload_bytes.saturating_add(len as u64);
                 offset += len;
             }
         }

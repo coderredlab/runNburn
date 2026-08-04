@@ -26,6 +26,66 @@ pub(in crate::runtime) struct ResidentSparseExpertsRequest<'a> {
     pub activation_limit: f32,
 }
 
+/// Diagnostic split of the resident call into weight resolution (cache
+/// lookup plus miss uploads), operand staging, kernels, and the result
+/// download that also drains the stream. Enabled by
+/// `RNB_CUDA_MOE_RESIDENT_TRACE=1`; the phase boundaries need stream
+/// synchronization, so this perturbs timing and is diagnostic only.
+mod phase_trace {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+    static STAGE_NS: AtomicU64 = AtomicU64::new(0);
+    static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
+    static DOWNLOAD_NS: AtomicU64 = AtomicU64::new(0);
+    static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn enabled() -> bool {
+        std::env::var("RNB_CUDA_MOE_RESIDENT_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }
+
+    pub(super) fn record(
+        resolve_ns: u64,
+        stage_ns: u64,
+        kernel_ns: u64,
+        download_ns: u64,
+        upload_bytes: u64,
+    ) {
+        RESOLVE_NS.fetch_add(resolve_ns, Ordering::Relaxed);
+        STAGE_NS.fetch_add(stage_ns, Ordering::Relaxed);
+        KERNEL_NS.fetch_add(kernel_ns, Ordering::Relaxed);
+        DOWNLOAD_NS.fetch_add(download_ns, Ordering::Relaxed);
+        UPLOAD_BYTES.fetch_add(upload_bytes, Ordering::Relaxed);
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        // ~20 decode tokens on a 43-layer model keeps the log readable.
+        if calls % 860 != 0 {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1.0e6;
+        let resolve = RESOLVE_NS.load(Ordering::Relaxed);
+        let bytes = UPLOAD_BYTES.load(Ordering::Relaxed);
+        // Effective H2D rate over the whole resolve phase, so it folds in the
+        // per-slice call overhead we are trying to attribute.
+        let gbps = if resolve > 0 {
+            bytes as f64 / resolve as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[cuda-moe-resident] calls={calls} resolve={:.1}ms stage={:.1}ms kernels={:.1}ms download={:.1}ms upload={:.2}GiB h2d={gbps:.2}GB/s",
+            ms(resolve),
+            ms(STAGE_NS.load(Ordering::Relaxed)),
+            ms(KERNEL_NS.load(Ordering::Relaxed)),
+            ms(DOWNLOAD_NS.load(Ordering::Relaxed)),
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
+}
+
 fn resident_kernels(
     gate_quant: u32,
     down_quant: u32,
@@ -151,10 +211,22 @@ impl CudaState {
         }
 
         self.set_current()?;
+        let trace = phase_trace::enabled();
+        let mut mark = std::time::Instant::now();
+        let upload_before = self.moe_slice_cache.resident_upload_bytes
+            + self.moe_slice_cache.temp_upload_bytes;
         let Some((gate_ptrs, up_ptrs, down_ptrs)) =
             self.moe_slice_resident_ptrs_3(gate_weights, up_weights, down_weights)?
         else {
             return Ok(None);
+        };
+        let resolve_ns = if trace {
+            self.stream_synchronize()?;
+            let elapsed = mark.elapsed().as_nanos() as u64;
+            mark = std::time::Instant::now();
+            elapsed
+        } else {
+            0
         };
 
         let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
@@ -214,6 +286,14 @@ impl CudaState {
                 self.stream,
             )?;
         }
+        let stage_ns = if trace {
+            self.stream_synchronize()?;
+            let elapsed = mark.elapsed().as_nanos() as u64;
+            mark = std::time::Instant::now();
+            elapsed
+        } else {
+            0
+        };
 
         self.launch_selected_glm_iq_gate_up_gemv_by_token_to_dev(
             gate_kernel,
@@ -240,9 +320,24 @@ impl CudaState {
             route_dev,
             output_dev,
         )?;
+        let kernel_ns = if trace {
+            self.stream_synchronize()?;
+            let elapsed = mark.elapsed().as_nanos() as u64;
+            mark = std::time::Instant::now();
+            elapsed
+        } else {
+            0
+        };
 
         let mut output = vec![0.0f32; token_count * n_embd];
         self.dtoh_f32_via_pinned(output_dev, &mut output)?;
+        if trace {
+            let download_ns = mark.elapsed().as_nanos() as u64;
+            let uploaded = (self.moe_slice_cache.resident_upload_bytes
+                + self.moe_slice_cache.temp_upload_bytes)
+                .saturating_sub(upload_before);
+            phase_trace::record(resolve_ns, stage_ns, kernel_ns, download_ns, uploaded);
+        }
         Ok(Some(output))
     }
 }
