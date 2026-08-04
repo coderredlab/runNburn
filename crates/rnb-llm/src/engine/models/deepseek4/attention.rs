@@ -30,20 +30,32 @@ pub(super) fn forward_attention(
     if let Some(output) = forward_attention_metal_decode(input, position, weights, state, config)? {
         return Ok(output);
     }
+    let profile_enabled = crate::engine::moe_profile::is_enabled();
+    let mut mark = profile_enabled.then(std::time::Instant::now);
+    let mut lap = |key: &'static str, mark: &mut Option<std::time::Instant>| {
+        if let Some(start) = mark {
+            crate::engine::moe_profile::record_moe_profile(key, start.elapsed());
+            *mark = Some(std::time::Instant::now());
+        }
+    };
     let qr = rms_norm(
         &weights.q_a.gemv_vec(input)?,
         &weights.q_a_norm,
         config.norm_eps,
     );
     let mut query = weights.q_b.gemv_vec(&qr)?;
+    lap("deepseek4:decode:attn:proj_q", &mut mark);
     let kv = rms_norm(
         &weights.kv.gemv_vec(input)?,
         &weights.kv_norm,
         config.norm_eps,
     );
-    forward_attention_projected(
+    lap("deepseek4:decode:attn:proj_kv", &mut mark);
+    let output = forward_attention_projected(
         input, &qr, None, &mut query, kv, position, weights, state, config, None, None,
-    )
+    );
+    lap("deepseek4:decode:attn:core", &mut mark);
+    output
 }
 
 fn forward_attention_metal_decode(
@@ -373,6 +385,14 @@ fn forward_attention_projected(
     compressor_projected: Option<(&[f32], &[f32])>,
     indexer_compressor_projected: Option<(&[f32], &[f32])>,
 ) -> Result<Vec<f32>> {
+    let profile_enabled = crate::engine::moe_profile::is_enabled();
+    let mut mark = profile_enabled.then(std::time::Instant::now);
+    let mut lap = |key: &'static str, mark: &mut Option<std::time::Instant>| {
+        if let Some(start) = mark {
+            crate::engine::moe_profile::record_moe_profile(key, start.elapsed());
+            *mark = Some(std::time::Instant::now());
+        }
+    };
     update_attention_compressors(
         input,
         position,
@@ -382,6 +402,7 @@ fn forward_attention_projected(
         compressor_projected,
         indexer_compressor_projected,
     )?;
+    lap("deepseek4:decode:attn:c:compressors", &mut mark);
     let attention_output = forward_attention_core_projected(
         input,
         qr,
@@ -393,7 +414,10 @@ fn forward_attention_projected(
         state,
         config,
     )?;
-    project_attention_output(&attention_output, weights, config)
+    lap("deepseek4:decode:attn:c:coreproj", &mut mark);
+    let output = project_attention_output(&attention_output, weights, config);
+    lap("deepseek4:decode:attn:c:out", &mut mark);
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -408,6 +432,14 @@ fn forward_attention_core_projected(
     state: &mut AttentionState,
     config: &DeepSeek4Config,
 ) -> Result<Vec<f32>> {
+    let profile_enabled = crate::engine::moe_profile::is_enabled();
+    let mut mark = profile_enabled.then(std::time::Instant::now);
+    let mut lap = |key: &'static str, mark: &mut Option<std::time::Instant>| {
+        if let Some(start) = mark {
+            crate::engine::moe_profile::record_moe_profile(key, start.elapsed());
+            *mark = Some(std::time::Instant::now());
+        }
+    };
     let compressed_layer = weights.compressor.is_some();
     for head in query.chunks_exact_mut(config.head_dim) {
         rms_unit_inplace(head, config.norm_eps);
@@ -435,6 +467,7 @@ fn forward_attention_core_projected(
     while state.window.len() > config.window_size {
         state.window.pop_front();
     }
+    lap("deepseek4:decode:attn:c:prep", &mut mark);
 
     let compressed_indices =
         if let (Some(indexer), Some(index_state)) = (&weights.indexer, &state.indexer_compressor) {
@@ -454,6 +487,7 @@ fn forward_attention_core_projected(
                 .map(|compressor| (0..compressor.compressed.len()).collect())
                 .unwrap_or_default()
         };
+    lap("deepseek4:decode:attn:c:index", &mut mark);
 
     let compressed = state.compressor.as_ref();
     let selected_count = state.window.len() + compressed_indices.len();
@@ -515,6 +549,7 @@ fn forward_attention_core_projected(
                 .for_each(|(head_index, output)| compute_head(head_index, output));
         }
     }
+    lap("deepseek4:decode:attn:c:heads", &mut mark);
 
     Ok(attention_output)
 }
