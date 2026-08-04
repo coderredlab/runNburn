@@ -32,6 +32,7 @@ fn resident_kernels(
 ) -> Result<(usize, &'static str, usize, &'static str), String> {
     let (gate_block_bytes, gate_kernel) = match gate_quant {
         16 => (66usize, "rnb_iq2_xxs_selected_gate_up_gemv_by_token"),
+        22 => (82usize, "rnb_iq2_s_selected_gate_up_gemv_by_token"),
         39 => (136usize, "rnb_mxfp4_selected_gate_up_gemv_by_token"),
         other => {
             return Err(format!(

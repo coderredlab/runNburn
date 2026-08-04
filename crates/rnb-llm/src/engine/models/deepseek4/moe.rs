@@ -38,10 +38,7 @@ pub(super) fn forward_moe(
     let (experts, route_weights) = route(input, token_id, weights, config);
     crate::engine::moe_trace::record_selection(layer_idx, &experts);
     if let Some(start) = route_start {
-        crate::engine::moe_profile::record_moe_profile(
-            "deepseek4:decode:moe:route",
-            start.elapsed(),
-        );
+        crate::engine::moe_profile::record_moe_profile("deepseek4:decode:moe:route", start.elapsed());
     }
     if let Some(output) =
         forward_moe_metal_decode(input, &experts, &route_weights, layer_idx, weights, config)?
@@ -49,7 +46,7 @@ pub(super) fn forward_moe(
         return Ok(output);
     }
     #[cfg(feature = "cuda")]
-    if routed_cuda_supported(weights, config) {
+    if routed_cuda_resident_supported(weights, config) {
         let routes = [(experts.clone(), route_weights.clone())];
         let sparse_start = profile_enabled.then(std::time::Instant::now);
         let sparse_result = compute_sparse_experts_cuda_resident(input, &routes, weights, config)?;
@@ -254,7 +251,7 @@ fn forward_moe_batch_impl(
         .collect();
 
     #[cfg(feature = "cuda")]
-    if routed_cuda_supported(weights, config) {
+    if routed_cuda_resident_supported(weights, config) {
         let sparse = match mode {
             MoeBatchMode::Verify | MoeBatchMode::Draft => {
                 compute_sparse_experts_cuda_resident(inputs, &routes, weights, config)?
@@ -266,9 +263,18 @@ fn forward_moe_batch_impl(
             // Verify must stay on the same arithmetic as tokenwise decode;
             // without the resident cache both drop to the host path below.
             (None, MoeBatchMode::Verify) => None,
-            (None, MoeBatchMode::Prefill | MoeBatchMode::Draft) => Some(
-                compute_sparse_experts_cuda_batch(inputs, &routes, weights, config)?,
-            ),
+            // The grouped prefill/draft batch kernels only cover the strict
+            // gate/up/down combos; mixed-quant layers fall through to the
+            // host path instead of misdispatching.
+            (None, MoeBatchMode::Prefill | MoeBatchMode::Draft) => {
+                if routed_cuda_supported(weights, config) {
+                    Some(compute_sparse_experts_cuda_batch(
+                        inputs, &routes, weights, config,
+                    )?)
+                } else {
+                    None
+                }
+            }
         };
         if let Some(sparse) = sparse {
             let shared = &weights.weights;
@@ -556,6 +562,52 @@ fn routed_cuda_layout_supported(
             || (gate_quant == GGMLType::MXFP4
                 && up_quant == GGMLType::MXFP4
                 && down_quant == GGMLType::MXFP4))
+        && hidden_dim % 256 == 0
+        && expert_ffn_dim % 256 == 0
+}
+
+/// Quant combos the deterministic resident by-token path can serve.
+///
+/// Wider than [`routed_cuda_layout_supported`]: the gate/up gemv kernel and
+/// the down activated-rowreduce kernel are selected independently, so any
+/// supported gate/up quant pairs with any supported down quant. UD-IQ2_M
+/// ships mixed layers (IQ2_S gate/up with MXFP4 down, IQ2_XXS gate/up with
+/// MXFP4 down) that the grouped prefill kernels reject but this path serves,
+/// keeping decode and speculative verify on CUDA instead of the host loop.
+#[cfg(feature = "cuda")]
+fn routed_cuda_resident_supported(
+    weights: &DeepSeek4MoeWeights,
+    config: &DeepSeek4Config,
+) -> bool {
+    let moe = &weights.weights;
+    routed_cuda_resident_layout_supported(
+        weights.prefer_sparse_moe_cuda,
+        moe.gate_quant,
+        moe.up_quant,
+        moe.down_quant,
+        config.hidden_dim,
+        config.expert_ffn_dim,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn routed_cuda_resident_layout_supported(
+    prefer_sparse_moe_cuda: bool,
+    gate_quant: GGMLType,
+    up_quant: GGMLType,
+    down_quant: GGMLType,
+    hidden_dim: usize,
+    expert_ffn_dim: usize,
+) -> bool {
+    // The fused gate/up kernel decodes both operands with one decoder, so the
+    // two must share a quant; down is decoded by its own kernel.
+    prefer_sparse_moe_cuda
+        && gate_quant == up_quant
+        && matches!(
+            gate_quant,
+            GGMLType::IQ2_XXS | GGMLType::IQ2_S | GGMLType::MXFP4
+        )
+        && matches!(down_quant, GGMLType::IQ3_XXS | GGMLType::MXFP4)
         && hidden_dim % 256 == 0
         && expert_ffn_dim % 256 == 0
 }
@@ -913,6 +965,75 @@ mod tests {
             GGMLType::IQ2_XXS,
             GGMLType::IQ3_XXS,
             7_168,
+            2_048,
+        ));
+    }
+
+    /// UD-IQ2_M mixes quants across layers: most are IQ2_XXS gate/up with
+    /// IQ3_XXS down, but some pair IQ2_S or IQ2_XXS gate/up with MXFP4 down.
+    /// Those mixed layers must stay off the grouped prefill kernels and on
+    /// the resident by-token path.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn routed_cuda_resident_layout_covers_mixed_quant_layers() {
+        use super::{routed_cuda_layout_supported, routed_cuda_resident_layout_supported};
+        use rnb_loader::GGMLType;
+
+        for (gate, down) in [
+            (GGMLType::IQ2_S, GGMLType::MXFP4),
+            (GGMLType::IQ2_XXS, GGMLType::MXFP4),
+        ] {
+            assert!(
+                !routed_cuda_layout_supported(true, gate, gate, down, 4_096, 2_048),
+                "grouped prefill must reject mixed {gate:?}/{down:?}"
+            );
+            assert!(
+                routed_cuda_resident_layout_supported(true, gate, gate, down, 4_096, 2_048),
+                "resident path must accept mixed {gate:?}/{down:?}"
+            );
+        }
+
+        // Existing homogeneous combos stay served by the resident path.
+        assert!(routed_cuda_resident_layout_supported(
+            true,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ3_XXS,
+            7_168,
+            2_048,
+        ));
+        assert!(routed_cuda_resident_layout_supported(
+            true,
+            GGMLType::MXFP4,
+            GGMLType::MXFP4,
+            GGMLType::MXFP4,
+            4_096,
+            2_048,
+        ));
+
+        // Policy opt-out, mismatched gate/up, and unsupported down stay rejected.
+        assert!(!routed_cuda_resident_layout_supported(
+            false,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ3_XXS,
+            7_168,
+            2_048,
+        ));
+        assert!(!routed_cuda_resident_layout_supported(
+            true,
+            GGMLType::IQ2_S,
+            GGMLType::IQ2_XXS,
+            GGMLType::MXFP4,
+            4_096,
+            2_048,
+        ));
+        assert!(!routed_cuda_resident_layout_supported(
+            true,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ2_XXS,
+            GGMLType::IQ4_XS,
+            4_096,
             2_048,
         ));
     }
