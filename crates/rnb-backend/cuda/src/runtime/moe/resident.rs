@@ -40,6 +40,7 @@ mod phase_trace {
     static KERNEL_NS: AtomicU64 = AtomicU64::new(0);
     static DOWNLOAD_NS: AtomicU64 = AtomicU64::new(0);
     static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static UPLOAD_NS: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn enabled() -> bool {
         std::env::var("RNB_CUDA_MOE_RESIDENT_TRACE")
@@ -54,12 +55,14 @@ mod phase_trace {
         kernel_ns: u64,
         download_ns: u64,
         upload_bytes: u64,
+        upload_ns: u64,
     ) {
         RESOLVE_NS.fetch_add(resolve_ns, Ordering::Relaxed);
         STAGE_NS.fetch_add(stage_ns, Ordering::Relaxed);
         KERNEL_NS.fetch_add(kernel_ns, Ordering::Relaxed);
         DOWNLOAD_NS.fetch_add(download_ns, Ordering::Relaxed);
         UPLOAD_BYTES.fetch_add(upload_bytes, Ordering::Relaxed);
+        UPLOAD_NS.fetch_add(upload_ns, Ordering::Relaxed);
         let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         // ~20 decode tokens on a 43-layer model keeps the log readable.
         if calls % 860 != 0 {
@@ -67,17 +70,20 @@ mod phase_trace {
         }
         let ms = |ns: u64| ns as f64 / 1.0e6;
         let resolve = RESOLVE_NS.load(Ordering::Relaxed);
+        let upload = UPLOAD_NS.load(Ordering::Relaxed);
         let bytes = UPLOAD_BYTES.load(Ordering::Relaxed);
-        // Effective H2D rate over the whole resolve phase, so it folds in the
-        // per-slice call overhead we are trying to attribute.
-        let gbps = if resolve > 0 {
-            bytes as f64 / resolve as f64
+        // `xfer` isolates the memcpy calls themselves; `resolve - xfer` is the
+        // lookup and admission bookkeeping around them.
+        let xfer_gbps = if upload > 0 {
+            bytes as f64 / upload as f64
         } else {
             0.0
         };
         eprintln!(
-            "[cuda-moe-resident] calls={calls} resolve={:.1}ms stage={:.1}ms kernels={:.1}ms download={:.1}ms upload={:.2}GiB h2d={gbps:.2}GB/s",
+            "[cuda-moe-resident] calls={calls} resolve={:.1}ms (xfer={:.1}ms bookkeep={:.1}ms) stage={:.1}ms kernels={:.1}ms download={:.1}ms upload={:.2}GiB xfer_h2d={xfer_gbps:.2}GB/s",
             ms(resolve),
+            ms(upload),
+            ms(resolve.saturating_sub(upload)),
             ms(STAGE_NS.load(Ordering::Relaxed)),
             ms(KERNEL_NS.load(Ordering::Relaxed)),
             ms(DOWNLOAD_NS.load(Ordering::Relaxed)),
@@ -215,6 +221,7 @@ impl CudaState {
         let mut mark = std::time::Instant::now();
         let upload_before = self.moe_slice_cache.resident_upload_bytes
             + self.moe_slice_cache.temp_upload_bytes;
+        let upload_ns_before = self.moe_slice_cache.upload_ns;
         let Some((gate_ptrs, up_ptrs, down_ptrs)) =
             self.moe_slice_resident_ptrs_3(gate_weights, up_weights, down_weights)?
         else {
@@ -336,7 +343,18 @@ impl CudaState {
             let uploaded = (self.moe_slice_cache.resident_upload_bytes
                 + self.moe_slice_cache.temp_upload_bytes)
                 .saturating_sub(upload_before);
-            phase_trace::record(resolve_ns, stage_ns, kernel_ns, download_ns, uploaded);
+            let upload_ns = self
+                .moe_slice_cache
+                .upload_ns
+                .saturating_sub(upload_ns_before);
+            phase_trace::record(
+                resolve_ns,
+                stage_ns,
+                kernel_ns,
+                download_ns,
+                uploaded,
+                upload_ns,
+            );
         }
         Ok(Some(output))
     }

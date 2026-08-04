@@ -27157,3 +27157,55 @@ fn gdn_prepare_delta_gate_beta_rejects_shape_mismatch() {
     .expect_err("non-divisible GDN gate rows must be rejected");
     assert!(err.contains("shape mismatch"), "unexpected error: {err}");
 }
+
+#[test]
+#[ignore = "microbenchmark: run explicitly with --ignored --nocapture"]
+fn cuda_h2d_pinned_vs_pageable_bandwidth() {
+    let _guard = runtime_test_lock();
+    let Ok(mut state) = CudaState::open() else {
+        eprintln!("skipping H2D bandwidth probe: no CUDA device");
+        return;
+    };
+    // Match the per-layer miss volume the DeepSeek4 resident path moves.
+    let bytes = 18 * 1024 * 1024usize;
+    let iters = 40;
+    let dev = state.compute_input_ptr(bytes).expect("device buffer");
+
+    let pageable = vec![0u8; bytes];
+    state.stream_synchronize().expect("sync");
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            state
+                .api
+                .memcpy_htod_async(dev, pageable.as_ptr().cast(), bytes, state.stream)
+                .expect("pageable h2d");
+        }
+        state.stream_synchronize().expect("sync");
+    }
+    let pageable_s = t0.elapsed().as_secs_f64();
+
+    let pinned = state.host_temp_slab_ptr(bytes).expect("pinned slab");
+    state.stream_synchronize().expect("sync");
+    let t1 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            state
+                .api
+                .memcpy_htod_async(dev, pinned.cast(), bytes, state.stream)
+                .expect("pinned h2d");
+        }
+        state.stream_synchronize().expect("sync");
+    }
+    let pinned_s = t1.elapsed().as_secs_f64();
+
+    let gb = (bytes * iters) as f64 / 1.0e9;
+    eprintln!(
+        "H2D {}MB x{}: pageable {:.2} GB/s | pinned {:.2} GB/s | speedup {:.2}x",
+        bytes / (1024 * 1024),
+        iters,
+        gb / pageable_s,
+        gb / pinned_s,
+        pageable_s / pinned_s
+    );
+}

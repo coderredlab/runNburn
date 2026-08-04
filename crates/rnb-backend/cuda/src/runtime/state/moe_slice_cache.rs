@@ -32,6 +32,9 @@ pub(in crate::runtime) struct MoeSliceCache {
     /// the resident phase trace to derive effective H2D bandwidth.
     pub(in crate::runtime) resident_upload_bytes: u64,
     pub(in crate::runtime) temp_upload_bytes: u64,
+    /// Wall time spent inside the miss `memcpy_htod_async` calls alone, so the
+    /// trace can separate real transfer from lookup/admission bookkeeping.
+    pub(in crate::runtime) upload_ns: u64,
 }
 
 struct MoeSliceEntry {
@@ -234,6 +237,7 @@ impl CudaState {
                 temp_overflow.push((index, len));
                 continue;
             };
+            let upload_start = std::time::Instant::now();
             unsafe {
                 self.api.memcpy_htod_async(
                     ptr,
@@ -242,6 +246,10 @@ impl CudaState {
                     self.stream,
                 )?;
             }
+            self.moe_slice_cache.upload_ns = self
+                .moe_slice_cache
+                .upload_ns
+                .saturating_add(upload_start.elapsed().as_nanos() as u64);
             self.moe_slice_cache.entries.insert(
                 *key,
                 MoeSliceEntry {
@@ -268,6 +276,7 @@ impl CudaState {
             let mut offset = 0usize;
             for (index, len) in temp_overflow {
                 let (key, weights) = order[index];
+                let upload_start = std::time::Instant::now();
                 unsafe {
                     self.api.memcpy_htod_async(
                         slab + offset as u64,
@@ -276,6 +285,10 @@ impl CudaState {
                         self.stream,
                     )?;
                 }
+                self.moe_slice_cache.upload_ns = self
+                    .moe_slice_cache
+                    .upload_ns
+                    .saturating_add(upload_start.elapsed().as_nanos() as u64);
                 temp_ptrs.insert(key, slab + offset as u64);
                 self.moe_slice_cache.temp_upload_bytes =
                     self.moe_slice_cache.temp_upload_bytes.saturating_add(len as u64);
