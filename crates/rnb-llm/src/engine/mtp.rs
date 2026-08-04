@@ -739,13 +739,23 @@ fn mtp_auto_policy_for_model(
             resource,
             reason: "insufficient-free-vram-for-mtp-device-verify",
         },
+        // mt103 실측(2026-08-04, RTX 3090, Qwen3.6 27B MTP Q4_K_M, prompt_qwen25_short
+        // 256 decode, warm): target-only 7.3 tok/s, device verify 1.0 tok/s,
+        // sequential verify 7.1 tok/s. accept는 83.5%로 충분한데 verify가
+        // 1907.9 ms/round로 sequential 220.2 ms/round의 8.7배다. dense decode는 batch
+        // verify로 공유할 expert read가 없어 M=2 GEMM 고정비만 늘기 때문이며,
+        // cu176이 DeepSeek4 prefill에서 관측한 저-M GEMM 고정비와 같은 현상이다.
+        // sequential로 낮춰도 target-only와 동률(7.1 vs 7.3)이라 dense에서는 MTP 자체가
+        // 이득이 아니므로 auto를 끈다. expert read를 공유하는 Qwen35MoE는 같은 조건에서
+        // 21.7 → 90.7 tok/s(4.2배)라 위 분기를 유지한다. Metal batch decode-chain은
+        // `mtp_auto_policy`가 별도로 덮으므로 영향받지 않는다.
         ModelArchitecture::Qwen35 => MtpAutoPolicy {
-            enabled: true,
+            enabled: false,
             spec_k: dense_spec_k,
-            device_verify: true,
+            device_verify: false,
             min_free_vram_mib: dense_min_free_vram_mib,
             resource,
-            reason: "dense-qwen35-device-verify-auto",
+            reason: "dense-qwen35-device-verify-slower-than-target-only",
         },
         _ => MtpAutoPolicy {
             enabled: false,
@@ -2075,10 +2085,32 @@ mod tests {
         ));
     }
 
+    /// dense Qwen35는 work/VRAM 임계를 넘겨도 auto-on하지 않는다. mt103 실측에서
+    /// device verify가 target-only보다 7배 느렸고 sequential로 낮춰도 동률이었다.
     #[test]
-    fn mtp_auto_policy_enables_dense_qwen35_when_work_and_vram_clear_thresholds() {
+    fn mtp_auto_policy_keeps_dense_qwen35_off_even_when_work_and_vram_clear_thresholds() {
         let policy = mtp_auto_policy_for_model(
             ModelArchitecture::Qwen35,
+            &policy_metadata(4096, 40),
+            true,
+            true,
+            false,
+            Some(policy_resource(12 * 1024, 10 * 1024)),
+        );
+
+        assert!(!policy.enabled);
+        assert!(!policy.device_verify);
+        assert_eq!(
+            policy.reason,
+            "dense-qwen35-device-verify-slower-than-target-only"
+        );
+    }
+
+    /// 같은 조건에서 MoE는 expert read를 공유해 4.2배 빨라지므로 auto-on을 유지한다.
+    #[test]
+    fn mtp_auto_policy_keeps_qwen35_moe_device_verify_auto_on() {
+        let policy = mtp_auto_policy_for_model(
+            ModelArchitecture::Qwen35MoE,
             &policy_metadata(4096, 40),
             true,
             true,
@@ -2089,7 +2121,7 @@ mod tests {
         assert!(policy.enabled);
         assert_eq!(policy.spec_k, 1);
         assert!(policy.device_verify);
-        assert_eq!(policy.reason, "dense-qwen35-device-verify-auto");
+        assert_eq!(policy.reason, "qwen35moe-k1-device-verify-auto");
     }
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     #[test]
