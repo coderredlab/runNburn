@@ -1267,6 +1267,19 @@ impl Engine {
     }
 
     pub(crate) fn mtp_draft_tokens(&mut self, first_token: u32, n_max: usize) -> Result<Vec<u32>> {
+        self.mtp_draft_tokens_with_probe(first_token, n_max, None)
+    }
+
+    /// `probe_probs`가 `Some`이면 각 draft 위치의 processed 분포 `q`를 순서대로 담는다.
+    ///
+    /// 진단 전용이다. probe가 켜지면 device argmax fast path를 건너뛰고 host에서 full
+    /// row를 만들어야 하므로 draft가 느려진다. 제품 경로는 `None`으로 호출한다.
+    pub(crate) fn mtp_draft_tokens_with_probe(
+        &mut self,
+        first_token: u32,
+        n_max: usize,
+        probe_probs: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Vec<u32>> {
         if n_max == 0 {
             return Ok(Vec::new());
         }
@@ -1297,6 +1310,7 @@ impl Engine {
                 self.architecture,
                 first_token,
                 n_max,
+                probe_probs,
                 #[cfg(feature = "vulkan")]
                 gpu_runtime.as_mut(),
             )
@@ -1444,6 +1458,7 @@ fn draft_tokens(
     architecture: ModelArchitecture,
     first_token: u32,
     n_max: usize,
+    mut probe_probs: Option<&mut Vec<Vec<f32>>>,
     #[cfg(feature = "vulkan")] mut gpu_runtime: Option<&mut super::gpu_runtime::LayerRuntime>,
 ) -> Result<Vec<u32>> {
     let mut h = runtime.last_hidden.clone().ok_or_else(|| {
@@ -1453,9 +1468,13 @@ fn draft_tokens(
     let mut out = Vec::with_capacity(n_max);
 
     for _ in 0..n_max {
+        // probe는 host full row가 있어야 하므로 device argmax fast path를 건너뛴다.
         #[cfg(feature = "cuda")]
-        let device_step =
-            run_mtp_device_draft_step(runtime, weights, architecture, cond_token, &h)?;
+        let device_step = if probe_probs.is_some() {
+            None
+        } else {
+            run_mtp_device_draft_step(runtime, weights, architecture, cond_token, &h)?
+        };
         #[cfg(not(feature = "cuda"))]
         let device_step: Option<(Vec<f32>, u32)> = None;
         let (hidden, token) = if let Some(step) = device_step {
@@ -1469,14 +1488,19 @@ fn draft_tokens(
                 &[&h],
                 runtime.next_pos,
             )?;
+            let mut row = probe_probs.is_some().then(Vec::new);
             let token = mtp_argmax(
                 runtime,
                 weights,
                 architecture,
                 &hidden,
+                row.as_mut(),
                 #[cfg(feature = "vulkan")]
                 gpu_runtime.as_deref_mut(),
             )?;
+            if let (Some(sink), Some(row)) = (probe_probs.as_mut(), row) {
+                sink.push(row);
+            }
             (hidden, token)
         };
         h = hidden;
@@ -1857,6 +1881,7 @@ fn mtp_argmax(
     weights: &ModelWeights,
     architecture: ModelArchitecture,
     hidden: &[f32],
+    probe_probs: Option<&mut Vec<f32>>,
     #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut super::gpu_runtime::LayerRuntime>,
 ) -> Result<u32> {
     let hidden_dim = runtime.metadata.hidden_dim;
@@ -1878,6 +1903,7 @@ fn mtp_argmax(
     if super::policy::mtp_output_argmax_override().unwrap_or(true)
         && runtime.weights.shared_head_head.is_none()
         && !crate::runtime::mtp_trace_enabled()
+        && probe_probs.is_none()
     {
         if let (Some(gpu), Some(output_quant)) = (
             gpu_runtime,
@@ -1894,8 +1920,10 @@ fn mtp_argmax(
         }
     }
     #[cfg(feature = "cuda")]
-    if let Some(token) = mtp_cuda_argmax_token(head, &normed) {
-        return Ok(token);
+    if probe_probs.is_none() {
+        if let Some(token) = mtp_cuda_argmax_token(head, &normed) {
+            return Ok(token);
+        }
     }
     let mut logits = head.gemv_vec(&normed)?;
     apply_logit_softcapping(&mut logits, runtime.metadata.final_logit_softcapping);
@@ -1916,6 +1944,11 @@ fn mtp_argmax(
         let denom: f32 = logits.iter().map(|&v| (v - top1).exp()).sum();
         let prob = if denom > 0.0 { 1.0 / denom } else { 0.0 };
         eprintln!("[MTP_DRAFT_PROB] prob={prob:.4} margin={:.3}", top1 - top2);
+    }
+    if let Some(sink) = probe_probs {
+        sink.clear();
+        sink.extend_from_slice(&logits);
+        crate::sampler::softmax_inplace(sink);
     }
     logits
         .iter()

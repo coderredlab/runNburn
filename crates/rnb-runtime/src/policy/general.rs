@@ -159,6 +159,13 @@ pub fn mtp_trace_enabled() -> bool {
     env_flag("RNB_MTP_TRACE")
 }
 
+/// `RNB_MTP_ACCEPT_PROBE=1`이면 MTP sequential verify가 target 분포 p와 draft 분포 q를
+/// 모두 만들어 accept 확률을 계측한다. 진단 전용이며 draft device fast path를 끄므로
+/// 느려진다.
+pub fn mtp_accept_probe_enabled() -> bool {
+    env_flag("RNB_MTP_ACCEPT_PROBE")
+}
+
 pub fn spec_force_batch_verify_enabled() -> bool {
     env_string("RNB_SPEC_FORCE_BATCH_VERIFY").is_some_and(|value| value == "1")
 }

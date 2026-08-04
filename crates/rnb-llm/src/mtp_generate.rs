@@ -838,6 +838,14 @@ fn generate_stream_mtp_with_tokens(
     };
     let mut phase = MtpPhaseTimings::default();
     let trace_mtp = crate::runtime::mtp_trace_enabled();
+    // B 단계 착수 판정용 진단. `RNB_MTP_ACCEPT_PROBE=1`이면 각 verify 위치에서 target
+    // 분포 p와 draft 분포 q를 모두 만들어 두 커플링의 accept 확률을 누적한다. draft가
+    // argmax point mass인 현재 방식은 p(v̂)에서 멈추고, draft를 q에서 샘플링해야만
+    // modified rejection sampling의 sum_v min(p, q)에 도달한다. 그 격차가 확률적 MTP의
+    // 유일한 이득 원천이므로 착수 전에 실측한다. sequential verify에서만 동작한다.
+    let mut acceptance_probe = crate::runtime::mtp_accept_probe_enabled()
+        .then(crate::mtp_sampling::AcceptanceStats::default);
+    let mut probe_draft_probs: Vec<Vec<f32>> = Vec::new();
     let target_needs_sequential = mtp_target_needs_sequential(engine.architecture());
     let target_has_recurrent_state =
         crate::speculative::architecture_has_recurrent_state(engine.architecture());
@@ -943,7 +951,16 @@ fn generate_stream_mtp_with_tokens(
         phase.checkpoint_ms += elapsed_ms(phase_start);
 
         let phase_start = Instant::now();
-        let draft_tokens = engine.mtp_draft_tokens(current_token, draft_k)?;
+        let draft_tokens = if acceptance_probe.is_some() {
+            probe_draft_probs.clear();
+            engine.mtp_draft_tokens_with_probe(
+                current_token,
+                draft_k,
+                Some(&mut probe_draft_probs),
+            )?
+        } else {
+            engine.mtp_draft_tokens(current_token, draft_k)?
+        };
         phase.draft_ms += elapsed_ms(phase_start);
         if draft_tokens.len() != draft_k {
             return Err(crate::error::LlmError::Forward(format!(
@@ -1540,8 +1557,30 @@ fn generate_stream_mtp_with_tokens(
 
         let phase_start = Instant::now();
         for i in 0..k {
-            let (target_token, hidden_rows) =
-                engine.forward_verify_argmax_sequential_collect_mtp(verify_input[i])?;
+            let (target_token, hidden_rows) = if acceptance_probe.is_some() {
+                // probe는 target 분포 p가 필요하므로 argmax 대신 full logits를 받는다.
+                let (mut rows, hidden_rows) = engine
+                    .forward_verify_all_logits_sequential_collect_mtp(&[verify_input[i]], true)?;
+                let mut logits = rows.pop().ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "MTP accept probe verify produced no logits".to_string(),
+                    )
+                })?;
+                let token = crate::sampler::greedy::greedy_sample(&logits);
+                if let (Some(stats), Some(draft_row)) =
+                    (acceptance_probe.as_mut(), probe_draft_probs.get(i))
+                {
+                    crate::sampler::softmax_inplace(&mut logits);
+                    if let Some(probabilities) =
+                        crate::mtp_sampling::acceptance_probabilities(&logits, draft_row)
+                    {
+                        stats.record(probabilities);
+                    }
+                }
+                (token, hidden_rows)
+            } else {
+                engine.forward_verify_argmax_sequential_collect_mtp(verify_input[i])?
+            };
             let target_token =
                 replace_ignored_eos_target(engine, params, target_token, &hidden_rows, eos)?;
             trace_mtp_sequence_state(engine, "sequential-forward");
@@ -1628,6 +1667,22 @@ fn generate_stream_mtp_with_tokens(
             request_prepare_ms,
             prompt_prefill_ms,
             elapsed_ms(decode_loop_start)
+        );
+    }
+
+    if let Some((greedy_mean, rejection_mean)) =
+        acceptance_probe.as_ref().and_then(|stats| stats.means())
+    {
+        let positions = acceptance_probe
+            .as_ref()
+            .map_or(0, crate::mtp_sampling::AcceptanceStats::positions);
+        let ratio = if greedy_mean > 0.0 {
+            rejection_mean / greedy_mean
+        } else {
+            f64::INFINITY
+        };
+        eprintln!(
+            "[MTP_ACCEPT_PROBE] positions={positions} greedy_draft={greedy_mean:.4} sampled_draft_rejection={rejection_mean:.4} ratio={ratio:.3}"
         );
     }
 

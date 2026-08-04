@@ -67,6 +67,10 @@ pub(crate) fn mtp_trace_enabled() -> bool {
     policy::mtp_trace_enabled()
 }
 
+pub(crate) fn mtp_accept_probe_enabled() -> bool {
+    policy::mtp_accept_probe_enabled()
+}
+
 pub(crate) fn spec_force_batch_verify_enabled() -> bool {
     policy::spec_force_batch_verify_enabled()
 }

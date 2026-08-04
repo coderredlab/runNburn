@@ -135,6 +135,78 @@ pub(crate) fn greedy_matched_prefix(draft_tokens: &[u32], target_tokens: &[u32])
         .count()
 }
 
+/// 한 위치에서 두 draft 커플링의 accept 확률.
+///
+/// 확률적 MTP의 이득을 판정하는 값이다. §Draft proposal이 draft를 `q`에서 샘플링하도록
+/// 규정한 이유가 여기 있다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AcceptanceProbabilities {
+    /// draft를 `q`의 argmax로 뽑는 현재 방식의 accept 확률 `p(argmax q)`.
+    ///
+    /// 이 커플링은 draft가 point mass이므로 modified rejection sampling을 적용해도
+    /// `sum_v min(p, q) = min(p(v̂), 1) = p(v̂)`로 같은 값이다. 즉 draft를 argmax로
+    /// 두는 한 rejection sampling의 이득은 정확히 0이다.
+    pub greedy_draft: f32,
+    /// draft를 `q`에서 샘플링하고 modified rejection sampling을 쓸 때의 accept 확률
+    /// `sum_v min(p(v), q(v))`.
+    pub sampled_draft_rejection: f32,
+}
+
+/// 정규화된 target 분포 `p`와 draft 분포 `q`에서 두 커플링의 accept 확률을 계산한다.
+///
+/// 길이가 다르면 `None`이다. 확률 합이 1에서 벗어나는지는 검사하지 않는다 — 호출부가
+/// 같은 softmax로 만든 row를 넘긴다는 계약이다.
+pub(crate) fn acceptance_probabilities(p: &[f32], q: &[f32]) -> Option<AcceptanceProbabilities> {
+    if p.len() != q.len() || p.is_empty() {
+        return None;
+    }
+
+    let mut best_index = 0usize;
+    let mut best_mass = q[0];
+    let mut overlap = 0.0f32;
+    for (index, (&p_v, &q_v)) in p.iter().zip(q).enumerate() {
+        if q_v > best_mass {
+            best_mass = q_v;
+            best_index = index;
+        }
+        overlap += p_v.min(q_v);
+    }
+
+    Some(AcceptanceProbabilities {
+        greedy_draft: p[best_index],
+        sampled_draft_rejection: overlap,
+    })
+}
+
+/// 여러 위치의 accept 확률을 누적해 평균을 낸다.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AcceptanceStats {
+    positions: usize,
+    greedy_sum: f64,
+    rejection_sum: f64,
+}
+
+impl AcceptanceStats {
+    pub(crate) fn record(&mut self, probabilities: AcceptanceProbabilities) {
+        self.positions += 1;
+        self.greedy_sum += f64::from(probabilities.greedy_draft);
+        self.rejection_sum += f64::from(probabilities.sampled_draft_rejection);
+    }
+
+    pub(crate) fn positions(&self) -> usize {
+        self.positions
+    }
+
+    /// `(greedy 평균, rejection 평균)`. 표본이 없으면 `None`.
+    pub(crate) fn means(&self) -> Option<(f64, f64)> {
+        if self.positions == 0 {
+            return None;
+        }
+        let n = self.positions as f64;
+        Some((self.greedy_sum / n, self.rejection_sum / n))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +350,65 @@ mod tests {
         assert_eq!(greedy_matched_prefix(&[1, 2, 3], &[1, 9, 3]), 1);
         assert_eq!(greedy_matched_prefix(&[1, 2, 3], &[9, 2, 3]), 0);
         assert_eq!(greedy_matched_prefix(&[], &[1, 2]), 0);
+    }
+
+    #[test]
+    fn point_mass_draft_gains_nothing_from_rejection_sampling() {
+        // q가 argmax point mass면 sum_v min(p, q) = p(v̂)다. draft를 argmax로 두는 한
+        // modified rejection sampling의 이득이 0이라는 사실을 고정한다.
+        let p = [0.5, 0.3, 0.2];
+        let q = [1.0, 0.0, 0.0];
+        let probs = acceptance_probabilities(&p, &q).expect("same length");
+
+        assert!((probs.greedy_draft - 0.5).abs() < 1e-6);
+        assert!((probs.sampled_draft_rejection - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn matching_distributions_accept_always_only_with_a_sampled_draft() {
+        // p == q인 완벽한 drafter. argmax 커플링은 p(v̂)에서 멈추고 rejection sampling만
+        // 1.0에 도달한다. 이 격차가 확률적 MTP의 유일한 이득 원천이다.
+        let p = [0.5, 0.5];
+        let q = [0.5, 0.5];
+        let probs = acceptance_probabilities(&p, &q).expect("same length");
+
+        assert!((probs.greedy_draft - 0.5).abs() < 1e-6);
+        assert!((probs.sampled_draft_rejection - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disjoint_support_never_accepts_a_sampled_draft() {
+        let p = [0.0, 1.0];
+        let q = [1.0, 0.0];
+        let probs = acceptance_probabilities(&p, &q).expect("same length");
+
+        assert!(probs.greedy_draft.abs() < 1e-6);
+        assert!(probs.sampled_draft_rejection.abs() < 1e-6);
+    }
+
+    #[test]
+    fn acceptance_probabilities_reject_mismatched_or_empty_rows() {
+        assert!(acceptance_probabilities(&[0.5, 0.5], &[1.0]).is_none());
+        assert!(acceptance_probabilities(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn acceptance_stats_average_each_coupling_separately() {
+        let mut stats = AcceptanceStats::default();
+        assert!(stats.means().is_none());
+
+        stats.record(AcceptanceProbabilities {
+            greedy_draft: 0.2,
+            sampled_draft_rejection: 0.8,
+        });
+        stats.record(AcceptanceProbabilities {
+            greedy_draft: 0.4,
+            sampled_draft_rejection: 0.6,
+        });
+
+        let (greedy, rejection) = stats.means().expect("two samples");
+        assert_eq!(stats.positions(), 2);
+        assert!((greedy - 0.3).abs() < 1e-6);
+        assert!((rejection - 0.7).abs() < 1e-6);
     }
 }
