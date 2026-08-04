@@ -886,5 +886,37 @@ fn select_indexed_compressed(
 
 #[inline]
 fn dot(left: &[f32], right: &[f32]) -> f32 {
-    left.iter().zip(right).map(|(&a, &b)| a * b).sum()
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "metal"))]
+    {
+        return crate::runtime::gemm::f32_gemv::dot_f32_row(
+            left,
+            right,
+            left.len().min(right.len()),
+        );
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "metal")))]
+    {
+        left.iter().zip(right).map(|(&a, &b)| a * b).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn accelerated_dot_stays_within_attention_tolerance() {
+        let left = (0..512)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) * 0.0078125)
+            .collect::<Vec<_>>();
+        let right = (0..512)
+            .map(|index| ((index * 53 % 113) as f32 - 56.0) * 0.00390625)
+            .collect::<Vec<_>>();
+        let expected = left.iter().zip(&right).map(|(&a, &b)| a * b).sum::<f32>();
+        let actual = crate::runtime::gemm::f32_gemv::dot_f32_row(&left, &right, left.len());
+        let tolerance = 1e-5 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, actual {actual}, tolerance {tolerance}"
+        );
+    }
 }
