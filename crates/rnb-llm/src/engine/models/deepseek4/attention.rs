@@ -930,18 +930,7 @@ fn select_indexed_compressed(
 
 #[inline]
 fn dot(left: &[f32], right: &[f32]) -> f32 {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "metal"))]
-    {
-        return crate::runtime::gemm::f32_gemv::dot_f32_row(
-            left,
-            right,
-            left.len().min(right.len()),
-        );
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "metal")))]
-    {
-        left.iter().zip(right).map(|(&a, &b)| a * b).sum()
-    }
+    crate::engine::dense_dispatch::dot_f32_row(left, right)
 }
 
 #[cfg(test)]
@@ -956,7 +945,7 @@ mod tests {
             .map(|index| ((index * 53 % 113) as f32 - 56.0) * 0.00390625)
             .collect::<Vec<_>>();
         let expected = left.iter().zip(&right).map(|(&a, &b)| a * b).sum::<f32>();
-        let actual = crate::runtime::gemm::f32_gemv::dot_f32_row(&left, &right, left.len());
+        let actual = super::dot(&left, &right);
         let tolerance = 1e-5 * expected.abs().max(1.0);
         assert!(
             (actual - expected).abs() <= tolerance,

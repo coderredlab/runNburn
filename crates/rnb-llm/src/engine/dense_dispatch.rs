@@ -1,3 +1,26 @@
+/// Dot product of two f32 rows, routed through the accelerated kernel where one
+/// exists.
+///
+/// Model code must not reach into `gemm_runtime` directly; the boundary tests
+/// keep those calls inside dispatch wrappers so backend selection stays in one
+/// place.
+#[inline]
+pub(super) fn dot_f32_row(left: &[f32], right: &[f32]) -> f32 {
+    let len = left.len().min(right.len());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "metal"))]
+    {
+        super::gemm_runtime::f32_gemv::dot_f32_row(left, right, len)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", feature = "metal")))]
+    {
+        left[..len]
+            .iter()
+            .zip(&right[..len])
+            .map(|(&a, &b)| a * b)
+            .sum()
+    }
+}
+
 pub(super) fn gemv_f32(
     weight: &[f32],
     input: &[f32],
