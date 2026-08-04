@@ -215,19 +215,22 @@ impl CudaState {
 
         self.set_current()?;
         let trace = phase_trace::enabled();
-        let mut mark = std::time::Instant::now();
-        let upload_before =
-            self.moe_slice_cache.resident_upload_bytes + self.moe_slice_cache.temp_upload_bytes;
-        let upload_ns_before = self.moe_slice_cache.upload_ns;
+        // Diagnostic opt-in must not cost anything on the decode hot path, so
+        // no clock reads or counter snapshots unless the trace is on.
+        let mut mark = trace.then(std::time::Instant::now);
+        let upload_before = trace.then(|| {
+            self.moe_slice_cache.resident_upload_bytes + self.moe_slice_cache.temp_upload_bytes
+        });
+        let upload_ns_before = trace.then(|| self.moe_slice_cache.upload_ns);
         let Some((gate_ptrs, up_ptrs, down_ptrs)) =
             self.moe_slice_resident_ptrs_3(gate_weights, up_weights, down_weights)?
         else {
             return Ok(None);
         };
-        let resolve_ns = if trace {
+        let resolve_ns = if let Some(start) = mark {
             self.stream_synchronize()?;
-            let elapsed = mark.elapsed().as_nanos() as u64;
-            mark = std::time::Instant::now();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            mark = Some(std::time::Instant::now());
             elapsed
         } else {
             0
@@ -290,10 +293,10 @@ impl CudaState {
                 self.stream,
             )?;
         }
-        let stage_ns = if trace {
+        let stage_ns = if let Some(start) = mark {
             self.stream_synchronize()?;
-            let elapsed = mark.elapsed().as_nanos() as u64;
-            mark = std::time::Instant::now();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            mark = Some(std::time::Instant::now());
             elapsed
         } else {
             0
@@ -324,10 +327,10 @@ impl CudaState {
             route_dev,
             output_dev,
         )?;
-        let kernel_ns = if trace {
+        let kernel_ns = if let Some(start) = mark {
             self.stream_synchronize()?;
-            let elapsed = mark.elapsed().as_nanos() as u64;
-            mark = std::time::Instant::now();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            mark = Some(std::time::Instant::now());
             elapsed
         } else {
             0
@@ -335,8 +338,10 @@ impl CudaState {
 
         let mut output = vec![0.0f32; token_count * n_embd];
         self.dtoh_f32_via_pinned(output_dev, &mut output)?;
-        if trace {
-            let download_ns = mark.elapsed().as_nanos() as u64;
+        if let (Some(start), Some(upload_before), Some(upload_ns_before)) =
+            (mark, upload_before, upload_ns_before)
+        {
+            let download_ns = start.elapsed().as_nanos() as u64;
             let uploaded = (self.moe_slice_cache.resident_upload_bytes
                 + self.moe_slice_cache.temp_upload_bytes)
                 .saturating_sub(upload_before);
