@@ -6934,13 +6934,16 @@ fn qwen35_moe_layer_limit_caps_implicit_cache_to_one_layer() {
 
 #[test]
 fn q4k_resident_default_reserve_adds_mtp_workspace_budget() {
+    // mt103: MTP workspace reserve는 실측 약 1.4GiB(총량의 1/16) 규모로 낮췄다. 이전
+    // total/4 clamp 4096은 실측의 세 배를 잡아 resident 예산을 그만큼 깎았다.
     assert_eq!(device_residency_default_reserve_mib(4096, false), 512);
-    assert_eq!(device_residency_default_reserve_mib(4096, true), 1536);
+    assert_eq!(device_residency_default_reserve_mib(4096, true), 1024);
     assert_eq!(device_residency_default_reserve_mib(8192, false), 512);
-    assert_eq!(device_residency_default_reserve_mib(8192, true), 2560);
+    assert_eq!(device_residency_default_reserve_mib(8192, true), 1024);
     assert_eq!(device_residency_default_reserve_mib(11917, false), 768);
-    assert_eq!(device_residency_default_reserve_mib(11917, true), 3840);
-    assert_eq!(device_residency_default_reserve_mib(16384, true), 5120);
+    assert_eq!(device_residency_default_reserve_mib(11917, true), 1536);
+    assert_eq!(device_residency_default_reserve_mib(16384, true), 2048);
+    assert_eq!(device_residency_default_reserve_mib(24576, true), 3072);
 }
 
 #[test]
@@ -6984,10 +6987,13 @@ fn q4k_resident_nemotron_decode_cache_cap_scales_with_vram() {
 fn q4k_resident_auto_cache_cap_offloads_on_low_vram() {
     assert_eq!(q4k_resident_auto_cache_cap_mib(11917, false), Some(3584));
     assert_eq!(q4k_resident_auto_cache_cap_mib(11917, true), Some(3584));
+    // mt103: MTP device verify 여부는 cap을 바꾸지 않는다. verify workspace는 reserve가
+    // 확보하며, 큰 VRAM에서 cap을 걸면 모델이 통째로 상주하지 못해 device verify가
+    // target-only보다 느려진다.
     assert_eq!(q4k_resident_auto_cache_cap_mib(16384, false), None);
-    assert_eq!(q4k_resident_auto_cache_cap_mib(16384, true), Some(4096));
+    assert_eq!(q4k_resident_auto_cache_cap_mib(16384, true), None);
     assert_eq!(q4k_resident_auto_cache_cap_mib(24576, false), None);
-    assert_eq!(q4k_resident_auto_cache_cap_mib(24576, true), Some(4096));
+    assert_eq!(q4k_resident_auto_cache_cap_mib(24576, true), None);
 }
 
 #[test]

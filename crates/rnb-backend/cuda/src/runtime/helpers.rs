@@ -2310,10 +2310,24 @@ pub(super) fn device_residency_default_reserve_mib(
     }
 }
 
+/// MTP device verify가 target decode 위에 추가로 쓰는 device workspace.
+///
+/// mt103 실측(RTX 3090 24GiB, Qwen3.6 27B MTP Q4_K_M): peak VRAM이 MTP sequential
+/// `20653 MiB` 대 device verify `22079 MiB`로 실제 추가분은 약 1.4GiB, total의 1/16
+/// 규모다. 이전 `total/4` clamp `4096`은 실측의 세 배를 잡아 resident 예산을 그만큼
+/// 깎았다.
 fn q4k_resident_mtp_workspace_reserve_mib(total_mib: usize) -> usize {
-    align_up(total_mib / 4, 256).clamp(512, 4096)
+    align_up(total_mib / 16, 256).clamp(512, 2048)
 }
 
+/// 저VRAM 장비에서만 적용하는 resident cache 상한.
+///
+/// mt103 이전에는 MTP device verify를 켜기만 해도 이 cap이 걸려 24GiB 장비에서도
+/// resident cache가 `4096 MiB`로 묶였다. 모델이 15.9GiB인 Qwen3.6 27B MTP에서는 후반
+/// layer가 매 round 재전송되어 device verify가 target-only보다 7배 느렸다.
+/// `RNB_CUDA_Q4K_CACHE_MB` 스윕은 4096/8192에서 2.7 tok/s, 12288에서 3.8, 16384에서
+/// 9.1 tok/s로 모델 전체가 상주해야 이득이 난다. verify workspace는 reserve가 이미
+/// 확보하므로 큰 VRAM에서는 이 cap을 걸지 않는다.
 pub(super) fn q4k_resident_mtp_slot_cache_cap_mib(total_mib: usize) -> usize {
     align_up(total_mib.saturating_mul(3) / 10, 256).clamp(512, 4096)
 }
@@ -2336,9 +2350,12 @@ pub(super) fn q4k_resident_nemotron_decode_cache_cap_mib(total_mib: usize) -> us
 
 pub(super) fn q4k_resident_auto_cache_cap_mib(
     total_mib: usize,
-    mtp_device_verify: bool,
+    _mtp_device_verify: bool,
 ) -> Option<usize> {
-    if mtp_device_verify || total_mib <= 12 * 1024 {
+    // mt103: MTP device verify 여부로 cap을 걸지 않는다. verify workspace는
+    // `device_residency_default_reserve_mib`가 reserve로 확보하므로, 여기서 다시 접으면
+    // 큰 VRAM 장비에서 모델이 통째로 상주하지 못해 매 round 재전송이 발생한다.
+    if total_mib <= 12 * 1024 {
         Some(q4k_resident_mtp_slot_cache_cap_mib(total_mib))
     } else {
         None
