@@ -1183,6 +1183,101 @@ impl GdnBatchCarrierKey {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AttnBatchCarrierKey {
+    layer: usize,
+    batch: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    q_out_dim: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    n_rot: usize,
+    capacity: usize,
+    eps_bits: u32,
+    theta_bits: u32,
+    scale_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl AttnBatchCarrierKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        layer: usize,
+        batch: usize,
+        hidden_dim: usize,
+        q_dim: usize,
+        q_out_dim: usize,
+        kv_dim: usize,
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        n_rot: usize,
+        capacity: usize,
+        eps: f32,
+        theta: f32,
+        scale: f32,
+    ) -> Self {
+        Self {
+            layer,
+            batch,
+            hidden_dim,
+            q_dim,
+            q_out_dim,
+            kv_dim,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            n_rot,
+            capacity,
+            eps_bits: eps.to_bits(),
+            theta_bits: theta.to_bits(),
+            scale_bits: scale.to_bits(),
+        }
+    }
+
+    fn dense(spec: &AttnChainSpecRef<'_>, batch: usize) -> Self {
+        Self::new(
+            spec.layer,
+            batch,
+            spec.hidden_dim,
+            spec.q_dim,
+            spec.q_out_dim,
+            spec.kv_dim,
+            spec.head_dim,
+            spec.num_heads,
+            spec.num_kv_heads,
+            spec.n_rot,
+            spec.capacity,
+            spec.eps,
+            spec.theta,
+            spec.scale,
+        )
+    }
+
+    fn qwen_moe(spec: &AttnMoeQwenChainSpecRef<'_>, batch: usize) -> Self {
+        Self::new(
+            spec.layer,
+            batch,
+            spec.hidden_dim,
+            spec.q_dim,
+            spec.q_out_dim,
+            spec.kv_dim,
+            spec.head_dim,
+            spec.num_heads,
+            spec.num_kv_heads,
+            spec.n_rot,
+            spec.capacity,
+            spec.eps,
+            spec.theta,
+            spec.scale,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QwenAtnOTailCarrierKey {
     seq_len: usize,
@@ -1646,7 +1741,7 @@ pub struct MetalBackend {
     gdn_batch_carriers: RefCell<HashMap<GdnBatchCarrierKey, gdn_chain::GdnBatchCarrier>>,
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
-    attn_batch_carriers: RefCell<HashMap<(usize, usize), attn_chain::AttnBatchCarrier>>,
+    attn_batch_carriers: RefCell<HashMap<AttnBatchCarrierKey, attn_chain::AttnBatchCarrier>>,
     /// Batched dense FFN B-column scratch. (batch, hidden, ffn, eps_bits) 별 1회 alloc.
     dense_ffn_batch_carriers:
         RefCell<HashMap<(usize, usize, usize, u32), ffn_chain::DenseFfnBatchCarrier>>,
@@ -10585,7 +10680,8 @@ impl MetalBackend {
 
                     {
                         let mut carriers = self.attn_batch_carriers.borrow_mut();
-                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
+                        let key = AttnBatchCarrierKey::dense(s, batch);
+                        let carrier = carriers.entry(key).or_insert_with(|| {
                             attn_chain::AttnBatchCarrier::new(
                                 ctx,
                                 batch,
@@ -10673,7 +10769,8 @@ impl MetalBackend {
 
                     {
                         let mut carriers = self.attn_batch_carriers.borrow_mut();
-                        let carrier = carriers.entry((s.layer, batch)).or_insert_with(|| {
+                        let key = AttnBatchCarrierKey::qwen_moe(s, batch);
+                        let carrier = carriers.entry(key).or_insert_with(|| {
                             attn_chain::AttnBatchCarrier::new(
                                 ctx,
                                 batch,
@@ -10784,13 +10881,13 @@ impl MetalBackend {
                 match spec {
                     ChainLayerSpecRef::Attn(s) => {
                         let carrier = carriers
-                            .get(&(s.layer, batch))
+                            .get(&AttnBatchCarrierKey::dense(s, batch))
                             .expect("fused dense attn batch carrier after encode");
                         *slot = Some(carrier.readback_kv_slots(s.pos, batch));
                     }
                     ChainLayerSpecRef::AttnMoeQwen(s) => {
                         let carrier = carriers
-                            .get(&(s.layer, batch))
+                            .get(&AttnBatchCarrierKey::qwen_moe(s, batch))
                             .expect("fused MoE attn batch carrier after encode");
                         *slot = Some(carrier.readback_kv_slots(s.pos, batch));
                     }
@@ -11187,6 +11284,37 @@ mod tests {
         assert_ne!(
             baseline,
             GdnBatchCarrierKey::new(3, 4, 256, 192, 4, 128, 8, 4, 32, 32, 1.0e-5)
+        );
+    }
+
+    #[test]
+    fn attn_batch_carrier_key_includes_model_shape_and_attention_constants() {
+        let baseline = AttnBatchCarrierKey::new(
+            3, 4, 256, 256, 256, 64, 32, 8, 2, 32, 2048, 1.0e-6, 1.0e6, 0.125,
+        );
+        assert_eq!(
+            baseline,
+            AttnBatchCarrierKey::new(
+                3, 4, 256, 256, 256, 64, 32, 8, 2, 32, 2048, 1.0e-6, 1.0e6, 0.125,
+            )
+        );
+        assert_ne!(
+            baseline,
+            AttnBatchCarrierKey::new(
+                3, 4, 512, 256, 256, 64, 32, 8, 2, 32, 2048, 1.0e-6, 1.0e6, 0.125,
+            )
+        );
+        assert_ne!(
+            baseline,
+            AttnBatchCarrierKey::new(
+                3, 4, 256, 256, 256, 64, 32, 8, 2, 32, 2048, 1.0e-6, 1.0e5, 0.125,
+            )
+        );
+        assert_ne!(
+            baseline,
+            AttnBatchCarrierKey::new(
+                3, 4, 256, 256, 256, 64, 32, 8, 2, 32, 2048, 1.0e-6, 1.0e6, 0.25,
+            )
         );
     }
 
