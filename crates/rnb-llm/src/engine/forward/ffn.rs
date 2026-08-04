@@ -83,7 +83,7 @@ pub(in crate::engine) fn forward_prefill_ffn(
 
     // pm33: Metal prefill FFN batch GEMM chain. non-Gemma(SiLU) + gate/up 분리(fused 제외) 한정,
     // RNB_METAL_PREFILL_FFN env opt-in. shim 이 quant/shape 미지원 시 used=false → CPU fallback.
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let metal_down: Option<Tensor> = if !use_gemma_block_semantics(architecture)
         && w.ffn_gate_up_fused.is_none()
         && dump_bin_dir().is_none()
@@ -106,7 +106,7 @@ pub(in crate::engine) fn forward_prefill_ffn(
     } else {
         None
     };
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     let metal_down: Option<Tensor> = None;
 
     #[cfg(feature = "mediatek")]

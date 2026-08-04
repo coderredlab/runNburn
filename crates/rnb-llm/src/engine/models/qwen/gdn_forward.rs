@@ -1282,7 +1282,7 @@ pub(in crate::engine) fn forward_gdn_layer_impl(
     }
     // pm33: Metal prefill FFN batch GEMM chain (GDN inline FFN, fused 제외 + trace off, env opt-in).
     // GDN silu(g/(1+exp(-g))*up)는 Metal silu_mul 과 일치. 미지원 quant/shape 시 used=false → CPU.
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let metal_down: Option<Tensor> = if w.ffn_gate_up_fused.is_none() && !trace_gdn_stages {
         let mut out = vec![0f32; seq_len * metadata.hidden_dim];
         let used = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
@@ -1302,7 +1302,7 @@ pub(in crate::engine) fn forward_gdn_layer_impl(
     } else {
         None
     };
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     let metal_down: Option<Tensor> = None;
 
     let down = if let Some(d) = metal_down {

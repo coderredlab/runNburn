@@ -17,6 +17,7 @@ Default checks:
   - host rnb-runtime CPU+MediaTek
   - host rnb-cli CPU-only (metal off)  [macOS only]
   - host rnb-cli CPU+metal             [macOS only]
+  - host rnb-cli CPU+CUDA+metal        [macOS only]
 
 Optional checks:
   --include-android  also checks Android aarch64 FFI CPU and CPU+Vulkan.
@@ -110,6 +111,8 @@ if [[ "$(uname)" == "Darwin" ]]; then
         cargo build -p rnb-cli --no-default-features --features cpu
     run_case "host cli cpu+metal" \
         cargo build -p rnb-cli --no-default-features --features cpu,metal
+    run_case "host cli cpu+cuda+metal" \
+        cargo check -p rnb-cli --no-default-features --features cpu,cuda,metal
 fi
 
 if [[ "$include_android" -eq 1 ]]; then
