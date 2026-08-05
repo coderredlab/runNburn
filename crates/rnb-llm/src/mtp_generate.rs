@@ -929,12 +929,10 @@ fn generate_stream_mtp_with_tokens(
     // 확률적 verify는 target 분포를 만들 수 있는 execution에서만 가능하다. CUDA device
     // verify는 logits 수집 모드가 있고, sequential은 all-logits 경로가 있다. 나머지는
     // argmax token만 돌려주므로 sampler를 태울 수 없다.
-    if sampled_verify
-        && !matches!(
-            verify_execution,
-            MtpVerifyExecution::DeviceResident | MtpVerifyExecution::Sequential
-        )
-    {
+    // sampler를 태우려면 target 분포가 있어야 한다. 지금 그걸 만들 수 있는 execution은
+    // CUDA device-resident verify(`collect_output_logits`)뿐이다. sequential은 all-logits
+    // 경로가 있지만 아직 sampler에 연결하지 않았으므로 허용하면 argmax로 조용히 되돌아간다.
+    if sampled_verify && verify_execution != MtpVerifyExecution::DeviceResident {
         return Err(crate::error::LlmError::Unsupported(format!(
             "MTP with temperature>0 requires device-resident or sequential verify, got {verify_execution:?}"
         )));

@@ -266,6 +266,7 @@ pub fn generate_stream(
             params,
             engine.mtp_spec_requested(),
             engine.mtp_explicitly_forced(),
+            engine.mtp_sampled_verify_supported(),
         ),
     ) {
         GenerateRoute::Mtp => {
@@ -329,9 +330,20 @@ fn mtp_generate_route_requested(
     params: &GenerateParams,
     mtp_requested: bool,
     mtp_explicitly_forced: bool,
+    sampled_verify_supported: bool,
 ) -> bool {
-    mtp_requested
-        && (crate::mtp_generate::mtp_greedy_verify_allowed(params) || mtp_explicitly_forced)
+    if !mtp_requested {
+        return false;
+    }
+    if mtp_explicitly_forced {
+        return true;
+    }
+    if crate::mtp_generate::mtp_greedy_verify_allowed(params) {
+        return true;
+    }
+    // `temperature > 0`은 target 분포를 만들 수 있는 backend에서만 자동 진입한다.
+    // 그렇지 않으면 MTP 경로가 unsupported로 실패하므로 standard generation이 맞다.
+    sampled_verify_supported && crate::mtp_generate::mtp_sampled_verify_allowed(params)
 }
 
 fn validate_forced_mtp_constraint(
@@ -402,6 +414,7 @@ pub(crate) fn generate_stream_resuming(
                 params,
                 engine.mtp_spec_requested(),
                 engine.mtp_explicitly_forced(),
+                engine.mtp_sampled_verify_supported(),
             ),
         )
     };
@@ -629,6 +642,7 @@ pub fn generate_stream_multimodal_resuming(
             params,
             engine.mtp_spec_requested(),
             engine.mtp_explicitly_forced(),
+            engine.mtp_sampled_verify_supported(),
         ),
     ) == GenerateRoute::Mtp
     {
@@ -730,6 +744,7 @@ pub fn generate_stream_multimodal(
             params,
             engine.mtp_spec_requested(),
             engine.mtp_explicitly_forced(),
+            engine.mtp_sampled_verify_supported(),
         ),
     ) == GenerateRoute::Mtp
     {
@@ -1225,14 +1240,30 @@ mod tests {
             GenerateRoute::Standard
         );
     }
-    /// `temperature > 0`은 forced에서만 MTP를 탄다. sampled verify는 동작하고 분포도
-    /// 보존하지만 accept가 낮아 target-only보다 느려서 auto 승격 기준에 못 미친다.
+    /// 기본 API 값(`temperature=1`)도 target 분포를 만들 수 있는 backend에서는 자동으로
+    /// MTP를 탄다. 그렇지 못한 backend는 unsupported 대신 standard generation으로 간다.
     #[test]
-    fn automatic_mtp_route_requires_greedy_but_forced_allows_sampling() {
+    fn automatic_mtp_route_accepts_sampling_only_when_backend_supports_it() {
         let default_params = GenerateParams::default();
         assert!(default_params.temperature > 0.0);
-        assert!(!mtp_generate_route_requested(&default_params, true, false));
-        assert!(mtp_generate_route_requested(&default_params, true, true));
+        assert!(mtp_generate_route_requested(
+            &default_params,
+            true,
+            false,
+            true
+        ));
+        assert!(!mtp_generate_route_requested(
+            &default_params,
+            true,
+            false,
+            false
+        ));
+        assert!(mtp_generate_route_requested(
+            &default_params,
+            true,
+            true,
+            false
+        ));
 
         let greedy_params = GenerateParams {
             temperature: 0.0,
@@ -1242,7 +1273,12 @@ mod tests {
             mirostat: None,
             ..GenerateParams::default()
         };
-        assert!(mtp_generate_route_requested(&greedy_params, true, false));
+        assert!(mtp_generate_route_requested(
+            &greedy_params,
+            true,
+            false,
+            false
+        ));
     }
 
     /// Mirostat은 `mu` state가 draft prefix를 따라 갈라져 rollback 계약이 필요하므로
@@ -1257,8 +1293,18 @@ mod tests {
             }),
             ..GenerateParams::default()
         };
-        assert!(!mtp_generate_route_requested(&mirostat_params, true, false));
-        assert!(mtp_generate_route_requested(&mirostat_params, true, true));
+        assert!(!mtp_generate_route_requested(
+            &mirostat_params,
+            true,
+            false,
+            true
+        ));
+        assert!(mtp_generate_route_requested(
+            &mirostat_params,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]

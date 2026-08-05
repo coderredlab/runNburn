@@ -914,6 +914,14 @@ impl Engine {
         policy
     }
 
+    /// `temperature > 0` 요청을 MTP로 처리할 수 있는가.
+    ///
+    /// target 분포가 필요하므로 CUDA device-resident verify에서만 가능하다. Metal
+    /// batched decode-chain과 Vulkan fullpath는 argmax token만 돌려주므로 제외된다.
+    pub(crate) fn mtp_sampled_verify_supported(&self) -> bool {
+        cfg!(feature = "cuda") && self.mtp_device_verify_requested()
+    }
+
     pub(crate) fn mtp_device_verify_requested(&self) -> bool {
         crate::engine::runtime::policy::mtp_device_verify_override()
             .unwrap_or_else(|| self.mtp_auto_policy().device_verify)
