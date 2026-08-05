@@ -17,9 +17,11 @@ impl Sampler for TopK {
             return;
         }
 
-        let mut sorted = logits.to_vec();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let threshold = sorted[self.k - 1];
+        let mut candidates = logits.to_vec();
+        let (_, threshold, _) = candidates.select_nth_unstable_by(self.k - 1, |a, b| {
+            b.partial_cmp(a).expect("top-k logits must not be NaN")
+        });
+        let threshold = *threshold;
 
         let mut kept = 0;
         for x in logits.iter_mut() {
@@ -73,5 +75,30 @@ mod tests {
         tk.apply(&mut logits, &[]);
         let kept = logits.iter().filter(|&&x| x != f32::NEG_INFINITY).count();
         assert_eq!(kept, 3);
+    }
+
+    #[test]
+    fn selection_threshold_matches_full_sort_reference() {
+        let source = (0..4096)
+            .map(|index| ((index * 37) % 113) as f32 * 0.125 - 7.0)
+            .collect::<Vec<_>>();
+        for k in [1, 2, 10, 128, 1024, source.len() - 1] {
+            let mut expected = source.clone();
+            let mut sorted = expected.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let threshold = sorted[k - 1];
+            let mut kept = 0;
+            for logit in &mut expected {
+                if *logit >= threshold && kept < k {
+                    kept += 1;
+                } else {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+
+            let mut actual = source.clone();
+            TopK::new(k).apply(&mut actual, &[]);
+            assert_eq!(actual, expected, "k={k}");
+        }
     }
 }
