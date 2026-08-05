@@ -14025,6 +14025,66 @@ mod tests {
         }
     }
 
+    /// Batched HD=256/GQA=8 shared-KV part는 lane별 query-head split-K와 같은
+    /// split partition, key 순서, partial ABI를 보존해야 한다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn attn_decode_f16_gqa_batch_splitk_matches_query_head_batch_reference() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(false) else {
+            panic!("no Metal device — run on macOS host")
+        };
+        use crate::compute::attn_decode_f16_batch_splitk_with_ctx;
+
+        let (nh, nkv, hd, batch) = (16usize, 2usize, 256usize, 3usize);
+        let kv_dim = nkv * hd;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        for (kv_lens, splits) in [
+            ([1025u32, 1026, 1027], 16usize),
+            ([2051u32, 2052, 2053], 32usize),
+        ] {
+            let max_kv_len = kv_lens[batch - 1] as usize;
+            let q: Vec<f32> = (0..batch * nh * hd)
+                .map(|i| (((i * 17 + 3) as f32) * 0.007).sin())
+                .collect();
+            let k16: Vec<u16> = (0..max_kv_len * kv_dim)
+                .map(|i| half::f16::from_f32((((i * 13 + 11) as f32) * 0.005).sin()).to_bits())
+                .collect();
+            let v16: Vec<u16> = (0..max_kv_len * kv_dim)
+                .map(|i| half::f16::from_f32((((i * 19 + 5) as f32) * 0.006).cos()).to_bits())
+                .collect();
+
+            let expected = {
+                let _reference = EnvGuard::set("RNB_TEST_METAL_MTP_BATCH_GQA_REFERENCE", "1");
+                attn_decode_f16_batch_splitk_with_ctx(
+                    &ctx, &q, &k16, &v16, nh, nkv, hd, &kv_lens, scale, splits,
+                )
+            };
+            let actual = {
+                let _candidate = EnvGuard::remove("RNB_TEST_METAL_MTP_BATCH_GQA_REFERENCE");
+                attn_decode_f16_batch_splitk_with_ctx(
+                    &ctx, &q, &k16, &v16, nh, nkv, hd, &kv_lens, scale, splits,
+                )
+            };
+
+            let max_abs = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "attn_decode_f16_gqa_batch_splitk kv_lens={kv_lens:?} splits={splits} max_abs={max_abs}"
+            );
+            assert!(
+                max_abs <= 1e-6,
+                "batch GQA shared-KV max_abs {max_abs} > 1e-6 for {kv_lens:?}/{splits}"
+            );
+        }
+    }
+
     /// footgun(pm17): in-process 로 engine 을 재사용(반복 측정/multi-turn)하면 직전
     /// sequence 가 carrier 에 남긴 device KV state(`KvResident::filled != 0`)가 그대로
     /// 살아, 새 sequence 의 prefill 재동기화를 `if filled == 0` 가드에서 skip → stale KV

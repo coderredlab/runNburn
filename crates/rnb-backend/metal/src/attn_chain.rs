@@ -1508,6 +1508,7 @@ pub(crate) fn attn_core_chain_encode_bcol(
                 .expect("batch splitk splits buffer missing"),
             &carrier.b_buf,
             num_heads,
+            num_kv_heads,
             head_dim,
             ctx.attn_splitk_splits,
             b,

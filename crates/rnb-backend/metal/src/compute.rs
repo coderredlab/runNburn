@@ -80,6 +80,8 @@ const ATTN_DECODE_I8_GQA_SPLITK_SRC: &str = include_str!("attn_decode_i8_gqa_spl
 const ATTN_DECODE_I8_GQA_MATRIX_SPLITK_SRC: &str =
     include_str!("attn_decode_i8_gqa_matrix_splitk.metal");
 const ATTN_DECODE_SPLITK_SRC: &str = include_str!("attn_decode_splitk.metal");
+const ATTN_DECODE_F16_GQA_BATCH_SPLITK_SRC: &str =
+    include_str!("attn_decode_f16_gqa_batch_splitk.metal");
 const ATTN_DECODE_GQA_SRC: &str = include_str!("attn_decode_gqa.metal");
 const ROPE_MROPE_SRC: &str = include_str!("rope_mrope.metal");
 const QK_NORM_SRC: &str = include_str!("qk_norm.metal");
@@ -602,6 +604,9 @@ pub struct MetalContext {
     pub attn_decode_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_reduce_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_part_batch_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Batched HD=256/GQA=8 f16 KV split-K part. Batch/query heads share each KV tile.
+    pub attn_decode_f16_gqa_batch_splitk_part_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_reduce_batch_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2244,6 +2249,11 @@ pub fn build_metal_context_with_opts(
         ATTN_DECODE_SPLITK_SRC,
         "attn_decode_splitk_part_batch",
     );
+    let attn_decode_f16_gqa_batch_splitk_part_pipeline = build_pipeline(
+        &device,
+        ATTN_DECODE_F16_GQA_BATCH_SPLITK_SRC,
+        "attn_decode_f16_gqa_batch_splitk_part",
+    );
     let attn_decode_splitk_reduce_batch_pipeline = build_pipeline(
         &device,
         ATTN_DECODE_SPLITK_SRC,
@@ -2455,6 +2465,7 @@ pub fn build_metal_context_with_opts(
         attn_decode_splitk_part_pipeline,
         attn_decode_splitk_reduce_pipeline,
         attn_decode_splitk_part_batch_pipeline,
+        attn_decode_f16_gqa_batch_splitk_part_pipeline,
         attn_decode_splitk_reduce_batch_pipeline,
         attn_decode_gqa_splitk_part_pipeline,
         attn_decode_gqa_splitk_reduce_pipeline,
@@ -10973,6 +10984,7 @@ pub(crate) fn encode_attn_decode_splitk_batch(
     splits_buf: &ProtocolObject<dyn MTLBuffer>,
     batch_buf: &ProtocolObject<dyn MTLBuffer>,
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
     num_splits: usize,
     batch: usize,
@@ -10986,6 +10998,31 @@ pub(crate) fn encode_attn_decode_splitk_batch(
         "attn_decode_splitk_batch requires >=2 splits"
     );
     assert!(batch >= 1, "attn_decode_splitk_batch requires batch >=1");
+    if try_encode_attn_decode_f16_gqa_batch_splitk(
+        ctx,
+        enc,
+        q_buf,
+        k_f16,
+        v_f16,
+        partial_acc,
+        partial_m,
+        partial_s,
+        o_buf,
+        nh_buf,
+        nkv_buf,
+        hd_buf,
+        kv_lens_buf,
+        scale_buf,
+        splits_buf,
+        batch_buf,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        num_splits,
+        batch,
+    ) {
+        return;
+    }
 
     enc.setComputePipelineState(&ctx.attn_decode_splitk_part_batch_pipeline);
     unsafe {
@@ -11037,6 +11074,119 @@ pub(crate) fn encode_attn_decode_splitk_batch(
         },
         tg,
     );
+}
+
+/// Batched HD=256/GQA=8 f16 KV split-K attention. 한 threadgroup의 SIMD-group들이
+/// `(batch lane, query head)`를 나눠 맡고 K/V tile을 공유한다. 적격하지 않으면
+/// 아무것도 encode하지 않고 false를 반환한다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_attn_decode_f16_gqa_batch_splitk(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_f16: &ProtocolObject<dyn MTLBuffer>,
+    v_f16: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc: &ProtocolObject<dyn MTLBuffer>,
+    partial_m: &ProtocolObject<dyn MTLBuffer>,
+    partial_s: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kv_lens_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    splits_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+    batch: usize,
+) -> bool {
+    const HEADS_PER_GROUP: usize = 8;
+    const HEAD_DIM: usize = 256;
+    const KV_TILE: usize = 8;
+
+    let pipeline = &ctx.attn_decode_f16_gqa_batch_splitk_part_pipeline;
+    let Some(threadgroup_width) = batch
+        .checked_mul(HEADS_PER_GROUP)
+        .and_then(|groups| groups.checked_mul(SIMD_WIDTH))
+    else {
+        return false;
+    };
+    #[cfg(test)]
+    if std::env::var_os("RNB_TEST_METAL_MTP_BATCH_GQA_REFERENCE").is_some() {
+        return false;
+    }
+    if batch < 2
+        || num_kv_heads == 0
+        || num_heads != num_kv_heads.saturating_mul(HEADS_PER_GROUP)
+        || head_dim != HEAD_DIM
+        || num_splits < 2
+        || pipeline.threadExecutionWidth() != SIMD_WIDTH
+        || threadgroup_width > pipeline.maxTotalThreadsPerThreadgroup()
+    {
+        return false;
+    }
+
+    enc.setComputePipelineState(pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_f16), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_f16), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(kv_lens_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 11);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 12);
+        enc.setThreadgroupMemoryLength_atIndex(
+            2 * KV_TILE * HEAD_DIM * std::mem::size_of::<u16>(),
+            0,
+        );
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: num_kv_heads,
+            height: num_splits,
+            depth: 1,
+        },
+        MTLSize {
+            width: threadgroup_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    chain_barrier(ctx, enc);
+
+    enc.setComputePipelineState(&ctx.attn_decode_splitk_reduce_batch_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 7);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: num_heads,
+            height: batch,
+            depth: 1,
+        },
+        MTLSize {
+            width: SIMD_WIDTH,
+            height: 1,
+            depth: 1,
+        },
+    );
+    true
 }
 
 /// pm132: GQA-grouped f16 KV split-K decode attention encode.
@@ -11433,6 +11583,117 @@ pub fn attn_decode_i8_splitk_with_ctx(
             num_splits,
         );
     }
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    let contents: NonNull<std::ffi::c_void> = o_buf.contents();
+    let out_slice: &[f32] =
+        unsafe { std::slice::from_raw_parts(contents.as_ptr() as *const f32, out_len) };
+    out_slice.to_vec()
+}
+
+/// Batched f16 KV split-K attention oneshot. Direct candidate/reference oracle only.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_decode_f16_batch_splitk_with_ctx(
+    ctx: &MetalContext,
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_lens: &[u32],
+    scale: f32,
+    num_splits: usize,
+) -> Vec<f32> {
+    assert!(!ctx.kv_int8, "f16 batch split-K requires f16 KV context");
+    let batch = kv_lens.len();
+    let kv_dim = num_kv_heads * head_dim;
+    let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0) as usize;
+    assert!(batch >= 2, "batch must be >= 2");
+    assert_eq!(q.len(), batch * num_heads * head_dim, "q length mismatch");
+    assert_eq!(k_f16.len(), max_kv_len * kv_dim, "k_f16 length mismatch");
+    assert_eq!(v_f16.len(), max_kv_len * kv_dim, "v_f16 length mismatch");
+
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mk_bytes =
+        |ptr: *const std::ffi::c_void, len: usize| -> Retained<ProtocolObject<dyn MTLBuffer>> {
+            let nn = NonNull::new(ptr as *mut std::ffi::c_void).expect("buffer ptr is null");
+            unsafe {
+                ctx.device
+                    .newBufferWithBytes_length_options(nn, len, shared)
+                    .expect("Metal: failed to create buffer")
+            }
+        };
+    let q_buf = mk_bytes(q.as_ptr() as *const _, std::mem::size_of_val(q));
+    let k_buf = mk_bytes(k_f16.as_ptr() as *const _, std::mem::size_of_val(k_f16));
+    let v_buf = mk_bytes(v_f16.as_ptr() as *const _, std::mem::size_of_val(v_f16));
+    let kv_lens_buf = mk_bytes(kv_lens.as_ptr() as *const _, std::mem::size_of_val(kv_lens));
+
+    let out_len = batch * num_heads * head_dim;
+    let o_buf = ctx
+        .device
+        .newBufferWithLength_options(out_len * std::mem::size_of::<f32>(), shared)
+        .expect("Metal: failed to create output buffer");
+    let partial_rows = batch * num_splits * num_heads;
+    let partial_acc = ctx
+        .device
+        .newBufferWithLength_options(partial_rows * head_dim * std::mem::size_of::<f32>(), shared)
+        .expect("Metal: failed to create split-K partial_acc buffer");
+    let partial_m = ctx
+        .device
+        .newBufferWithLength_options(partial_rows * std::mem::size_of::<f32>(), shared)
+        .expect("Metal: failed to create split-K partial_m buffer");
+    let partial_s = ctx
+        .device
+        .newBufferWithLength_options(partial_rows * std::mem::size_of::<f32>(), shared)
+        .expect("Metal: failed to create split-K partial_s buffer");
+
+    let nh = num_heads as u32;
+    let nkv = num_kv_heads as u32;
+    let hd = head_dim as u32;
+    let splits = num_splits as u32;
+    let batch_u32 = batch as u32;
+    let mk_u32 = |v: &u32| mk_bytes(v as *const u32 as *const _, std::mem::size_of::<u32>());
+    let nh_buf = mk_u32(&nh);
+    let nkv_buf = mk_u32(&nkv);
+    let hd_buf = mk_u32(&hd);
+    let splits_buf = mk_u32(&splits);
+    let batch_buf = mk_u32(&batch_u32);
+    let scale_buf = mk_bytes(&scale as *const f32 as *const _, std::mem::size_of::<f32>());
+
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .expect("Metal: failed to create command buffer");
+    let enc = cmd
+        .computeCommandEncoder()
+        .expect("Metal: failed to create compute command encoder");
+    encode_attn_decode_splitk_batch(
+        ctx,
+        &enc,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &partial_acc,
+        &partial_m,
+        &partial_s,
+        &o_buf,
+        &nh_buf,
+        &nkv_buf,
+        &hd_buf,
+        &kv_lens_buf,
+        &scale_buf,
+        &splits_buf,
+        &batch_buf,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        num_splits,
+        batch,
+    );
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
