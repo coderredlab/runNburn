@@ -17,8 +17,9 @@ pub(crate) struct BatchedVerifyCommit {
     pub(crate) batch: usize,
     /// run layer 순서의 model layer index.
     layer_indices: Vec<usize>,
-    /// GDN prefix state: gdn_prefix[n-1][layer] = n lane 처리 후 conv/delta(dense/MoE GDN만
-    /// Some). 재실행 없이 carrier에서 readback하며 commit은 `[committed-1]`을 쓴다.
+    /// Device carrier의 exact generation. Accept 수 확정 전에는 GDN state를 host로 읽지 않는다.
+    gdn_state_handle: Option<u64>,
+    #[cfg(test)]
     gdn_prefix: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
     /// attn layer = Some((k,v))(slot-major [batch*kv_dim] post-rope f16 bits), 그 외 None.
     out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>>,
@@ -669,7 +670,7 @@ impl Engine {
         let capacity = self.kv_cache.max_seq_len;
         let mut out_states: Vec<Option<(Vec<f32>, Vec<f32>)>> = vec![None; run.len()];
         let mut out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
-        let mut gdn_prefix: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>> = Vec::new();
+        let mut gdn_state_handle = None;
         let mut output_logits = Vec::new();
         let reports = backend_runtime::metal_decode_chain_run_batched(
             &mut hidden,
@@ -679,7 +680,7 @@ impl Engine {
             &attn_shapes,
             &mut out_states,
             &mut out_attn_kv,
-            &mut gdn_prefix,
+            &mut gdn_state_handle,
             collect_output_logits.then_some(&mut output_logits),
             capacity,
             hidden_dim,
@@ -704,6 +705,11 @@ impl Engine {
                 None => return Ok(None),
             }
         }
+        if gdn_state_handle.is_none() {
+            return Err(crate::error::LlmError::Forward(
+                "batched verify returned no GDN state handle".to_string(),
+            ));
+        }
         let layer_indices: Vec<usize> = run.iter().map(|(li, _)| *li).collect();
         let window = crate::engine::verify_window::VerifyWindowResult {
             target_tokens,
@@ -721,7 +727,9 @@ impl Engine {
             base_pos,
             batch,
             layer_indices,
-            gdn_prefix,
+            gdn_state_handle,
+            #[cfg(test)]
+            gdn_prefix: Vec::new(),
             out_attn_kv,
             kv_dims,
         };
@@ -832,11 +840,38 @@ impl Engine {
                 "batched verify commit layer payload count mismatch".to_string(),
             ));
         }
-        let gdn_state = commit.gdn_prefix.get(committed - 1).ok_or_else(|| {
-            crate::error::LlmError::Forward(format!(
-                "batched verify commit missing GDN prefix {committed}"
-            ))
-        })?;
+        let gdn_state = match commit.gdn_state_handle {
+            Some(handle) => {
+                crate::engine::metal_runtime::metal_decode_chain_read_batched_gdn_prefix(
+                    handle, committed,
+                )
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(format!(
+                        "batched verify GDN state handle is stale: {handle}"
+                    ))
+                })?
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    commit
+                        .gdn_prefix
+                        .get(committed - 1)
+                        .cloned()
+                        .ok_or_else(|| {
+                            crate::error::LlmError::Forward(format!(
+                                "batched verify commit missing test GDN prefix {committed}"
+                            ))
+                        })?
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(crate::error::LlmError::Forward(
+                        "batched verify commit missing GDN state handle".to_string(),
+                    ));
+                }
+            }
+        };
         if gdn_state.len() != layer_count {
             return Err(crate::error::LlmError::Forward(
                 "batched verify commit GDN layer count mismatch".to_string(),
@@ -908,11 +943,14 @@ impl Engine {
             }
         }
         self.kv_cache.set_len(target_len);
-        crate::engine::metal_runtime::metal_decode_chain_commit_batched_gdn_prefix(
-            &commit.layer_indices,
-            commit.batch,
-            committed,
-        );
+        if let Some(handle) = commit.gdn_state_handle {
+            assert!(
+                crate::engine::metal_runtime::metal_decode_chain_commit_batched_gdn_prefix(
+                    handle, committed,
+                ),
+                "validated batched GDN state handle must commit"
+            );
+        }
         self.last_layer_hidden_cached = last_hidden;
         Ok(())
     }
@@ -2377,6 +2415,7 @@ mod tests {
             base_pos: 0,
             batch: 2,
             layer_indices: vec![0],
+            gdn_state_handle: None,
             gdn_prefix: vec![vec![None], vec![None]],
             out_attn_kv: vec![Some((vec![0; kv_dim], vec![0; kv_dim]))],
             kv_dims: vec![Some(kv_dim)],
@@ -2400,6 +2439,7 @@ mod tests {
             base_pos: 0,
             batch: 2,
             layer_indices: vec![0],
+            gdn_state_handle: None,
             gdn_prefix: vec![vec![None], vec![None]],
             out_attn_kv: vec![Some((vec![0; 2 * kv_dim], vec![0; 2 * kv_dim]))],
             kv_dims: vec![Some(kv_dim)],

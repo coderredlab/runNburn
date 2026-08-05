@@ -1924,6 +1924,11 @@ fn generate_stream_mtp_with_tokens(
         })?;
     }
 
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if verify_execution == MtpVerifyExecution::BatchDecodeChain {
+        engine.materialize_sequence_state()?;
+    }
+
     if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
         eprintln!("{}", stats.report());
         eprintln!("{}", phase.report(stats.rounds));

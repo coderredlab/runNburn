@@ -592,6 +592,14 @@ fn qwen35_metal_batch_auto_eligible(
     }
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn qwen35_metal_batch_auto_spec_k(architecture: ModelArchitecture) -> usize {
+    match architecture {
+        ModelArchitecture::Qwen35MoE => 2,
+        _ => 1,
+    }
+}
+
 fn mtp_auto_policy_for_model(
     architecture: ModelArchitecture,
     metadata: &ModelMetadata,
@@ -899,13 +907,19 @@ impl Engine {
             self.mtp_runtime_ready(),
             self.batched_decode_chain_ready(),
         ) {
-            let reason = match self.architecture {
-                ModelArchitecture::Qwen35MoE => "qwen35moe-metal-batch-decode-chain-auto",
-                _ => "dense-qwen35-metal-batch-decode-chain-auto",
+            let (spec_k, reason) = match self.architecture {
+                ModelArchitecture::Qwen35MoE => (
+                    qwen35_metal_batch_auto_spec_k(self.architecture),
+                    "qwen35moe-k2-metal-batch-decode-chain-auto",
+                ),
+                _ => (
+                    qwen35_metal_batch_auto_spec_k(self.architecture),
+                    "dense-qwen35-metal-batch-decode-chain-auto",
+                ),
             };
             return MtpAutoPolicy {
                 enabled: true,
-                spec_k: 1,
+                spec_k,
                 device_verify: false,
                 reason,
                 ..policy
@@ -2174,6 +2188,11 @@ mod tests {
     #[test]
     fn qwen35_metal_batch_auto_requires_supported_arch_full_chain_and_runtime() {
         let dense = policy_metadata(4096, 40);
+        assert_eq!(qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35), 1);
+        assert_eq!(
+            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35MoE),
+            2
+        );
         assert!(qwen35_metal_batch_auto_eligible(
             ModelArchitecture::Qwen35,
             &dense,

@@ -2933,14 +2933,9 @@ pub fn metal_decode_chain_run(
     Ok(report)
 }
 
-/// milestone 5(MTP): 배치(B-lane) decode chain seam. `metal_decode_chain_run` 과 동일한 spec
-/// 변환(`chain_layer_to_ref`)을 쓰되 `decode_chain_run_batched_collect_attn_kv` 로 B lane 을
-/// 한 command buffer 에 처리한다. 반환: lane 별 `MetalDecodeChainReport`(각 output_argmax.token_id
-/// = 그 lane 의 argmax). `out_attn_kv` = attn layer 별 window post-rope f16 K/V([batch*kv_dim],
-/// slot-major; 엔진이 accept-n 커밋에서 host kv_cache 에 append). `out_gdn_prefix[n-1]` = n lane
-/// 처리 후 GDN prefix state(layer 순서; GdnMoeQwen=Some((conv,delta)), 그 외 None) — 재실행 없이
-/// carrier 에서 readback(병목2). 엔진은 accept-n(=committed)에서 `out_gdn_prefix[committed-1]` 로
-/// GDN, `out_attn_kv` 앞 committed slot 으로 attn 을 커밋한다. f16 KV + non-KVarn + batch 1..=8.
+/// milestone 5(MTP): 배치(B-lane) decode chain seam. Attention K/V는 즉시
+/// 반환하고 GDN state는 device carrier에 남긴다. `out_gdn_state_handle`은 accept 수가
+/// 정해진 뒤 committed prefix 하나만 materialize하고 durable slot을 전진시키는 generation key다.
 #[cfg(feature = "metal")]
 #[allow(clippy::too_many_arguments)]
 pub fn metal_decode_chain_run_batched_collect_attn_kv(
@@ -2949,11 +2944,11 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
     specs: &[MetalChainLayer<'_>],
     out_states: &mut [Option<(Vec<f32>, Vec<f32>)>],
     out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
-    out_gdn_prefix: &mut Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
+    out_gdn_state_handle: &mut Option<u64>,
     output_argmax: Option<MetalDecodeOutputArgmax<'_>>,
     out_output_logits: Option<&mut Vec<f32>>,
 ) -> Result<Vec<MetalDecodeChainReport>> {
-    out_gdn_prefix.clear();
+    *out_gdn_state_handle = None;
     let fallback_reports = |reason: &'static str| {
         (0..batch)
             .map(|_| MetalDecodeChainReport::fallback(reason, false))
@@ -2971,8 +2966,8 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
     let refs = {
         let mut refs: Vec<rnb_backend_metal::ChainLayerSpecRef<'_>> =
             Vec::with_capacity(specs.len());
-        for s in specs {
-            match chain_layer_to_ref(s) {
+        for spec in specs {
+            match chain_layer_to_ref(spec) {
                 Ok(spec) => refs.push(spec),
                 Err(reason) => return Ok(fallback_reports(reason)),
             }
@@ -2980,14 +2975,12 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
         refs
     };
     let output_argmax_ref = match chain_output_argmax_to_ref(output_argmax) {
-        Ok(r) => r,
+        Ok(output) => output,
         Err(reason) => return Ok(fallback_reports(reason)),
     };
     let options = decode_chain_options(policy);
-    // forward + prefix readback 을 같은 backend borrow 안에서 완결. gdn_prefix 는 forward 가
-    // (layer,batch) carrier 에 보존한 ping-pong delta/rolling conv 를 재실행 없이 읽는다.
-    let (reports, gdn_prefix) = METAL.with(|b| {
-        let reports = b.decode_chain_run_batched_collect_attn_kv(
+    let reports = METAL.with(|backend| {
+        backend.decode_chain_run_batched_collect_attn_kv(
             hidden,
             batch,
             &refs,
@@ -2995,17 +2988,10 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
             options,
             output_argmax_ref,
             out_attn_kv,
+            out_gdn_state_handle,
             out_output_logits,
-        );
-        let mut gdn_prefix = Vec::with_capacity(batch);
-        if reports.first().is_some_and(|r| r.did_run) {
-            for n in 1..=batch {
-                gdn_prefix.push(b.decode_chain_run_batched_gdn_prefix(&refs, batch, n));
-            }
-        }
-        (reports, gdn_prefix)
+        )
     });
-    *out_gdn_prefix = gdn_prefix;
     Ok(reports
         .into_iter()
         .map(MetalDecodeChainReport::from)
@@ -3013,14 +2999,16 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
 }
 
 #[cfg(feature = "metal")]
-pub fn metal_decode_chain_commit_batched_gdn_prefix(
-    layer_indices: &[usize],
-    batch: usize,
+pub fn metal_decode_chain_read_batched_gdn_prefix(
+    handle: u64,
     committed: usize,
-) {
-    METAL.with(|backend| {
-        backend.decode_chain_commit_batched_gdn_prefix(layer_indices, batch, committed)
-    });
+) -> Option<Vec<Option<(Vec<f32>, Vec<f32>)>>> {
+    METAL.with(|backend| backend.decode_chain_read_batched_gdn_prefix(handle, committed))
+}
+
+#[cfg(feature = "metal")]
+pub fn metal_decode_chain_commit_batched_gdn_prefix(handle: u64, committed: usize) -> bool {
+    METAL.with(|backend| backend.decode_chain_commit_batched_gdn_prefix(handle, committed))
 }
 
 /// GDN layer 전체 device-resident carrier. pm25: default ON(opt-out) —

@@ -369,17 +369,26 @@ impl GdnBatchCarrier {
         }
     }
 
-    /// chain 진입 전 conv state는 rolling buffer 시작점에 동기화한다. delta state는 직전
-    /// batched verify의 committed prefix가 device slot에 남아 있으면 그 slot을 재사용하고,
-    /// 그렇지 않으면 host source of truth를 slot 0에 upload한다.
-    pub(crate) fn upload_states(&mut self, conv_state: &[f32], delta_state: &[f32]) {
+    /// Conv는 host source를 매 round 동기화한다. Delta는 같은 active carrier면 committed
+    /// device slot을 재사용하고, batch shape가 바뀌면 caller가 넘긴 최신 seed를 slot 0에 올린다.
+    pub(crate) fn upload_states(
+        &mut self,
+        conv_state: &[f32],
+        delta_state: &[f32],
+        reuse_device_delta: bool,
+    ) {
         assert_eq!(conv_state.len(), self.conv_state_len);
         assert_eq!(delta_state.len(), self.delta_state_len);
         Self::upload(&self.conv_roll, conv_state);
-        if self.reuse_committed_delta {
+        if reuse_device_delta {
+            assert!(
+                self.reuse_committed_delta,
+                "active batched GDN carrier must own a committed delta slot"
+            );
             self.reuse_committed_delta = false;
         } else {
             self.delta_start_slot = 0;
+            self.reuse_committed_delta = false;
             Self::upload(&self.delta_all, delta_state);
         }
     }
@@ -404,6 +413,29 @@ impl GdnBatchCarrier {
             self.delta_state_len,
         );
         (conv_new, delta_new)
+    }
+
+    pub(crate) fn readback_prefix_conv_state(&self, n: usize) -> Vec<f32> {
+        assert!(n >= 1 && n <= self.b, "prefix n out of range");
+        Self::readback_at(&self.conv_roll, n * self.conv_channels, self.conv_state_len)
+    }
+
+    pub(crate) fn readback_committed_delta(&self) -> Vec<f32> {
+        Self::readback_at(
+            &self.delta_all,
+            self.delta_start_slot * self.delta_state_len,
+            self.delta_state_len,
+        )
+    }
+
+    pub(crate) fn sync_committed_delta(&self, out: &mut [f32]) {
+        assert_eq!(out.len(), self.delta_state_len);
+        let contents = self.delta_all.contents();
+        unsafe {
+            let src =
+                (contents.as_ptr() as *const f32).add(self.delta_start_slot * self.delta_state_len);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), out.len());
+        }
     }
 
     pub(crate) fn mark_committed_prefix(&mut self, n: usize) {

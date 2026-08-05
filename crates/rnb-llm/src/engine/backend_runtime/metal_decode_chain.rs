@@ -179,7 +179,7 @@ fn metal_decode_chain_run_impl(
     attn_shapes: &[Option<ChainAttnShape>],
     out_states: &mut [Option<(Vec<f32>, Vec<f32>)>],
     out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
-    out_gdn_prefix: Option<&mut Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>>,
+    out_gdn_state_handle: Option<&mut Option<u64>>,
     out_output_logits: Option<&mut Vec<f32>>,
     capacity: usize,
     hidden_dim: usize,
@@ -544,8 +544,8 @@ fn metal_decode_chain_run_impl(
         };
         return match out_attn_kv {
             Some(out_kv) => {
-                let out_prefix =
-                    out_gdn_prefix.expect("batched decode chain requires out_gdn_prefix buffer");
+                let state_handle = out_gdn_state_handle
+                    .expect("batched decode chain requires GDN state handle output");
                 metal_decode_chain_runtime_result_batched(
                     metal_runtime::metal_decode_chain_run_batched_collect_attn_kv(
                         hidden,
@@ -553,7 +553,7 @@ fn metal_decode_chain_run_impl(
                         &specs,
                         out_states,
                         out_kv,
-                        out_prefix,
+                        state_handle,
                         output_tail,
                         out_output_logits,
                     ),
@@ -578,7 +578,7 @@ fn metal_decode_chain_run_impl(
             attn_shapes,
             out_states,
             out_attn_kv,
-            out_gdn_prefix,
+            out_gdn_state_handle,
             out_output_logits,
             capacity,
             hidden_dim,
@@ -662,7 +662,7 @@ pub(in crate::engine) fn metal_decode_chain_run_batched(
     attn_shapes: &[Option<ChainAttnShape>],
     out_states: &mut [Option<(Vec<f32>, Vec<f32>)>],
     out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
-    out_gdn_prefix: &mut Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
+    out_gdn_state_handle: &mut Option<u64>,
     out_output_logits: Option<&mut Vec<f32>>,
     capacity: usize,
     hidden_dim: usize,
@@ -684,7 +684,7 @@ pub(in crate::engine) fn metal_decode_chain_run_batched(
         attn_shapes,
         out_states,
         Some(out_attn_kv),
-        Some(out_gdn_prefix),
+        Some(out_gdn_state_handle),
         out_output_logits,
         capacity,
         hidden_dim,

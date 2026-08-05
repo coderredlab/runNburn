@@ -24,7 +24,7 @@ use objc2_metal::{
 #[cfg(target_os = "macos")]
 use rnb_core::tensor::HostStorageLease;
 #[cfg(target_os = "macos")]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
 
@@ -1745,6 +1745,12 @@ pub struct MetalBackend {
     /// milestone 3: batched(B-lane) GDN core carrier. (layer, B) 별 1회 alloc, single-token
     /// `gdn_carriers` 와 분리(프로덕션 single-token 경로 불변). MTP verify body fusion 전용.
     gdn_batch_carriers: RefCell<HashMap<GdnBatchCarrierKey, gdn_chain::GdnBatchCarrier>>,
+    /// 직전 batched verify가 device에 남긴 GDN prefix를 accept 수 확정 뒤 한 번만
+    /// materialize하기 위한 generation-tagged carrier key.
+    next_batched_gdn_state_handle: Cell<u64>,
+    batched_gdn_state_handle: RefCell<Option<(u64, Vec<Option<GdnBatchCarrierKey>>)>>,
+    /// Layer별 최신 committed delta를 소유한 batch-shape carrier.
+    active_batched_gdn_carriers: RefCell<HashMap<usize, GdnBatchCarrierKey>>,
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
     attn_batch_carriers: RefCell<HashMap<AttnBatchCarrierKey, attn_chain::AttnBatchCarrier>>,
@@ -1957,6 +1963,9 @@ impl MetalBackend {
                 gdn_carriers: RefCell::new(HashMap::new()),
                 gdn_core_carriers: RefCell::new(HashMap::new()),
                 gdn_batch_carriers: RefCell::new(HashMap::new()),
+                next_batched_gdn_state_handle: Cell::new(0),
+                batched_gdn_state_handle: RefCell::new(None),
+                active_batched_gdn_carriers: RefCell::new(HashMap::new()),
                 attn_batch_carriers: RefCell::new(HashMap::new()),
                 dense_ffn_batch_carriers: RefCell::new(HashMap::new()),
             }
@@ -1989,6 +1998,9 @@ impl MetalBackend {
         self.kv_residents.borrow_mut().clear();
         self.kvarn_residents.borrow_mut().clear();
         self.attn_batch_carriers.borrow_mut().clear();
+        self.gdn_batch_carriers.borrow_mut().clear();
+        self.batched_gdn_state_handle.borrow_mut().take();
+        self.active_batched_gdn_carriers.borrow_mut().clear();
     }
 
     /// pm112: weight residency 활성 여부. 기본 ON — MLA dense GEMV Metal 경로가
@@ -2030,6 +2042,17 @@ impl MetalBackend {
     /// 미초기화 GDN)는 `false` 반환(host `out` 미변경). `out.len()` == delta_state_len 가정.
     #[cfg(target_os = "macos")]
     pub fn sync_delta_state(&self, layer: usize, out: &mut [f32]) -> bool {
+        if let Some(key) = self
+            .active_batched_gdn_carriers
+            .borrow()
+            .get(&layer)
+            .copied()
+        {
+            if let Some(carrier) = self.gdn_batch_carriers.borrow().get(&key) {
+                carrier.sync_committed_delta(out);
+                return true;
+            }
+        }
         let carriers = self.gdn_carriers.borrow();
         let Some(carrier) = carriers.get(&layer) else {
             return false;
@@ -2122,6 +2145,9 @@ impl MetalBackend {
             gdn_carriers: RefCell::new(HashMap::new()),
             gdn_core_carriers: RefCell::new(HashMap::new()),
             gdn_batch_carriers: RefCell::new(HashMap::new()),
+            next_batched_gdn_state_handle: Cell::new(0),
+            batched_gdn_state_handle: RefCell::new(None),
+            active_batched_gdn_carriers: RefCell::new(HashMap::new()),
             attn_batch_carriers: RefCell::new(HashMap::new()),
             dense_ffn_batch_carriers: RefCell::new(HashMap::new()),
         }
@@ -10371,11 +10397,9 @@ impl MetalBackend {
         )
     }
 
-    /// `decode_chain_run_batched`의 MTP verify 변형. 각 dense/MoE attention layer가 이번
-    /// pass에서 device append한 window의 post-rope f16 K/V를 `out_attn_kv`에 채운다.
-    /// 반환 K/V는 slot-major contiguous `[batch*kv_dim]`; 엔진은 accept-n 커밋에서 앞 n slot만
-    /// host KV cache에 append한다. f16 KV + non-KVarn + batch 1..=8 fused 경로 전제이며,
-    /// fallback이면 attention 항목은 None으로 남는다.
+    /// `decode_chain_run_batched`의 MTP verify 변형. Attention K/V는 즉시 반환하지만
+    /// GDN prefix는 device carrier에 남기고 generation handle만 반환한다. Accept 수를
+    /// 정한 뒤 `decode_chain_read_batched_gdn_prefix`가 실제 committed prefix 하나만 읽는다.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     pub fn decode_chain_run_batched_collect_attn_kv(
@@ -10387,6 +10411,7 @@ impl MetalBackend {
         options: DecodeChainOptions,
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
+        out_gdn_state_handle: &mut Option<u64>,
         mut out_output_logits: Option<&mut Vec<f32>>,
     ) -> Vec<DecodeChainReport> {
         if let Some(output_logits) = out_output_logits.as_deref_mut() {
@@ -10394,7 +10419,8 @@ impl MetalBackend {
         }
         out_attn_kv.clear();
         out_attn_kv.resize(specs.len(), None);
-        self.decode_chain_run_batched_impl(
+        *out_gdn_state_handle = None;
+        let reports = self.decode_chain_run_batched_impl(
             hidden,
             batch,
             specs,
@@ -10403,49 +10429,94 @@ impl MetalBackend {
             output_argmax,
             Some(out_attn_kv),
             out_output_logits,
-        )
+        );
+        if reports.first().is_some_and(|report| report.did_run) {
+            *out_gdn_state_handle = self.register_batched_gdn_state(specs, batch);
+        }
+        reports
     }
 
-    /// MTP verify accept-n 커밋(partial): 직전 batched forward가 device에 보존한 prefix에서
-    /// n lane 처리 후의 dense/MoE GDN conv/delta state를 재실행 없이 readback한다.
-    /// `n == batch`는 forward 최종 state와 같고 carrier는 다음 forward 전까지 유효하다.
     #[cfg(target_os = "macos")]
-    pub fn decode_chain_run_batched_gdn_prefix(
+    fn register_batched_gdn_state(
         &self,
         specs: &[ChainLayerSpecRef<'_>],
         batch: usize,
-        n: usize,
-    ) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
-        let carriers = self.gdn_batch_carriers.borrow();
-        specs
+    ) -> Option<u64> {
+        let keys = specs
             .iter()
-            .map(|s| match s {
-                ChainLayerSpecRef::Gdn(g) => carriers
-                    .get(&GdnBatchCarrierKey::dense(g, batch))
-                    .map(|c| c.readback_prefix_states(n)),
-                ChainLayerSpecRef::GdnMoeQwen(g) => carriers
-                    .get(&GdnBatchCarrierKey::qwen_moe(g, batch))
-                    .map(|c| c.readback_prefix_states(n)),
+            .map(|spec| match spec {
+                ChainLayerSpecRef::Gdn(gdn) => Some(GdnBatchCarrierKey::dense(gdn, batch)),
+                ChainLayerSpecRef::GdnMoeQwen(gdn) => {
+                    Some(GdnBatchCarrierKey::qwen_moe(gdn, batch))
+                }
                 _ => None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if !keys.iter().any(Option::is_some) {
+            return None;
+        }
+        let mut handle = self.next_batched_gdn_state_handle.get().wrapping_add(1);
+        if handle == 0 {
+            handle = 1;
+        }
+        self.next_batched_gdn_state_handle.set(handle);
+        self.batched_gdn_state_handle.replace(Some((handle, keys)));
+        Some(handle)
     }
 
-    /// accept-n 확정 뒤 GDN batch carrier의 durable delta slot을 전진한다. 다음 verify는
-    /// host delta 전체를 다시 upload하지 않고 이 slot을 입력 상태로 사용한다.
+    /// Accept 수가 확정된 뒤 그 prefix의 GDN state만 host로 materialize한다.
     #[cfg(target_os = "macos")]
-    pub fn decode_chain_commit_batched_gdn_prefix(
+    pub fn decode_chain_read_batched_gdn_prefix(
         &self,
-        layer_indices: &[usize],
-        batch: usize,
+        handle: u64,
         committed: usize,
-    ) {
-        let mut carriers = self.gdn_batch_carriers.borrow_mut();
-        for (key, carrier) in carriers.iter_mut() {
-            if key.batch == batch && layer_indices.contains(&key.layer) {
-                carrier.mark_committed_prefix(committed);
-            }
+    ) -> Option<Vec<Option<(Vec<f32>, Vec<f32>)>>> {
+        let pending = self.batched_gdn_state_handle.borrow();
+        let (pending_handle, keys) = pending.as_ref()?;
+        if *pending_handle != handle {
+            return None;
         }
+        let carriers = self.gdn_batch_carriers.borrow();
+        let states = keys
+            .iter()
+            .map(|key| {
+                key.as_ref().map(|key| {
+                    let carrier = carriers
+                        .get(key)
+                        .expect("registered batched GDN carrier must remain present");
+                    (carrier.readback_prefix_conv_state(committed), Vec::new())
+                })
+            })
+            .collect::<Vec<_>>();
+        Some(states)
+    }
+
+    /// Host state apply가 끝난 뒤 같은 generation의 durable device delta slot을 전진한다.
+    #[cfg(target_os = "macos")]
+    pub fn decode_chain_commit_batched_gdn_prefix(&self, handle: u64, committed: usize) -> bool {
+        let keys = {
+            let pending = self.batched_gdn_state_handle.borrow();
+            let Some((pending_handle, keys)) = pending.as_ref() else {
+                return false;
+            };
+            if *pending_handle != handle {
+                return false;
+            }
+            keys.clone()
+        };
+        let mut carriers = self.gdn_batch_carriers.borrow_mut();
+        let mut active = self.active_batched_gdn_carriers.borrow_mut();
+        for key in keys.iter().flatten() {
+            carriers
+                .get_mut(key)
+                .expect("registered batched GDN carrier must remain present")
+                .mark_committed_prefix(committed);
+            active.insert(key.layer, *key);
+        }
+        drop(active);
+        drop(carriers);
+        self.batched_gdn_state_handle.borrow_mut().take();
+        true
     }
 
     /// Qwen dense/MoE full chain을 B lane에 대해 layer당 dense weight 1회 읽기로 한 command
@@ -10467,6 +10538,7 @@ impl MetalBackend {
         out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
     ) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
+        let defer_gdn_state_readback = out_attn_kv.is_some();
         let constant_u32 = |value| {
             let mut cache = self.constant_u32.borrow_mut();
             cache
@@ -10527,25 +10599,41 @@ impl MetalBackend {
                     let ffn_norm_w_buf = constant_f32(s.ffn_norm_weight);
 
                     {
+                        let key = GdnBatchCarrierKey::dense(s, batch);
+                        let active_key = self
+                            .active_batched_gdn_carriers
+                            .borrow()
+                            .get(&s.layer)
+                            .copied();
                         let mut carriers = self.gdn_batch_carriers.borrow_mut();
-                        let carrier = carriers
-                            .entry(GdnBatchCarrierKey::dense(s, batch))
-                            .or_insert_with(|| {
-                                gdn_chain::GdnBatchCarrier::new(
-                                    ctx,
-                                    batch,
-                                    s.hidden_dim,
-                                    s.conv_channels,
-                                    s.conv_kernel,
-                                    s.z_dim,
-                                    s.num_v_heads,
-                                    s.num_k_heads,
-                                    s.head_k_dim,
-                                    s.head_v_dim,
-                                    s.eps,
-                                )
-                            });
-                        carrier.upload_states(s.conv_state, s.delta_state);
+                        let delta_seed =
+                            active_key
+                                .filter(|active| *active != key)
+                                .and_then(|active| {
+                                    carriers
+                                        .get(&active)
+                                        .map(gdn_chain::GdnBatchCarrier::readback_committed_delta)
+                                });
+                        let carrier = carriers.entry(key).or_insert_with(|| {
+                            gdn_chain::GdnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.conv_channels,
+                                s.conv_kernel,
+                                s.z_dim,
+                                s.num_v_heads,
+                                s.num_k_heads,
+                                s.head_k_dim,
+                                s.head_v_dim,
+                                s.eps,
+                            )
+                        });
+                        carrier.upload_states(
+                            s.conv_state,
+                            delta_seed.as_deref().unwrap_or(s.delta_state),
+                            active_key == Some(key),
+                        );
                         gdn_chain::gdn_core_chain_encode_bcol(
                             ctx,
                             &enc,
@@ -10621,25 +10709,41 @@ impl MetalBackend {
                     let ssm_norm_w_buf = constant_f32(s.ssm_norm_weight);
 
                     {
+                        let key = GdnBatchCarrierKey::qwen_moe(s, batch);
+                        let active_key = self
+                            .active_batched_gdn_carriers
+                            .borrow()
+                            .get(&s.layer)
+                            .copied();
                         let mut carriers = self.gdn_batch_carriers.borrow_mut();
-                        let carrier = carriers
-                            .entry(GdnBatchCarrierKey::qwen_moe(s, batch))
-                            .or_insert_with(|| {
-                                gdn_chain::GdnBatchCarrier::new(
-                                    ctx,
-                                    batch,
-                                    s.hidden_dim,
-                                    s.conv_channels,
-                                    s.conv_kernel,
-                                    s.z_dim,
-                                    s.num_v_heads,
-                                    s.num_k_heads,
-                                    s.head_k_dim,
-                                    s.head_v_dim,
-                                    s.eps,
-                                )
-                            });
-                        carrier.upload_states(s.conv_state, s.delta_state);
+                        let delta_seed =
+                            active_key
+                                .filter(|active| *active != key)
+                                .and_then(|active| {
+                                    carriers
+                                        .get(&active)
+                                        .map(gdn_chain::GdnBatchCarrier::readback_committed_delta)
+                                });
+                        let carrier = carriers.entry(key).or_insert_with(|| {
+                            gdn_chain::GdnBatchCarrier::new(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.conv_channels,
+                                s.conv_kernel,
+                                s.z_dim,
+                                s.num_v_heads,
+                                s.num_k_heads,
+                                s.head_k_dim,
+                                s.head_v_dim,
+                                s.eps,
+                            )
+                        });
+                        carrier.upload_states(
+                            s.conv_state,
+                            delta_seed.as_deref().unwrap_or(s.delta_state),
+                            active_key == Some(key),
+                        );
                         gdn_chain::gdn_core_chain_encode_bcol(
                             ctx,
                             &enc,
@@ -10904,8 +11008,9 @@ impl MetalBackend {
 
         hidden.copy_from_slice(&ffn_chain::readback(&shared_hidden, batch * hidden_dim));
 
-        // GDN layer: conv/delta state readback → out_states. ATTN layer: None(KV 는 host truth).
-        {
+        // 일반 batched 호출은 final GDN state를 즉시 반환한다. MTP collect 호출은
+        // accept 수가 아직 미정이므로 device carrier에 두고 committed prefix만 나중에 읽는다.
+        if !defer_gdn_state_readback {
             let carriers = self.gdn_batch_carriers.borrow();
             for (spec, out) in specs.iter().zip(out_states.iter_mut()) {
                 match spec {
@@ -19317,6 +19422,7 @@ kernel void q4k_ro_vec4(
         h.extend_from_slice(&emb_b);
         let mut st = vec![None];
         let mut first_attn_kv = Vec::new();
+        let mut gdn_handle = None;
         let reps = backend.decode_chain_run_batched_collect_attn_kv(
             &mut h,
             2,
@@ -19325,6 +19431,7 @@ kernel void q4k_ro_vec4(
             options,
             Some(argmax_spec()),
             &mut first_attn_kv,
+            &mut gdn_handle,
             None,
         );
         assert_eq!(reps.len(), 2);
@@ -19644,6 +19751,7 @@ kernel void q4k_ro_vec4(
         let mut st = vec![None];
         let mut attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
         let mut output_logits = Vec::new();
+        let mut gdn_handle = None;
         let reports = backend.decode_chain_run_batched_collect_attn_kv(
             &mut h,
             2,
@@ -19652,6 +19760,7 @@ kernel void q4k_ro_vec4(
             options,
             Some(argmax_spec()),
             &mut attn_kv,
+            &mut gdn_handle,
             Some(&mut output_logits),
         );
         assert_eq!(output_logits.len(), 2 * out_rows);
@@ -19764,6 +19873,7 @@ kernel void q4k_ro_vec4(
         let mut h = fixture.hidden.clone();
         let mut st = vec![None];
         let mut attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
+        let mut gdn_handle = None;
         let reps = backend.decode_chain_run_batched_collect_attn_kv(
             &mut h,
             1,
@@ -19772,6 +19882,7 @@ kernel void q4k_ro_vec4(
             options,
             Some(argmax_spec()),
             &mut attn_kv,
+            &mut gdn_handle,
             None,
         );
         assert_eq!(reps.len(), 1);
@@ -19989,7 +20100,7 @@ kernel void q4k_ro_vec4(
         );
         let (conv2, delta2) = st1[0].clone().expect("prefix-2 state");
 
-        // batched batch=2 → fused ping-pong. out_states = prefix-2.
+        // 일반 batched 호출은 final state를 즉시 반환한다.
         let backend = MetalBackend::new();
         let mut h = Vec::with_capacity(2 * hidden_dim);
         h.extend_from_slice(&emb_a);
@@ -20001,35 +20112,91 @@ kernel void q4k_ro_vec4(
         assert_close(&bconv2, &conv2, "batched final conv == seq prefix-2");
         assert_close(&bdelta2, &delta2, "batched final delta == seq prefix-2");
 
-        // prefix readback: n=1 == seq prefix-1, n=2 == seq prefix-2.
-        let p1 = backend.decode_chain_run_batched_gdn_prefix(&specs, 2, 1);
-        let (pc1, pd1) = p1[0].clone().expect("gdn prefix-1");
-        assert_close(&pc1, &conv1, "gdn_prefix(1) conv == seq prefix-1");
-        assert_close(&pd1, &delta1, "gdn_prefix(1) delta == seq prefix-1");
-        let p2 = backend.decode_chain_run_batched_gdn_prefix(&specs, 2, 2);
-        let (pc2, pd2) = p2[0].clone().expect("gdn prefix-2");
-        assert_close(&pc2, &conv2, "gdn_prefix(2) conv == seq prefix-2");
-        assert_close(&pd2, &delta2, "gdn_prefix(2) delta == seq prefix-2");
+        // MTP collect는 accept 전 delta를 host로 읽지 않는다. Conv prefix만 materialize하고
+        // commit한 device delta는 materialize_sequence_state와 같은 sync seam에서 검증한다.
+        let mut collect_h = Vec::with_capacity(2 * hidden_dim);
+        collect_h.extend_from_slice(&emb_a);
+        collect_h.extend_from_slice(&emb_b);
+        let mut collect_st = vec![None];
+        let mut attn_kv = Vec::new();
+        let mut handle = None;
+        backend.decode_chain_run_batched_collect_attn_kv(
+            &mut collect_h,
+            2,
+            &specs,
+            &mut collect_st,
+            options,
+            None,
+            &mut attn_kv,
+            &mut handle,
+            None,
+        );
+        assert!(
+            collect_st[0].is_none(),
+            "collect must defer final GDN state"
+        );
+        let handle = handle.expect("collect must register GDN state handle");
+        let p1 = backend
+            .decode_chain_read_batched_gdn_prefix(handle, 1)
+            .expect("prefix-1 handle");
+        let (pc1, pd1) = p1[0].as_ref().expect("gdn prefix-1");
+        assert_close(pc1, &conv1, "gdn_prefix(1) conv == seq prefix-1");
+        assert!(
+            pd1.is_empty(),
+            "delta stays device-resident until materialize"
+        );
+        let p2 = backend
+            .decode_chain_read_batched_gdn_prefix(handle, 2)
+            .expect("prefix-2 handle");
+        let (pc2, pd2) = p2[0].as_ref().expect("gdn prefix-2");
+        assert_close(pc2, &conv2, "gdn_prefix(2) conv == seq prefix-2");
+        assert!(
+            pd2.is_empty(),
+            "delta stays device-resident until materialize"
+        );
 
-        // prefix-1 commit 뒤 다음 batch는 host delta upload 없이 device slot 1을 재사용한다.
-        backend.decode_chain_commit_batched_gdn_prefix(&[0], 2, 1);
+        assert!(backend.decode_chain_commit_batched_gdn_prefix(handle, 1));
+        let mut synced_delta = vec![0.0; delta1.len()];
+        assert!(backend.sync_delta_state(0, &mut synced_delta));
+        assert_close(&synced_delta, &delta1, "committed prefix-1 delta sync");
+
+        // 다음 batch는 stale host delta 대신 active device slot을 재사용한다.
         let mut committed_spec = fixture.layer0_spec();
         committed_spec.conv_state = &conv1;
-        committed_spec.delta_state = &delta1;
         let committed_specs = [ChainLayerSpecRef::GdnMoeQwen(committed_spec)];
         let mut h_next = Vec::with_capacity(2 * hidden_dim);
         h_next.extend_from_slice(&emb_b);
         h_next.extend_from_slice(&emb_c);
-        backend.decode_chain_run_batched(&mut h_next, 2, &committed_specs, &mut st, options, None);
+        let mut next_st = vec![None];
+        let mut next_attn_kv = Vec::new();
+        let mut next_handle = None;
+        backend.decode_chain_run_batched_collect_attn_kv(
+            &mut h_next,
+            2,
+            &committed_specs,
+            &mut next_st,
+            options,
+            None,
+            &mut next_attn_kv,
+            &mut next_handle,
+            None,
+        );
         assert_close(
             &h_next[..hidden_dim],
             &row1,
             "committed device delta reuse lane0 hidden",
         );
-        let next_p1 = backend.decode_chain_run_batched_gdn_prefix(&committed_specs, 2, 1);
-        let (next_conv1, next_delta1) = next_p1[0].as_ref().expect("next prefix-1");
+        let next_handle = next_handle.expect("next collect handle");
+        let next_p1 = backend
+            .decode_chain_read_batched_gdn_prefix(next_handle, 1)
+            .expect("next prefix-1");
+        let (next_conv1, next_delta1) = next_p1[0].as_ref().expect("next gdn prefix-1");
         assert_close(next_conv1, &conv2, "committed delta reuse conv");
-        assert_close(next_delta1, &delta2, "committed delta reuse delta");
+        assert!(next_delta1.is_empty());
+        assert!(backend.decode_chain_commit_batched_gdn_prefix(next_handle, 1));
+        let mut next_synced_delta = vec![0.0; delta2.len()];
+        assert!(backend.sync_delta_state(0, &mut next_synced_delta));
+        assert_close(&next_synced_delta, &delta2, "committed delta reuse delta");
     }
 
     #[test]
