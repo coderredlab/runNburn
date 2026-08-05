@@ -580,16 +580,10 @@ fn qwen35_metal_batch_auto_eligible(
     has_mtp_runtime: bool,
     batched_decode_chain_ready: bool,
 ) -> bool {
-    if !has_mtp_runtime || !batched_decode_chain_ready {
-        return false;
-    }
-    match architecture {
-        ModelArchitecture::Qwen35 => {
-            mtp_dense_decode_work_units(metadata) >= mtp_dense_decode_work_threshold(metadata)
-        }
-        ModelArchitecture::Qwen35MoE => true,
-        _ => false,
-    }
+    architecture == ModelArchitecture::Qwen35
+        && has_mtp_runtime
+        && batched_decode_chain_ready
+        && mtp_dense_decode_work_units(metadata) >= mtp_dense_decode_work_threshold(metadata)
 }
 
 fn mtp_auto_policy_for_model(
@@ -892,6 +886,21 @@ impl Engine {
             usize::try_from(self.host_memory_plan.mapped_weight_bytes() / (1024 * 1024))
                 .unwrap_or(usize::MAX),
         );
+        // Sparse MoE의 batch-2 attention은 긴 context에서 single-token chain보다 느리다.
+        // Carrier는 강제 진단용으로 보존하되 제품 auto policy에서는 선택하지 않는다.
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if self.architecture == ModelArchitecture::Qwen35MoE
+            && self.mtp_runtime_ready()
+            && self.batched_decode_chain_ready()
+        {
+            return MtpAutoPolicy {
+                enabled: false,
+                spec_k: 1,
+                device_verify: false,
+                reason: "qwen35moe-metal-batch-decode-chain-explicit-only",
+                ..policy
+            };
+        }
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         if qwen35_metal_batch_auto_eligible(
             self.architecture,
@@ -899,10 +908,7 @@ impl Engine {
             self.mtp_runtime_ready(),
             self.batched_decode_chain_ready(),
         ) {
-            let reason = match self.architecture {
-                ModelArchitecture::Qwen35MoE => "qwen35moe-metal-batch-decode-chain-auto",
-                _ => "dense-qwen35-metal-batch-decode-chain-auto",
-            };
+            let reason = "dense-qwen35-metal-batch-decode-chain-auto";
             return MtpAutoPolicy {
                 enabled: true,
                 spec_k: 1,
@@ -2172,7 +2178,7 @@ mod tests {
     }
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     #[test]
-    fn qwen35_metal_batch_auto_requires_supported_arch_full_chain_and_runtime() {
+    fn qwen35_dense_metal_batch_auto_requires_full_chain_and_rejects_sparse_moe() {
         let dense = policy_metadata(4096, 40);
         assert!(qwen35_metal_batch_auto_eligible(
             ModelArchitecture::Qwen35,
@@ -2180,7 +2186,7 @@ mod tests {
             true,
             true,
         ));
-        assert!(qwen35_metal_batch_auto_eligible(
+        assert!(!qwen35_metal_batch_auto_eligible(
             ModelArchitecture::Qwen35MoE,
             &policy_metadata(2048, 40),
             true,
@@ -2193,13 +2199,13 @@ mod tests {
             true,
         ));
         assert!(!qwen35_metal_batch_auto_eligible(
-            ModelArchitecture::Qwen35MoE,
+            ModelArchitecture::Qwen35,
             &dense,
             false,
             true,
         ));
         assert!(!qwen35_metal_batch_auto_eligible(
-            ModelArchitecture::Qwen35MoE,
+            ModelArchitecture::Qwen35,
             &dense,
             true,
             false,
