@@ -260,34 +260,21 @@ impl Engine {
         layer.seq_len = end;
     }
 
-    /// N+1 token parallel forward for MTP verify (mc78 Task 10).
+    /// N+1 token parallel forward for external-drafter MTP verify.
     ///
-    /// `tokens` 슬라이스 (보통 `[anchor_token, draft_t1, ..., draft_tN]`, 길이 N+1) 를
-    /// target 모델에 batch forward 로 돌리고, 각 위치의 top-1 argmax 를 반환한다.
-    /// `result[i]` 는 `tokens[i]` 를 소비한 뒤 모델이 예측한 다음 토큰.
+    /// `tokens`는 보통 `[anchor_token, draft_t1, ..., draft_tN]`이고, 결과의
+    /// `target_tokens[i]`는 `tokens[i]`를 소비한 뒤의 target argmax다. 확률적 verify가
+    /// 요청되면 같은 위치의 full logits도 `output_logits`에 평탄화해 반환한다.
     ///
-    /// KV cache 는 `tokens.len()` 포지션 전체에 대해 커밋된다. Caller 는 verify 가
-    /// 일부 draft 토큰을 거부하면 `commit_kv_through` (Task 11) 로 롤백해야 한다.
-    ///
-    /// `position_offset` 은 `kv_cache.current_len()` 이 이미 해당 값과 일치한다는
-    /// 전제 하에 document 용도로만 받는다 (실제 pos_start 는 `forward_prefill_all_logits`
-    /// 내부에서 `kv_cache.current_len()` 으로 자동 결정).
-    ///
-    /// **구현 선택 — Option B (true batch parallel)**: `forward_prefill_all_logits` 를
-    /// 재사용. 이 함수는 이미 N-token prefill + 모든 위치의 logits 반환을 지원하므로
-    /// sequential fallback(Option A) 보다 빠르고 KV 쓰기도 한 번에 완료됨.
+    /// KV cache는 `tokens.len()` 포지션 전체에 대해 커밋된다. Caller는 일부 draft를
+    /// 거부하면 `commit_kv_through`로 실제 committed prefix까지만 남겨야 한다.
     pub(crate) fn forward_batch_verify(
         &mut self,
         tokens: &[u32],
         _position_offset: u32,
-    ) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
-        // mc78 verify wall fix: 기존 forward_prefill_all_logits 는 host CPU lm_head
-        // (모든 N+1 position × 262144 vocab × 1536 hidden Q6_K dequant + matmul)
-        // 로 verify wall 의 큰 부분. GPU argmax-only path 는 logits 전체 대신 token
-        // id 와 rollback 가능한 output-normalized hidden row 만 반환한다.
-        let (result, output_hidden_rows) =
-            self.forward_prefill_argmax_tokens_collect_output_hidden(tokens)?;
-        Ok((result.target_tokens, output_hidden_rows))
+        collect_output_logits: bool,
+    ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
+        self.forward_prefill_argmax_tokens_collect_output_hidden(tokens, collect_output_logits)
     }
 
     /// Target Engine 의 KV cache 를 `new_position` 으로 truncate 한다.

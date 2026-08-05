@@ -2951,6 +2951,7 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
     out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
     out_gdn_prefix: &mut Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>>,
     output_argmax: Option<MetalDecodeOutputArgmax<'_>>,
+    out_output_logits: Option<&mut Vec<f32>>,
 ) -> Result<Vec<MetalDecodeChainReport>> {
     out_gdn_prefix.clear();
     let fallback_reports = |reason: &'static str| {
@@ -2994,6 +2995,7 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
             options,
             output_argmax_ref,
             out_attn_kv,
+            out_output_logits,
         );
         let mut gdn_prefix = Vec::with_capacity(batch);
         if reports.first().is_some_and(|r| r.did_run) {

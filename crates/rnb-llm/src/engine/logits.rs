@@ -436,7 +436,8 @@ pub(super) fn finalize_prefill_all_logits(
     Ok(all_logits)
 }
 
-/// Greedy verify용: 모든 토큰 위치의 target argmax만 반환한다.
+/// Batch verify용: 모든 위치의 target argmax와 output-normalized hidden을 반환하고,
+/// 요청 시 sampler가 사용할 위치별 full logits도 함께 보존한다.
 pub(super) fn finalize_prefill_argmax_tokens(
     kv_cache: &mut KVCache,
     metadata: &ModelMetadata,
@@ -446,12 +447,18 @@ pub(super) fn finalize_prefill_argmax_tokens(
     seq_len: usize,
     pos_start: usize,
     norm_eps: f32,
-) -> crate::error::Result<(Vec<u32>, Vec<f32>)> {
+    collect_output_logits: bool,
+) -> crate::error::Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
     let hidden_data = kernels::tensor_as_f32_slice(&hidden);
     let hidden_dim = metadata.hidden_dim;
     let gemma_runtime_flavor = detect_gemma_runtime_flavor(metadata, weights);
     let mut target_tokens = Vec::with_capacity(seq_len);
     let mut output_hidden_rows = Vec::with_capacity(seq_len * hidden_dim);
+    let mut output_logits = if collect_output_logits {
+        Vec::with_capacity(seq_len * metadata.vocab_size)
+    } else {
+        Vec::new()
+    };
 
     for t in 0..seq_len {
         let start = t * hidden_dim;
@@ -471,7 +478,7 @@ pub(super) fn finalize_prefill_argmax_tokens(
         output_hidden_rows.extend_from_slice(normed_data);
         let exact_output = policy::exact_output_gemv_enabled();
         #[cfg(feature = "cuda")]
-        if !use_token_embedding_as_output() && !exact_output {
+        if !collect_output_logits && !use_token_embedding_as_output() && !exact_output {
             if let Some(token) = prefill_output_argmax_token_cuda(weights, normed_data) {
                 target_tokens.push(token);
                 continue;
@@ -489,9 +496,12 @@ pub(super) fn finalize_prefill_argmax_tokens(
             weights.output.gemv_vec(normed_data)?
         };
         apply_logit_softcapping(&mut logits, metadata.final_logit_softcapping);
+        if collect_output_logits {
+            output_logits.extend_from_slice(&logits);
+        }
         target_tokens.push(greedy_sample(&logits));
     }
 
     kv_cache.set_len(pos_start + seq_len);
-    Ok((target_tokens, output_hidden_rows))
+    Ok((target_tokens, output_hidden_rows, output_logits))
 }

@@ -10147,6 +10147,7 @@ impl MetalBackend {
         options: DecodeChainOptions,
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         mut out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
+        out_output_logits: Option<&mut Vec<f32>>,
     ) -> Vec<DecodeChainReport> {
         assert!(batch >= 1, "decode_chain_run_batched: batch must be >= 1");
         assert_eq!(
@@ -10330,7 +10331,14 @@ impl MetalBackend {
 
         if want_batched_tail {
             let tail = output_argmax.expect("want_batched_tail implies Some");
-            self.decode_chain_batched_output_argmax(hidden, batch, hidden_dim, &tail, &mut reports);
+            self.decode_chain_batched_output_argmax(
+                hidden,
+                batch,
+                hidden_dim,
+                &tail,
+                &mut reports,
+                out_output_logits,
+            );
         }
 
         reports
@@ -10359,6 +10367,7 @@ impl MetalBackend {
             options,
             output_argmax,
             None,
+            None,
         )
     }
 
@@ -10378,7 +10387,11 @@ impl MetalBackend {
         options: DecodeChainOptions,
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
+        mut out_output_logits: Option<&mut Vec<f32>>,
     ) -> Vec<DecodeChainReport> {
+        if let Some(output_logits) = out_output_logits.as_deref_mut() {
+            output_logits.clear();
+        }
         out_attn_kv.clear();
         out_attn_kv.resize(specs.len(), None);
         self.decode_chain_run_batched_impl(
@@ -10389,6 +10402,7 @@ impl MetalBackend {
             options,
             output_argmax,
             Some(out_attn_kv),
+            out_output_logits,
         )
     }
 
@@ -11081,6 +11095,7 @@ impl MetalBackend {
         hidden_dim: usize,
         tail: &DecodeOutputArgmaxSpecRef<'_>,
         reports: &mut [DecodeChainReport],
+        out_output_logits: Option<&mut Vec<f32>>,
     ) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
         assert_eq!(
@@ -11172,6 +11187,16 @@ impl MetalBackend {
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
+        if let Some(out) = out_output_logits {
+            let values = unsafe {
+                std::slice::from_raw_parts(
+                    logits.contents().as_ptr() as *const f32,
+                    batch * tail.rows,
+                )
+            };
+            out.clear();
+            out.extend_from_slice(values);
+        }
 
         for (lane, report) in reports.iter_mut().enumerate().take(batch) {
             let token = unsafe { *(token_bufs[lane].contents().as_ptr() as *const u32) };
@@ -19519,7 +19544,8 @@ kernel void q4k_ro_vec4(
         h.extend_from_slice(&emb_b);
         let mut st = vec![None];
         let mut attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
-        let _ = backend.decode_chain_run_batched_collect_attn_kv(
+        let mut output_logits = Vec::new();
+        let reports = backend.decode_chain_run_batched_collect_attn_kv(
             &mut h,
             2,
             &[ChainLayerSpecRef::AttnMoeQwen(fixture.spec(0, base_pos))],
@@ -19527,7 +19553,17 @@ kernel void q4k_ro_vec4(
             options,
             Some(argmax_spec()),
             &mut attn_kv,
+            Some(&mut output_logits),
         );
+        assert_eq!(output_logits.len(), 2 * out_rows);
+        for (report, row) in reports.iter().zip(output_logits.chunks_exact(out_rows)) {
+            let logits_argmax = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index as u32);
+            assert_eq!(report.output_argmax.token_id, logits_argmax);
+        }
         assert_eq!(attn_kv.len(), 1, "one layer");
         let (win_k, win_v) = attn_kv[0]
             .as_ref()
@@ -19637,6 +19673,7 @@ kernel void q4k_ro_vec4(
             options,
             Some(argmax_spec()),
             &mut attn_kv,
+            None,
         );
         assert_eq!(reps.len(), 1);
         assert!(reps[0].did_run);

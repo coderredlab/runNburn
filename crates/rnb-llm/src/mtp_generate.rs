@@ -141,11 +141,13 @@ pub(crate) fn mtp_verify_sampling_allowed(params: &GenerateParams) -> bool {
     mtp_greedy_verify_allowed(params) || mtp_sampled_verify_allowed(params)
 }
 
-/// device verify가 돌려준 target 분포에서 위치 `index`의 토큰을 요청 sampler로 뽑는다.
-fn sample_target_from_window_logits(
-    window: &VerifyWindowResult,
+/// verify가 돌려준 평탄화 target 분포에서 위치 `index`의 토큰을 요청 sampler로 뽑는다.
+fn sample_target_from_logits(
+    output_logits: &[f32],
     index: usize,
     vocab_size: usize,
+    params: &GenerateParams,
+    eos: u32,
     sampler: &mut SamplerChain,
     context_tokens: &[u32],
     rng: &mut SmallRng,
@@ -161,14 +163,78 @@ fn sample_target_from_window_logits(
         ))
     })?;
     let end = start + vocab_size;
-    let row = window.output_logits.get(start..end).ok_or_else(|| {
+    let row = output_logits.get(start..end).ok_or_else(|| {
         crate::error::LlmError::Forward(format!(
             "MTP sampled verify missing target logits at {index}: have {} values, need {end}",
-            window.output_logits.len()
+            output_logits.len()
         ))
     })?;
     let mut logits = row.to_vec();
+    params.suppress_eos_logit(&mut logits, eos)?;
     Ok(sampler.sample(&mut logits, context_tokens, rng))
+}
+
+fn sample_target_window_prefix(
+    output_logits: &[f32],
+    draft_tokens: &[u32],
+    vocab_size: usize,
+    params: &GenerateParams,
+    eos: u32,
+    sampler: &mut SamplerChain,
+    generated_tokens: &mut Vec<u32>,
+    rng: &mut SmallRng,
+) -> crate::error::Result<(usize, Option<u32>, bool)> {
+    let context_len = generated_tokens.len();
+    let outcome = (|| {
+        let mut round = crate::mtp_sampling::GreedyRound::new();
+        for (index, &draft_token) in draft_tokens.iter().enumerate() {
+            let target_token = sample_target_from_logits(
+                output_logits,
+                index,
+                vocab_size,
+                params,
+                eos,
+                sampler,
+                generated_tokens,
+                rng,
+            )?;
+            match round.observe(
+                index,
+                draft_token,
+                target_token,
+                draft_tokens.len(),
+                params,
+                eos,
+            ) {
+                crate::mtp_sampling::RoundAction::Reject
+                | crate::mtp_sampling::RoundAction::Stop => break,
+                crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                crate::mtp_sampling::RoundAction::Emit => generated_tokens.push(draft_token),
+            }
+        }
+
+        let accepted = round.accepted();
+        let stopped = round.stopped();
+        let next_token = if stopped {
+            None
+        } else if accepted == draft_tokens.len() {
+            Some(sample_target_from_logits(
+                output_logits,
+                draft_tokens.len(),
+                vocab_size,
+                params,
+                eos,
+                sampler,
+                generated_tokens,
+                rng,
+            )?)
+        } else {
+            round.mismatch_target()
+        };
+        Ok((accepted, next_token, stopped))
+    })();
+    generated_tokens.truncate(context_len);
+    outcome
 }
 
 /// 한 round에서 조회한 target 예측을 draft와 나란히 찍는 trace 문자열.
@@ -562,9 +628,11 @@ fn next_token_from_current_logits(
     params: &GenerateParams,
 ) -> crate::error::Result<u32> {
     let eos = engine.tokenizer.vocab.special.eos;
-    if let Some(token) = engine.last_backend_argmax_token() {
-        if !params.ignore_eos || token != eos {
-            return Ok(token);
+    if params.temperature == 0.0 {
+        if let Some(token) = engine.last_backend_argmax_token() {
+            if !params.ignore_eos || token != eos {
+                return Ok(token);
+            }
         }
     }
     if logits.is_empty() {
@@ -926,16 +994,13 @@ fn generate_stream_mtp_with_tokens(
     } else {
         mtp_verify_execution(mtp_device_verify, batch_verify, batch_decode_chain)
     };
-    // 확률적 verify는 target 분포를 만들 수 있는 execution에서만 가능하다. CUDA device
-    // verify는 logits 수집 모드가 있고, sequential은 all-logits 경로가 있다. 나머지는
-    // argmax token만 돌려주므로 sampler를 태울 수 없다.
-    // sampler를 태우려면 target 분포가 있어야 한다. 지금 그걸 만들 수 있는 execution은
-    // CUDA device-resident verify(`collect_output_logits`)뿐이다. sequential은 all-logits
-    // 경로가 있지만 아직 sampler에 연결하지 않았으므로 허용하면 argmax로 조용히 되돌아간다.
-    if sampled_verify && verify_execution != MtpVerifyExecution::DeviceResident {
-        return Err(crate::error::LlmError::Unsupported(format!(
-            "MTP with temperature>0 requires device-resident or sequential verify, got {verify_execution:?}"
-        )));
+    // 확률적 verify는 위치별 target 분포를 반환하는 execution만 허용한다. CUDA
+    // device-resident, Metal batch decode-chain/prefill, 그리고 sequential all-logits는
+    // 이 계약을 만족한다. Vulkan fullpath는 아직 argmax만 반환한다.
+    if sampled_verify && verify_execution == MtpVerifyExecution::VulkanFullpath {
+        return Err(crate::error::LlmError::Unsupported(
+            "MTP with temperature>0 is not supported by Vulkan fullpath verify".to_string(),
+        ));
     }
     let fast_retain = crate::runtime::mtp_fast_retain_enabled();
     let no_bonus_verify_override = mtp_no_bonus_verify_env_override();
@@ -1057,24 +1122,39 @@ fn generate_stream_mtp_with_tokens(
 
             let phase_start = Instant::now();
             let (mut window, commit) = engine
-                .forward_batched_decode_verify_window(&verify_input)?
+                .forward_batched_decode_verify_window(&verify_input, sampled_verify)?
                 .ok_or_else(|| {
                     crate::error::LlmError::Forward(
                         "MTP batched decode-chain verify ineligible mid-generation".to_string(),
                     )
                 })?;
-            replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+            if !sampled_verify {
+                replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+            }
             trace_mtp_sequence_state(engine, "batch-decode-chain-forward");
             stats.add_target_verify(window.len(), 1);
 
             observed_targets.clear();
             let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..draft_k {
-                let target_token = *window.target_tokens.get(i).ok_or_else(|| {
-                    crate::error::LlmError::Forward(format!(
-                        "MTP batched verify missing target token at {i}"
-                    ))
-                })?;
+                let target_token = if sampled_verify {
+                    sample_target_from_logits(
+                        &window.output_logits,
+                        i,
+                        engine.metadata.vocab_size,
+                        params,
+                        eos,
+                        &mut sampler,
+                        &generated_tokens,
+                        &mut rng,
+                    )?
+                } else {
+                    *window.target_tokens.get(i).ok_or_else(|| {
+                        crate::error::LlmError::Forward(format!(
+                            "MTP batched verify missing target token at {i}"
+                        ))
+                    })?
+                };
                 observed_targets.push(target_token);
                 match round.observe(i, draft_tokens[i], target_token, draft_k, params, eos) {
                     crate::mtp_sampling::RoundAction::Reject
@@ -1127,11 +1207,24 @@ fn generate_stream_mtp_with_tokens(
             }
 
             current_token = if n_accepted == draft_k {
-                *window.target_tokens.get(draft_k).ok_or_else(|| {
-                    crate::error::LlmError::Forward(
-                        "MTP batched verify missing bonus token".to_string(),
-                    )
-                })?
+                if sampled_verify {
+                    sample_target_from_logits(
+                        &window.output_logits,
+                        draft_k,
+                        engine.metadata.vocab_size,
+                        params,
+                        eos,
+                        &mut sampler,
+                        &generated_tokens,
+                        &mut rng,
+                    )?
+                } else {
+                    *window.target_tokens.get(draft_k).ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "MTP batched verify missing bonus token".to_string(),
+                        )
+                    })?
+                }
             } else {
                 next_forced_token.ok_or_else(|| {
                     crate::error::LlmError::Forward(
@@ -1292,8 +1385,11 @@ fn generate_stream_mtp_with_tokens(
                     .forward_prefill_argmax_tokens_collect_mtp_prefix_states_deferred_observe(
                         &verify_input,
                         &prefix_tokens,
+                        sampled_verify,
                     )?,
-                MtpVerifyExecution::Sequential => unreachable!("sequential verify handled below"),
+                MtpVerifyExecution::Sequential => {
+                    unreachable!("sequential verify handled below")
+                }
                 MtpVerifyExecution::BatchDecodeChain => {
                     unreachable!("batched decode-chain verify handled above")
                 }
@@ -1301,7 +1397,9 @@ fn generate_stream_mtp_with_tokens(
                     unreachable!("Vulkan fullpath verify handled above")
                 }
             };
-            replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+            if !sampled_verify {
+                replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+            }
             trace_mtp_sequence_state(engine, "batch-forward");
             stats.add_target_verify(window.len(), 1);
 
@@ -1313,10 +1411,12 @@ fn generate_stream_mtp_with_tokens(
                     // draft와 같은 값을, reject면 이 표본을 내보내므로 어느 쪽이든 출력은
                     // target 분포의 표본이고 marginal이 보존된다. `generated_tokens`는 이
                     // 시점에 앞서 accept된 draft를 이미 포함하므로 penalty history도 맞다.
-                    sample_target_from_window_logits(
-                        &window,
+                    sample_target_from_logits(
+                        &window.output_logits,
                         i,
                         engine.metadata.vocab_size,
+                        params,
+                        eos,
                         &mut sampler,
                         &generated_tokens,
                         &mut rng,
@@ -1522,10 +1622,12 @@ fn generate_stream_mtp_with_tokens(
                     // Full accept의 bonus 토큰도 같은 sampler를 타야 그 위치의 marginal이
                     // target 분포와 같다.
                     let next_token = if sampled_verify {
-                        sample_target_from_window_logits(
-                            &window,
+                        sample_target_from_logits(
+                            &window.output_logits,
                             draft_k,
                             engine.metadata.vocab_size,
+                            params,
+                            eos,
                             &mut sampler,
                             &generated_tokens,
                             &mut rng,
@@ -1667,16 +1769,28 @@ fn generate_stream_mtp_with_tokens(
 
         let phase_start = Instant::now();
         for i in 0..k {
-            let (target_token, hidden_rows) = if acceptance_probe.is_some() {
-                // probe는 target 분포 p가 필요하므로 argmax 대신 full logits를 받는다.
+            let (target_token, hidden_rows) = if sampled_verify || acceptance_probe.is_some() {
                 let (mut rows, hidden_rows) = engine
-                    .forward_verify_all_logits_sequential_collect_mtp(&[verify_input[i]], true)?;
+                    .forward_verify_all_logits_sequential_collect_mtp(&verify_input[i..=i], true)?;
                 let mut logits = rows.pop().ok_or_else(|| {
                     crate::error::LlmError::Forward(
-                        "MTP accept probe verify produced no logits".to_string(),
+                        "MTP sequential verify produced no logits".to_string(),
                     )
                 })?;
-                let token = crate::sampler::greedy::greedy_sample(&logits);
+                let token = if sampled_verify {
+                    sample_target_from_logits(
+                        &logits,
+                        0,
+                        engine.metadata.vocab_size,
+                        params,
+                        eos,
+                        &mut sampler,
+                        &generated_tokens,
+                        &mut rng,
+                    )?
+                } else {
+                    crate::sampler::greedy::greedy_sample(&logits)
+                };
                 if let (Some(stats), Some(sampler), Some(draft_logits)) = (
                     acceptance_probe.as_mut(),
                     probe_sampler.as_mut(),
@@ -1708,8 +1822,11 @@ fn generate_stream_mtp_with_tokens(
             } else {
                 engine.forward_verify_argmax_sequential_collect_mtp(verify_input[i])?
             };
-            let target_token =
-                replace_ignored_eos_target(engine, params, target_token, &hidden_rows, eos)?;
+            let target_token = if sampled_verify {
+                target_token
+            } else {
+                replace_ignored_eos_target(engine, params, target_token, &hidden_rows, eos)?
+            };
             trace_mtp_sequence_state(engine, "sequential-forward");
             stats.add_target_verify(1, 1);
             observed_hidden_rows.extend_from_slice(&hidden_rows);
@@ -1733,10 +1850,31 @@ fn generate_stream_mtp_with_tokens(
         stats.accepted += n_accepted;
 
         if !stopped && tokens_remaining > 0 && n_accepted == k {
-            let (target_token, hidden_rows) =
-                engine.forward_verify_argmax_sequential_collect_mtp(verify_input[k])?;
-            let target_token =
-                replace_ignored_eos_target(engine, params, target_token, &hidden_rows, eos)?;
+            let (target_token, hidden_rows) = if sampled_verify {
+                let (rows, hidden_rows) = engine
+                    .forward_verify_all_logits_sequential_collect_mtp(&verify_input[k..=k], true)?;
+                let target_token = sample_target_from_logits(
+                    rows.first().ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "MTP sequential bonus verify produced no logits".to_string(),
+                        )
+                    })?,
+                    0,
+                    engine.metadata.vocab_size,
+                    params,
+                    eos,
+                    &mut sampler,
+                    &generated_tokens,
+                    &mut rng,
+                )?;
+                (target_token, hidden_rows)
+            } else {
+                let (target_token, hidden_rows) =
+                    engine.forward_verify_argmax_sequential_collect_mtp(verify_input[k])?;
+                let target_token =
+                    replace_ignored_eos_target(engine, params, target_token, &hidden_rows, eos)?;
+                (target_token, hidden_rows)
+            };
             stats.add_target_verify(1, 1);
             trace_mtp_sequence_state(engine, "sequential-bonus-forward");
             observed_hidden_rows.extend_from_slice(&hidden_rows);
@@ -1850,7 +1988,7 @@ fn dspark_confident_prefix_len(confidences: &[f32], max_tokens: usize) -> usize 
 /// 3. accept 된 draft 토큰 + target correction token 1 개 emit.
 /// 4. EOS/stop token/max_tokens 도달 시 종료.
 ///
-/// Greedy only: `mtp_greedy_verify_allowed` 가 이미 외부에서 체크됐다.
+/// Greedy와 target-sampler-equality 확률 verify를 같은 DSpark batch 결과로 처리한다.
 fn generate_with_dspark(
     engine: &mut Engine,
     prompt_tokens: &[u32],
@@ -1889,8 +2027,12 @@ fn generate_with_dspark(
         (logits, elapsed_ms(prefill_start))
     };
 
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = match params.seed {
+        Some(seed) => SmallRng::seed_from_u64(seed),
+        None => SmallRng::from_entropy(),
+    };
     let mut sampler = SamplerChain::from_params(params);
+    let sampled_verify = mtp_sampled_verify_allowed(params);
     let mut generated_tokens = Vec::new();
     let mut generated_text = GeneratedTextStream::new();
     let Some(mut tokens_remaining) = mtp_initial_generation_budget(params.max_tokens)? else {
@@ -1978,7 +2120,7 @@ fn generate_with_dspark(
                 verify_tokens.len()
             )));
         }
-        if params.ignore_eos {
+        if !sampled_verify && params.ignore_eos {
             let hidden_dim = engine.metadata.hidden_dim;
             for (index, prediction) in verify.predictions.iter_mut().enumerate() {
                 let start = index * hidden_dim;
@@ -1995,14 +2137,41 @@ fn generate_with_dspark(
             }
         }
 
-        let accepted = crate::mtp_sampling::greedy_matched_prefix(drafts, &verify.predictions);
+        let (accepted, correction, sampled_stopped, target_trace) = if sampled_verify {
+            let (accepted, correction, stopped) = sample_target_window_prefix(
+                &verify.output_logits,
+                drafts,
+                engine.metadata.vocab_size,
+                params,
+                eos,
+                &mut sampler,
+                &mut generated_tokens,
+                &mut rng,
+            )?;
+            let mut target_trace = drafts[..accepted].to_vec();
+            if stopped {
+                if let Some(&stop_token) = drafts.get(accepted) {
+                    target_trace.push(stop_token);
+                }
+            } else if let Some(correction) = correction {
+                target_trace.push(correction);
+            }
+            (accepted, correction, stopped, target_trace)
+        } else {
+            let accepted = crate::mtp_sampling::greedy_matched_prefix(drafts, &verify.predictions);
+            (
+                accepted,
+                Some(verify.predictions[accepted]),
+                false,
+                verify.predictions.clone(),
+            )
+        };
         if crate::runtime::mtp_trace_enabled() {
             let draft_pieces = drafts
                 .iter()
                 .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
                 .collect::<Vec<_>>();
-            let target_pieces = verify
-                .predictions
+            let target_pieces = target_trace
                 .iter()
                 .map(|&token| format!("{token}:{:?}", engine.tokenizer.decode_token(token)))
                 .collect::<Vec<_>>();
@@ -2012,10 +2181,9 @@ fn generate_with_dspark(
             );
         }
         stats.accepted += accepted;
-        let correction = verify.predictions[accepted];
         let mut round = crate::mtp_sampling::GreedyRound::new();
         for i in 0..accepted {
-            match round.observe(i, drafts[i], verify.predictions[i], accepted, params, eos) {
+            match round.observe(i, drafts[i], drafts[i], accepted, params, eos) {
                 crate::mtp_sampling::RoundAction::Reject
                 | crate::mtp_sampling::RoundAction::Stop => break,
                 crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
@@ -2028,7 +2196,7 @@ fn generate_with_dspark(
             }
         }
         let emitted = round.emitted();
-        let stopped = round.stopped();
+        let stopped = sampled_stopped || round.stopped();
 
         let verified_tokens = verify_tokens.len();
         let committed_tokens = 1 + emitted;
@@ -2046,6 +2214,11 @@ fn generate_with_dspark(
         if stopped || tokens_remaining == 0 {
             break;
         }
+        let correction = correction.ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "DSpark sampled verify did not produce a correction token".to_string(),
+            )
+        })?;
         if params.should_stop(correction, eos) {
             break;
         }
@@ -2130,7 +2303,10 @@ fn generate_with_external_drafter(
             generated_tokens,
         ));
     };
-    let mut dummy_rng = rand::rngs::SmallRng::from_entropy();
+    let mut dummy_rng = match params.seed {
+        Some(seed) => SmallRng::seed_from_u64(seed),
+        None => SmallRng::from_entropy(),
+    };
     let mut dummy_sampler = SamplerChain::from_params(params);
 
     let first_token = next_token_from_current_logits(
@@ -2187,6 +2363,7 @@ fn generate_with_external_drafter(
     let t_commit_emit = 0.0f64;
     let timing_enabled = crate::engine::policy::env_string("RNB_MC78_TIMING").is_some();
     let external_device_verify = engine.mtp_device_verify_requested();
+    let sampled_verify = mtp_sampled_verify_allowed(params);
     if external_device_verify {
         engine.prewarm_mtp_device_verify_static_weights()?;
     }
@@ -2312,41 +2489,53 @@ fn generate_with_external_drafter(
         let mut verify_seq = Vec::with_capacity(effective_n + 1);
         verify_seq.push(current_token);
         verify_seq.extend_from_slice(drafts_used);
-
-        let t_v0 = std::time::Instant::now();
+        let t_v0 = Instant::now();
+        let mut accepted_draft_tokens: usize;
+        let mut target_token: Option<u32>;
         let mut stopped = false;
-        let mut accepted_draft_tokens = 0usize;
-        let mut target_token = None;
         let mut emitted_draft_tokens = 0usize;
         let mut external_batch_output_hidden_rows = None;
 
         if external_device_verify {
             let verify_request =
                 MtpVerifyWindowRequest::new(current_token, drafts_used, MtpVerifyBonus::Include);
-            let mut window = engine
-                .forward_mtp_device_verify_window_argmax_collect_mtp_shadow(&verify_request)?;
-            replace_ignored_eos_targets(engine, params, &mut window, eos)?;
-            stats.add_target_verify(window.len(), 1);
-
-            let targets = window.target_tokens.get(..effective_n).ok_or_else(|| {
-                crate::error::LlmError::Forward(format!(
-                    "external device verify missing target token at {}",
-                    window.target_tokens.len()
-                ))
-            })?;
-            accepted_draft_tokens =
-                crate::mtp_sampling::greedy_matched_prefix(drafts_used, targets);
+            let mut window = engine.forward_mtp_device_verify_window_collect_mtp_shadow(
+                &verify_request,
+                sampled_verify,
+            )?;
+            if sampled_verify {
+                (accepted_draft_tokens, target_token, stopped) = sample_target_window_prefix(
+                    &window.output_logits,
+                    drafts_used,
+                    engine.metadata.vocab_size,
+                    params,
+                    eos,
+                    &mut dummy_sampler,
+                    &mut generated_tokens,
+                    &mut dummy_rng,
+                )?;
+            } else {
+                replace_ignored_eos_targets(engine, params, &mut window, eos)?;
+                let targets = window.target_tokens.get(..effective_n).ok_or_else(|| {
+                    crate::error::LlmError::Forward(format!(
+                        "external device verify missing target token at {}",
+                        window.target_tokens.len()
+                    ))
+                })?;
+                accepted_draft_tokens =
+                    crate::mtp_sampling::greedy_matched_prefix(drafts_used, targets);
+                target_token = if accepted_draft_tokens < effective_n {
+                    Some(targets[accepted_draft_tokens])
+                } else {
+                    Some(*window.target_tokens.get(effective_n).ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "external device verify missing bonus target token".to_string(),
+                        )
+                    })?)
+                };
+            }
             stats.accepted += accepted_draft_tokens;
-            if accepted_draft_tokens < effective_n {
-                target_token = Some(targets[accepted_draft_tokens]);
-            }
-            if accepted_draft_tokens == effective_n {
-                target_token = Some(*window.target_tokens.get(effective_n).ok_or_else(|| {
-                    crate::error::LlmError::Forward(
-                        "external device verify missing bonus target token".to_string(),
-                    )
-                })?);
-            }
+            stats.add_target_verify(window.len(), 1);
             #[cfg(feature = "cuda")]
             engine.commit_device_verify_window_prefix_states(
                 position_before_verify as usize,
@@ -2357,11 +2546,11 @@ fn generate_with_external_drafter(
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
         } else if external_batch_verify {
-            let (mut target_preds, output_hidden_rows) =
-                engine.forward_batch_verify(&verify_seq, position_before_verify)?;
-            if params.ignore_eos {
+            let (mut window, output_hidden_rows) =
+                engine.forward_batch_verify(&verify_seq, position_before_verify, sampled_verify)?;
+            if !sampled_verify && params.ignore_eos {
                 let hidden_dim = engine.metadata.hidden_dim;
-                for (index, target_token) in target_preds.iter_mut().enumerate() {
+                for (index, target_token) in window.target_tokens.iter_mut().enumerate() {
                     let start = index * hidden_dim;
                     let end = start + hidden_dim;
                     let hidden = output_hidden_rows.get(start..end).ok_or_else(|| {
@@ -2381,37 +2570,69 @@ fn generate_with_external_drafter(
             if timing_enabled {
                 t_verify += t_v0.elapsed().as_secs_f64() * 1000.0;
             }
-            // target_preds.len() == verify_seq.len() == effective_n + 1
-            // target_preds[i] = 모델이 verify_seq[i] 를 소비한 뒤 예측한 다음 토큰
-            if target_preds.len() != effective_n + 1 {
+            if window.len() != effective_n + 1 {
                 return Err(crate::error::LlmError::Forward(format!(
                     "external batch verify returned {} predictions for {} draft tokens",
-                    target_preds.len(),
+                    window.len(),
                     effective_n
                 )));
             }
-            accepted_draft_tokens =
-                crate::mtp_sampling::greedy_matched_prefix(drafts_used, &target_preds);
+            if sampled_verify {
+                (accepted_draft_tokens, target_token, stopped) = sample_target_window_prefix(
+                    &window.output_logits,
+                    drafts_used,
+                    engine.metadata.vocab_size,
+                    params,
+                    eos,
+                    &mut dummy_sampler,
+                    &mut generated_tokens,
+                    &mut dummy_rng,
+                )?;
+            } else {
+                accepted_draft_tokens =
+                    crate::mtp_sampling::greedy_matched_prefix(drafts_used, &window.target_tokens);
+                target_token = Some(window.target_tokens[accepted_draft_tokens]);
+            }
 
             let new_kv_position = position_before_verify + accepted_draft_tokens as u32 + 1;
             engine.commit_kv_through(new_kv_position)?;
             external_batch_output_hidden_rows = Some(output_hidden_rows);
 
             stats.accepted += accepted_draft_tokens;
-            stats.add_target_verify(1, 1);
-            target_token = Some(target_preds[accepted_draft_tokens]);
+            stats.add_target_verify(window.len(), 1);
         } else {
             let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..effective_n {
-                let (target_tok, _) =
-                    engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[i])?;
-                let target_tok = replace_ignored_eos_output_target(
-                    engine,
-                    params,
-                    target_tok,
-                    engine.last_hidden_for_decode(),
-                    eos,
-                )?;
+                let target_tok = if sampled_verify {
+                    let (rows, _) = engine.forward_verify_all_logits_sequential_collect_mtp(
+                        &verify_seq[i..=i],
+                        true,
+                    )?;
+                    sample_target_from_logits(
+                        rows.first().ok_or_else(|| {
+                            crate::error::LlmError::Forward(
+                                "external sequential verify returned no logits".to_string(),
+                            )
+                        })?,
+                        0,
+                        engine.metadata.vocab_size,
+                        params,
+                        eos,
+                        &mut dummy_sampler,
+                        &generated_tokens,
+                        &mut dummy_rng,
+                    )?
+                } else {
+                    let (target_tok, _) =
+                        engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[i])?;
+                    replace_ignored_eos_output_target(
+                        engine,
+                        params,
+                        target_tok,
+                        engine.last_hidden_for_decode(),
+                        eos,
+                    )?
+                };
                 stats.add_target_verify(1, 1);
                 match round.observe(i, drafts_used[i], target_tok, effective_n, params, eos) {
                     crate::mtp_sampling::RoundAction::Reject
@@ -2432,15 +2653,36 @@ fn generate_with_external_drafter(
             stopped = round.stopped() || tokens_remaining == 0;
 
             if !stopped && tokens_remaining > 0 && accepted_draft_tokens == effective_n {
-                let (target_tok, _) =
-                    engine.forward_verify_argmax_sequential_collect_mtp(verify_seq[effective_n])?;
-                let target_tok = replace_ignored_eos_output_target(
-                    engine,
-                    params,
-                    target_tok,
-                    engine.last_hidden_for_decode(),
-                    eos,
-                )?;
+                let target_tok = if sampled_verify {
+                    let (rows, _) = engine.forward_verify_all_logits_sequential_collect_mtp(
+                        &verify_seq[effective_n..=effective_n],
+                        true,
+                    )?;
+                    sample_target_from_logits(
+                        rows.first().ok_or_else(|| {
+                            crate::error::LlmError::Forward(
+                                "external sequential bonus verify returned no logits".to_string(),
+                            )
+                        })?,
+                        0,
+                        engine.metadata.vocab_size,
+                        params,
+                        eos,
+                        &mut dummy_sampler,
+                        &generated_tokens,
+                        &mut dummy_rng,
+                    )?
+                } else {
+                    let (target_tok, _) = engine
+                        .forward_verify_argmax_sequential_collect_mtp(verify_seq[effective_n])?;
+                    replace_ignored_eos_output_target(
+                        engine,
+                        params,
+                        target_tok,
+                        engine.last_hidden_for_decode(),
+                        eos,
+                    )?
+                };
                 stats.add_target_verify(1, 1);
                 target_token = Some(target_tok);
             }
@@ -2467,7 +2709,7 @@ fn generate_with_external_drafter(
                 }
             }
             emitted_draft_tokens = round.emitted();
-            stopped = round.stopped() || tokens_remaining == 0;
+            stopped = stopped || round.stopped() || tokens_remaining == 0;
         }
 
         // 5g. target correction token emit (accept 가 끝났고 아직 여유 있을 때).
@@ -3127,5 +3369,66 @@ mod tests {
         assert!(draft_only_should_emit(7, 2, &[3, 4]));
         assert!(!draft_only_should_emit(2, 2, &[3, 4]));
         assert!(!draft_only_should_emit(4, 2, &[3, 4]));
+    }
+    #[test]
+    fn sampled_target_window_applies_top_k_top_p_and_ignored_eos() {
+        let params = GenerateParams {
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 0.5,
+            ignore_eos: true,
+            ..GenerateParams::default()
+        };
+        assert!(mtp_sampled_verify_allowed(&params));
+        let logits = vec![
+            9.0, 10.0, -10.0, -10.0, // draft 1 accepted
+            -10.0, 9.0, 10.0, -10.0, // draft 2 accepted
+            10.0, 9.0, -10.0, 20.0, // EOS suppressed; bonus becomes 0
+        ];
+        let mut sampler = SamplerChain::from_params(&params);
+        let mut generated_tokens = vec![42];
+        let mut rng = SmallRng::seed_from_u64(7);
+
+        let outcome = sample_target_window_prefix(
+            &logits,
+            &[1, 2],
+            4,
+            &params,
+            3,
+            &mut sampler,
+            &mut generated_tokens,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, (2, Some(0), false));
+        assert_eq!(generated_tokens, vec![42]);
+    }
+
+    #[test]
+    fn sampled_target_window_stops_without_accepting_stop_token() {
+        let params = GenerateParams {
+            temperature: 0.8,
+            top_k: 1,
+            ..GenerateParams::default()
+        };
+        let mut sampler = SamplerChain::from_params(&params);
+        let mut generated_tokens = vec![7, 8];
+        let mut rng = SmallRng::seed_from_u64(11);
+
+        let outcome = sample_target_window_prefix(
+            &[0.0, 0.0, 0.0, 10.0],
+            &[3],
+            4,
+            &params,
+            3,
+            &mut sampler,
+            &mut generated_tokens,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, (0, None, true));
+        assert_eq!(generated_tokens, vec![7, 8]);
     }
 }

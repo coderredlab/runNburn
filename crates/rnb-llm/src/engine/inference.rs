@@ -49,6 +49,7 @@ pub(crate) struct DeepSeek4VerifyCheckpoint {
 
 pub(crate) struct DeepSeek4VerifyBatch {
     pub(crate) predictions: Vec<u32>,
+    pub(crate) output_logits: Vec<f32>,
     pub(crate) output_hidden_rows: Vec<f32>,
     pub(crate) extracted_features: Vec<f32>,
     pub(crate) target_prefix_states: Vec<super::models::deepseek4::DeepSeek4StateCheckpoint>,
@@ -535,7 +536,7 @@ impl Engine {
         &mut self,
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true, false)
             .map(|(result, _)| result)
     }
 
@@ -544,15 +545,20 @@ impl Engine {
         tokens: &[u32],
         prefix_tokens: usize,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, Some(vec![prefix_tokens]), true)
-            .map(|(result, _)| result)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(
+            tokens,
+            Some(vec![prefix_tokens]),
+            true,
+            false,
+        )
+        .map(|(result, _)| result)
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_deferred_observe(
         &mut self,
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, false)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, false, false)
             .map(|(result, _)| result)
     }
 
@@ -565,6 +571,7 @@ impl Engine {
             tokens,
             Some(vec![prefix_tokens]),
             false,
+            false,
         )
         .map(|(result, _)| result)
     }
@@ -573,19 +580,27 @@ impl Engine {
         &mut self,
         tokens: &[u32],
         prefix_tokens: &[usize],
+        collect_output_logits: bool,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(
             tokens,
             Some(prefix_tokens.to_vec()),
             false,
+            collect_output_logits,
         )
         .map(|(result, _)| result)
     }
     pub(crate) fn forward_prefill_argmax_tokens_collect_output_hidden(
         &mut self,
         tokens: &[u32],
+        collect_output_logits: bool,
     ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(
+            tokens,
+            None,
+            true,
+            collect_output_logits,
+        )
     }
 
     pub(crate) fn forward_mtp_device_verify_window_argmax_collect_mtp(
@@ -617,15 +632,16 @@ impl Engine {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn forward_mtp_device_verify_window_argmax_collect_mtp_shadow(
+    pub(crate) fn forward_mtp_device_verify_window_collect_mtp_shadow(
         &mut self,
         request: &crate::engine::verify_window::MtpVerifyWindowRequest,
+        collect_output_logits: bool,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_mtp_device_verify_window_argmax_collect_mtp_impl(
             request,
             request.shadow_commit_prefix_tokens(),
             false,
-            false,
+            collect_output_logits,
         )
     }
 
@@ -848,6 +864,7 @@ impl Engine {
         tokens: &[u32],
         prefix_tokens: Option<Vec<usize>>,
         observe_mtp: bool,
+        collect_output_logits: bool,
     ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
         let weights = match &self.weights {
             Some(w) => w,
@@ -954,7 +971,7 @@ impl Engine {
         let mtp_hidden_rows = self
             .mtp_spec_requested()
             .then(|| kernels::tensor_as_f32_slice(&hidden).to_vec());
-        let (target_tokens, output_hidden_rows) = finalize_prefill_argmax_tokens(
+        let (target_tokens, output_hidden_rows, output_logits) = finalize_prefill_argmax_tokens(
             &mut self.kv_cache,
             &self.metadata,
             self.architecture,
@@ -963,6 +980,7 @@ impl Engine {
             seq_len,
             pos_start,
             norm_eps,
+            collect_output_logits,
         )?;
         if let Some(last_hidden) = output_hidden_rows
             .chunks_exact(self.metadata.hidden_dim)
@@ -1007,7 +1025,7 @@ impl Engine {
         Ok((
             crate::engine::verify_window::VerifyWindowResult {
                 target_tokens,
-                output_logits: Vec::new(),
+                output_logits,
                 mtp_hidden_rows: mtp_hidden_rows.unwrap_or_default(),
                 hidden_dim: self.metadata.hidden_dim,
                 prefix_state,
@@ -1983,6 +2001,7 @@ impl Engine {
                     })
                     .collect();
                 Ok(DeepSeek4VerifyBatch {
+                    output_logits: output.logits,
                     predictions,
                     output_hidden_rows: output.final_hidden_rows,
                     extracted_features: output.extracted_features,

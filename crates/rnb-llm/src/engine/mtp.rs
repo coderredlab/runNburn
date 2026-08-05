@@ -916,10 +916,13 @@ impl Engine {
 
     /// `temperature > 0` 요청을 MTP로 처리할 수 있는가.
     ///
-    /// target 분포가 필요하므로 CUDA device-resident verify에서만 가능하다. Metal
-    /// batched decode-chain과 Vulkan fullpath는 argmax token만 돌려주므로 제외된다.
+    /// CUDA device-resident verify와 Metal의 batch decode-chain, batch prefill,
+    /// external/DSpark batch, sequential fallback은 모두 위치별 target logits를 반환한다.
+    /// Vulkan fullpath는 아직 argmax 전용이라 해당 backend 정책에서는 이 capability를
+    /// 열지 않는다.
     pub(crate) fn mtp_sampled_verify_supported(&self) -> bool {
-        cfg!(feature = "cuda") && self.mtp_device_verify_requested()
+        (cfg!(feature = "cuda") && self.mtp_device_verify_requested())
+            || (cfg!(all(feature = "metal", not(feature = "cuda"))) && self.mtp_runtime_ready())
     }
 
     pub(crate) fn mtp_device_verify_requested(&self) -> bool {

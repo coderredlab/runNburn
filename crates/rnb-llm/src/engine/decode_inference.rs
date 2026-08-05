@@ -503,6 +503,7 @@ impl Engine {
     pub(crate) fn forward_batched_decode_verify_window(
         &self,
         verify_input: &[u32],
+        collect_output_logits: bool,
     ) -> crate::error::Result<
         Option<(
             crate::engine::verify_window::VerifyWindowResult,
@@ -669,6 +670,7 @@ impl Engine {
         let mut out_states: Vec<Option<(Vec<f32>, Vec<f32>)>> = vec![None; run.len()];
         let mut out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
         let mut gdn_prefix: Vec<Vec<Option<(Vec<f32>, Vec<f32>)>>> = Vec::new();
+        let mut output_logits = Vec::new();
         let reports = backend_runtime::metal_decode_chain_run_batched(
             &mut hidden,
             batch,
@@ -678,6 +680,7 @@ impl Engine {
             &mut out_states,
             &mut out_attn_kv,
             &mut gdn_prefix,
+            collect_output_logits.then_some(&mut output_logits),
             capacity,
             hidden_dim,
             conv_channels,
@@ -704,11 +707,7 @@ impl Engine {
         let layer_indices: Vec<usize> = run.iter().map(|(li, _)| *li).collect();
         let window = crate::engine::verify_window::VerifyWindowResult {
             target_tokens,
-            // Metal batched decode-chain은 greedy 전용이다. 확률적 verify는
-            // `mtp_generate`의 sampled 가드가 CUDA device-resident와 sequential로만
-            // 허용하므로 이 경로에는 target 분포가 필요 없다. Metal에서 `temperature>0`을
-            // 열려면 여기서 위치별 output logits를 실제로 수집해야 한다.
-            output_logits: Vec::new(),
+            output_logits,
             mtp_hidden_rows: hidden,
             hidden_dim,
             prefix_state: None,
