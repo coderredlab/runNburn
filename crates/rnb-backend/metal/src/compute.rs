@@ -601,6 +601,10 @@ pub struct MetalContext {
     /// pm132: split-K f16 KV decode attention.
     pub attn_decode_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_splitk_reduce_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_splitk_part_batch_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_splitk_reduce_batch_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm132: GQA-grouped split-K f16 KV decode attention (KV read 1x, query head 재사용).
     pub attn_decode_gqa_splitk_part_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_gqa_splitk_reduce_pipeline:
@@ -610,7 +614,10 @@ pub struct MetalContext {
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rope_mrope_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_qk_norm_rope_batch_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub kv_append_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub kv_append_batch_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm22: per-slot int8 KV append 커널. f16 kv_append 와 택일(ctx.kv_int8 분기).
     pub kv_append_i8_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub ssm_conv_silu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2232,6 +2239,16 @@ pub fn build_metal_context_with_opts(
         build_pipeline(&device, ATTN_DECODE_SPLITK_SRC, "attn_decode_splitk_part");
     let attn_decode_splitk_reduce_pipeline =
         build_pipeline(&device, ATTN_DECODE_SPLITK_SRC, "attn_decode_splitk_reduce");
+    let attn_decode_splitk_part_batch_pipeline = build_pipeline(
+        &device,
+        ATTN_DECODE_SPLITK_SRC,
+        "attn_decode_splitk_part_batch",
+    );
+    let attn_decode_splitk_reduce_batch_pipeline = build_pipeline(
+        &device,
+        ATTN_DECODE_SPLITK_SRC,
+        "attn_decode_splitk_reduce_batch",
+    );
     let attn_decode_gqa_splitk_part_pipeline =
         build_pipeline(&device, ATTN_DECODE_GQA_SRC, "attn_decode_gqa_splitk_part");
     let attn_decode_gqa_splitk_reduce_pipeline = build_pipeline(
@@ -2251,7 +2268,10 @@ pub fn build_metal_context_with_opts(
     );
     let rope_mrope_pipeline = build_pipeline(&device, ROPE_MROPE_SRC, "rope_mrope");
     let qk_norm_pipeline = build_pipeline(&device, QK_NORM_SRC, "qk_norm");
+    let attn_decode_qk_norm_rope_batch_pipeline =
+        build_pipeline(&device, QK_NORM_SRC, "attn_decode_qk_norm_rope_batch");
     let kv_append_pipeline = build_pipeline(&device, KV_APPEND_SRC, "kv_append");
+    let kv_append_batch_pipeline = build_pipeline(&device, KV_APPEND_SRC, "kv_append_batch");
     let kv_append_i8_pipeline = build_pipeline(&device, KV_APPEND_I8_SRC, "kv_append_i8");
     let ssm_conv_silu_pipeline = build_pipeline(&device, SSM_CONV_SILU_SRC, "ssm_conv1d_silu");
     let ssm_conv_silu_batch_pipeline =
@@ -2434,13 +2454,17 @@ pub fn build_metal_context_with_opts(
         attn_decode_i8_gqa_matrix_splitk_part_pipeline,
         attn_decode_splitk_part_pipeline,
         attn_decode_splitk_reduce_pipeline,
+        attn_decode_splitk_part_batch_pipeline,
+        attn_decode_splitk_reduce_batch_pipeline,
         attn_decode_gqa_splitk_part_pipeline,
         attn_decode_gqa_splitk_reduce_pipeline,
         kvarn_attention_splitk_part_pipeline,
         kvarn_attention_splitk_reduce_pipeline,
         rope_mrope_pipeline,
         qk_norm_pipeline,
+        attn_decode_qk_norm_rope_batch_pipeline,
         kv_append_pipeline,
+        kv_append_batch_pipeline,
         kv_append_i8_pipeline,
         ssm_conv_silu_pipeline,
         ssm_conv_silu_batch_pipeline,
@@ -10202,6 +10226,44 @@ pub(crate) fn encode_kv_append(
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_kv_append_batch(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    k_in_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_in_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_cache_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_cache_buf: &ProtocolObject<dyn MTLBuffer>,
+    kvd_buf: &ProtocolObject<dyn MTLBuffer>,
+    pos_start_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_buf: &ProtocolObject<dyn MTLBuffer>,
+    total: usize,
+) {
+    enc.setComputePipelineState(&ctx.kv_append_batch_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(k_in_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(v_in_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(k_cache_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(v_cache_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(kvd_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(pos_start_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 6);
+    }
+    let tg_width = ctx.kv_append_batch_pipeline.threadExecutionWidth().max(1);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: total.div_ceil(tg_width),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// attn_decode(q device + KV device → o_buf) 를 encoder 에 encode. grid=num_heads,
 /// tg=SIMD_WIDTH(1 head=1 SIMD-group).
 #[allow(clippy::too_many_arguments)]
@@ -10279,6 +10341,49 @@ pub(crate) fn encode_qk_norm_at(
         depth: 1,
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_qk_norm_rope_batch(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    in_out_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    nrot_buf: &ProtocolObject<dyn MTLBuffer>,
+    theta_scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    eps_buf: &ProtocolObject<dyn MTLBuffer>,
+    pos_start_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch: usize,
+    num_heads: usize,
+) {
+    enc.setComputePipelineState(&ctx.attn_decode_qk_norm_rope_batch_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(in_out_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(in_out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(nrot_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(theta_scale_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(pos_start_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 9);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: batch * num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// `encode_split_qgate` 의 byte-offset 변형 — lane 슬롯(`q_full_all[i*q_out_dim]`
@@ -10742,21 +10847,74 @@ pub(crate) fn encode_attn_decode_splitk(
     head_dim: usize,
     num_splits: usize,
 ) {
+    encode_attn_decode_splitk_at(
+        ctx,
+        enc,
+        q_buf,
+        0,
+        k_f16,
+        v_f16,
+        partial_acc,
+        0,
+        partial_m,
+        partial_s,
+        0,
+        o_buf,
+        0,
+        nh_buf,
+        nkv_buf,
+        hd_buf,
+        kl_buf,
+        scale_buf,
+        splits_buf,
+        num_heads,
+        head_dim,
+        num_splits,
+    );
+}
+
+/// f16 KV split-K decode attention의 q/output/partial byte-offset 변형.
+/// Batched verify가 lane별 scratch를 공유 buffer에 두면서 single-token과 같은 part/reduce
+/// kernel을 사용한다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_splitk_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_off: usize,
+    k_f16: &ProtocolObject<dyn MTLBuffer>,
+    v_f16: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc_off: usize,
+    partial_m: &ProtocolObject<dyn MTLBuffer>,
+    partial_s: &ProtocolObject<dyn MTLBuffer>,
+    partial_stats_off: usize,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_off: usize,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    splits_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+) {
     assert!(
         head_dim <= 8 * SIMD_WIDTH,
         "attn_decode_splitk head_dim {head_dim} > 256 (lane-local bound)"
     );
     assert!(num_splits >= 2, "attn_decode_splitk requires >=2 splits");
 
-    // Part kernel
     enc.setComputePipelineState(&ctx.attn_decode_splitk_part_pipeline);
     unsafe {
-        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(q_buf), q_off, 0);
         enc.setBuffer_offset_atIndex(Some(k_f16), 0, 1);
         enc.setBuffer_offset_atIndex(Some(v_f16), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), partial_acc_off, 3);
+        enc.setBuffer_offset_atIndex(Some(partial_m), partial_stats_off, 4);
+        enc.setBuffer_offset_atIndex(Some(partial_s), partial_stats_off, 5);
         enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 6);
         enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 7);
         enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 8);
@@ -10777,13 +10935,12 @@ pub(crate) fn encode_attn_decode_splitk(
     enc.dispatchThreadgroups_threadsPerThreadgroup(part_grid, tg);
     chain_barrier(ctx, enc);
 
-    // Reduce kernel
     enc.setComputePipelineState(&ctx.attn_decode_splitk_reduce_pipeline);
     unsafe {
-        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), partial_acc_off, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_m), partial_stats_off, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_s), partial_stats_off, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), o_off, 3);
         enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
         enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
         enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 6);
@@ -10794,6 +10951,92 @@ pub(crate) fn encode_attn_decode_splitk(
         depth: 1,
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, tg);
+}
+
+/// Batched f16 KV split-K attention. 모든 lane을 part/reduce 각 한 dispatch에 넣는다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_splitk_batch(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_f16: &ProtocolObject<dyn MTLBuffer>,
+    v_f16: &ProtocolObject<dyn MTLBuffer>,
+    partial_acc: &ProtocolObject<dyn MTLBuffer>,
+    partial_m: &ProtocolObject<dyn MTLBuffer>,
+    partial_s: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kv_lens_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    splits_buf: &ProtocolObject<dyn MTLBuffer>,
+    batch_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    head_dim: usize,
+    num_splits: usize,
+    batch: usize,
+) {
+    assert!(
+        head_dim <= 8 * SIMD_WIDTH,
+        "attn_decode_splitk_batch head_dim {head_dim} > 256 (lane-local bound)"
+    );
+    assert!(
+        num_splits >= 2,
+        "attn_decode_splitk_batch requires >=2 splits"
+    );
+    assert!(batch >= 1, "attn_decode_splitk_batch requires batch >=1");
+
+    enc.setComputePipelineState(&ctx.attn_decode_splitk_part_batch_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_f16), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_f16), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(kv_lens_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 11);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 12);
+    }
+    let tg = MTLSize {
+        width: SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: num_heads,
+            height: num_splits,
+            depth: batch,
+        },
+        tg,
+    );
+    chain_barrier(ctx, enc);
+
+    enc.setComputePipelineState(&ctx.attn_decode_splitk_reduce_batch_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(partial_acc), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_m), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_s), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(splits_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(batch_buf), 0, 7);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: num_heads,
+            height: batch,
+            depth: 1,
+        },
+        tg,
+    );
 }
 
 /// pm132: GQA-grouped f16 KV split-K decode attention encode.

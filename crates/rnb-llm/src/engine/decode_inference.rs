@@ -908,6 +908,11 @@ impl Engine {
             }
         }
         self.kv_cache.set_len(target_len);
+        crate::engine::metal_runtime::metal_decode_chain_commit_batched_gdn_prefix(
+            &commit.layer_indices,
+            commit.batch,
+            committed,
+        );
         self.last_layer_hidden_cached = last_hidden;
         Ok(())
     }

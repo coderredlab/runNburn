@@ -156,3 +156,145 @@ kernel void attn_decode_splitk_reduce(
         idx++;
     }
 }
+
+// Batched verify 변형. B lane을 grid의 z/y 축으로 합쳐 lane별 encode 호출을
+// part 1회 + reduce 1회 dispatch로 줄인다.
+kernel void attn_decode_splitk_part_batch(
+    device const float*  q            [[buffer(0)]],
+    device const ushort* k_cache      [[buffer(1)]],
+    device const ushort* v_cache      [[buffer(2)]],
+    device float*        partial_acc  [[buffer(3)]],
+    device float*        partial_m    [[buffer(4)]],
+    device float*        partial_s    [[buffer(5)]],
+    constant uint&       num_heads    [[buffer(6)]],
+    constant uint&       num_kv_heads [[buffer(7)]],
+    constant uint&       head_dim     [[buffer(8)]],
+    device const uint*   kv_lens      [[buffer(9)]],
+    constant float&      scale        [[buffer(10)]],
+    constant uint&       num_splits   [[buffer(11)]],
+    constant uint&       batch        [[buffer(12)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_threadgroup]])
+{
+    uint h = gid.x;
+    uint split = gid.y;
+    uint batch_idx = gid.z;
+    if (h >= num_heads || split >= num_splits || batch_idx >= batch) return;
+
+    uint row = (batch_idx * num_splits + split) * num_heads + h;
+    uint heads_per_group = num_heads / num_kv_heads;
+    uint kv_h = h / heads_per_group;
+    uint kv_dim = num_kv_heads * head_dim;
+    uint q_off = batch_idx * num_heads * head_dim + h * head_dim;
+    uint kv_len = kv_lens[batch_idx];
+    uint chunk = (kv_len + num_splits - 1u) / num_splits;
+    uint start = split * chunk;
+    uint end = min(kv_len, start + chunk);
+
+    float qf[8];
+    float acc[8];
+    uint nloc = 0u;
+    for (uint d = lane; d < head_dim; d += 32u) {
+        qf[nloc] = (float)(half)q[q_off + d];
+        acc[nloc] = 0.0f;
+        nloc++;
+    }
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    for (uint j = start; j < end; j++) {
+        uint kv_off = j * kv_dim + kv_h * head_dim;
+        float partial = 0.0f;
+        uint idx = 0u;
+        for (uint d = lane; d < head_dim; d += 32u) {
+            float kf = (float)as_type<half>(k_cache[kv_off + d]);
+            partial += qf[idx] * kf;
+            idx++;
+        }
+        float x = simd_sum(partial) * scale;
+        if (x > m) {
+            bool rescale = (m > -INFINITY);
+            float alpha = rescale ? exp(m - x) : 1.0f;
+            if (rescale) s *= alpha;
+            idx = 0u;
+            for (uint d = lane; d < head_dim; d += 32u) {
+                float a = acc[idx];
+                if (rescale) a *= alpha;
+                float vv = (float)as_type<half>(v_cache[kv_off + d]);
+                acc[idx] = a + vv;
+                idx++;
+            }
+            s += 1.0f;
+            m = x;
+        } else {
+            float p = exp(x - m);
+            idx = 0u;
+            for (uint d = lane; d < head_dim; d += 32u) {
+                float vv = (float)as_type<half>(v_cache[kv_off + d]);
+                acc[idx] += vv * p;
+                idx++;
+            }
+            s += p;
+        }
+    }
+
+    if (lane == 0u) {
+        partial_m[row] = m;
+        partial_s[row] = s;
+    }
+    uint idx = 0u;
+    for (uint d = lane; d < head_dim; d += 32u) {
+        partial_acc[row * head_dim + d] = acc[idx];
+        idx++;
+    }
+}
+
+kernel void attn_decode_splitk_reduce_batch(
+    device const float* partial_acc [[buffer(0)]],
+    device const float* partial_m   [[buffer(1)]],
+    device const float* partial_s   [[buffer(2)]],
+    device float*       out         [[buffer(3)]],
+    constant uint&      num_heads   [[buffer(4)]],
+    constant uint&      head_dim    [[buffer(5)]],
+    constant uint&      num_splits  [[buffer(6)]],
+    constant uint&      batch       [[buffer(7)]],
+    uint2 gid  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]])
+{
+    uint h = gid.x;
+    uint batch_idx = gid.y;
+    if (h >= num_heads || batch_idx >= batch) return;
+
+    uint row_base = batch_idx * num_splits * num_heads;
+    float m = -INFINITY;
+    for (uint split = 0u; split < num_splits; split++) {
+        m = max(m, partial_m[row_base + split * num_heads + h]);
+    }
+
+    float denom = 0.0f;
+    float acc[8];
+    uint nloc = 0u;
+    for (uint d = lane; d < head_dim; d += 32u) {
+        acc[nloc] = 0.0f;
+        nloc++;
+    }
+    for (uint split = 0u; split < num_splits; split++) {
+        uint row = row_base + split * num_heads + h;
+        float split_s = partial_s[row];
+        float factor = (split_s > 0.0f) ? exp(partial_m[row] - m) : 0.0f;
+        denom += split_s * factor;
+        uint idx = 0u;
+        for (uint d = lane; d < head_dim; d += 32u) {
+            acc[idx] += partial_acc[row * head_dim + d] * factor;
+            idx++;
+        }
+    }
+
+    float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    uint out_off = batch_idx * num_heads * head_dim + h * head_dim;
+    uint idx = 0u;
+    for (uint d = lane; d < head_dim; d += 32u) {
+        out[out_off + d] = acc[idx] * inv;
+        idx++;
+    }
+}

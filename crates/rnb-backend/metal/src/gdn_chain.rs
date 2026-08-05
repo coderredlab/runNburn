@@ -270,6 +270,8 @@ pub(crate) struct GdnBatchCarrier {
     // delta_all: [(b+1)*delta_state_len] — slot i = i lane 처리 후 delta state(prefix). slot 0 =
     // 진입 초기값. lane i: slot i(read) → slot i+1(write) ping-pong 으로 모든 prefix 보존.
     delta_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    delta_start_slot: usize,
+    reuse_committed_delta: bool,
 
     hdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     conv_ch_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -335,6 +337,8 @@ impl GdnBatchCarrier {
             gated: empty_f32_buf(ctx, z_dim),
             delta_all: empty_f32_buf(ctx, (b + 1) * delta_state_len),
             hdim_buf: u32_buf(ctx, hidden_dim as u32),
+            delta_start_slot: 0,
+            reuse_committed_delta: false,
             conv_ch_buf: u32_buf(ctx, conv_channels as u32),
             conv_k_buf: u32_buf(ctx, conv_kernel as u32),
             zdim_buf: u32_buf(ctx, z_dim as u32),
@@ -365,15 +369,19 @@ impl GdnBatchCarrier {
         }
     }
 
-    /// chain 진입 전: 이 layer 의 conv_state 를 rolling buffer 의 [0..conv_state_len] 로,
-    /// delta_state 를 device delta buffer 로 올린다(매 chain 호출마다 — batched 경로는
-    /// single-token delta residency 와 독립, host state 가 source of truth).
-    pub(crate) fn upload_states(&self, conv_state: &[f32], delta_state: &[f32]) {
+    /// chain 진입 전 conv state는 rolling buffer 시작점에 동기화한다. delta state는 직전
+    /// batched verify의 committed prefix가 device slot에 남아 있으면 그 slot을 재사용하고,
+    /// 그렇지 않으면 host source of truth를 slot 0에 upload한다.
+    pub(crate) fn upload_states(&mut self, conv_state: &[f32], delta_state: &[f32]) {
         assert_eq!(conv_state.len(), self.conv_state_len);
         assert_eq!(delta_state.len(), self.delta_state_len);
         Self::upload(&self.conv_roll, conv_state);
-        // delta_all slot 0 = 진입 초기값(lane 0 이 여기서 읽어 slot 1 에 쓴다).
-        Self::upload(&self.delta_all, delta_state);
+        if self.reuse_committed_delta {
+            self.reuse_committed_delta = false;
+        } else {
+            self.delta_start_slot = 0;
+            Self::upload(&self.delta_all, delta_state);
+        }
     }
 
     /// chain commit 후: B lane 처리 이후의 새 state(= prefix-B). conv_new = rolling buffer 의
@@ -389,12 +397,19 @@ impl GdnBatchCarrier {
         assert!(n >= 1 && n <= self.b, "prefix n out of range");
         let conv_new =
             Self::readback_at(&self.conv_roll, n * self.conv_channels, self.conv_state_len);
+        let delta_slot = (self.delta_start_slot + n) % (self.b + 1);
         let delta_new = Self::readback_at(
             &self.delta_all,
-            n * self.delta_state_len,
+            delta_slot * self.delta_state_len,
             self.delta_state_len,
         );
         (conv_new, delta_new)
+    }
+
+    pub(crate) fn mark_committed_prefix(&mut self, n: usize) {
+        assert!(n >= 1 && n <= self.b, "committed prefix n out of range");
+        self.delta_start_slot = (self.delta_start_slot + n) % (self.b + 1);
+        self.reuse_committed_delta = true;
     }
 }
 
@@ -517,6 +532,8 @@ pub(crate) fn gdn_core_chain_encode_bcol(
     chain_barrier(ctx, enc);
 
     // 3. per-lane 순차 middle(conv/delta/ssm-small). delta_state 는 device in-place 전진.
+    let delta_slots = b + 1;
+    let delta_start_slot = carrier.delta_start_slot;
     for i in 0..b {
         encode_gdn_alpha_beta_at(
             ctx,
@@ -583,9 +600,9 @@ pub(crate) fn gdn_core_chain_encode_bcol(
             &carrier.beta_all,
             i * num_v_heads * f32b,
             &carrier.delta_all,
-            i * dsl * f32b,
+            ((delta_start_slot + i) % delta_slots) * dsl * f32b,
             &carrier.delta_all,
-            (i + 1) * dsl * f32b,
+            ((delta_start_slot + i + 1) % delta_slots) * dsl * f32b,
             &carrier.delta_out,
             &carrier.hk_buf,
             &carrier.hv_buf,

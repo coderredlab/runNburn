@@ -3012,6 +3012,17 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
         .collect())
 }
 
+#[cfg(feature = "metal")]
+pub fn metal_decode_chain_commit_batched_gdn_prefix(
+    layer_indices: &[usize],
+    batch: usize,
+    committed: usize,
+) {
+    METAL.with(|backend| {
+        backend.decode_chain_commit_batched_gdn_prefix(layer_indices, batch, committed)
+    });
+}
+
 /// GDN layer 전체 device-resident carrier. pm25: default ON(opt-out) —
 /// `RNB_METAL_GDN_LAYER="0"` 으로만 끈다.
 /// qkv/gate/alpha/beta/ssm_out/ffn_gate/ffn_up = Q4_K, ffn_down = Q4_K|Q6_K 한정.

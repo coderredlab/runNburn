@@ -18,14 +18,16 @@ use objc2_metal::{
 use crate::compute::{
     self, chain_barrier, chain_compute_encoder, encode_attn_decode, encode_attn_decode_at,
     encode_attn_decode_gqa_splitk, encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk,
-    encode_attn_decode_i8_splitk, encode_attn_decode_splitk, encode_gate_apply,
-    encode_gate_apply_at, encode_gemv_quant_bcol, encode_kv_append, encode_kv_append_at,
-    encode_kv_append_i8, encode_qk_norm, encode_qk_norm_at, encode_rope_partial,
-    encode_rope_partial_at, encode_split_qgate, encode_split_qgate_at, KvResident, MetalContext,
+    encode_attn_decode_i8_splitk, encode_attn_decode_qk_norm_rope_batch, encode_attn_decode_splitk,
+    encode_attn_decode_splitk_at, encode_attn_decode_splitk_batch, encode_gate_apply,
+    encode_gate_apply_at, encode_gemv_quant_bcol, encode_kv_append, encode_kv_append_batch,
+    encode_kv_append_i8, encode_prefill_gate_apply, encode_prefill_split_q_gate, encode_qk_norm,
+    encode_rms_norm_batch, encode_rope_partial, encode_split_qgate, encode_split_qgate_at,
+    KvResident, MetalContext,
 };
 use crate::ffn_chain::{
-    empty_f32_buf, encode_residual_add, encode_residual_add_at, encode_rms_norm,
-    encode_rms_norm_io_offset, encode_silu_mul, f32_buf, readback, u32_buf,
+    empty_f32_buf, encode_residual_add, encode_rms_norm, encode_silu_mul, f32_buf, readback,
+    shared_u32_buf, u32_buf,
 };
 
 // f16 grouped kernel은 register pressure 회귀 때문에 명시적 opt-in만 허용한다.
@@ -1038,10 +1040,10 @@ pub struct AttnChainSpecRef<'a> {
 /// layer 당 1회만** 읽는다:
 ///   - q/k/v/o 는 B-column GEMV(`encode_gemv_quant_bcol`)로 amortize.
 ///   - split/qk-norm/rope/kv-append/attn/gate 는 lane 슬롯 offset 으로 per-lane 순차.
-///   - KV 는 device-resident f16. prior [0..base_pos] 를 1회 upload, lane i 는 slot
-///     base_pos+i 에 device append 후 kv_len=base_pos+i+1 로 `[0..base_pos+i]` attend —
-///     append/attn 이 같은 command buffer 안에서 barrier 로 순서 보장되어 lane i+1 이
-///     lane i 의 slot 을 host post-commit 없이 본다(device-side filled advance).
+///   - KV 는 device-resident f16. 첫 verify 는 host prior 를 upload하고, 이후 verify 는
+///     이미 device 에 남은 durable prefix를 재사용한다. lane i 는 slot base_pos+i 에 append 후
+///     kv_len=base_pos+i+1 로 `[0..base_pos+i]` 를 attend — 같은 command buffer의 barrier가
+///     lane i+1이 lane i의 slot을 host post-commit 없이 보도록 보장한다.
 /// (layer, B) 별 1회 alloc 후 토큰 간 재사용. `!Send+!Sync` 라 thread_local.
 /// f16 KV 전용(int8/KVarn chain 은 caller 가 per-lane 경로로 폴백).
 #[allow(dead_code)]
@@ -1063,7 +1065,11 @@ pub(crate) struct AttnBatchCarrier {
     k_all: Retained<ProtocolObject<dyn MTLBuffer>>,      // [b*kv_dim]
     v_all: Retained<ProtocolObject<dyn MTLBuffer>>,      // [b*kv_dim]
     attn_out_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*q_dim]
-    o_out_all: Retained<ProtocolObject<dyn MTLBuffer>>,  // [b*hidden_dim]
+    attn_splitk_acc_all: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_splitk_m_all: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_splitk_s_all: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    attn_splitk_splits_buf: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    o_out_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*hidden_dim]
     kv: KvResident,
 
     hdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1080,6 +1086,11 @@ pub(crate) struct AttnBatchCarrier {
     k_qdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,   // o GEMV 의 K = q_dim
     scale_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     b_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pos_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    kl_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    kv_lens_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_all_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_all_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl AttnBatchCarrier {
@@ -1113,6 +1124,18 @@ impl AttnBatchCarrier {
         // host `rope_partial_inplace` 와 동일 식(AttnCarrier::new 와 일치).
         let nr = n_rot.min(head_dim);
         let theta_scale: f32 = theta.powf(-2.0_f32 / nr as f32);
+        let splitk_splits = ctx.attn_splitk_splits;
+        let (attn_splitk_acc_all, attn_splitk_m_all, attn_splitk_s_all, attn_splitk_splits_buf) =
+            if splitk_splits > 1 {
+                (
+                    Some(empty_f32_buf(ctx, b * splitk_splits * num_heads * head_dim)),
+                    Some(empty_f32_buf(ctx, b * splitk_splits * num_heads)),
+                    Some(empty_f32_buf(ctx, b * splitk_splits * num_heads)),
+                    Some(u32_buf(ctx, splitk_splits as u32)),
+                )
+            } else {
+                (None, None, None, None)
+            };
         Self {
             b,
             hidden_dim,
@@ -1130,6 +1153,10 @@ impl AttnBatchCarrier {
             k_all: empty_f32_buf(ctx, b * kv_dim),
             v_all: empty_f32_buf(ctx, b * kv_dim),
             attn_out_all: empty_f32_buf(ctx, b * q_dim),
+            attn_splitk_acc_all,
+            attn_splitk_m_all,
+            attn_splitk_s_all,
+            attn_splitk_splits_buf,
             o_out_all: empty_f32_buf(ctx, b * hidden_dim),
             kv: KvResident::new_f16(ctx, num_kv_heads, head_dim, capacity),
             hdim_buf: u32_buf(ctx, hidden_dim as u32),
@@ -1146,13 +1173,19 @@ impl AttnBatchCarrier {
             k_qdim_buf: u32_buf(ctx, q_dim as u32),
             scale_buf: f32_buf(ctx, scale),
             b_buf: u32_buf(ctx, b as u32),
+            pos_bufs: (0..b).map(|_| u32_buf(ctx, 0)).collect(),
+            kl_bufs: (0..b).map(|_| u32_buf(ctx, 0)).collect(),
+            kv_lens_buf: shared_u32_buf(ctx, &vec![0; b]),
+            hidden_all_buf: u32_buf(ctx, (b * hidden_dim) as u32),
+            q_all_elems_buf: u32_buf(ctx, (b * q_dim) as u32),
         }
     }
 
-    /// chain 진입 전: 이 layer 의 prior KV([0..base_pos], host f16 bits, [base_pos*kv_dim])를
-    /// device KV cache 의 slot 0.. 에 **무조건** upload(배치 경로는 host state 가 source of
-    /// truth — MTP verify 마다 base_pos/prior 가 다르므로 incremental filled 가드를 쓰지 않는다).
-    pub(crate) fn upload_prior(&self, prior_k: &[u16], prior_v: &[u16], base_pos: usize) {
+    /// chain 진입 전: host KV를 source of truth로 검증하되, device에 이미 존재하는 durable
+    /// prefix는 유지하고 아직 채워지지 않은 suffix만 upload한다. 거절 뒤 base_pos가 직전
+    /// speculative window 안으로 되돌아오면 그 prefix는 유효하고 window는 이어지는 append가
+    /// 덮어쓴다. 새 sequence에서는 backend가 carrier를 evict한다.
+    pub(crate) fn upload_prior(&mut self, prior_k: &[u16], prior_v: &[u16], base_pos: usize) {
         crate::carrier_validation::assert_exact_len(
             "attention KV dimension",
             self.kv_dim,
@@ -1171,12 +1204,33 @@ impl AttnBatchCarrier {
         );
         crate::carrier_validation::assert_exact_len("attention prior K", prior_k.len(), expected);
         crate::carrier_validation::assert_exact_len("attention prior V", prior_v.len(), expected);
-        unsafe {
-            let kp = self.kv.k_buf.contents().as_ptr() as *mut u16;
-            let vp = self.kv.v_buf.contents().as_ptr() as *mut u16;
-            std::ptr::copy_nonoverlapping(prior_k.as_ptr(), kp, expected);
-            std::ptr::copy_nonoverlapping(prior_v.as_ptr(), vp, expected);
+
+        let start_slot = self.kv.filled.min(base_pos);
+        let start = crate::carrier_validation::checked_product(
+            "attention prior KV upload offset",
+            start_slot,
+            self.kv.kv_dim,
+        );
+        let missing = expected - start;
+        if missing != 0 {
+            unsafe {
+                let kp = self.kv.k_buf.contents().as_ptr() as *mut u16;
+                let vp = self.kv.v_buf.contents().as_ptr() as *mut u16;
+                std::ptr::copy_nonoverlapping(prior_k.as_ptr().add(start), kp.add(start), missing);
+                std::ptr::copy_nonoverlapping(prior_v.as_ptr().add(start), vp.add(start), missing);
+            }
         }
+        self.kv.filled = base_pos;
+    }
+
+    pub(crate) fn mark_encoded(&mut self, end_pos: usize) {
+        crate::carrier_validation::checked_slot_range_end(
+            "attention encoded KV",
+            0,
+            end_pos,
+            self.kv.capacity,
+        );
+        self.kv.filled = end_pos;
     }
 
     /// chain commit 후: 방금 verify pass 가 device append 한 window slot
@@ -1271,38 +1325,31 @@ pub(crate) fn attn_core_chain_encode_bcol(
         carrier.kv.capacity,
     );
 
-    // per-lane pos(base_pos+i) / kv_len(base_pos+i+1) scalar buffers.
-    let pos_bufs: Vec<_> = (0..b)
-        .map(|i| {
-            u32_buf(
-                ctx,
-                u32::try_from(base_pos + i).expect("validated attention KV position"),
-            )
-        })
-        .collect();
-    let kl_bufs: Vec<_> = (0..b)
-        .map(|i| {
-            u32_buf(
-                ctx,
-                u32::try_from(base_pos + i + 1).expect("validated attention KV length"),
-            )
-        })
-        .collect();
-
-    // 1. per-lane rms_norm: shared_hidden[i] -> normed_all[i].
+    // per-lane pos/kv_len scalar buffer는 carrier와 함께 재사용한다. verify round마다
+    // tiny MTLBuffer를 다시 만들면 batch 경로의 command-encode 절감분을 상쇄한다.
     for i in 0..b {
-        encode_rms_norm_io_offset(
-            ctx,
-            enc,
-            shared_hidden,
-            i * hidden_dim * f32b,
-            norm_w_buf,
-            &carrier.normed_all,
-            i * hidden_dim * f32b,
-            &carrier.hdim_buf,
-            &carrier.eps_buf,
-        );
+        let pos = u32::try_from(base_pos + i).expect("validated attention KV position");
+        let kv_len = u32::try_from(base_pos + i + 1).expect("validated attention KV length");
+        unsafe {
+            (carrier.pos_bufs[i].contents().as_ptr() as *mut u32).write(pos);
+            (carrier.kl_bufs[i].contents().as_ptr() as *mut u32).write(kv_len);
+            (carrier.kv_lens_buf.contents().as_ptr() as *mut u32)
+                .add(i)
+                .write(kv_len);
+        }
     }
+
+    // 1. all-lane rms_norm: shared_hidden -> normed_all.
+    encode_rms_norm_batch(
+        ctx,
+        enc,
+        shared_hidden,
+        norm_w_buf,
+        &carrier.normed_all,
+        &carrier.hdim_buf,
+        &carrier.eps_buf,
+        b,
+    );
     chain_barrier(ctx, enc);
 
     // 2. B-column q/k/v(weight 1회): normed_all -> q_full_all / k_all / v_all.
@@ -1347,136 +1394,212 @@ pub(crate) fn attn_core_chain_encode_bcol(
     );
     chain_barrier(ctx, enc);
 
-    // 3. per-lane split_qgate: q_full_all[i] -> q_all[i]/gate_all[i].
-    for i in 0..b {
-        encode_split_qgate_at(
+    // 3. all-lane split_qgate. prefill helper가 비활성화된 진단 구성은 기존 lane 경로.
+    if ctx.prefill_split_gate_pipeline.is_some() {
+        encode_prefill_split_q_gate(
             ctx,
             enc,
             &carrier.q_full_all,
-            i * q_out_dim * f32b,
             &carrier.q_all,
-            i * q_dim * f32b,
             &carrier.gate_all,
-            i * q_dim * f32b,
+            &carrier.b_buf,
+            &carrier.nh_buf,
             &carrier.hd_buf,
-            num_heads,
-            q_dim / num_heads,
+            b * q_dim,
         );
+    } else {
+        for i in 0..b {
+            encode_split_qgate_at(
+                ctx,
+                enc,
+                &carrier.q_full_all,
+                i * q_out_dim * f32b,
+                &carrier.q_all,
+                i * q_dim * f32b,
+                &carrier.gate_all,
+                i * q_dim * f32b,
+                &carrier.hd_buf,
+                num_heads,
+                q_dim / num_heads,
+            );
+        }
     }
     chain_barrier(ctx, enc);
 
-    // 4. per-lane q_norm / k_norm(per-head RMSNorm, in-place).
-    for i in 0..b {
-        encode_qk_norm_at(
-            ctx,
-            enc,
-            &carrier.q_all,
-            i * q_dim * f32b,
-            q_norm_w_buf,
-            &carrier.q_all,
-            i * q_dim * f32b,
-            &carrier.hd_buf,
-            &carrier.eps_buf,
-            num_heads,
-        );
-    }
-    chain_barrier(ctx, enc);
-    for i in 0..b {
-        encode_qk_norm_at(
-            ctx,
-            enc,
-            &carrier.k_all,
-            i * kv_dim * f32b,
-            k_norm_w_buf,
-            &carrier.k_all,
-            i * kv_dim * f32b,
-            &carrier.hd_buf,
-            &carrier.eps_buf,
-            num_kv_heads,
-        );
-    }
-    chain_barrier(ctx, enc);
-
-    // 5. per-lane rope(q/k, pos=base_pos+i).
-    for i in 0..b {
-        encode_rope_partial_at(
-            ctx,
-            enc,
-            &carrier.q_all,
-            i * q_dim * f32b,
-            &carrier.hd_buf,
-            &carrier.qdim_buf,
-            &carrier.nrot_buf,
-            &carrier.theta_scale_buf,
-            &pos_bufs[i],
-            num_heads,
-        );
-        encode_rope_partial_at(
-            ctx,
-            enc,
-            &carrier.k_all,
-            i * kv_dim * f32b,
-            &carrier.hd_buf,
-            &carrier.kvdim_buf,
-            &carrier.nrot_buf,
-            &carrier.theta_scale_buf,
-            &pos_bufs[i],
-            num_kv_heads,
-        );
-    }
+    // 4-5. q/k per-head RMSNorm + RoPE를 q와 k 각 한 dispatch로 처리한다.
+    encode_attn_decode_qk_norm_rope_batch(
+        ctx,
+        enc,
+        &carrier.q_all,
+        q_norm_w_buf,
+        &carrier.nh_buf,
+        &carrier.hd_buf,
+        &carrier.nrot_buf,
+        &carrier.theta_scale_buf,
+        &carrier.eps_buf,
+        &carrier.pos_bufs[0],
+        &carrier.b_buf,
+        b,
+        num_heads,
+    );
+    encode_attn_decode_qk_norm_rope_batch(
+        ctx,
+        enc,
+        &carrier.k_all,
+        k_norm_w_buf,
+        &carrier.nkv_buf,
+        &carrier.hd_buf,
+        &carrier.nrot_buf,
+        &carrier.theta_scale_buf,
+        &carrier.eps_buf,
+        &carrier.pos_bufs[0],
+        &carrier.b_buf,
+        b,
+        num_kv_heads,
+    );
     chain_barrier(ctx, enc);
 
-    // 6. per-lane kv_append: k_all[i]/v_all[i] -> KV[base_pos+i] (device append).
-    for i in 0..b {
-        encode_kv_append_at(
+    // 6. all-lane kv_append: k_all/v_all -> KV[base_pos..base_pos+b].
+    encode_kv_append_batch(
+        ctx,
+        enc,
+        &carrier.k_all,
+        &carrier.v_all,
+        &carrier.kv.k_buf,
+        &carrier.kv.v_buf,
+        &carrier.kvdim_buf,
+        &carrier.pos_bufs[0],
+        &carrier.b_buf,
+        b * kv_dim,
+    );
+    chain_barrier(ctx, enc);
+
+    // 7. attention: 모든 lane이 긴-context면 part/reduce를 각각 한 dispatch로 합친다.
+    // threshold를 가로지르는 한 window만 lane별 single-token 정책으로 처리한다.
+    let first_kv_len = base_pos + 1;
+    if ctx.attn_splitk_splits > 1 && first_kv_len >= ctx.attn_splitk_min_kv {
+        encode_attn_decode_splitk_batch(
             ctx,
             enc,
-            &carrier.k_all,
-            i * kv_dim * f32b,
-            &carrier.v_all,
-            i * kv_dim * f32b,
+            &carrier.q_all,
             &carrier.kv.k_buf,
             &carrier.kv.v_buf,
-            &carrier.kvdim_buf,
-            &pos_bufs[i],
-            kv_dim,
-        );
-    }
-    chain_barrier(ctx, enc);
-
-    // 7. per-lane attention: q_all[i] + KV[0..base_pos+i+1] -> attn_out_all[i].
-    for i in 0..b {
-        encode_attn_decode_at(
-            ctx,
-            enc,
-            &carrier.q_all,
-            i * q_dim * f32b,
-            &carrier.kv.k_buf,
-            &carrier.kv.v_buf,
+            carrier
+                .attn_splitk_acc_all
+                .as_ref()
+                .expect("batch splitk acc buffer missing"),
+            carrier
+                .attn_splitk_m_all
+                .as_ref()
+                .expect("batch splitk m buffer missing"),
+            carrier
+                .attn_splitk_s_all
+                .as_ref()
+                .expect("batch splitk s buffer missing"),
             &carrier.attn_out_all,
-            i * q_dim * f32b,
             &carrier.nh_buf,
             &carrier.nkv_buf,
             &carrier.hd_buf,
-            &kl_bufs[i],
+            &carrier.kv_lens_buf,
             &carrier.scale_buf,
+            carrier
+                .attn_splitk_splits_buf
+                .as_ref()
+                .expect("batch splitk splits buffer missing"),
+            &carrier.b_buf,
             num_heads,
+            head_dim,
+            ctx.attn_splitk_splits,
+            b,
         );
+    } else {
+        for i in 0..b {
+            let kv_len = base_pos + i + 1;
+            if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
+                let partial_acc_off = i * ctx.attn_splitk_splits * num_heads * head_dim * f32b;
+                let partial_stats_off = i * ctx.attn_splitk_splits * num_heads * f32b;
+                encode_attn_decode_splitk_at(
+                    ctx,
+                    enc,
+                    &carrier.q_all,
+                    i * q_dim * f32b,
+                    &carrier.kv.k_buf,
+                    &carrier.kv.v_buf,
+                    carrier
+                        .attn_splitk_acc_all
+                        .as_ref()
+                        .expect("batch splitk acc buffer missing"),
+                    partial_acc_off,
+                    carrier
+                        .attn_splitk_m_all
+                        .as_ref()
+                        .expect("batch splitk m buffer missing"),
+                    carrier
+                        .attn_splitk_s_all
+                        .as_ref()
+                        .expect("batch splitk s buffer missing"),
+                    partial_stats_off,
+                    &carrier.attn_out_all,
+                    i * q_dim * f32b,
+                    &carrier.nh_buf,
+                    &carrier.nkv_buf,
+                    &carrier.hd_buf,
+                    &carrier.kl_bufs[i],
+                    &carrier.scale_buf,
+                    carrier
+                        .attn_splitk_splits_buf
+                        .as_ref()
+                        .expect("batch splitk splits buffer missing"),
+                    num_heads,
+                    head_dim,
+                    ctx.attn_splitk_splits,
+                );
+            } else {
+                encode_attn_decode_at(
+                    ctx,
+                    enc,
+                    &carrier.q_all,
+                    i * q_dim * f32b,
+                    &carrier.kv.k_buf,
+                    &carrier.kv.v_buf,
+                    &carrier.attn_out_all,
+                    i * q_dim * f32b,
+                    &carrier.nh_buf,
+                    &carrier.nkv_buf,
+                    &carrier.hd_buf,
+                    &carrier.kl_bufs[i],
+                    &carrier.scale_buf,
+                    num_heads,
+                );
+            }
+        }
     }
     chain_barrier(ctx, enc);
 
-    // 8. per-lane gate_apply: attn_out_all[i] *= sigmoid(gate_all[i]).
-    for i in 0..b {
-        encode_gate_apply_at(
+    // 8. all-lane gate_apply. 진단 구성에서 prefill helper가 없으면 기존 lane 경로.
+    if ctx.prefill_gate_apply_pipeline.is_some() {
+        encode_prefill_gate_apply(
             ctx,
             enc,
             &carrier.attn_out_all,
-            i * q_dim * f32b,
             &carrier.gate_all,
-            i * q_dim * f32b,
-            &carrier.qdim_buf,
-            q_dim,
+            &carrier.attn_out_all,
+            &carrier.q_all_elems_buf,
+            b * q_dim,
         );
+    } else {
+        for i in 0..b {
+            encode_gate_apply_at(
+                ctx,
+                enc,
+                &carrier.attn_out_all,
+                i * q_dim * f32b,
+                &carrier.gate_all,
+                i * q_dim * f32b,
+                &carrier.qdim_buf,
+                q_dim,
+            );
+        }
     }
     chain_barrier(ctx, enc);
 
@@ -1496,18 +1619,15 @@ pub(crate) fn attn_core_chain_encode_bcol(
     );
     chain_barrier(ctx, enc);
 
-    // 10. per-lane residual: shared_hidden[i] += o_out_all[i].
-    for i in 0..b {
-        encode_residual_add_at(
-            ctx,
-            enc,
-            shared_hidden,
-            i * hidden_dim * f32b,
-            &carrier.o_out_all,
-            i * hidden_dim * f32b,
-            hidden_dim,
-        );
-    }
+    // 10. all-lane residual: shared_hidden += o_out_all.
+    encode_residual_add(
+        ctx,
+        enc,
+        shared_hidden,
+        &carrier.o_out_all,
+        &carrier.hidden_all_buf,
+        b * hidden_dim,
+    );
     chain_barrier(ctx, enc);
 
     let _ = head_dim;

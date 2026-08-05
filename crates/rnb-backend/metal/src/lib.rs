@@ -10431,6 +10431,23 @@ impl MetalBackend {
             .collect()
     }
 
+    /// accept-n 확정 뒤 GDN batch carrier의 durable delta slot을 전진한다. 다음 verify는
+    /// host delta 전체를 다시 upload하지 않고 이 slot을 입력 상태로 사용한다.
+    #[cfg(target_os = "macos")]
+    pub fn decode_chain_commit_batched_gdn_prefix(
+        &self,
+        layer_indices: &[usize],
+        batch: usize,
+        committed: usize,
+    ) {
+        let mut carriers = self.gdn_batch_carriers.borrow_mut();
+        for (key, carrier) in carriers.iter_mut() {
+            if key.batch == batch && layer_indices.contains(&key.layer) {
+                carrier.mark_committed_prefix(committed);
+            }
+        }
+    }
+
     /// Qwen dense/MoE full chain을 B lane에 대해 layer당 dense weight 1회 읽기로 한 command
     /// buffer에서 처리한다.
     /// - GDN core는 rolling conv + device delta state를 lane 순서로 전진한다.
@@ -10868,6 +10885,22 @@ impl MetalBackend {
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
+        {
+            let mut carriers = self.attn_batch_carriers.borrow_mut();
+            for spec in specs {
+                match spec {
+                    ChainLayerSpecRef::Attn(s) => carriers
+                        .get_mut(&AttnBatchCarrierKey::dense(s, batch))
+                        .expect("fused dense attn batch carrier after encode")
+                        .mark_encoded(s.pos + batch),
+                    ChainLayerSpecRef::AttnMoeQwen(s) => carriers
+                        .get_mut(&AttnBatchCarrierKey::qwen_moe(s, batch))
+                        .expect("fused MoE attn batch carrier after encode")
+                        .mark_encoded(s.pos + batch),
+                    _ => {}
+                }
+            }
+        }
 
         hidden.copy_from_slice(&ffn_chain::readback(&shared_hidden, batch * hidden_dim));
 
@@ -19194,6 +19227,11 @@ kernel void q4k_ro_vec4(
                 );
             }
         }
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _splitk = EnvGuard::set("RNB_METAL_ATTN_SPLITK", "32");
+        let _splitk_min_kv = EnvGuard::set("RNB_METAL_ATTN_SPLITK_MIN_KV", "1");
 
         let probe = MetalBackend::new_with_kv_int8(false);
         if probe.ctx.is_none() {
@@ -19214,6 +19252,18 @@ kernel void q4k_ro_vec4(
             .iter()
             .enumerate()
             .map(|(i, &v)| v * 0.5 + ((i % 5) as f32 - 2.0) * 0.0007)
+            .collect();
+        let emb_c: Vec<f32> = fixture
+            .hidden
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * -0.25 + ((i % 7) as f32 - 3.0) * 0.0003)
+            .collect();
+        let emb_d: Vec<f32> = fixture
+            .hidden
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * 0.75 - ((i % 11) as f32 - 5.0) * 0.0002)
             .collect();
 
         let out_rows = 8usize;
@@ -19258,7 +19308,7 @@ kernel void q4k_ro_vec4(
             (hiddens, tokens)
         };
 
-        let embs_distinct = [emb_a.clone(), emb_b.clone()];
+        let embs_distinct = [emb_a.clone(), emb_b.clone(), emb_c.clone(), emb_d.clone()];
         let (ref_h, ref_tok) = sequential_reference(&embs_distinct);
 
         let backend = MetalBackend::new_with_kv_int8(false);
@@ -19266,13 +19316,16 @@ kernel void q4k_ro_vec4(
         h.extend_from_slice(&emb_a);
         h.extend_from_slice(&emb_b);
         let mut st = vec![None];
-        let reps = backend.decode_chain_run_batched(
+        let mut first_attn_kv = Vec::new();
+        let reps = backend.decode_chain_run_batched_collect_attn_kv(
             &mut h,
             2,
             &[ChainLayerSpecRef::AttnMoeQwen(fixture.spec(0, base_pos))],
             &mut st,
             options,
             Some(argmax_spec()),
+            &mut first_attn_kv,
+            None,
         );
         assert_eq!(reps.len(), 2);
         assert!(reps[0].did_run && reps[1].did_run);
@@ -19295,6 +19348,52 @@ kernel void q4k_ro_vec4(
         assert_eq!(
             reps[1].output_argmax.token_id, ref_tok[1],
             "attn batch2 lane1 token"
+        );
+
+        let (window_k, window_v) = first_attn_kv[0].as_ref().expect("first batch attention KV");
+        let initial_spec = fixture.spec(0, base_pos);
+        let mut prior_k = initial_spec.prior_k.to_vec();
+        let mut prior_v = initial_spec.prior_v.to_vec();
+        prior_k.extend_from_slice(window_k);
+        prior_v.extend_from_slice(window_v);
+
+        let second_base = base_pos + 2;
+        let second_spec = AttnMoeQwenChainSpecRef {
+            prior_k: &prior_k,
+            prior_v: &prior_v,
+            ..fixture.spec(0, second_base)
+        };
+        let mut h_second = Vec::with_capacity(2 * hidden_dim);
+        h_second.extend_from_slice(&emb_c);
+        h_second.extend_from_slice(&emb_d);
+        let second_reps = backend.decode_chain_run_batched(
+            &mut h_second,
+            2,
+            &[ChainLayerSpecRef::AttnMoeQwen(second_spec)],
+            &mut st,
+            options,
+            Some(argmax_spec()),
+        );
+        assert!(second_reps[0].did_run && second_reps[1].did_run);
+        assert_close(
+            &h_second[0..hidden_dim],
+            &ref_h[2],
+            "attn incremental batch2 lane0 hidden",
+            2e-3,
+        );
+        assert_close(
+            &h_second[hidden_dim..2 * hidden_dim],
+            &ref_h[3],
+            "attn incremental batch2 lane1 hidden",
+            2e-3,
+        );
+        assert_eq!(
+            second_reps[0].output_argmax.token_id, ref_tok[2],
+            "attn incremental batch2 lane0 token"
+        );
+        assert_eq!(
+            second_reps[1].output_argmax.token_id, ref_tok[3],
+            "attn incremental batch2 lane1 token"
         );
     }
 
@@ -19857,6 +19956,12 @@ kernel void q4k_ro_vec4(
             .enumerate()
             .map(|(i, &v)| v * 0.5 + ((i % 5) as f32 - 2.0) * 0.0007)
             .collect();
+        let emb_c: Vec<f32> = fixture
+            .hidden
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * -0.25 + ((i % 7) as f32 - 3.0) * 0.0003)
+            .collect();
 
         // 순차 참조: token0 → prefix-1 state, token1(threaded) → prefix-2 state.
         let backend_ref = MetalBackend::new();
@@ -19905,6 +20010,26 @@ kernel void q4k_ro_vec4(
         let (pc2, pd2) = p2[0].clone().expect("gdn prefix-2");
         assert_close(&pc2, &conv2, "gdn_prefix(2) conv == seq prefix-2");
         assert_close(&pd2, &delta2, "gdn_prefix(2) delta == seq prefix-2");
+
+        // prefix-1 commit 뒤 다음 batch는 host delta upload 없이 device slot 1을 재사용한다.
+        backend.decode_chain_commit_batched_gdn_prefix(&[0], 2, 1);
+        let mut committed_spec = fixture.layer0_spec();
+        committed_spec.conv_state = &conv1;
+        committed_spec.delta_state = &delta1;
+        let committed_specs = [ChainLayerSpecRef::GdnMoeQwen(committed_spec)];
+        let mut h_next = Vec::with_capacity(2 * hidden_dim);
+        h_next.extend_from_slice(&emb_b);
+        h_next.extend_from_slice(&emb_c);
+        backend.decode_chain_run_batched(&mut h_next, 2, &committed_specs, &mut st, options, None);
+        assert_close(
+            &h_next[..hidden_dim],
+            &row1,
+            "committed device delta reuse lane0 hidden",
+        );
+        let next_p1 = backend.decode_chain_run_batched_gdn_prefix(&committed_specs, 2, 1);
+        let (next_conv1, next_delta1) = next_p1[0].as_ref().expect("next prefix-1");
+        assert_close(next_conv1, &conv2, "committed delta reuse conv");
+        assert_close(next_delta1, &delta2, "committed delta reuse delta");
     }
 
     #[test]

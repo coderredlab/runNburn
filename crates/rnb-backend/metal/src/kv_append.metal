@@ -20,3 +20,22 @@ kernel void kv_append(
     k_cache[off] = as_type<ushort>((half)k_f32[i]);
     v_cache[off] = as_type<ushort>((half)v_f32[i]);
 }
+
+kernel void kv_append_batch(
+    device const float* k_f32  [[buffer(0)]],
+    device const float* v_f32  [[buffer(1)]],
+    device ushort*      k_cache [[buffer(2)]],
+    device ushort*      v_cache [[buffer(3)]],
+    constant uint&      kv_dim  [[buffer(4)]],
+    constant uint&      pos_start [[buffer(5)]],
+    constant uint&      batch   [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = batch * kv_dim;
+    if (gid >= total) return;
+    uint token = gid / kv_dim;
+    uint col = gid - token * kv_dim;
+    uint cache_off = (pos_start + token) * kv_dim + col;
+    k_cache[cache_off] = as_type<ushort>((half)k_f32[gid]);
+    v_cache[cache_off] = as_type<ushort>((half)v_f32[gid]);
+}
