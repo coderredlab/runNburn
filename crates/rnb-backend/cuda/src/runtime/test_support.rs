@@ -3269,7 +3269,10 @@ fn qk_gemv_q8_for_test(
 }
 
 #[cfg(test)]
-fn quantize_q8_1_by_32_for_test(input: &[f32], blocks_per_row: usize) -> (Vec<i8>, Vec<f32>) {
+pub(in crate::runtime) fn quantize_q8_1_by_32_for_test(
+    input: &[f32],
+    blocks_per_row: usize,
+) -> (Vec<i8>, Vec<f32>) {
     let mut qs = vec![0i8; blocks_per_row * 256];
     let mut ds = vec![0.0f32; blocks_per_row * 8];
     for b in 0..blocks_per_row {

@@ -11260,6 +11260,62 @@ fn cuda_q5k_gemv_high_bits_match_cpu_reference() {
     assert_close_rows("Q5_K high-bit GEMV", &actual, &expected, 0.08);
 }
 
+// rows >= 1024 and blocks_per_row >= 4 is the shipping gate for the q8dot
+// decode kernels, so these exercise the default product path, not an env-forced
+// one.
+//
+// The reference feeds the *same* Q8_1-quantized activations the kernel sees, so
+// the only remaining differences are float accumulation order. Comparing against
+// the raw F32 reference instead would need a tolerance wide enough to hide a
+// mis-unpacked nibble, high bit, or scale index, which is exactly what these
+// guard.
+fn dequantize_q8_1_by_32(qs: &[i8], ds: &[f32]) -> Vec<f32> {
+    qs.iter()
+        .enumerate()
+        .map(|(i, &q)| f32::from(q) * ds[(i / 256) * 8 + (i % 256) / 32])
+        .collect()
+}
+
+#[test]
+fn cuda_q5k_gemv_q8dot_matches_quantized_reference() {
+    let _guard = runtime_test_lock();
+    let rows = 1024usize;
+    let cols = 1280usize;
+    let blocks_per_row = cols / 256;
+    let weights = make_test_q5k_weights(rows, blocks_per_row, 137);
+    let mut input = vec![0.0f32; cols];
+    for (i, x) in input.iter_mut().enumerate() {
+        *x = ((i as f32 % 29.0) - 14.0) * 0.0341796875;
+    }
+    let (qs, ds) = test_support::quantize_q8_1_by_32_for_test(&input, blocks_per_row);
+    let quantized_input = dequantize_q8_1_by_32(&qs, &ds);
+    let expected = cpu_q5k_gemv_rows(&weights, rows, blocks_per_row, &quantized_input);
+    let actual = q5k_gemv_for_test(&weights, rows, cols, &input).expect("CUDA Q5_K q8dot GEMV");
+
+    assert_close_rows_abs_rel("Q5_K q8dot GEMV", &actual, &expected, 1e-3, 1e-5);
+}
+
+#[test]
+fn cuda_q6k_gemv_q8dot_matches_quantized_reference() {
+    let _guard = runtime_test_lock();
+    let rows = 1024usize;
+    let cols = 1280usize;
+    let blocks_per_row = cols / 256;
+    let weights = make_test_q6k_weights(1, rows, blocks_per_row, 149)
+        .pop()
+        .unwrap();
+    let mut input = vec![0.0f32; cols];
+    for (i, x) in input.iter_mut().enumerate() {
+        *x = ((i as f32 % 23.0) - 11.0) * 0.0439453125;
+    }
+    let (qs, ds) = test_support::quantize_q8_1_by_32_for_test(&input, blocks_per_row);
+    let quantized_input = dequantize_q8_1_by_32(&qs, &ds);
+    let expected = cpu_q6k_gemv_rows(&weights, rows, blocks_per_row, &quantized_input);
+    let actual = q6k_gemv_for_test(&weights, rows, cols, &input).expect("CUDA Q6_K q8dot GEMV");
+
+    assert_close_rows_abs_rel("Q6_K q8dot GEMV", &actual, &expected, 1e-3, 1e-5);
+}
+
 #[test]
 fn cuda_q4k_gate_up_q8_dot_matches_cpu_reference() {
     let _guard = runtime_test_lock();

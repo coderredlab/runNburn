@@ -69,6 +69,29 @@ fn q4k_q8dot_decode_enabled(default: bool) -> bool {
     }
 }
 
+// Q6_K decode GEMV activation quantization gate. Mirrors the Q4_K switch above
+// so both quant formats share one opt-out convention.
+fn q6k_q8dot_decode_enabled(default: bool) -> bool {
+    match std::env::var("RNB_CUDA_Q6K_GEMV_Q8DOT") {
+        Ok(value) => {
+            let value = value.to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => default,
+    }
+}
+
+// Q5_K decode GEMV activation quantization gate.
+fn q5k_q8dot_decode_enabled(default: bool) -> bool {
+    match std::env::var("RNB_CUDA_Q5K_GEMV_Q8DOT") {
+        Ok(value) => {
+            let value = value.to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => default,
+    }
+}
+
 fn q4k_q8dot_prefill_enabled(default: bool) -> bool {
     match std::env::var("RNB_CUDA_Q4K_BATCH_Q8DOT") {
         Ok(value) => {
@@ -1023,17 +1046,56 @@ impl CudaState {
         Ok(output)
     }
 
-    pub(super) fn q6k_gemv(
+    // Uploads the activation in whichever form the selected Q6_K kernel wants
+    // and launches it. Shared by the Vec and the into variants so both decode
+    // entry points stay on the same kernel.
+    fn upload_and_launch_q6k_gemv(
         &mut self,
-        weights: &[u8],
+        weights_dev: u64,
         rows: usize,
         blocks_per_row: usize,
         input: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        if q6k_q8dot_decode_enabled(rows >= 1024 && blocks_per_row >= 4) {
+            let (qs, ds) = quantize_q8_1_by_32(input, blocks_per_row);
+            let qs_dev = self.compute_input_ptr(qs.len())?;
+            let ds_dev = self.compute_aux_output_ptr(std::mem::size_of_val(ds.as_slice()))?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    qs_dev,
+                    qs.as_ptr().cast::<libc::c_void>(),
+                    qs.len(),
+                    self.stream,
+                )?;
+                self.api.memcpy_htod_async(
+                    ds_dev,
+                    ds.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(ds.as_slice()),
+                    self.stream,
+                )?;
+            }
+            let mut qs_arg = qs_dev;
+            let mut ds_arg = ds_dev;
+            return self.launch_cached_gemv(
+                "rnb_q6k_gemv_q8dot_warp8",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut qs_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut ds_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            );
+        }
         let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
-        let output_bytes = rows * std::mem::size_of::<f32>();
-        let output_dev = self.compute_output_ptr(output_bytes)?;
         unsafe {
             self.api.memcpy_htod_async(
                 input_dev,
@@ -1042,13 +1104,8 @@ impl CudaState {
                 self.stream,
             )?;
         }
-        let mut output_arg = output_dev;
-        let mut weights_arg = weights_dev;
         let mut input_arg = input_dev;
-        let mut rows_arg = rows as u32;
-        let mut blocks_per_row_arg = blocks_per_row as u32;
-        let warp8_output = tuning::q6k_output_warp8_enabled();
-        let (kernel, grid_x) = if warp8_output {
+        let (kernel, grid_x) = if tuning::q6k_output_warp8_enabled() {
             ("rnb_q6k_gemv_warp8", rows.div_ceil(8) as u32)
         } else {
             ("rnb_q6k_gemv", rows as u32)
@@ -1064,7 +1121,20 @@ impl CudaState {
             ],
             (grid_x, 1, 1),
             (256, 1, 1),
-        )?;
+        )
+    }
+
+    pub(super) fn q6k_gemv(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let output_bytes = rows * std::mem::size_of::<f32>();
+        let output_dev = self.compute_output_ptr(output_bytes)?;
+        self.upload_and_launch_q6k_gemv(weights_dev, rows, blocks_per_row, input, output_dev)?;
         let mut output = vec![0.0f32; rows];
         unsafe {
             self.api.memcpy_dtoh_async(
@@ -1114,40 +1184,9 @@ impl CudaState {
         } else {
             self.resident_q4k_weights_ptr(weights)?
         };
-        let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
         let output_bytes = std::mem::size_of_val(output);
         let output_dev = self.compute_output_ptr(output_bytes)?;
-        unsafe {
-            self.api.memcpy_htod_async(
-                input_dev,
-                input.as_ptr().cast::<libc::c_void>(),
-                std::mem::size_of_val(input),
-                self.stream,
-            )?;
-        }
-        let mut output_arg = output_dev;
-        let mut weights_arg = weights_dev;
-        let mut input_arg = input_dev;
-        let mut rows_arg = rows as u32;
-        let mut blocks_per_row_arg = blocks_per_row as u32;
-        let warp8_output = tuning::q6k_output_warp8_enabled();
-        let (kernel, grid_x) = if warp8_output {
-            ("rnb_q6k_gemv_warp8", rows.div_ceil(8) as u32)
-        } else {
-            ("rnb_q6k_gemv", rows as u32)
-        };
-        self.launch_cached_gemv(
-            kernel,
-            &[
-                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
-            ],
-            (grid_x, 1, 1),
-            (256, 1, 1),
-        )?;
+        self.upload_and_launch_q6k_gemv(weights_dev, rows, blocks_per_row, input, output_dev)?;
         unsafe {
             self.api.memcpy_dtoh_async(
                 output.as_mut_ptr().cast::<libc::c_void>(),
@@ -1633,17 +1672,56 @@ impl CudaState {
         Ok(output)
     }
 
-    pub(super) fn q5k_gemv(
+    // Uploads the activation in whichever form the selected Q5_K kernel wants
+    // and launches it. Shared by the Vec and the into variants so both decode
+    // entry points stay on the same kernel.
+    fn upload_and_launch_q5k_gemv(
         &mut self,
-        weights: &[u8],
+        weights_dev: u64,
         rows: usize,
         blocks_per_row: usize,
         input: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        if q5k_q8dot_decode_enabled(rows >= 1024 && blocks_per_row >= 4) {
+            let (qs, ds) = quantize_q8_1_by_32(input, blocks_per_row);
+            let qs_dev = self.compute_input_ptr(qs.len())?;
+            let ds_dev = self.compute_aux_output_ptr(std::mem::size_of_val(ds.as_slice()))?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    qs_dev,
+                    qs.as_ptr().cast::<libc::c_void>(),
+                    qs.len(),
+                    self.stream,
+                )?;
+                self.api.memcpy_htod_async(
+                    ds_dev,
+                    ds.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(ds.as_slice()),
+                    self.stream,
+                )?;
+            }
+            let mut qs_arg = qs_dev;
+            let mut ds_arg = ds_dev;
+            return self.launch_cached_gemv(
+                "rnb_q5k_gemv_q8dot_warp8",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut qs_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut ds_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            );
+        }
         let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
-        let output_bytes = rows * std::mem::size_of::<f32>();
-        let output_dev = self.compute_output_ptr(output_bytes)?;
         unsafe {
             self.api.memcpy_htod_async(
                 input_dev,
@@ -1652,11 +1730,7 @@ impl CudaState {
                 self.stream,
             )?;
         }
-        let mut output_arg = output_dev;
-        let mut weights_arg = weights_dev;
         let mut input_arg = input_dev;
-        let mut rows_arg = rows as u32;
-        let mut blocks_per_row_arg = blocks_per_row as u32;
         self.launch_cached_gemv(
             "rnb_q5k_gemv",
             &[
@@ -1668,7 +1742,20 @@ impl CudaState {
             ],
             (rows as u32, 1, 1),
             (256, 1, 1),
-        )?;
+        )
+    }
+
+    pub(super) fn q5k_gemv(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let output_bytes = rows * std::mem::size_of::<f32>();
+        let output_dev = self.compute_output_ptr(output_bytes)?;
+        self.upload_and_launch_q5k_gemv(weights_dev, rows, blocks_per_row, input, output_dev)?;
         let mut output = vec![0.0f32; rows];
         unsafe {
             self.api.memcpy_dtoh_async(
@@ -1691,34 +1778,9 @@ impl CudaState {
         output: &mut [f32],
     ) -> Result<(), String> {
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
-        let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
         let output_bytes = std::mem::size_of_val(output);
         let output_dev = self.compute_output_ptr(output_bytes)?;
-        unsafe {
-            self.api.memcpy_htod_async(
-                input_dev,
-                input.as_ptr().cast::<libc::c_void>(),
-                std::mem::size_of_val(input),
-                self.stream,
-            )?;
-        }
-        let mut output_arg = output_dev;
-        let mut weights_arg = weights_dev;
-        let mut input_arg = input_dev;
-        let mut rows_arg = rows as u32;
-        let mut blocks_per_row_arg = blocks_per_row as u32;
-        self.launch_cached_gemv(
-            "rnb_q5k_gemv",
-            &[
-                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
-            ],
-            (rows as u32, 1, 1),
-            (256, 1, 1),
-        )?;
+        self.upload_and_launch_q5k_gemv(weights_dev, rows, blocks_per_row, input, output_dev)?;
         unsafe {
             self.api.memcpy_dtoh_async(
                 output.as_mut_ptr().cast::<libc::c_void>(),
