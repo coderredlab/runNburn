@@ -240,6 +240,8 @@ pub struct MtpDeviceVerifyWindowRequest<'a> {
     pub output_cols: usize,
     pub output_norm: &'a [f32],
     pub norm_eps: f32,
+    /// `true`면 융합 argmax 대신 full logits row를 host로 돌려받는다.
+    pub collect_output_logits: bool,
 }
 
 #[derive(Debug)]
@@ -269,6 +271,8 @@ pub struct MtpDeviceDraftResult {
 #[derive(Debug)]
 pub struct MtpDeviceVerifyWindowResult {
     pub target_tokens: Vec<u32>,
+    /// `collect_output_logits` 요청 시의 `window_tokens x vocab` row-major logits.
+    pub output_logits: Vec<f32>,
     pub mtp_hidden_rows: Vec<f32>,
     pub hidden_dim: usize,
     pub prefix_states: Vec<MtpDeviceVerifyPrefixState>,
@@ -599,9 +603,11 @@ pub fn qwen35_mtp_device_verify_window(
         output_cols: request.output_cols,
         output_norm: request.output_norm,
         norm_eps: request.norm_eps,
+        collect_output_logits: request.collect_output_logits,
     })
     .map(|result| MtpDeviceVerifyWindowResult {
         target_tokens: result.target_tokens,
+        output_logits: result.output_logits,
         mtp_hidden_rows: result.mtp_hidden_rows,
         hidden_dim: result.hidden_dim,
         prefix_states: result

@@ -5068,6 +5068,7 @@ fn cuda_qwen35_mtp_device_verify_api_stages_before_unimplemented() {
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let err = match qwen35_mtp_device_verify_window(request) {
@@ -5185,6 +5186,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_attention_projection_before_unimpl
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let err = match qwen35_mtp_device_verify_window(request) {
@@ -5310,6 +5312,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_attention_qk_norm_rope_before_unim
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let err = match qwen35_mtp_device_verify_window(request) {
@@ -5473,6 +5476,7 @@ fn cuda_qwen35_mtp_device_verify_api_returns_attention_kv_states() {
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let result = qwen35_mtp_device_verify_window(request).expect("attention-only device verify");
@@ -5611,6 +5615,7 @@ fn cuda_qwen35_mtp_device_verify_api_executes_layer_graph_before_unimplemented()
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let err = match qwen35_mtp_device_verify_window(request) {
@@ -5800,6 +5805,7 @@ fn cuda_qwen35_mtp_device_verify_api_returns_gdn_prefix_states() {
         output_cols: hidden_dim,
         output_norm: &output_norm,
         norm_eps: 1.0e-5,
+        collect_output_logits: false,
     };
 
     let result = qwen35_mtp_device_verify_window(request).expect("GDN-only device verify result");

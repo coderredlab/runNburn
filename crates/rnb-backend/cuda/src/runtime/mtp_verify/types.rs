@@ -497,6 +497,9 @@ pub struct Qwen35MtpDeviceVerifyRequest<'a> {
     pub output_cols: usize,
     pub output_norm: &'a [f32],
     pub norm_eps: f32,
+    /// `true`면 융합 argmax 대신 full logits row를 host로 돌려준다. 확률적 verify가
+    /// target 분포를 필요로 할 때만 켠다.
+    pub collect_output_logits: bool,
 }
 
 #[derive(Debug)]
@@ -526,6 +529,8 @@ pub struct Qwen35MtpDeviceDraftResult {
 #[derive(Debug)]
 pub struct Qwen35MtpDeviceVerifyResult {
     pub target_tokens: Vec<u32>,
+    /// `collect_output_logits`가 켜졌을 때의 `window_tokens x vocab` row-major logits.
+    pub output_logits: Vec<f32>,
     pub mtp_hidden_rows: Vec<f32>,
     pub hidden_dim: usize,
     pub prefix_states: Vec<Qwen35MtpDeviceVerifyPrefixState>,

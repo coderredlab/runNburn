@@ -1,6 +1,9 @@
 #[derive(Debug)]
 pub(crate) struct VerifyWindowResult {
     pub(crate) target_tokens: Vec<u32>,
+    /// device verify가 logits 수집 요청을 받았을 때의 `window_tokens x vocab` row-major
+    /// target 분포. greedy 경로에서는 비어 있다.
+    pub(crate) output_logits: Vec<f32>,
     pub(crate) mtp_hidden_rows: Vec<f32>,
     pub(crate) hidden_dim: usize,
     pub(crate) prefix_state: Option<VerifyWindowPrefixState>,
@@ -20,6 +23,7 @@ impl VerifyWindowResult {
     ) -> crate::error::Result<Self> {
         Self::from_device_parts(
             target_tokens,
+            Vec::new(),
             mtp_hidden_rows,
             hidden_dim,
             Vec::new(),
@@ -38,6 +42,7 @@ impl VerifyWindowResult {
     ) -> crate::error::Result<Self> {
         Self::from_device_result_with_state_payload(
             target_tokens,
+            Vec::new(),
             mtp_hidden_rows,
             hidden_dim,
             prefix_states,
@@ -49,6 +54,7 @@ impl VerifyWindowResult {
     #[cfg(feature = "cuda")]
     pub(crate) fn from_device_result_with_state_payload(
         target_tokens: Vec<u32>,
+        output_logits: Vec<f32>,
         mtp_hidden_rows: Vec<f32>,
         hidden_dim: usize,
         prefix_states: Vec<crate::engine::cuda_runtime::MtpDeviceVerifyPrefixState>,
@@ -94,6 +100,7 @@ impl VerifyWindowResult {
             .collect();
         Self::from_device_parts(
             target_tokens,
+            output_logits,
             mtp_hidden_rows,
             hidden_dim,
             prefix_states,
@@ -105,6 +112,7 @@ impl VerifyWindowResult {
     #[cfg(any(feature = "cuda", test))]
     fn from_device_parts(
         target_tokens: Vec<u32>,
+        output_logits: Vec<f32>,
         mtp_hidden_rows: Vec<f32>,
         hidden_dim: usize,
         prefix_states: Vec<VerifyWindowPrefixState>,
@@ -130,6 +138,7 @@ impl VerifyWindowResult {
         }
         Ok(Self {
             target_tokens,
+            output_logits,
             mtp_hidden_rows,
             hidden_dim,
             prefix_state: None,
@@ -486,6 +495,7 @@ mod tests {
     #[test]
     fn verify_window_result_records_one_token_per_input() {
         let result = VerifyWindowResult {
+            output_logits: Vec::new(),
             target_tokens: vec![10, 20],
             mtp_hidden_rows: vec![0.0; 4],
             hidden_dim: 2,
@@ -529,6 +539,7 @@ mod tests {
     #[test]
     fn verify_window_result_slices_committed_mtp_hidden_rows() {
         let result = VerifyWindowResult {
+            output_logits: Vec::new(),
             target_tokens: vec![10, 20, 30],
             mtp_hidden_rows: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             hidden_dim: 2,
@@ -547,6 +558,7 @@ mod tests {
     #[test]
     fn verify_window_result_finds_multi_prefix_state() {
         let result = VerifyWindowResult {
+            output_logits: Vec::new(),
             target_tokens: vec![10, 20, 30],
             mtp_hidden_rows: Vec::new(),
             hidden_dim: 2,
@@ -612,6 +624,7 @@ mod tests {
     fn device_verify_result_carries_prefix_states_for_reject_restore() {
         let result = VerifyWindowResult::from_device_result_with_state_payload(
             vec![10, 20],
+            Vec::new(),
             vec![1.0, 2.0, 3.0, 4.0],
             2,
             vec![crate::engine::cuda_runtime::MtpDeviceVerifyPrefixState {

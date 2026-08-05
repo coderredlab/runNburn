@@ -124,6 +124,53 @@ pub(crate) fn mtp_greedy_verify_allowed(params: &GenerateParams) -> bool {
         && params.mirostat.is_none()
 }
 
+/// `temperature > 0` 요청이 MTP를 쓸 수 있는 조합인가.
+///
+/// draft는 그대로 argmax로 두고 target만 sampler로 뽑아 대조한다. draft가 무엇을
+/// 제안하든 출력 토큰은 target 분포에서 뽑은 표본이므로 marginal이 target-only와 같다.
+/// accept든 reject든 내보내는 토큰이 같은 표본이라는 점이 근거이며, `speculative.rs`가
+/// 이미 같은 커플링을 쓴다.
+///
+/// Mirostat은 `mu` state가 draft prefix에 따라 갈라져 rollback 계약이 필요하므로 제외한다.
+pub(crate) fn mtp_sampled_verify_allowed(params: &GenerateParams) -> bool {
+    params.temperature > 0.0 && params.mirostat.is_none()
+}
+
+/// MTP 진입이 허용되는 sampler 조합.
+pub(crate) fn mtp_verify_sampling_allowed(params: &GenerateParams) -> bool {
+    mtp_greedy_verify_allowed(params) || mtp_sampled_verify_allowed(params)
+}
+
+/// device verify가 돌려준 target 분포에서 위치 `index`의 토큰을 요청 sampler로 뽑는다.
+fn sample_target_from_window_logits(
+    window: &VerifyWindowResult,
+    index: usize,
+    vocab_size: usize,
+    sampler: &mut SamplerChain,
+    context_tokens: &[u32],
+    rng: &mut SmallRng,
+) -> crate::error::Result<u32> {
+    if vocab_size == 0 {
+        return Err(crate::error::LlmError::Forward(
+            "MTP sampled verify requires non-zero vocab size".to_string(),
+        ));
+    }
+    let start = index.checked_mul(vocab_size).ok_or_else(|| {
+        crate::error::LlmError::Forward(format!(
+            "MTP sampled verify logits offset overflow at {index}"
+        ))
+    })?;
+    let end = start + vocab_size;
+    let row = window.output_logits.get(start..end).ok_or_else(|| {
+        crate::error::LlmError::Forward(format!(
+            "MTP sampled verify missing target logits at {index}: have {} values, need {end}",
+            window.output_logits.len()
+        ))
+    })?;
+    let mut logits = row.to_vec();
+    Ok(sampler.sample(&mut logits, context_tokens, rng))
+}
+
 /// 한 round에서 조회한 target 예측을 draft와 나란히 찍는 trace 문자열.
 ///
 /// `observed_targets`는 실제로 조회한 위치까지만 담기므로, reject나 stop으로 끊긴
@@ -662,11 +709,16 @@ fn generate_stream_mtp_with_tokens(
             "RNB_MTP=1 but loaded model does not expose an MTP runtime".to_string(),
         ));
     }
-    if !mtp_greedy_verify_allowed(params) {
-        return Err(crate::error::LlmError::Forward(
-            "MTP generate currently requires greedy sampling".to_string(),
-        ));
+    if !mtp_verify_sampling_allowed(params) {
+        return Err(crate::error::LlmError::Forward(format!(
+            "MTP generate does not support this sampler combination: temperature={}, mirostat={}",
+            params.temperature,
+            params.mirostat.is_some()
+        )));
     }
+    // `temperature > 0`은 target을 sampler로 뽑아 draft와 대조한다. 그러려면 target 분포가
+    // 필요하고, 그 분포를 만들 수 있는 verify execution만 쓸 수 있다.
+    let sampled_verify = mtp_sampled_verify_allowed(params);
     let start = prefilled
         .as_ref()
         .map_or_else(Instant::now, |prompt| prompt.started_at);
@@ -874,6 +926,19 @@ fn generate_stream_mtp_with_tokens(
     } else {
         mtp_verify_execution(mtp_device_verify, batch_verify, batch_decode_chain)
     };
+    // 확률적 verify는 target 분포를 만들 수 있는 execution에서만 가능하다. CUDA device
+    // verify는 logits 수집 모드가 있고, sequential은 all-logits 경로가 있다. 나머지는
+    // argmax token만 돌려주므로 sampler를 태울 수 없다.
+    if sampled_verify
+        && !matches!(
+            verify_execution,
+            MtpVerifyExecution::DeviceResident | MtpVerifyExecution::Sequential
+        )
+    {
+        return Err(crate::error::LlmError::Unsupported(format!(
+            "MTP with temperature>0 requires device-resident or sequential verify, got {verify_execution:?}"
+        )));
+    }
     let fast_retain = crate::runtime::mtp_fast_retain_enabled();
     let no_bonus_verify_override = mtp_no_bonus_verify_env_override();
     let verified_runway_enabled = crate::runtime::mtp_shadow_precompute_enabled()
@@ -1217,7 +1282,13 @@ fn generate_stream_mtp_with_tokens(
             let phase_start = Instant::now();
             let mut window = match verify_execution {
                 MtpVerifyExecution::DeviceResident => {
-                    engine.forward_mtp_device_verify_window_argmax_collect_mtp(&verify_request)?
+                    if sampled_verify {
+                        engine
+                            .forward_mtp_device_verify_window_logits_collect_mtp(&verify_request)?
+                    } else {
+                        engine
+                            .forward_mtp_device_verify_window_argmax_collect_mtp(&verify_request)?
+                    }
                 }
                 MtpVerifyExecution::BatchPrefill => engine
                     .forward_prefill_argmax_tokens_collect_mtp_prefix_states_deferred_observe(
@@ -1239,11 +1310,26 @@ fn generate_stream_mtp_with_tokens(
             observed_targets.clear();
             let mut round = crate::mtp_sampling::GreedyRound::new();
             for i in 0..draft_k {
-                let target_token = *window.target_tokens.get(i).ok_or_else(|| {
-                    crate::error::LlmError::Forward(format!(
-                        "MTP batch verify missing target token at {i}"
-                    ))
-                })?;
+                let target_token = if sampled_verify {
+                    // draft는 argmax 그대로 두고 target만 요청 sampler로 뽑는다. accept면
+                    // draft와 같은 값을, reject면 이 표본을 내보내므로 어느 쪽이든 출력은
+                    // target 분포의 표본이고 marginal이 보존된다. `generated_tokens`는 이
+                    // 시점에 앞서 accept된 draft를 이미 포함하므로 penalty history도 맞다.
+                    sample_target_from_window_logits(
+                        &window,
+                        i,
+                        engine.metadata.vocab_size,
+                        &mut sampler,
+                        &generated_tokens,
+                        &mut rng,
+                    )?
+                } else {
+                    *window.target_tokens.get(i).ok_or_else(|| {
+                        crate::error::LlmError::Forward(format!(
+                            "MTP batch verify missing target token at {i}"
+                        ))
+                    })?
+                };
                 observed_targets.push(target_token);
                 match round.observe(i, draft_tokens[i], target_token, k, params, eos) {
                     crate::mtp_sampling::RoundAction::Reject
@@ -1435,11 +1521,24 @@ fn generate_stream_mtp_with_tokens(
                         engine.mtp_observe_target_batch(&verify_input, &window.mtp_hidden_rows)?;
                     }
                     phase.verify_ms += elapsed_ms(phase_start);
-                    let next_token = *window.target_tokens.get(draft_k).ok_or_else(|| {
-                        crate::error::LlmError::Forward(
-                            "MTP batch full-window verify missing bonus token".to_string(),
-                        )
-                    })?;
+                    // Full accept의 bonus 토큰도 같은 sampler를 타야 그 위치의 marginal이
+                    // target 분포와 같다.
+                    let next_token = if sampled_verify {
+                        sample_target_from_window_logits(
+                            &window,
+                            draft_k,
+                            engine.metadata.vocab_size,
+                            &mut sampler,
+                            &generated_tokens,
+                            &mut rng,
+                        )?
+                    } else {
+                        *window.target_tokens.get(draft_k).ok_or_else(|| {
+                            crate::error::LlmError::Forward(
+                                "MTP batch full-window verify missing bonus token".to_string(),
+                            )
+                        })?
+                    };
                     if runway_extra_depth > 0 {
                         let runway_tokens = draft_tokens[k..draft_k].to_vec();
                         if let Some(runway) = MtpVerifiedRunway::new(runway_tokens, next_token) {

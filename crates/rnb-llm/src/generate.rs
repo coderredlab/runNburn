@@ -1225,9 +1225,12 @@ mod tests {
             GenerateRoute::Standard
         );
     }
+    /// `temperature > 0`은 forced에서만 MTP를 탄다. sampled verify는 동작하고 분포도
+    /// 보존하지만 accept가 낮아 target-only보다 느려서 auto 승격 기준에 못 미친다.
     #[test]
-    fn automatic_mtp_route_requires_greedy_sampling() {
+    fn automatic_mtp_route_requires_greedy_but_forced_allows_sampling() {
         let default_params = GenerateParams::default();
+        assert!(default_params.temperature > 0.0);
         assert!(!mtp_generate_route_requested(&default_params, true, false));
         assert!(mtp_generate_route_requested(&default_params, true, true));
 
@@ -1240,6 +1243,22 @@ mod tests {
             ..GenerateParams::default()
         };
         assert!(mtp_generate_route_requested(&greedy_params, true, false));
+    }
+
+    /// Mirostat은 `mu` state가 draft prefix를 따라 갈라져 rollback 계약이 필요하므로
+    /// 자동 진입에서 제외한다.
+    #[test]
+    fn automatic_mtp_route_excludes_mirostat() {
+        let mirostat_params = GenerateParams {
+            mirostat: Some(crate::MirostatParams {
+                version: 2,
+                tau: 5.0,
+                eta: 0.1,
+            }),
+            ..GenerateParams::default()
+        };
+        assert!(!mtp_generate_route_requested(&mirostat_params, true, false));
+        assert!(mtp_generate_route_requested(&mirostat_params, true, true));
     }
 
     #[test]

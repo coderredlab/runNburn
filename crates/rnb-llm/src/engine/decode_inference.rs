@@ -336,6 +336,7 @@ impl Engine {
 
         Ok(crate::engine::verify_window::VerifyWindowResult {
             target_tokens,
+            output_logits: Vec::new(),
             mtp_hidden_rows,
             hidden_dim,
             prefix_state: None,

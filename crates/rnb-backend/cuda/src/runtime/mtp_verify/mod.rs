@@ -1692,6 +1692,84 @@ impl super::CudaState {
         Ok(())
     }
 
+    /// Output projection 결과를 argmax로 접지 않고 full logits row로 host에 돌려준다.
+    ///
+    /// 확률적 verify가 target 분포를 필요로 할 때 쓴다. `window_tokens × vocab × f32`를
+    /// 한 번 내려받으며, Qwen3.6 27B 기준 5 × 248320 × 4B 약 4.97 MiB로 round 커널
+    /// 181ms 대비 무시할 수준이다. greedy 경로는 계속 융합 argmax 커널을 쓴다.
+    pub(in crate::runtime) fn stage_mtp_verify_output_logits(
+        &mut self,
+        buffers: &MtpVerifyDeviceBuffers,
+        output_weight: &[u8],
+        output_rows: usize,
+        output_cols: usize,
+        output_quant: u32,
+        output_norm: &[f32],
+        norm_eps: f32,
+    ) -> Result<Vec<f32>, String> {
+        let plan = buffers.plan;
+        if output_rows == 0 {
+            return Err("MTP verify output rows must be non-zero".to_string());
+        }
+        if output_cols != plan.hidden_dim {
+            return Err(format!(
+                "MTP verify output cols must match hidden_dim: cols={output_cols}, hidden_dim={}",
+                plan.hidden_dim
+            ));
+        }
+        if output_cols % 256 != 0 {
+            return Err(format!(
+                "MTP verify logits output cols must be divisible by 256, got {output_cols}"
+            ));
+        }
+        let blocks_per_row = output_cols / 256;
+        let logit_values = plan
+            .window_tokens
+            .checked_mul(output_rows)
+            .ok_or_else(|| "MTP verify logits value count overflow".to_string())?;
+        let logit_bytes = logit_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "MTP verify logits byte count overflow".to_string())?;
+
+        self.stage_mtp_verify_hidden_rows_rms_norm(buffers, output_norm, norm_eps, false)?;
+        let logits_dev = self.compute_mid_a_ptr(logit_bytes)?;
+        match output_quant {
+            GGML_Q4_K => self.q4k_batch_dev_input_to_dev(
+                output_weight,
+                output_rows,
+                blocks_per_row,
+                plan.window_tokens,
+                buffers.scratch_hidden_dev,
+                logits_dev,
+            )?,
+            GGML_Q6_K => self.q6k_batch_dev_input_to_dev(
+                output_weight,
+                output_rows,
+                blocks_per_row,
+                plan.window_tokens,
+                buffers.scratch_hidden_dev,
+                logits_dev,
+            )?,
+            other => {
+                return Err(format!(
+                    "MTP verify logits output quant must be Q4_K or Q6_K, got {other}"
+                ));
+            }
+        }
+
+        let mut logits = vec![0.0f32; logit_values];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                logits.as_mut_ptr().cast::<libc::c_void>(),
+                logits_dev,
+                logit_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+        Ok(logits)
+    }
+
     pub(in crate::runtime) fn stage_mtp_verify_hidden_rows_rms_norm(
         &mut self,
         buffers: &MtpVerifyDeviceBuffers,
@@ -7351,6 +7429,7 @@ impl super::CudaState {
             target_tokens,
             mtp_hidden_rows,
             hidden_dim: plan.hidden_dim,
+            output_logits: Vec::new(),
             prefix_states: Vec::new(),
             ssm_final_states: Vec::new(),
             attention_kv_states: Vec::new(),

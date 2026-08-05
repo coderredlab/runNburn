@@ -414,6 +414,31 @@ pub fn qwen35_mtp_device_verify_window(
     }
     ensure_qwen35_mtp_prefix_placeholders(&mut state_capture, request.prefix_tokens);
     let stage_start = Instant::now();
+    // 확률적 verify는 target 분포가 필요하므로 융합 argmax 대신 full logits를 내려받는다.
+    let mut output_logits = Vec::new();
+    if request.collect_output_logits {
+        match state.stage_mtp_verify_output_logits(
+            &buffers,
+            request.output_q6k,
+            request.output_rows,
+            request.output_cols,
+            request.output_quant,
+            request.output_norm,
+            request.norm_eps,
+        ) {
+            Ok(logits) => output_logits = logits,
+            Err(err) => {
+                if let Err(free_err) =
+                    state.free_mtp_verify_prefix_state_snapshots(state_capture.prefix_states)
+                {
+                    return Err(format!(
+                        "{err}; failed to free prefix snapshots: {free_err}"
+                    ));
+                }
+                return Err(err);
+            }
+        }
+    }
     let output_argmax = match request.output_quant {
         GGML_Q4_K => state.stage_mtp_verify_output_argmax_q4k(
             &buffers,
@@ -485,6 +510,7 @@ pub fn qwen35_mtp_device_verify_window(
     result.prefix_states = state_capture.prefix_states;
     result.ssm_final_states = state_capture.ssm_final_states;
     result.attention_kv_states = state_capture.attention_kv_states;
+    result.output_logits = output_logits;
     trace_mtp_verify_stage(trace, state, "total", total_start)?;
     Ok(result)
 }

@@ -265,6 +265,7 @@ fn device_verify_final_state_commit_updates_gdn_conv_state_and_len() {
     let mut engine = make_mock_engine(8);
     engine.kv_cache.init_ssm_state(1, 3, 2, 1, 2, 2);
     let result = verify_window::VerifyWindowResult {
+        output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
@@ -299,6 +300,7 @@ fn device_verify_final_state_commit_leaves_state_untouched_when_payload_is_inval
     // conv_state 길이가 어긋난 payload. 커밋은 KV 길이도 layer state도 건드리지 않고
     // 실패해야 한다. 검증보다 set_len이 먼저 실행되면 current_len이 6으로 전진한다.
     let result = verify_window::VerifyWindowResult {
+        output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
@@ -371,6 +373,7 @@ fn device_verify_final_state_commit_writes_attention_kv_range() {
         .map(|i| half::f16::from_f32(100.0 + i as f32).to_bits())
         .collect::<Vec<_>>();
     let result = verify_window::VerifyWindowResult {
+        output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
@@ -407,6 +410,7 @@ fn device_verify_prefix_commit_writes_only_committed_attention_kv() {
         .map(|i| half::f16::from_f32(100.0 + i as f32).to_bits())
         .collect::<Vec<_>>();
     let result = verify_window::VerifyWindowResult {
+        output_logits: Vec::new(),
         target_tokens: vec![10, 11, 12],
         mtp_hidden_rows: vec![0.0; 3 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,

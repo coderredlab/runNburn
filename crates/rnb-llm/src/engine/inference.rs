@@ -596,6 +596,23 @@ impl Engine {
             request,
             request.prefix_tokens(),
             true,
+            false,
+        )
+    }
+
+    /// device verify를 실행하되 target 분포를 full logits로 함께 돌려받는다.
+    ///
+    /// `temperature > 0` 요청이 sampler로 target 토큰을 뽑아야 할 때 쓴다. greedy는
+    /// 융합 argmax가 더 싸므로 계속 위 진입점을 쓴다.
+    pub(crate) fn forward_mtp_device_verify_window_logits_collect_mtp(
+        &mut self,
+        request: &crate::engine::verify_window::MtpVerifyWindowRequest,
+    ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
+        self.forward_mtp_device_verify_window_argmax_collect_mtp_impl(
+            request,
+            request.prefix_tokens(),
+            true,
+            true,
         )
     }
 
@@ -608,6 +625,7 @@ impl Engine {
             request,
             request.shadow_commit_prefix_tokens(),
             false,
+            false,
         )
     }
 
@@ -616,6 +634,7 @@ impl Engine {
         _request: &crate::engine::verify_window::MtpVerifyWindowRequest,
         _prefix_tokens: Vec<usize>,
         _commit_final_states: bool,
+        _collect_output_logits: bool,
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         let pos_start = self.kv_cache.current_len();
         #[cfg(feature = "cuda")]
@@ -780,6 +799,7 @@ impl Engine {
                 output_cols: output.cols,
                 output_norm,
                 norm_eps: self.metadata.norm_eps,
+                collect_output_logits: _collect_output_logits,
             };
             let kernel_start = std::time::Instant::now();
             let result =
@@ -793,6 +813,7 @@ impl Engine {
             let kernel_ms = kernel_start.elapsed().as_secs_f64() * 1000.0;
             let result = crate::engine::verify_window::VerifyWindowResult::from_device_result_with_state_payload(
                 result.target_tokens,
+                result.output_logits,
                 result.mtp_hidden_rows,
                 result.hidden_dim,
                 result.prefix_states,
@@ -835,6 +856,7 @@ impl Engine {
                 return Ok((
                     crate::engine::verify_window::VerifyWindowResult {
                         target_tokens: vec![token; tokens.len()],
+                        output_logits: Vec::new(),
                         mtp_hidden_rows: Vec::new(),
                         hidden_dim: self.metadata.hidden_dim,
                         prefix_state: None,
@@ -985,6 +1007,7 @@ impl Engine {
         Ok((
             crate::engine::verify_window::VerifyWindowResult {
                 target_tokens,
+                output_logits: Vec::new(),
                 mtp_hidden_rows: mtp_hidden_rows.unwrap_or_default(),
                 hidden_dim: self.metadata.hidden_dim,
                 prefix_state,
