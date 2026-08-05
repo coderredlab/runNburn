@@ -45,6 +45,8 @@ fn llm_bench_usage() -> &'static str {
        RNB_PROMPT_FILE=<prompt text path>\n\
        RNB_PREFILL_TOKENS=<token count>\n\
        RNB_DECODE_TOKENS=<token count>\n\
+       RNB_TEMPERATURE=<0..2> RNB_TOP_K=<count> RNB_TOP_P=<0..1>\n\
+       RNB_MIN_P=<0..1> RNB_SEED=<u64>\n\
        RNB_BENCH_WALL=1\n\
        RNB_QUIET_DECODE=1"
 }
@@ -73,6 +75,78 @@ fn host_ram_budget_bytes_from_env() -> Result<Option<u64>, String> {
             Err(format!("{HOST_RAM_BUDGET_ENV} must be decimal u64 bytes"))
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BenchSamplingParams {
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    seed: Option<u64>,
+}
+
+fn parse_bench_f32(
+    raw: Option<&str>,
+    name: &str,
+    default: f32,
+    min: f32,
+    max: f32,
+) -> Result<f32, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| format!("{name} must be a finite number in {min}..={max}, got {raw:?}"))?;
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return Err(format!(
+            "{name} must be a finite number in {min}..={max}, got {raw:?}"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_bench_sampling_params(
+    temperature: Option<&str>,
+    top_k: Option<&str>,
+    top_p: Option<&str>,
+    min_p: Option<&str>,
+    seed: Option<&str>,
+) -> Result<BenchSamplingParams, String> {
+    let top_k = match top_k {
+        Some(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("RNB_TOP_K must be a non-negative integer, got {raw:?}"))?,
+        None => 0,
+    };
+    let seed = match seed {
+        Some(raw) => Some(
+            raw.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("RNB_SEED must be a u64 integer, got {raw:?}"))?,
+        ),
+        None => None,
+    };
+    Ok(BenchSamplingParams {
+        temperature: parse_bench_f32(temperature, "RNB_TEMPERATURE", 0.0, 0.0, 2.0)?,
+        top_k,
+        top_p: parse_bench_f32(top_p, "RNB_TOP_P", 1.0, 0.0, 1.0)?,
+        min_p: parse_bench_f32(min_p, "RNB_MIN_P", 0.0, 0.0, 1.0)?,
+        seed,
+    })
+}
+
+fn bench_sampling_params_from_env() -> Result<BenchSamplingParams, String> {
+    parse_bench_sampling_params(
+        std::env::var("RNB_TEMPERATURE").ok().as_deref(),
+        std::env::var("RNB_TOP_K").ok().as_deref(),
+        std::env::var("RNB_TOP_P").ok().as_deref(),
+        std::env::var("RNB_MIN_P").ok().as_deref(),
+        std::env::var("RNB_SEED").ok().as_deref(),
+    )
 }
 
 #[cfg(feature = "mediatek")]
@@ -1533,6 +1607,10 @@ fn run_mtp_onoff_abab(
     params: &rnb_llm::generate::GenerateParams,
     repeat: usize,
 ) {
+    assert!(
+        params.temperature == 0.0 || params.seed.is_some(),
+        "sampled MTP on/off ABAB requires RNB_SEED for within-variant reproducibility"
+    );
     let _mtp_restore = EnvVarRestore::capture("RNB_MTP");
     let mut baseline_ms = Vec::with_capacity(repeat.div_ceil(2));
     let mut mtp_ms = Vec::with_capacity(repeat / 2);
@@ -1545,10 +1623,18 @@ fn run_mtp_onoff_abab(
         .generate_stream(prompt, params, mtp_abab_continue)
         .unwrap_or_else(|err| panic!("MTP on/off ABAB baseline warmup failed: {err}"));
     let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
-    let canonical_tokens = warmup.generated_token_ids;
+    let baseline_canonical = warmup.generated_token_ids;
+    let mut mtp_canonical: Option<Vec<u32>> = None;
+    let mut cross_variant_equal_all = true;
+    let mut within_variant_equal_all = true;
     eprintln!(
-        "[MTP_ONOFF_ABAB] warmup variant=A/Baseline measured=false mtp=0 wall_ms={warmup_ms:.3} generated_tokens={}",
-        canonical_tokens.len(),
+        "[MTP_ONOFF_ABAB] warmup variant=A/Baseline measured=false mtp=0 wall_ms={warmup_ms:.3} generated_tokens={} temperature={} top_k={} top_p={} min_p={} seed={:?}",
+        baseline_canonical.len(),
+        params.temperature,
+        params.top_k,
+        params.top_p,
+        params.min_p,
+        params.seed,
     );
 
     for run_index in 0..repeat {
@@ -1567,29 +1653,50 @@ fn run_mtp_onoff_abab(
                 )
             });
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let exact_match = result.generated_token_ids == canonical_tokens;
+        let cross_variant_equal = result.generated_token_ids == baseline_canonical;
+        cross_variant_equal_all &= cross_variant_equal;
+        let within_variant_equal = if mtp_enabled {
+            match &mtp_canonical {
+                Some(canonical) => result.generated_token_ids == *canonical,
+                None => {
+                    mtp_canonical = Some(result.generated_token_ids.clone());
+                    true
+                }
+            }
+        } else {
+            cross_variant_equal
+        };
+        within_variant_equal_all &= within_variant_equal;
         let text_sha256 = generated_text_sha256_hex(&result.text);
         eprintln!(
-            "[MTP_ONOFF_ABAB] run={} variant={} mtp={} measured=true wall_ms={wall_ms:.3} generated_tokens={} token_ids_equal={} text_sha256={text_sha256}",
+            "[MTP_ONOFF_ABAB] run={} variant={} mtp={} measured=true wall_ms={wall_ms:.3} generated_tokens={} cross_variant_token_ids_equal={cross_variant_equal} within_variant_token_ids_equal={within_variant_equal} text_sha256={text_sha256}",
             run_index + 1,
             if mtp_enabled { "B/MTP" } else { "A/Baseline" },
             usize::from(mtp_enabled),
             result.generated_token_ids.len(),
-            exact_match,
         );
-        if !exact_match {
-            let diff = first_token_diff(&canonical_tokens, &result.generated_token_ids);
+        if !cross_variant_equal {
+            let diff = first_token_diff(&baseline_canonical, &result.generated_token_ids);
             eprintln!(
-                "[MTP_ONOFF_ABAB] mismatch first_diff={diff:?} expected={:?} actual={:?}",
-                canonical_tokens, result.generated_token_ids
+                "[MTP_ONOFF_ABAB] cross_variant_mismatch run={} first_diff={diff:?}",
+                run_index + 1,
             );
         }
-        assert!(
-            exact_match,
-            "MTP on/off ABAB token mismatch at run {} ({})",
-            run_index + 1,
-            if mtp_enabled { "B/MTP" } else { "A/Baseline" }
-        );
+        if params.temperature == 0.0 {
+            assert!(
+                cross_variant_equal,
+                "greedy MTP on/off token mismatch at run {} ({})",
+                run_index + 1,
+                if mtp_enabled { "B/MTP" } else { "A/Baseline" }
+            );
+        } else {
+            assert!(
+                within_variant_equal,
+                "sampled MTP on/off variant is not reproducible at run {} ({})",
+                run_index + 1,
+                if mtp_enabled { "B/MTP" } else { "A/Baseline" }
+            );
+        }
         if mtp_enabled {
             mtp_ms.push(wall_ms);
         } else {
@@ -1602,7 +1709,7 @@ fn run_mtp_onoff_abab(
     let mtp_median_ms = mtp_median_ms.expect("MTP on/off ABAB requires MTP samples");
     let improvement_pct = (baseline_median_ms - mtp_median_ms) / baseline_median_ms * 100.0;
     eprintln!(
-        "[MTP_ONOFF_ABAB] summary warmup=1 measured_runs={repeat} baseline_samples={baseline_ms:?} mtp_samples={mtp_ms:?} baseline_median_ms={baseline_median_ms:.3} mtp_median_ms={mtp_median_ms:.3} improvement_pct={improvement_pct:.3} token_ids_equal=true",
+        "[MTP_ONOFF_ABAB] summary warmup=1 measured_runs={repeat} baseline_samples={baseline_ms:?} mtp_samples={mtp_ms:?} baseline_median_ms={baseline_median_ms:.3} mtp_median_ms={mtp_median_ms:.3} improvement_pct={improvement_pct:.3} cross_variant_token_ids_equal={cross_variant_equal_all} within_variant_token_ids_equal={within_variant_equal_all}",
     );
 }
 
@@ -2453,9 +2560,13 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
+        let sampling = bench_sampling_params_from_env().unwrap_or_else(|err| panic!("{err}"));
         let params = GenerateParams {
             max_tokens: decode_count,
-            temperature: 0.0,
+            temperature: sampling.temperature,
+            top_k: sampling.top_k,
+            top_p: sampling.top_p,
+            min_p: sampling.min_p,
             repetition_penalty,
             ignore_eos: std::env::var("RNB_IGNORE_EOS").ok().is_some_and(|value| {
                 value != "0"
@@ -2463,6 +2574,7 @@ fn main() {
                     && !value.eq_ignore_ascii_case("off")
                     && !value.eq_ignore_ascii_case("no")
             }),
+            seed: sampling.seed,
             spec_k,
             spec_depth,
             ..GenerateParams::default()
@@ -3703,6 +3815,40 @@ mod tests {
         assert_eq!(parse_mtp_abab_repeat(None).unwrap(), None);
         assert_eq!(parse_mtp_abab_repeat(Some("4")).unwrap(), Some(4));
         assert_eq!(parse_mtp_abab_repeat(Some(" 6 ")).unwrap(), Some(6));
+    }
+
+    #[test]
+    fn bench_sampling_params_accept_sampled_mtp_inputs() {
+        assert_eq!(
+            parse_bench_sampling_params(
+                Some("0.8"),
+                Some("10"),
+                Some("0.9"),
+                Some("0.05"),
+                Some("31"),
+            )
+            .unwrap(),
+            BenchSamplingParams {
+                temperature: 0.8,
+                top_k: 10,
+                top_p: 0.9,
+                min_p: 0.05,
+                seed: Some(31),
+            }
+        );
+    }
+
+    #[test]
+    fn bench_sampling_params_reject_invalid_ranges_and_integers() {
+        for invalid in [
+            parse_bench_sampling_params(Some("2.1"), None, None, None, None),
+            parse_bench_sampling_params(None, Some("-1"), None, None, None),
+            parse_bench_sampling_params(None, None, Some("1.1"), None, None),
+            parse_bench_sampling_params(None, None, None, Some("NaN"), None),
+            parse_bench_sampling_params(None, None, None, None, Some("-1")),
+        ] {
+            assert!(invalid.is_err());
+        }
     }
 
     #[test]
