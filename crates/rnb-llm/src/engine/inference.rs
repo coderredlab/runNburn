@@ -1613,6 +1613,9 @@ impl Engine {
             Ok((
                 crate::engine::verify_window::VerifyWindowResult {
                     target_tokens,
+                    // Vulkan fullpath verify도 greedy 전용이다. sampled 가드가 CUDA
+                    // device-resident와 sequential만 허용한다.
+                    output_logits: Vec::new(),
                     mtp_hidden_rows,
                     hidden_dim: self.metadata.hidden_dim,
                     prefix_state: None,
