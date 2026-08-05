@@ -49,13 +49,34 @@ pub fn sample_from_probs(probs: &[f32], rng: &mut impl Rng) -> u32 {
     (probs.len() - 1) as u32
 }
 
+fn sample_dense_from_logits(logits: &[f32], rng: &mut impl Rng) -> u32 {
+    let mut probs = logits.to_vec();
+    softmax_inplace(&mut probs);
+    sample_from_probs(&probs, rng)
+}
+
 /// 필터링 뒤 살아 있는 logit만 확률 버퍼에 보존해 같은 분포와 RNG 소비로 샘플링한다.
 ///
-/// Top-k/top-p가 대부분을 `-inf`로 만든 뒤에도 전체 vocab을 복사하고 `exp`하던 비용을
-/// 피한다. 누적 순서는 원래 token index 순서라 dense softmax 경로와 결과가 같다.
-fn sample_from_logits(logits: &[f32], rng: &mut impl Rng) -> u32 {
+/// 후보 버퍼가 dense 확률 버퍼보다 작을 때만 compact 경로를 쓴다. 누적 순서는 원래
+/// token index 순서라 dense softmax 경로와 결과가 같다.
+fn sample_from_logits(logits: &[f32], candidate_limit: Option<usize>, rng: &mut impl Rng) -> u32 {
+    let survivor_count = candidate_limit.map_or_else(
+        || {
+            logits
+                .iter()
+                .filter(|&&logit| logit != f32::NEG_INFINITY)
+                .count()
+        },
+        |limit| limit.min(logits.len()),
+    );
+    if survivor_count.saturating_mul(std::mem::size_of::<(u32, f32)>())
+        >= std::mem::size_of_val(logits)
+    {
+        return sample_dense_from_logits(logits, rng);
+    }
+
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut weighted = Vec::new();
+    let mut weighted = Vec::with_capacity(survivor_count);
     let mut sum = 0.0f32;
     for (index, &logit) in logits.iter().enumerate() {
         if logit == f32::NEG_INFINITY {
@@ -63,7 +84,7 @@ fn sample_from_logits(logits: &[f32], rng: &mut impl Rng) -> u32 {
         }
         let probability = (logit - max).exp();
         sum += probability;
-        weighted.push((index, probability));
+        weighted.push((index as u32, probability));
     }
     if sum > 0.0 {
         for (_, probability) in &mut weighted {
@@ -76,7 +97,7 @@ fn sample_from_logits(logits: &[f32], rng: &mut impl Rng) -> u32 {
     for (index, probability) in weighted {
         cumsum += probability;
         if r <= cumsum {
-            return index as u32;
+            return index;
         }
     }
     (logits.len() - 1) as u32
@@ -85,6 +106,8 @@ fn sample_from_logits(logits: &[f32], rng: &mut impl Rng) -> u32 {
 pub struct SamplerChain {
     samplers: Vec<Box<dyn Sampler>>,
     greedy: bool,
+    may_filter_logits: bool,
+    compact_candidate_limit: Option<usize>,
 }
 
 impl SamplerChain {
@@ -102,6 +125,13 @@ impl SamplerChain {
         }
 
         let is_greedy = params.temperature == 0.0;
+        let may_filter_logits = !is_greedy
+            && (params.mirostat.is_some()
+                || params.top_k > 0
+                || params.top_p < 1.0
+                || params.min_p > 0.0);
+        let compact_candidate_limit =
+            (!is_greedy && params.mirostat.is_none() && params.top_k > 0).then_some(params.top_k);
 
         if !is_greedy {
             if let Some(mirostat_params) = &params.mirostat {
@@ -125,6 +155,8 @@ impl SamplerChain {
         Self {
             samplers: chain,
             greedy: is_greedy,
+            may_filter_logits,
+            compact_candidate_limit,
         }
     }
 
@@ -142,7 +174,11 @@ impl SamplerChain {
             return greedy::greedy_sample(logits);
         }
 
-        sample_from_logits(logits, rng)
+        if self.may_filter_logits {
+            sample_from_logits(logits, self.compact_candidate_limit, rng)
+        } else {
+            sample_dense_from_logits(logits, rng)
+        }
     }
 
     /// sampler processor를 적용한 뒤 정규화된 확률 분포를 `probs`에 채운다.
@@ -243,16 +279,10 @@ mod tests {
 
     #[test]
     fn sparse_sampling_matches_dense_softmax_for_fixed_rng() {
-        let logits = vec![
-            f32::NEG_INFINITY,
-            1.25,
-            f32::NEG_INFINITY,
-            -0.75,
-            3.5,
-            f32::NEG_INFINITY,
-            2.0,
-            -4.0,
-        ];
+        let mut logits = vec![f32::NEG_INFINITY; 64];
+        for (index, value) in [(1, 1.25), (7, -0.75), (19, 3.5), (31, 2.0), (47, -4.0)] {
+            logits[index] = value;
+        }
         for seed in 0..256 {
             let mut dense_probs = logits.clone();
             softmax_inplace(&mut dense_probs);
@@ -260,7 +290,7 @@ mod tests {
             let expected = sample_from_probs(&dense_probs, &mut dense_rng);
 
             let mut sparse_rng = SmallRng::seed_from_u64(seed);
-            assert_eq!(sample_from_logits(&logits, &mut sparse_rng), expected);
+            assert_eq!(sample_from_logits(&logits, None, &mut sparse_rng), expected);
         }
     }
 
@@ -279,6 +309,36 @@ mod tests {
         let mut probs = logits.to_vec();
         softmax_inplace(&mut probs);
         sample_from_probs(&probs, rng)
+    }
+
+    #[test]
+    fn dense_workset_chain_matches_dense_reference() {
+        let source = (0..4096)
+            .map(|index| ((index * 53) % 257) as f32 * 0.03125 - 4.0)
+            .collect::<Vec<_>>();
+        let mut noop_top_k = default_params();
+        noop_top_k.top_k = source.len() + 1;
+
+        for (label, params) in [("default", default_params()), ("noop-top-k", noop_top_k)] {
+            for seed in 0..64 {
+                let mut expected_logits = source.clone();
+                let mut expected_chain = SamplerChain::from_params(&params);
+                let mut expected_rng = SmallRng::seed_from_u64(seed);
+                let expected = dense_reference_sample(
+                    &mut expected_chain,
+                    &mut expected_logits,
+                    &[],
+                    &mut expected_rng,
+                );
+
+                let mut actual_logits = source.clone();
+                let mut actual_chain = SamplerChain::from_params(&params);
+                let mut actual_rng = SmallRng::seed_from_u64(seed);
+                let actual = actual_chain.sample(&mut actual_logits, &[], &mut actual_rng);
+                assert_eq!(actual_logits, expected_logits, "{label}/seed={seed}");
+                assert_eq!(actual, expected, "{label}/seed={seed}");
+            }
+        }
     }
 
     #[test]
