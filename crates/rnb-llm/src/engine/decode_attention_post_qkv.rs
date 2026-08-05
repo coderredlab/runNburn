@@ -40,47 +40,43 @@ pub(super) fn apply_decode_attention_qkv_postprocess(
                 .copy_from_slice(&scratch.q_buf[src_off + head_dim..src_off + head_dim * 2]);
         }
         if let Some(q_norm) = &w.q_norm {
+            // One call per head made this the single most frequent CUDA launch
+            // in decode (2701 per token on Qwen3.6 27B), each a grid=1 kernel
+            // wrapped in its own H2D/D2H/sync. RMS norm is independent per row,
+            // so the whole [num_heads, head_dim] block normalizes in one launch
+            // with identical arithmetic.
             let q_norm_data = kernels::tensor_as_f32_slice(q_norm);
-            for h in 0..layout.num_heads {
-                let off = h * head_dim;
-                apply_model_qk_norm_into(
-                    &scratch.q_split[off..off + head_dim],
-                    q_norm_data,
-                    norm_eps,
-                    &mut scratch.norm_buf2[off..off + head_dim],
-                    architecture,
-                );
-            }
+            apply_model_qk_norm_into(
+                &scratch.q_split[..q_dim],
+                q_norm_data,
+                norm_eps,
+                &mut scratch.norm_buf2[..q_dim],
+                architecture,
+            );
             scratch.q_split[..q_dim].copy_from_slice(&scratch.norm_buf2[..q_dim]);
         }
     } else if let Some(q_norm) = &w.q_norm {
         let q_norm_data = kernels::tensor_as_f32_slice(q_norm);
-        for h in 0..layout.num_heads {
-            let off = h * head_dim;
-            apply_model_qk_norm_into(
-                &scratch.q_buf[off..off + head_dim],
-                q_norm_data,
-                norm_eps,
-                &mut scratch.norm_buf2[off..off + head_dim],
-                architecture,
-            );
-        }
+        apply_model_qk_norm_into(
+            &scratch.q_buf[..q_dim],
+            q_norm_data,
+            norm_eps,
+            &mut scratch.norm_buf2[..q_dim],
+            architecture,
+        );
         scratch.q_buf[..q_dim].copy_from_slice(&scratch.norm_buf2[..q_dim]);
     }
 
     if !gemma4_reuse_q_only {
         if let Some(k_norm) = &w.k_norm {
             let k_norm_data = kernels::tensor_as_f32_slice(k_norm);
-            for h in 0..layout.num_kv_heads {
-                let off = h * head_dim;
-                apply_model_qk_norm_into(
-                    &scratch.k_buf[off..off + head_dim],
-                    k_norm_data,
-                    norm_eps,
-                    &mut scratch.norm_buf2[off..off + head_dim],
-                    architecture,
-                );
-            }
+            apply_model_qk_norm_into(
+                &scratch.k_buf[..kv_dim],
+                k_norm_data,
+                norm_eps,
+                &mut scratch.norm_buf2[..kv_dim],
+                architecture,
+            );
             scratch.k_buf[..kv_dim].copy_from_slice(&scratch.norm_buf2[..kv_dim]);
         }
     }

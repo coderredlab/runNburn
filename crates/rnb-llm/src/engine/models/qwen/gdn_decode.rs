@@ -631,16 +631,16 @@ fn decode_gdn_layer_qwen_impl(
         );
     }
 
+    // Same per-head launch storm as the QKV norms: ssm_norm is head_v_dim wide
+    // and RMS norm is row-independent, so the whole d_inner block goes in one
+    // call with identical arithmetic.
     let ssm_norm_data = kernels::tensor_as_f32_slice(&w.ssm_norm);
-    for h in 0..num_v_heads {
-        let off = h * head_v_dim;
-        apply_plain_rms_norm_into(
-            &scratch.delta_out[off..off + head_v_dim],
-            ssm_norm_data,
-            norm_eps,
-            &mut scratch.gated_out[off..off + head_v_dim],
-        );
-    }
+    apply_plain_rms_norm_into(
+        &scratch.delta_out[..d_inner],
+        ssm_norm_data,
+        norm_eps,
+        &mut scratch.gated_out[..d_inner],
+    );
 
     apply_model_gate_mul_inplace(
         &mut scratch.z_buf[..d_inner],
