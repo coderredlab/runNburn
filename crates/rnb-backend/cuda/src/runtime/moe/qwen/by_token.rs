@@ -3547,7 +3547,13 @@ impl CudaState {
             && n_embd % 256 == 0
             && n_ff % 256 == 0
             && match down_quant {
-                13 => true,
+                // Q5_K down was the only arm admitted unconditionally, and the
+                // combination is wrong. Comparing the fused device MoE against the
+                // host staged MoE per layer on Qwen3.6 35B-A3B gives max rel 1.06e-1
+                // with grouped gate/up and 1.35e-6 without, and the chat answer
+                // degrades from "대한민국의 수도는 서울입니다" to a refusal. The Q4_K and
+                // Q6_K arms gate on their own down kernels; Q5_K had no such check.
+                13 => tuning::qwen35_q4_gate_up_q8dot_mmq_group16_q5_down_enabled(),
                 12 => {
                     tuning::qwen35_q4_down_group4_enabled()
                         && tuning::qwen35_q4_gate_up_q8dot_q4_down_enabled()

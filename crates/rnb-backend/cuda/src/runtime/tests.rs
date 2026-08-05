@@ -23258,6 +23258,106 @@ fn cuda_qwen35_sparse_experts_by_token_q6_pack4_gate_up_q8dot_group16_matches_gr
     );
 }
 
+// The existing MMQ gate/up parity tests all pass down_quant=14, so the Q5_K down
+// arm — the only one admitted into the grouped q8dot MMQ gate/up path without a
+// matching down-kernel check — was never compared against the ungrouped path.
+// On Qwen3.6 35B-A3B that combination returns wrong MoE output (max rel 1.06e-1
+// against the host staged MoE) and the chat answer degrades to a refusal.
+#[test]
+fn cuda_qwen35_sparse_experts_q5_down_gate_up_mmq_matches_ungrouped() {
+    let _guard = runtime_test_lock();
+    reset_delta_state_cache().expect("reset CUDA runtime cache");
+
+    let _token_major = EnvVarGuard::set("RNB_CUDA_QWEN35_DOWN_TOKEN_MAJOR", "0");
+    let _group2 = EnvVarGuard::set("RNB_CUDA_GROUP2_DOWN_WARP4", "0");
+    let _group8_down = EnvVarGuard::set("RNB_CUDA_GROUP8_DOWN_WARP4", "0");
+    let _group8_gate_up = EnvVarGuard::set("RNB_CUDA_GROUP8_GATE_UP_WARP4", "1");
+    let _q5_mmq = EnvVarGuard::set("RNB_CUDA_QWEN35_Q5_DOWN_Q8DOT_MMQ", "0");
+
+    let n_ff = 256usize;
+    let n_embd = 512usize;
+    let token_count = 8usize;
+    let gate = make_test_q4k_weights(1, n_ff, n_embd / 256, 617)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, n_embd / 256, 619)
+        .pop()
+        .unwrap();
+    let down = make_test_q5k_weights(n_embd, n_ff / 256, 631);
+    let gate_refs = vec![gate.as_slice(); 32];
+    let up_refs = vec![up.as_slice(); 32];
+    let down_refs = vec![down.as_slice(); 32];
+    let route = (1..=32)
+        .map(|value| value as f32 / 32.0)
+        .collect::<Vec<_>>();
+    let token_ids = (0..32)
+        .map(|slot| (slot % token_count) as u32)
+        .collect::<Vec<_>>();
+    let input = (0..token_count * n_embd)
+        .map(|i| ((i as f32 % 71.0) - 35.0) * 0.005859375)
+        .collect::<Vec<_>>();
+
+    let run = || {
+        qwen35_sparse_experts_by_token(
+            &gate_refs,
+            &up_refs,
+            &down_refs,
+            &route,
+            &token_ids,
+            token_count,
+            13,
+            n_ff,
+            n_embd,
+            &input,
+        )
+        .expect("CUDA qwen35 Q5_K down sparse experts")
+    };
+
+    let ungrouped = {
+        let _mmq = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ", "0");
+        let _group16 = EnvVarGuard::set("RNB_CUDA_GROUP16_GATE_UP_WARP4", "0");
+        run()
+    };
+    let mmq_group16 = {
+        let _q5_admit =
+            EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16_Q5_DOWN", "1");
+        let _mmq = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ", "1");
+        let _group16 = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16", "1");
+        let _group32 = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP32", "0");
+        run()
+    };
+    let mmq_group32 = {
+        let _q5_admit =
+            EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16_Q5_DOWN", "1");
+        let _mmq = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ", "1");
+        let _group16 = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16", "1");
+        let _group32 = EnvVarGuard::set("RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP32", "1");
+        run()
+    };
+
+    let scale = ungrouped.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
+    // The shipping default keeps Q5_K out of the grouped MMQ path, so it must
+    // agree with the ungrouped reference.
+    let shipping = run();
+    let (idx, abs, rel) = max_abs_rel(&shipping, &ungrouped);
+    assert!(
+        abs <= scale * 0.003,
+        "default Q5_K down path diverged from the ungrouped gate/up path: idx={idx} abs={abs:.6} rel={rel:.6} scale={scale:.6}"
+    );
+
+    // Opting Q5_K back in is expected to be wrong until the MMQ kernels are
+    // fixed; assert that so this test starts failing the moment they are, which
+    // is the signal to drop the opt-out and re-enable the fast path.
+    for (label, got) in [("group16", &mmq_group16), ("group32", &mmq_group32)] {
+        let (_, abs, _) = max_abs_rel(got, &ungrouped);
+        assert!(
+            abs > scale * 0.003,
+            "grouped q8dot MMQ gate/up ({label}) now agrees with the ungrouped path for Q5_K down: remove the RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16_Q5_DOWN opt-out and restore the fast path"
+        );
+    }
+}
+
 #[test]
 fn cuda_qwen35_sparse_experts_q5_down_mmq_is_deterministic_and_matches_group4() {
     let _guard = runtime_test_lock();

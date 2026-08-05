@@ -748,6 +748,16 @@ pub fn qwen35_q5_down_q8dot_mmq_group32_enabled() -> bool {
     env_bool("RNB_CUDA_QWEN35_Q5_DOWN_Q8DOT_MMQ_GROUP32", true)
 }
 
+// Off by default: grouped q8dot MMQ gate/up combined with Q5_K routed down
+// produces wrong MoE output on Qwen3.6 35B-A3B (max rel 1.06e-1 against the host
+// staged MoE, versus 1.35e-6 with grouping disabled).
+pub fn qwen35_q4_gate_up_q8dot_mmq_group16_q5_down_enabled() -> bool {
+    env_bool(
+        "RNB_CUDA_QWEN35_Q4_GATE_UP_Q8DOT_MMQ_GROUP16_Q5_DOWN",
+        false,
+    )
+}
+
 pub fn qwen35_q5_down_q8dot_mmq_group64_enabled() -> bool {
     env_bool("RNB_CUDA_QWEN35_Q5_DOWN_Q8DOT_MMQ_GROUP64", true)
 }
