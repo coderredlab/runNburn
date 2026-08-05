@@ -603,31 +603,12 @@ fn mtp_auto_policy_for_model(
 ) -> MtpAutoPolicy {
     let dense_spec_k = 1;
     let dense_min_free_vram_mib = mtp_device_verify_min_free_vram_mib(metadata, dense_spec_k);
-    // mt103: dense Qwen35 device verify는 window 크기에 따라 부호가 갈린다. RTX 3090
-    // Qwen3.6 27B MTP Q4_K_M 256 decode warm에서 2-position window는 0.9 tok/s로
-    // target-only 7.2의 1/8인데 4-position은 8.9 tok/s로 1.24배 앞선다. device verify
-    // 커널 시간은 각각 1898ms와 181ms이고, layer 단가가 평균 30.1ms 대 2.8ms로 특정
-    // 구간이 아니라 전 layer에서 균일하게 갈린다.
-    //
-    // 원인은 아직 규명하지 못했다. 다음을 실측으로 배제했다: window-2 전용 커널
-    // (`RNB_CUDA_MTP_VERIFY_WINDOW2_GRAPHS` / `_OUTPUT_Q6K_TOKEN2` /
-    // `RNB_CUDA_Q8_0_GEMV_BATCH_TOKEN2` / `_SELECTED_GATE_PAIR2` / `_SILU` /
-    // `_SELECTED_DOWN_PAIR2` / `_SELECTED_PAIR_MAP`), CUDA graph
-    // (`_GDN_GRAPH` / `_ATTENTION_GRAPH`), resident weight 부족(두 window의 peak VRAM이
-    // 20955 대 21353 MiB로 동일), prefix state capture 양(오히려 큰 window가 더 많이
-    // 뜬다). 남은 후보는 커널 grid/block 구성이며 커널 단위 프로파일이 필요하다.
-    //
-    // 측정된 부호만 반영해 dense는 큰 window를 쓴다. MoE는 `k=1`에서 이미 90 tok/s대라
-    // `dense_spec_k`를 그대로 둔다.
-    let dense_qwen35_spec_k = 4;
-    let dense_qwen35_min_free_vram_mib =
-        mtp_device_verify_min_free_vram_mib(metadata, dense_qwen35_spec_k);
     // mt103: dense device verify의 이득은 모델 weight가 device에 통째로 상주할 때만
     // 난다. 12GiB RTX 3060에 15.9GiB인 Qwen3.6 27B를 올리면 auto MTP가 2400초 안에
     // 256 token을 끝내지 못해 target-only 0.5 tok/s 대비 5배 이상 느렸다. free VRAM은
     // 모델 로드 뒤 값이라 기준이 될 수 없으므로 장비 total로 판정한다.
     let dense_model_fits_resident = resource.as_ref().is_some_and(|hint| {
-        hint.total_vram_mib >= model_weight_mib.saturating_add(dense_qwen35_min_free_vram_mib)
+        hint.total_vram_mib >= model_weight_mib.saturating_add(dense_min_free_vram_mib)
     });
     if !has_mtp_runtime {
         return MtpAutoPolicy {
@@ -774,7 +755,7 @@ fn mtp_auto_policy_for_model(
             enabled: false,
             spec_k: dense_spec_k,
             device_verify: false,
-            min_free_vram_mib: dense_qwen35_min_free_vram_mib,
+            min_free_vram_mib: dense_min_free_vram_mib,
             resource,
             reason: "dense-qwen35-model-exceeds-resident-vram",
         },
@@ -785,9 +766,9 @@ fn mtp_auto_policy_for_model(
         // 35B-A3B는 89.9~91.3 tok/s로 회귀가 없다.
         ModelArchitecture::Qwen35 => MtpAutoPolicy {
             enabled: true,
-            spec_k: dense_qwen35_spec_k,
+            spec_k: dense_spec_k,
             device_verify: true,
-            min_free_vram_mib: dense_qwen35_min_free_vram_mib,
+            min_free_vram_mib: dense_min_free_vram_mib,
             resource,
             reason: "dense-qwen35-device-verify-auto",
         },
@@ -2136,8 +2117,7 @@ mod tests {
         );
 
         assert!(policy.enabled);
-        // dense는 소window에서 단가가 급등해 큰 window를 쓴다(mt103).
-        assert_eq!(policy.spec_k, 4);
+        assert_eq!(policy.spec_k, 1);
         assert!(policy.device_verify);
         assert_eq!(policy.reason, "dense-qwen35-device-verify-auto");
     }

@@ -148,8 +148,17 @@ pub fn q8_0_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usiz
     eligible && env_bool("RNB_CUDA_Q8_0_MMQ_TILE32", true)
 }
 
+/// `seq_len == 2` 전용 Q4_K gate/up q8dot 배치 커널.
+///
+/// mt103 실측으로 기본값을 내렸다. RTX 3090 Qwen3.6 27B MTP Q4_K_M의 `k=1` MTP device
+/// verify(2-position window)에서 이 커널이 verify kernel을 `89.1ms`에서 `1933.1ms`로
+/// 21배 늘렸고, 제품 처리량은 `14.0` 대 `0.9 tok/s`였다. 4-position window는 이 분기를
+/// 타지 않아 영향이 없었고, 같은 토글을 Qwen3.6 35B-A3B(90.9 대 90.9)와 Gemma 4
+/// 26B-A4B(warm 교차 25.0/24.9/24.7/24.7)에서 켜고 꺼도 차이가 없어 이 경로를 타는
+/// 워크로드는 27B dense verify뿐이다. 즉 어느 측정에서도 이득이 확인되지 않는다.
+/// 필요하면 `RNB_CUDA_Q4K_GATE_UP_BATCH_SEQ2_Q8DOT=1`로 되켤 수 있다.
 pub fn q4k_gate_up_batch_seq2_q8dot_enabled() -> bool {
-    env_bool("RNB_CUDA_Q4K_GATE_UP_BATCH_SEQ2_Q8DOT", true)
+    env_bool("RNB_CUDA_Q4K_GATE_UP_BATCH_SEQ2_Q8DOT", false)
 }
 
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
