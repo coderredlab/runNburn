@@ -604,12 +604,21 @@ fn mtp_auto_policy_for_model(
     let dense_spec_k = 1;
     let dense_min_free_vram_mib = mtp_device_verify_min_free_vram_mib(metadata, dense_spec_k);
     // mt103: dense Qwen35 device verify는 window 크기에 따라 부호가 갈린다. RTX 3090
-    // Qwen3.6 27B MTP Q4_K_M 256 decode warm에서 `k=1`(2-position window)은 1.0 tok/s로
-    // target-only 7.3의 1/7인데 `k=4`(5-position)는 8.9 tok/s로 1.22배 앞선다.
-    // `RNB_CUDA_MTP_VERIFY_WINDOW2_GRAPHS=0`으로 2-token 전용 graph를 꺼도 1.0으로
-    // 동일해 그 경로 탓은 아니며, 소window에서 왜 단가가 급등하는지는 아직 규명하지
-    // 못했다. 측정된 부호만 반영해 dense는 큰 window를 쓴다. MoE는 `k=1`에서 이미
-    // 90 tok/s대라 `dense_spec_k`를 그대로 둔다.
+    // Qwen3.6 27B MTP Q4_K_M 256 decode warm에서 2-position window는 0.9 tok/s로
+    // target-only 7.2의 1/8인데 4-position은 8.9 tok/s로 1.24배 앞선다. device verify
+    // 커널 시간은 각각 1898ms와 181ms이고, layer 단가가 평균 30.1ms 대 2.8ms로 특정
+    // 구간이 아니라 전 layer에서 균일하게 갈린다.
+    //
+    // 원인은 아직 규명하지 못했다. 다음을 실측으로 배제했다: window-2 전용 커널
+    // (`RNB_CUDA_MTP_VERIFY_WINDOW2_GRAPHS` / `_OUTPUT_Q6K_TOKEN2` /
+    // `RNB_CUDA_Q8_0_GEMV_BATCH_TOKEN2` / `_SELECTED_GATE_PAIR2` / `_SILU` /
+    // `_SELECTED_DOWN_PAIR2` / `_SELECTED_PAIR_MAP`), CUDA graph
+    // (`_GDN_GRAPH` / `_ATTENTION_GRAPH`), resident weight 부족(두 window의 peak VRAM이
+    // 20955 대 21353 MiB로 동일), prefix state capture 양(오히려 큰 window가 더 많이
+    // 뜬다). 남은 후보는 커널 grid/block 구성이며 커널 단위 프로파일이 필요하다.
+    //
+    // 측정된 부호만 반영해 dense는 큰 window를 쓴다. MoE는 `k=1`에서 이미 90 tok/s대라
+    // `dense_spec_k`를 그대로 둔다.
     let dense_qwen35_spec_k = 4;
     let dense_qwen35_min_free_vram_mib =
         mtp_device_verify_min_free_vram_mib(metadata, dense_qwen35_spec_k);
@@ -770,12 +779,10 @@ fn mtp_auto_policy_for_model(
             reason: "dense-qwen35-model-exceeds-resident-vram",
         },
         // mt103: 한때 이 분기를 auto-off로 내렸다가 되돌렸다. device verify가 1.0 tok/s로
-        // target-only 7.3의 1/7이던 원인은 batch verify 자체가 아니라 resident cache
-        // 상한이었다. MTP device verify를 켜면 `q4k_resident_auto_cache_cap_mib`가 24GiB
-        // 장비에서도 캐시를 4096 MiB로 묶어 15.9GiB 모델의 후반 layer를 매 round
-        // 재전송했다. 캐시 cap을 저VRAM 전용으로 좁히고 workspace reserve를 실측 1.4GiB
-        // 규모로 낮춘 뒤, `dense_qwen35_spec_k`가 주는 큰 window에서 같은 워크로드가
-        // 8.9 tok/s로 target-only를 1.22배 앞선다. 35B-A3B는 91.3 tok/s로 회귀가 없다.
+        // target-only 7.2의 1/7이던 원인은 `spec_k`였다. 같은 코드에서 `k=4`만 주면
+        // 8.9 tok/s로 target-only를 1.24배 앞서고, 이는 resident cache 상한 수정 이전
+        // 코드에서도 동일하다. 즉 auto 경로 개선분은 전부 window 크기에서 온다.
+        // 35B-A3B는 89.9~91.3 tok/s로 회귀가 없다.
         ModelArchitecture::Qwen35 => MtpAutoPolicy {
             enabled: true,
             spec_k: dense_qwen35_spec_k,
