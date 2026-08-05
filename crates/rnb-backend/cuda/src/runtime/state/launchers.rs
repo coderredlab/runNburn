@@ -3045,6 +3045,16 @@ impl CudaState {
         route_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        if std::env::var("RNB_DEBUG_DOWN_LAUNCH_TRACE").is_ok() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEEN: AtomicUsize = AtomicUsize::new(0);
+            if SEEN.fetch_add(1, Ordering::Relaxed) < 2 {
+                eprintln!(
+                    "[down-launch] kernel={kernel_name} rows={rows} groups={groups} blocks_per_row={blocks_per_row}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
         let mut output_arg = output_dev;
         let mut weights_arg = weight_ptrs_dev;
         let mut input_arg = input_dev;

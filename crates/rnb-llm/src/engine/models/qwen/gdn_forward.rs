@@ -173,6 +173,27 @@ fn try_forward_gdn_layer_to_device_output(
             w.ssm_out.ggml_type,
         );
     }
+    if let Some(max) = crate::engine::policy::env_string("RNB_DEBUG_GDN_DEVICE_MAX_LAYER")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if layer_idx >= max {
+            return Ok(None);
+        }
+    }
+    if let Some(skip) = crate::engine::policy::env_string("RNB_DEBUG_GDN_DEVICE_SKIP_LAYER")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if layer_idx == skip {
+            return Ok(None);
+        }
+    }
+    if let Some(only) = crate::engine::policy::env_string("RNB_DEBUG_GDN_DEVICE_ONLY_LAYER")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if layer_idx != only {
+            return Ok(None);
+        }
+    }
     if !crate::engine::tuning_runtime::gdn_prefill_chain_moe_input_device_enabled()
         || !crate::engine::tuning_runtime::gdn_prefill_chain_moe_output_device_enabled()
     {
@@ -256,6 +277,16 @@ fn try_forward_gdn_layer_to_device_output(
         };
     };
 
+    // Diagnostic: compare the fused device MoE against the host staged MoE on
+    // the same GDN output. The residual must be captured before the call
+    // because the carrier path can write its output in place over it.
+    let selfcheck_residual =
+        if crate::engine::policy::env_string("RNB_DEBUG_MOE_SELFCHECK").is_some() {
+            backend_runtime::download_cuda_device_tensor_f32(residual_id).ok()
+        } else {
+            None
+        };
+
     match try_forward_ffn_qwen35moe_device_input_carrier(
         moe_w,
         seq_len,
@@ -266,6 +297,44 @@ fn try_forward_gdn_layer_to_device_output(
         residual_desc,
     ) {
         Ok(Some(output)) => {
+            if let Some(residual_host) = selfcheck_residual {
+                let dev = backend_runtime::download_cuda_device_tensor_f32(output.output_id);
+                let host = crate::engine::models::shared_expert_moe::forward_shared_expert_moe(
+                    ModelArchitecture::Qwen35MoE,
+                    Tensor::from_vec(residual_host, &[seq_len, metadata.hidden_dim]),
+                    &w.post_attn_norm,
+                    moe_w,
+                    seq_len,
+                    metadata.hidden_dim,
+                    norm_eps,
+                    layer_idx,
+                );
+                match (dev, host) {
+                    (Ok(d), Ok(h)) => {
+                        let hv = kernels::tensor_as_f32_slice(&h);
+                        let (mut max_abs, mut argi) = (0.0f32, 0usize);
+                        for (i, (a, b)) in d.iter().zip(hv.iter()).enumerate() {
+                            let e = (a - b).abs();
+                            if e > max_abs {
+                                max_abs = e;
+                                argi = i;
+                            }
+                        }
+                        let scale = hv.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                        eprintln!(
+                            "[moe-selfcheck] layer={layer_idx} max_abs={max_abs:.6e} rel={:.3e} at={argi} dev={:.6} host={:.6}",
+                            max_abs / (scale + 1e-9),
+                            d.get(argi).copied().unwrap_or(0.0),
+                            hv.get(argi).copied().unwrap_or(0.0)
+                        );
+                    }
+                    (d, h) => eprintln!(
+                        "[moe-selfcheck] layer={layer_idx} compare unavailable dev_ok={} host_ok={}",
+                        d.is_ok(),
+                        h.is_ok()
+                    ),
+                }
+            }
             if output.output_id == residual_id {
                 chain_output.device_residual = None;
             }
