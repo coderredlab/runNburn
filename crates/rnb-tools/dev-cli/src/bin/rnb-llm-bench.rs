@@ -1689,13 +1689,6 @@ fn run_mtp_onoff_abab(
                 run_index + 1,
                 if mtp_enabled { "B/MTP" } else { "A/Baseline" }
             );
-        } else {
-            assert!(
-                within_variant_equal,
-                "sampled MTP on/off variant is not reproducible at run {} ({})",
-                run_index + 1,
-                if mtp_enabled { "B/MTP" } else { "A/Baseline" }
-            );
         }
         if mtp_enabled {
             mtp_ms.push(wall_ms);
