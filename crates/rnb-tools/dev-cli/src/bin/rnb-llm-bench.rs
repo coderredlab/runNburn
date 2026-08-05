@@ -1611,6 +1611,12 @@ fn run_mtp_onoff_abab(
         params.temperature == 0.0 || params.seed.is_some(),
         "sampled MTP on/off ABAB requires RNB_SEED for within-variant reproducibility"
     );
+    let allow_output_drift = params.temperature > 0.0
+        || mtp_abab_draft_only_requested(
+            std::env::var("RNB_MTP_ONOFF_ALLOW_OUTPUT_DRIFT")
+                .ok()
+                .as_deref(),
+        );
     let _mtp_restore = EnvVarRestore::capture("RNB_MTP");
     let mut baseline_ms = Vec::with_capacity(repeat.div_ceil(2));
     let mut mtp_ms = Vec::with_capacity(repeat / 2);
@@ -1628,7 +1634,7 @@ fn run_mtp_onoff_abab(
     let mut cross_variant_equal_all = true;
     let mut within_variant_equal_all = true;
     eprintln!(
-        "[MTP_ONOFF_ABAB] warmup variant=A/Baseline measured=false mtp=0 wall_ms={warmup_ms:.3} generated_tokens={} temperature={} top_k={} top_p={} min_p={} seed={:?}",
+        "[MTP_ONOFF_ABAB] warmup variant=A/Baseline measured=false mtp=0 wall_ms={warmup_ms:.3} generated_tokens={} temperature={} top_k={} top_p={} min_p={} seed={:?} output_drift_allowed={allow_output_drift}",
         baseline_canonical.len(),
         params.temperature,
         params.top_k,
@@ -1682,10 +1688,10 @@ fn run_mtp_onoff_abab(
                 run_index + 1,
             );
         }
-        if params.temperature == 0.0 {
+        if !allow_output_drift {
             assert!(
                 cross_variant_equal,
-                "greedy MTP on/off token mismatch at run {} ({})",
+                "MTP on/off token mismatch at run {} ({})",
                 run_index + 1,
                 if mtp_enabled { "B/MTP" } else { "A/Baseline" }
             );
@@ -1702,7 +1708,7 @@ fn run_mtp_onoff_abab(
     let mtp_median_ms = mtp_median_ms.expect("MTP on/off ABAB requires MTP samples");
     let improvement_pct = (baseline_median_ms - mtp_median_ms) / baseline_median_ms * 100.0;
     eprintln!(
-        "[MTP_ONOFF_ABAB] summary warmup=1 measured_runs={repeat} baseline_samples={baseline_ms:?} mtp_samples={mtp_ms:?} baseline_median_ms={baseline_median_ms:.3} mtp_median_ms={mtp_median_ms:.3} improvement_pct={improvement_pct:.3} cross_variant_token_ids_equal={cross_variant_equal_all} within_variant_token_ids_equal={within_variant_equal_all}",
+        "[MTP_ONOFF_ABAB] summary warmup=1 measured_runs={repeat} baseline_samples={baseline_ms:?} mtp_samples={mtp_ms:?} baseline_median_ms={baseline_median_ms:.3} mtp_median_ms={mtp_median_ms:.3} improvement_pct={improvement_pct:.3} cross_variant_token_ids_equal={cross_variant_equal_all} within_variant_token_ids_equal={within_variant_equal_all} output_drift_allowed={allow_output_drift}",
     );
 }
 
