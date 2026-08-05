@@ -999,6 +999,12 @@ pub struct DecodeOutputArgmaxSpecRef<'a> {
     pub eps: f32,
 }
 
+#[cfg(target_os = "macos")]
+struct BatchedOutputTailBuffers {
+    logits: Retained<ProtocolObject<dyn MTLBuffer>>,
+    token_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeChainOptions {
     pub collect_timing: bool,
@@ -10173,7 +10179,7 @@ impl MetalBackend {
         options: DecodeChainOptions,
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         mut out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
-        out_output_logits: Option<&mut Vec<f32>>,
+        mut out_output_logits: Option<&mut Vec<f32>>,
     ) -> Vec<DecodeChainReport> {
         assert!(batch >= 1, "decode_chain_run_batched: batch must be >= 1");
         assert_eq!(
@@ -10281,6 +10287,13 @@ impl MetalBackend {
                     out_states,
                     &mut reports,
                     out_attn_kv.take(),
+                    want_batched_tail
+                        .then(|| output_argmax.expect("want_batched_tail implies output tail")),
+                    if want_batched_tail {
+                        out_output_logits.as_deref_mut()
+                    } else {
+                        None
+                    },
                 );
                 true
             } else {
@@ -10355,7 +10368,7 @@ impl MetalBackend {
             }
         }
 
-        if want_batched_tail {
+        if want_batched_tail && !fused_ran {
             let tail = output_argmax.expect("want_batched_tail implies Some");
             self.decode_chain_batched_output_argmax(
                 hidden,
@@ -10536,6 +10549,8 @@ impl MetalBackend {
         out_states: &mut [Option<(Vec<f32>, Vec<f32>)>],
         reports: &mut Vec<DecodeChainReport>,
         out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
+        output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
+        out_output_logits: Option<&mut Vec<f32>>,
     ) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
         let defer_gdn_state_readback = out_attn_kv.is_some();
@@ -10986,6 +11001,17 @@ impl MetalBackend {
             }
         }
 
+        let output_tail_buffers = output_argmax.as_ref().map(|tail| {
+            self.encode_decode_chain_batched_output_argmax(
+                ctx,
+                &enc,
+                &shared_hidden,
+                batch,
+                hidden_dim,
+                tail,
+            )
+        });
+
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
@@ -11074,17 +11100,30 @@ impl MetalBackend {
                 ..DecodeChainReport::default()
             });
         }
+        let output_tail_fused = output_tail_buffers.is_some();
+        if let Some(buffers) = output_tail_buffers {
+            Self::read_decode_chain_batched_output_argmax(
+                &buffers,
+                batch,
+                output_argmax
+                    .expect("output tail buffers imply output_argmax")
+                    .rows,
+                reports,
+                out_output_logits,
+            );
+        }
         if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
             eprintln!(
                 "[batch-fused] did_run=true layers={} (attn={} gdn={} dense={} moe={}) batch={} \
                  dense_weight_reads_per_layer=1 dense_ffn=bcol-fused \
-                 moe_shared=bcol-fused moe_sparse=per-lane",
+                 moe_shared=bcol-fused moe_sparse=per-lane output_tail_fused={}",
                 specs.len(),
                 attn_layers,
                 specs.len() - attn_layers,
                 dense_layers,
                 moe_layers,
-                batch
+                batch,
+                output_tail_fused
             );
         }
     }
@@ -11222,9 +11261,9 @@ impl MetalBackend {
         );
     }
 
-    /// milestone 2: B lane 의 최종 hidden 을 모아 출력 프로젝션(rms_norm → vocab GEMV → argmax)을
-    /// **B-column GEMV 로 weight 1회 읽기**로 계산한다. 기존 per-lane 경로는 vocab weight 를 B 번
-    /// 읽었는데(가장 큰 행렬 중 하나), 여기서 1번으로 amortize. 단일 command buffer.
+    /// B lane 의 최종 hidden 을 모아 출력 프로젝션(rms_norm → vocab GEMV → argmax)을
+    /// B-column GEMV 로 계산한다. Fused chain은 기존 encoder에 직접 이어 붙이고, 일반
+    /// 비적격 호출만 이 wrapper에서 별도 command buffer를 사용한다.
     #[cfg(target_os = "macos")]
     fn decode_chain_batched_output_argmax(
         &self,
@@ -11236,6 +11275,39 @@ impl MetalBackend {
         out_output_logits: Option<&mut Vec<f32>>,
     ) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
+        let hidden_dev = ffn_chain::shared_f32_buf(ctx, hidden);
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = compute::chain_compute_encoder(ctx, &cmd);
+        let buffers = self.encode_decode_chain_batched_output_argmax(
+            ctx,
+            &enc,
+            &hidden_dev,
+            batch,
+            hidden_dim,
+            tail,
+        );
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Self::read_decode_chain_batched_output_argmax(
+            &buffers,
+            batch,
+            tail.rows,
+            reports,
+            out_output_logits,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn encode_decode_chain_batched_output_argmax(
+        &self,
+        ctx: &compute::MetalContext,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        hidden_dev: &ProtocolObject<dyn MTLBuffer>,
+        batch: usize,
+        hidden_dim: usize,
+        tail: &DecodeOutputArgmaxSpecRef<'_>,
+    ) -> BatchedOutputTailBuffers {
         assert_eq!(
             tail.cols, hidden_dim,
             "batched output tail cols must match hidden dim"
@@ -11251,15 +11323,13 @@ impl MetalBackend {
         );
         assert!(tail.rows > 0, "batched output tail rows must be > 0");
 
-        // vocab weight NoCopy resident wrap (self.resident 재사용 — lane 간/토큰 간 1회 업로드).
         let (out_w, out_off) = {
-            let mut r = self.resident.borrow_mut();
-            let e = r
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
                 .entry(resident_key(tail.output_raw))
                 .or_insert_with(|| resident_cache_entry(ctx, tail.output_raw));
-            (e.0.clone(), e.1)
+            (entry.0.clone(), entry.1)
         };
-        let hidden_dev = ffn_chain::shared_f32_buf(ctx, hidden); // [batch*hidden_dim]
         let normed = ffn_chain::empty_f32_buf(ctx, batch * hidden_dim);
         let logits = ffn_chain::empty_f32_buf(ctx, batch * tail.rows);
         let norm_w_buf = ffn_chain::shared_f32_buf(ctx, tail.norm_weight);
@@ -11269,7 +11339,7 @@ impl MetalBackend {
         let cols_buf = ffn_chain::u32_buf(ctx, tail.cols as u32);
         let out_off_buf = ffn_chain::u32_buf(ctx, out_off);
         let b_buf = ffn_chain::u32_buf(ctx, batch as u32);
-        let token_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = (0..batch)
+        let token_bufs = (0..batch)
             .map(|_| {
                 ctx.device
                     .newBufferWithLength_options(
@@ -11278,16 +11348,13 @@ impl MetalBackend {
                     )
                     .expect("Metal: batched output token buffer")
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        let cmd = ctx.queue.commandBuffer().expect("command buffer");
-        let enc = compute::chain_compute_encoder(ctx, &cmd);
-        // 컬럼(lane)별 rms_norm → normed[lane*hidden_dim..] (column-major-by-lane 배치).
         for lane in 0..batch {
             ffn_chain::encode_rms_norm_io_offset(
                 ctx,
-                &enc,
-                &hidden_dev,
+                enc,
+                hidden_dev,
                 lane * hidden_dim * std::mem::size_of::<f32>(),
                 &norm_w_buf,
                 &normed,
@@ -11297,10 +11364,9 @@ impl MetalBackend {
             );
         }
         enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        // vocab weight 1회 읽기: out_w × normed[B*hidden_dim] → logits[B*rows].
         compute::encode_gemv_quant_bcol(
             ctx,
-            &enc,
+            enc,
             tail.output_quant,
             &out_w,
             &normed,
@@ -11312,24 +11378,33 @@ impl MetalBackend {
             tail.rows,
         );
         enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        for lane in 0..batch {
+        for (lane, token_buf) in token_bufs.iter().enumerate() {
             compute::encode_argmax_f32_at(
                 ctx,
-                &enc,
+                enc,
                 &logits,
                 lane * tail.rows * std::mem::size_of::<f32>(),
-                &token_bufs[lane],
+                token_buf,
                 &rows_buf,
             );
         }
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+
+        BatchedOutputTailBuffers { logits, token_bufs }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_decode_chain_batched_output_argmax(
+        buffers: &BatchedOutputTailBuffers,
+        batch: usize,
+        rows: usize,
+        reports: &mut [DecodeChainReport],
+        out_output_logits: Option<&mut Vec<f32>>,
+    ) {
         if let Some(out) = out_output_logits {
             let values = unsafe {
                 std::slice::from_raw_parts(
-                    logits.contents().as_ptr() as *const f32,
-                    batch * tail.rows,
+                    buffers.logits.contents().as_ptr() as *const f32,
+                    batch * rows,
                 )
             };
             out.clear();
@@ -11337,7 +11412,7 @@ impl MetalBackend {
         }
 
         for (lane, report) in reports.iter_mut().enumerate().take(batch) {
-            let token = unsafe { *(token_bufs[lane].contents().as_ptr() as *const u32) };
+            let token = unsafe { *(buffers.token_bufs[lane].contents().as_ptr() as *const u32) };
             report.argmax_only = true;
             report.output_argmax = OutputArgmaxReport {
                 attempted: true,
