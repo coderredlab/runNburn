@@ -145,6 +145,7 @@ impl Engine {
     }
 
     pub fn clear_sequence_state(&mut self) -> crate::error::Result<()> {
+        let has_loaded_model = self.has_weights();
         self.kv_cache.clear();
         self.sequence_cursor = None;
         if let Some(model) = self
@@ -155,7 +156,11 @@ impl Engine {
             model.clear_state();
         }
         self.mtp_clear_sequence_state();
-        self.backend_runtime.clear_sequence_state()
+        if has_loaded_model {
+            self.backend_runtime.clear_sequence_state()
+        } else {
+            Ok(())
+        }
     }
 
     #[allow(dead_code)]

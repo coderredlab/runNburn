@@ -1711,6 +1711,8 @@ mod tests {
 
     #[test]
     fn engine_checkpoint_restore_preserves_ssm_delta_allocation() {
+        #[cfg(feature = "cuda")]
+        let _sequence_state_guard = crate::cuda_sequence_state_test_lock();
         let mut engine = make_spec_test_engine(9);
         engine.kv_cache.init_ssm_state(0, 3, 4, 1, 2, 2);
 
@@ -1832,6 +1834,11 @@ mod tests {
         )
         .expect("CUDA resident delta should be enabled")
         .expect("second resident delta call");
+
+        // A mock engine has no backend-owned sequence state and must not clear
+        // another loaded engine's process-global CUDA resident state.
+        let mut unrelated_mock = make_spec_test_engine(9);
+        unrelated_mock.clear_sequence_state().unwrap();
 
         checkpoint.restore_engine(&mut engine).unwrap();
         let restored = crate::engine::cuda_runtime::sync_delta_state_cache(
