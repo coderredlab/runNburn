@@ -129,6 +129,18 @@ pub struct MetalGemmaPrefillQkvOTailRequest<'a> {
     pub softcap: Option<f32>,
 }
 
+pub struct MetalGemmaPrefillFullLayerRequest<'a> {
+    pub attention: MetalGemmaPrefillQkvOTailRequest<'a>,
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub ffn_gate_weight: MetalQuantWeightRef<'a>,
+    pub ffn_up_weight: MetalQuantWeightRef<'a>,
+    pub ffn_down_weight: MetalQuantWeightRef<'a>,
+    pub ffn_dim: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35RouteAlgorithm {
     SelectedSoftmaxTopKLowerExpertTieV1,
@@ -5336,6 +5348,125 @@ pub fn metal_gemma_prefill_qkv_o_tail_if_supported(
             )
             .map(|result| {
                 result.map(|(hidden, k_bits, v_bits)| MetalPrefillAtnOTailOut {
+                    hidden,
+                    k_bits,
+                    v_bits,
+                })
+            })
+    })
+}
+
+pub fn metal_gemma_prefill_full_layer_if_supported(
+    req: MetalGemmaPrefillFullLayerRequest<'_>,
+) -> Result<Option<MetalPrefillAtnFullLayerOut>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_FULL_LAYER_CHAIN") {
+        return Ok(None);
+    }
+    let attention = req.attention;
+    if attention.head_dim == 512 && env_falsey("RNB_METAL_GEMMA_PREFILL_GLOBAL_QKV_O_CHAIN") {
+        return Ok(None);
+    }
+    let Some(q_quant) = tensorops_quant_from_ggml(attention.q_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(k_quant) = tensorops_quant_from_ggml(attention.k_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(v_quant) = tensorops_quant_from_ggml(attention.v_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(o_quant) = tensorops_quant_from_ggml(attention.o_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_gate_quant) = tensorops_quant_from_ggml(req.ffn_gate_weight.ggml_type) else {
+        return Ok(None);
+    };
+    let Some(ffn_up_quant) = tensorops_quant_from_ggml(req.ffn_up_weight.ggml_type) else {
+        return Ok(None);
+    };
+    let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight.ggml_type) else {
+        return Ok(None);
+    };
+    let view = |raw, quant, rows, cols| rnb_backend_metal::PrefillAtnCoreWeightView {
+        raw,
+        quant,
+        rows,
+        cols,
+    };
+    METAL.with(|backend| {
+        backend
+            .prefill_gemma_full_layer_if_supported(
+                rnb_backend_metal::GemmaPrefillFullLayerBackendRequest {
+                    attention: rnb_backend_metal::GemmaPrefillQkvOTailBackendRequest {
+                        normed: attention.normed,
+                        q_norm_w: attention.q_norm_w,
+                        k_norm_w: attention.k_norm_w,
+                        rope_freq_factors: attention.rope_freq_factors,
+                        v_from_k: attention.v_from_k,
+                        q_weight: view(
+                            attention.q_weight_raw,
+                            q_quant,
+                            attention.q_weight_rows,
+                            attention.q_weight_cols,
+                        ),
+                        k_weight: view(
+                            attention.k_weight_raw,
+                            k_quant,
+                            attention.k_weight_rows,
+                            attention.k_weight_cols,
+                        ),
+                        v_weight: view(
+                            attention.v_weight_raw,
+                            v_quant,
+                            attention.v_weight_rows,
+                            attention.v_weight_cols,
+                        ),
+                        o_weight: view(
+                            attention.o_weight_raw,
+                            o_quant,
+                            attention.o_weight_rows,
+                            attention.o_weight_cols,
+                        ),
+                        seq_len: attention.seq_len,
+                        num_heads: attention.num_heads,
+                        num_kv_heads: attention.num_kv_heads,
+                        head_dim: attention.head_dim,
+                        hidden_dim: attention.hidden_dim,
+                        q_dim: attention.q_dim,
+                        kv_dim: attention.kv_dim,
+                        rope_theta: attention.rope_theta,
+                        scale: attention.scale,
+                        norm_eps: attention.norm_eps,
+                        sliding_window: attention.sliding_window,
+                        softcap: attention.softcap,
+                    },
+                    hidden: req.hidden,
+                    post_attn_norm_w: req.post_attn_norm_w,
+                    ffn_norm_w: req.ffn_norm_w,
+                    post_ffn_norm_w: req.post_ffn_norm_w,
+                    ffn_gate_weight: view(
+                        req.ffn_gate_weight.raw,
+                        ffn_gate_quant,
+                        req.ffn_gate_weight.rows,
+                        req.ffn_gate_weight.cols,
+                    ),
+                    ffn_up_weight: view(
+                        req.ffn_up_weight.raw,
+                        ffn_up_quant,
+                        req.ffn_up_weight.rows,
+                        req.ffn_up_weight.cols,
+                    ),
+                    ffn_down_weight: view(
+                        req.ffn_down_weight.raw,
+                        ffn_down_quant,
+                        req.ffn_down_weight.rows,
+                        req.ffn_down_weight.cols,
+                    ),
+                    ffn_dim: req.ffn_dim,
+                },
+            )
+            .map(|result| {
+                result.map(|(hidden, k_bits, v_bits)| MetalPrefillAtnFullLayerOut {
                     hidden,
                     k_bits,
                     v_bits,

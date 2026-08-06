@@ -7,14 +7,17 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 use crate::compute::{
     self, encode_cast_f32_to_f16, encode_flash_attn_prefill_gemma, encode_prefill_neox_qk_norm,
     MetalContext,
 };
 use crate::ffn_chain::{
-    empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, shared_f32_buf, u32_buf,
+    empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, private_f16_buf,
+    private_f32_buf, shared_f32_buf, u32_buf,
 };
 use crate::prefill_atn_core_chain::{encode_quant_gemm_v2, ensure_command_completed};
 use crate::TensoropsQuant;
@@ -60,6 +63,25 @@ pub(crate) struct GemmaPrefillQkvOTailCarrier {
     normed_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kv_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+pub(crate) struct GemmaPrefillFullLayerCarrier {
+    pub attention: GemmaPrefillQkvOTailCarrier,
+    ffn_dim: usize,
+    hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_attn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_attn_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_normed_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_normed_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_up_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_act_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_down_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_ffn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_ffn_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl GemmaPrefillQkvOTailCarrier {
@@ -151,6 +173,73 @@ impl GemmaPrefillQkvOTailCarrier {
     }
 }
 
+impl GemmaPrefillFullLayerCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_dim: usize,
+        q_dim: usize,
+        ffn_dim: usize,
+        rope_theta: f32,
+        scale: f32,
+        norm_eps: f32,
+    ) -> Self {
+        Self {
+            attention: GemmaPrefillQkvOTailCarrier::new(
+                ctx,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                rope_theta,
+                scale,
+                norm_eps,
+            ),
+            ffn_dim,
+            hidden_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
+            post_attn_norm_w_dev: shared_f32_buf(ctx, &vec![0.0; hidden_dim]),
+            post_attn_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            ffn_norm_w_dev: shared_f32_buf(ctx, &vec![0.0; hidden_dim]),
+            ffn_normed_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            ffn_normed_f16_dev: private_f16_buf(ctx, seq_len * hidden_dim),
+            ffn_gate_dev: private_f32_buf(ctx, seq_len * ffn_dim),
+            ffn_up_dev: private_f32_buf(ctx, seq_len * ffn_dim),
+            ffn_act_f16_dev: private_f16_buf(ctx, seq_len * ffn_dim),
+            ffn_down_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            post_ffn_norm_w_dev: shared_f32_buf(ctx, &vec![0.0; hidden_dim]),
+            post_ffn_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            ffn_dim_buf: u32_buf(ctx, ffn_dim as u32),
+            ffn_elems_buf: u32_buf(ctx, (seq_len * ffn_dim) as u32),
+        }
+    }
+
+    fn upload(
+        &self,
+        hidden: &[f32],
+        post_attn_norm_w: &[f32],
+        ffn_norm_w: &[f32],
+        post_ffn_norm_w: &[f32],
+    ) {
+        debug_assert_eq!(
+            hidden.len(),
+            self.attention.seq_len * self.attention.hidden_dim
+        );
+        debug_assert_eq!(post_attn_norm_w.len(), self.attention.hidden_dim);
+        debug_assert_eq!(ffn_norm_w.len(), self.attention.hidden_dim);
+        debug_assert_eq!(post_ffn_norm_w.len(), self.attention.hidden_dim);
+        copy_f32(hidden, &self.hidden_dev);
+        copy_f32(post_attn_norm_w, &self.post_attn_norm_w_dev);
+        copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
+        copy_f32(post_ffn_norm_w, &self.post_ffn_norm_w_dev);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) struct GemmaPrefillQkvOTailDispatchRequest<'a> {
     pub normed: &'a [f32],
@@ -174,35 +263,39 @@ pub(crate) struct GemmaPrefillQkvOTailDispatchRequest<'a> {
     pub softcap: Option<f32>,
 }
 
-pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct GemmaPrefillFullLayerDispatchRequest<'a> {
+    pub attention: GemmaPrefillQkvOTailDispatchRequest<'a>,
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub ffn_gate_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_gate_w_off: u32,
+    pub ffn_gate_quant: TensoropsQuant,
+    pub ffn_up_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_up_w_off: u32,
+    pub ffn_up_quant: TensoropsQuant,
+    pub ffn_down_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_down_w_off: u32,
+    pub ffn_down_quant: TensoropsQuant,
+}
+
+fn encode_gemma_qkv_o(
     ctx: &MetalContext,
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &GemmaPrefillQkvOTailCarrier,
-    req: GemmaPrefillQkvOTailDispatchRequest<'_>,
-) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
-    carrier.upload(
-        req.normed,
-        req.q_norm_w,
-        req.k_norm_w,
-        req.rope_freq_factors,
-    );
-
-    let command = ctx
-        .queue
-        .commandBuffer()
-        .ok_or_else(|| "Metal Gemma prefill carrier: command buffer creation failed".to_string())?;
-    let encoder = command
-        .computeCommandEncoder()
-        .ok_or_else(|| "Metal Gemma prefill carrier: encoder creation failed".to_string())?;
-
+    req: &GemmaPrefillQkvOTailDispatchRequest<'_>,
+) {
     encode_cast_f32_to_f16(
         ctx,
-        &encoder,
+        encoder,
         &carrier.normed_dev,
         &carrier.normed_f16_dev,
         &carrier.normed_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
     );
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     for (enabled, quant, weight, offset, output, output_dim, output_dim_buf) in [
         (
             true,
@@ -237,7 +330,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         }
         encode_quant_gemm_v2(
             ctx,
-            &encoder,
+            encoder,
             quant,
             weight,
             offset,
@@ -250,10 +343,10 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
             carrier.seq_len,
         );
     }
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     encode_prefill_neox_qk_norm(
         ctx,
-        &encoder,
+        encoder,
         &carrier.q_dev,
         &carrier.q_norm_w_dev,
         &carrier.q_rope_dev,
@@ -269,7 +362,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
     );
     encode_prefill_neox_qk_norm(
         ctx,
-        &encoder,
+        encoder,
         &carrier.k_dev,
         &carrier.k_norm_w_dev,
         &carrier.k_rope_dev,
@@ -285,7 +378,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
     );
     encode_prefill_neox_qk_norm(
         ctx,
-        &encoder,
+        encoder,
         if req.v_from_k {
             &carrier.k_dev
         } else {
@@ -303,10 +396,10 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         carrier.seq_len,
         carrier.num_kv_heads,
     );
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     encode_cast_f32_to_f16(
         ctx,
-        &encoder,
+        encoder,
         &carrier.k_rope_dev,
         &carrier.k_f16_dev,
         &carrier.kv_elems_buf,
@@ -314,16 +407,16 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
     );
     encode_cast_f32_to_f16(
         ctx,
-        &encoder,
+        encoder,
         &carrier.v_norm_dev,
         &carrier.v_f16_dev,
         &carrier.kv_elems_buf,
         carrier.seq_len * carrier.kv_dim,
     );
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     encode_flash_attn_prefill_gemma(
         ctx,
-        &encoder,
+        encoder,
         &carrier.q_rope_dev,
         &carrier.k_f16_dev,
         &carrier.v_f16_dev,
@@ -339,19 +432,19 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         carrier.num_heads,
         carrier.seq_len,
     );
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     encode_cast_f32_to_f16(
         ctx,
-        &encoder,
+        encoder,
         &carrier.attn_out_dev,
         &carrier.attn_out_f16_dev,
         &carrier.q_elems_buf,
         carrier.seq_len * carrier.q_dim,
     );
-    compute::chain_barrier(ctx, &encoder);
+    compute::chain_barrier(ctx, encoder);
     encode_quant_gemm_v2(
         ctx,
-        &encoder,
+        encoder,
         req.o_quant,
         req.o_w_buf,
         req.o_w_off,
@@ -363,7 +456,28 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         carrier.hidden_dim,
         carrier.seq_len,
     );
+}
 
+pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
+    ctx: &MetalContext,
+    carrier: &GemmaPrefillQkvOTailCarrier,
+    req: GemmaPrefillQkvOTailDispatchRequest<'_>,
+) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
+    carrier.upload(
+        req.normed,
+        req.q_norm_w,
+        req.k_norm_w,
+        req.rope_freq_factors,
+    );
+
+    let command = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal Gemma prefill carrier: command buffer creation failed".to_string())?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Gemma prefill carrier: encoder creation failed".to_string())?;
+    encode_gemma_qkv_o(ctx, &encoder, carrier, &req);
     encoder.endEncoding();
     command.commit();
     command.waitUntilCompleted();
@@ -372,6 +486,161 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         readback_f32(&carrier.o_proj_dev, carrier.seq_len * carrier.hidden_dim),
         readback_u16(&carrier.k_f16_dev, carrier.seq_len * carrier.kv_dim),
         readback_u16(&carrier.v_f16_dev, carrier.seq_len * carrier.kv_dim),
+    ))
+}
+
+pub(crate) fn prefill_gemma_full_layer_dispatch(
+    ctx: &MetalContext,
+    carrier: &GemmaPrefillFullLayerCarrier,
+    req: GemmaPrefillFullLayerDispatchRequest<'_>,
+) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
+    let attention = &carrier.attention;
+    attention.upload(
+        req.attention.normed,
+        req.attention.q_norm_w,
+        req.attention.k_norm_w,
+        req.attention.rope_freq_factors,
+    );
+    carrier.upload(
+        req.hidden,
+        req.post_attn_norm_w,
+        req.ffn_norm_w,
+        req.post_ffn_norm_w,
+    );
+
+    let command = ctx.queue.commandBuffer().ok_or_else(|| {
+        "Metal Gemma prefill full layer: command buffer creation failed".to_string()
+    })?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Gemma prefill full layer: encoder creation failed".to_string())?;
+    encode_gemma_qkv_o(ctx, &encoder, attention, &req.attention);
+    compute::chain_barrier(ctx, &encoder);
+    compute::encode_rms_norm_batch(
+        ctx,
+        &encoder,
+        &attention.o_proj_dev,
+        &carrier.post_attn_norm_w_dev,
+        &carrier.post_attn_dev,
+        &attention.hidden_dim_buf,
+        &attention.eps_buf,
+        attention.seq_len,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &encoder,
+        &carrier.hidden_dev,
+        &carrier.post_attn_dev,
+        &attention.normed_elems_buf,
+        attention.seq_len * attention.hidden_dim,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    compute::encode_rms_norm_batch(
+        ctx,
+        &encoder,
+        &carrier.hidden_dev,
+        &carrier.ffn_norm_w_dev,
+        &carrier.ffn_normed_dev,
+        &attention.hidden_dim_buf,
+        &attention.eps_buf,
+        attention.seq_len,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    encode_cast_f32_to_f16(
+        ctx,
+        &encoder,
+        &carrier.ffn_normed_dev,
+        &carrier.ffn_normed_f16_dev,
+        &attention.normed_elems_buf,
+        attention.seq_len * attention.hidden_dim,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    encode_quant_gemm_v2(
+        ctx,
+        &encoder,
+        req.ffn_gate_quant,
+        req.ffn_gate_w_buf,
+        req.ffn_gate_w_off,
+        &carrier.ffn_normed_f16_dev,
+        &carrier.ffn_gate_dev,
+        &carrier.ffn_dim_buf,
+        &attention.hidden_dim_buf,
+        &attention.seq_buf,
+        carrier.ffn_dim,
+        attention.seq_len,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &encoder,
+        req.ffn_up_quant,
+        req.ffn_up_w_buf,
+        req.ffn_up_w_off,
+        &carrier.ffn_normed_f16_dev,
+        &carrier.ffn_up_dev,
+        &carrier.ffn_dim_buf,
+        &attention.hidden_dim_buf,
+        &attention.seq_buf,
+        carrier.ffn_dim,
+        attention.seq_len,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    compute::encode_gelu_mul_to_f16(
+        ctx,
+        &encoder,
+        &carrier.ffn_gate_dev,
+        &carrier.ffn_up_dev,
+        &carrier.ffn_act_f16_dev,
+        &carrier.ffn_elems_buf,
+        attention.seq_len * carrier.ffn_dim,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    encode_quant_gemm_v2(
+        ctx,
+        &encoder,
+        req.ffn_down_quant,
+        req.ffn_down_w_buf,
+        req.ffn_down_w_off,
+        &carrier.ffn_act_f16_dev,
+        &carrier.ffn_down_dev,
+        &attention.hidden_dim_buf,
+        &carrier.ffn_dim_buf,
+        &attention.seq_buf,
+        attention.hidden_dim,
+        attention.seq_len,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    compute::encode_rms_norm_batch(
+        ctx,
+        &encoder,
+        &carrier.ffn_down_dev,
+        &carrier.post_ffn_norm_w_dev,
+        &carrier.post_ffn_dev,
+        &attention.hidden_dim_buf,
+        &attention.eps_buf,
+        attention.seq_len,
+    );
+    compute::chain_barrier(ctx, &encoder);
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &encoder,
+        &carrier.hidden_dev,
+        &carrier.post_ffn_dev,
+        &attention.normed_elems_buf,
+        attention.seq_len * attention.hidden_dim,
+    );
+
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    ensure_command_completed(&command)?;
+    Ok((
+        readback_f32(
+            &carrier.hidden_dev,
+            attention.seq_len * attention.hidden_dim,
+        ),
+        readback_u16(&attention.k_f16_dev, attention.seq_len * attention.kv_dim),
+        readback_u16(&attention.v_f16_dev, attention.seq_len * attention.kv_dim),
     ))
 }
 

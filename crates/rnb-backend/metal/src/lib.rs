@@ -1363,6 +1363,16 @@ struct GemmaPrefillQkvOTailCarrierKey {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GemmaPrefillFullLayerCarrierKey {
+    attention: GemmaPrefillQkvOTailCarrierKey,
+    ffn_dim: usize,
+    ffn_gate_quant: TensoropsQuant,
+    ffn_up_quant: TensoropsQuant,
+    ffn_down_quant: TensoropsQuant,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillAtnCoreWeightView<'a> {
     pub raw: &'a [u8],
@@ -1395,6 +1405,20 @@ pub struct GemmaPrefillQkvOTailBackendRequest<'a> {
     pub norm_eps: f32,
     pub sliding_window: Option<usize>,
     pub softcap: Option<f32>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct GemmaPrefillFullLayerBackendRequest<'a> {
+    pub attention: GemmaPrefillQkvOTailBackendRequest<'a>,
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub ffn_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_dim: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -1780,6 +1804,13 @@ pub struct MetalBackend {
             prefill_gemma_attn_chain::GemmaPrefillQkvOTailCarrier,
         >,
     >,
+    /// Gemma prefill attention→post norms/residual→GeGLU FFN full-layer carrier.
+    gemma_prefill_full_layer_carriers: RefCell<
+        HashMap<
+            GemmaPrefillFullLayerCarrierKey,
+            prefill_gemma_attn_chain::GemmaPrefillFullLayerCarrier,
+        >,
+    >,
     qwen_prefill_gdn_carriers:
         RefCell<HashMap<QwenGdnPrefillCarrierKey, gdn_chain::QwenGdnPrefillCarrier>>,
     qwen_prefill_atn_o_tail_carriers:
@@ -2013,6 +2044,7 @@ impl MetalBackend {
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
+                gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 qkv_carriers: RefCell::new(HashMap::new()),
@@ -2196,6 +2228,7 @@ impl MetalBackend {
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
             prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
+            gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             qkv_carriers: RefCell::new(HashMap::new()),
@@ -3927,6 +3960,273 @@ impl MetalBackend {
                 o_quant: req.o_weight.quant,
                 sliding_window: req.sliding_window,
                 softcap: req.softcap,
+            },
+        )?;
+        Ok(Some(output))
+    }
+
+    /// Gemma dense layer: attention carrier output, post-attention norm/residual,
+    /// GeGLU FFN, post-FFN norm, and final residual in one command buffer.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_gemma_full_layer_if_supported(
+        &self,
+        req: GemmaPrefillFullLayerBackendRequest<'_>,
+    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        let attention = req.attention;
+        let flash_supported = match attention.head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !flash_supported
+            || ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.q_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.k_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.v_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.o_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_gate_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_up_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_down_weight.quant)
+        {
+            return Ok(None);
+        }
+        if attention.seq_len == 0 || req.ffn_dim == 0 {
+            return Err(
+                "Metal Gemma prefill full layer: seq_len and ffn_dim must be > 0".to_string(),
+            );
+        }
+        if attention.num_heads == 0
+            || attention.num_kv_heads == 0
+            || attention.num_heads % attention.num_kv_heads != 0
+        {
+            return Err("Metal Gemma prefill full layer: invalid GQA head counts".to_string());
+        }
+        if attention.sliding_window.is_some_and(|window| window == 0) {
+            return Err("Metal Gemma prefill full layer: sliding window must be > 0".to_string());
+        }
+        if !attention.rope_theta.is_finite()
+            || attention.rope_theta <= 0.0
+            || !attention.scale.is_finite()
+            || !attention.norm_eps.is_finite()
+            || attention.norm_eps <= 0.0
+            || attention
+                .softcap
+                .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+        {
+            return Err("Metal Gemma prefill full layer: invalid numeric parameter".to_string());
+        }
+
+        let expected_q_dim =
+            Self::atn_core_checked_mul(attention.num_heads, attention.head_dim, "q_dim")?;
+        let expected_kv_dim =
+            Self::atn_core_checked_mul(attention.num_kv_heads, attention.head_dim, "kv_dim")?;
+        let expected_hidden =
+            Self::atn_core_checked_mul(attention.seq_len, attention.hidden_dim, "hidden len")?;
+        Self::atn_core_require_eq("q_dim", attention.q_dim, expected_q_dim)?;
+        Self::atn_core_require_eq("kv_dim", attention.kv_dim, expected_kv_dim)?;
+        Self::atn_core_require_eq("normed len", attention.normed.len(), expected_hidden)?;
+        Self::atn_core_require_eq("hidden len", req.hidden.len(), expected_hidden)?;
+        Self::atn_core_require_eq("q_norm_w len", attention.q_norm_w.len(), attention.head_dim)?;
+        Self::atn_core_require_eq("k_norm_w len", attention.k_norm_w.len(), attention.head_dim)?;
+        for (role, norm) in [
+            ("post_attn_norm", req.post_attn_norm_w),
+            ("ffn_norm", req.ffn_norm_w),
+            ("post_ffn_norm", req.post_ffn_norm_w),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} len"), norm.len(), attention.hidden_dim)?;
+        }
+        if let Some(factors) = attention.rope_freq_factors {
+            Self::atn_core_require_eq(
+                "rope_freq_factors len",
+                factors.len(),
+                attention.head_dim / 2,
+            )?;
+            if factors
+                .iter()
+                .any(|factor| !factor.is_finite() || *factor <= 0.0)
+            {
+                return Err(
+                    "Metal Gemma prefill full layer: invalid RoPE frequency factor".to_string(),
+                );
+            }
+        }
+        for (role, weight, rows, cols) in [
+            (
+                "q",
+                attention.q_weight,
+                attention.q_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "k",
+                attention.k_weight,
+                attention.kv_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "v",
+                attention.v_weight,
+                attention.kv_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "o",
+                attention.o_weight,
+                attention.hidden_dim,
+                attention.q_dim,
+            ),
+            (
+                "ffn gate",
+                req.ffn_gate_weight,
+                req.ffn_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "ffn up",
+                req.ffn_up_weight,
+                req.ffn_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "ffn down",
+                req.ffn_down_weight,
+                attention.hidden_dim,
+                req.ffn_dim,
+            ),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} weight rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} weight cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+
+        let (
+            q_w_buf,
+            q_w_off,
+            k_w_buf,
+            k_w_off,
+            v_w_buf,
+            v_w_off,
+            o_w_buf,
+            o_w_off,
+            ffn_gate_w_buf,
+            ffn_gate_w_off,
+            ffn_up_w_buf,
+            ffn_up_w_off,
+            ffn_down_w_buf,
+            ffn_down_w_off,
+        ) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (q_w_buf, q_w_off) = wrap(attention.q_weight.raw);
+            let (k_w_buf, k_w_off) = wrap(attention.k_weight.raw);
+            let (v_w_buf, v_w_off) = wrap(attention.v_weight.raw);
+            let (o_w_buf, o_w_off) = wrap(attention.o_weight.raw);
+            let (ffn_gate_w_buf, ffn_gate_w_off) = wrap(req.ffn_gate_weight.raw);
+            let (ffn_up_w_buf, ffn_up_w_off) = wrap(req.ffn_up_weight.raw);
+            let (ffn_down_w_buf, ffn_down_w_off) = wrap(req.ffn_down_weight.raw);
+            (
+                q_w_buf,
+                q_w_off,
+                k_w_buf,
+                k_w_off,
+                v_w_buf,
+                v_w_off,
+                o_w_buf,
+                o_w_off,
+                ffn_gate_w_buf,
+                ffn_gate_w_off,
+                ffn_up_w_buf,
+                ffn_up_w_off,
+                ffn_down_w_buf,
+                ffn_down_w_off,
+            )
+        };
+        let attention_key = GemmaPrefillQkvOTailCarrierKey {
+            seq_len: attention.seq_len,
+            num_heads: attention.num_heads,
+            num_kv_heads: attention.num_kv_heads,
+            head_dim: attention.head_dim,
+            hidden_dim: attention.hidden_dim,
+            q_dim: attention.q_dim,
+            rope_theta_bits: attention.rope_theta.to_bits(),
+            scale_bits: attention.scale.to_bits(),
+            norm_eps_bits: attention.norm_eps.to_bits(),
+            sliding_window: attention.sliding_window,
+            softcap_bits: attention.softcap.map(f32::to_bits),
+            q_quant: attention.q_weight.quant,
+            k_quant: attention.k_weight.quant,
+            v_quant: attention.v_weight.quant,
+            o_quant: attention.o_weight.quant,
+        };
+        let key = GemmaPrefillFullLayerCarrierKey {
+            attention: attention_key,
+            ffn_dim: req.ffn_dim,
+            ffn_gate_quant: req.ffn_gate_weight.quant,
+            ffn_up_quant: req.ffn_up_weight.quant,
+            ffn_down_quant: req.ffn_down_weight.quant,
+        };
+        let mut carriers = self.gemma_prefill_full_layer_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_gemma_attn_chain::GemmaPrefillFullLayerCarrier::new(
+                ctx,
+                attention.seq_len,
+                attention.num_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.hidden_dim,
+                attention.q_dim,
+                req.ffn_dim,
+                attention.rope_theta,
+                attention.scale,
+                attention.norm_eps,
+            )
+        });
+        let output = prefill_gemma_attn_chain::prefill_gemma_full_layer_dispatch(
+            ctx,
+            carrier,
+            prefill_gemma_attn_chain::GemmaPrefillFullLayerDispatchRequest {
+                attention: prefill_gemma_attn_chain::GemmaPrefillQkvOTailDispatchRequest {
+                    normed: attention.normed,
+                    q_norm_w: attention.q_norm_w,
+                    k_norm_w: attention.k_norm_w,
+                    rope_freq_factors: attention.rope_freq_factors,
+                    v_from_k: attention.v_from_k,
+                    q_w_buf: &q_w_buf,
+                    q_w_off,
+                    q_quant: attention.q_weight.quant,
+                    k_w_buf: &k_w_buf,
+                    k_w_off,
+                    k_quant: attention.k_weight.quant,
+                    v_w_buf: &v_w_buf,
+                    v_w_off,
+                    v_quant: attention.v_weight.quant,
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: attention.o_weight.quant,
+                    sliding_window: attention.sliding_window,
+                    softcap: attention.softcap,
+                },
+                hidden: req.hidden,
+                post_attn_norm_w: req.post_attn_norm_w,
+                ffn_norm_w: req.ffn_norm_w,
+                post_ffn_norm_w: req.post_ffn_norm_w,
+                ffn_gate_w_buf: &ffn_gate_w_buf,
+                ffn_gate_w_off,
+                ffn_gate_quant: req.ffn_gate_weight.quant,
+                ffn_up_w_buf: &ffn_up_w_buf,
+                ffn_up_w_off,
+                ffn_up_quant: req.ffn_up_weight.quant,
+                ffn_down_w_buf: &ffn_down_w_buf,
+                ffn_down_w_off,
+                ffn_down_quant: req.ffn_down_weight.quant,
             },
         )?;
         Ok(Some(output))
@@ -15148,48 +15448,90 @@ kernel void coop_right_direct_fill_probe(
         let k_w = quantize_rows_q4k(&det_vals(kv_dim * hidden, 0.009), kv_dim, hidden);
         let v_w = quantize_rows_q4k(&det_vals(kv_dim * hidden, 0.005), kv_dim, hidden);
         let o_w = quantize_rows_q4k(&det_vals(hidden * q_dim, 0.006), hidden, q_dim);
+        let ffn_dim = 512usize;
+        let hidden_input = det_vals(seq * hidden, 0.017);
+        let post_attn_norm = det_vals(hidden, 0.009)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let ffn_norm = det_vals(hidden, 0.008)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let post_ffn_norm = det_vals(hidden, 0.007)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let ffn_gate_w = quantize_rows_q4k(&det_vals(ffn_dim * hidden, 0.004), ffn_dim, hidden);
+        let ffn_up_w = quantize_rows_q4k(&det_vals(ffn_dim * hidden, 0.003), ffn_dim, hidden);
+        let ffn_down_w = quantize_rows_q4k(&det_vals(hidden * ffn_dim, 0.002), hidden, ffn_dim);
         let q_storage = mapped_test_tensor(&q_w);
         let k_storage = mapped_test_tensor(&k_w);
         let v_storage = mapped_test_tensor(&v_w);
         let o_storage = mapped_test_tensor(&o_w);
+        let ffn_gate_storage = mapped_test_tensor(&ffn_gate_w);
+        let ffn_up_storage = mapped_test_tensor(&ffn_up_w);
+        let ffn_down_storage = mapped_test_tensor(&ffn_down_w);
         let q_raw = q_storage.as_bytes().expect("q mapped bytes");
         let k_raw = k_storage.as_bytes().expect("k mapped bytes");
         let v_raw = v_storage.as_bytes().expect("v mapped bytes");
         let o_raw = o_storage.as_bytes().expect("o mapped bytes");
+        let ffn_gate_raw = ffn_gate_storage.as_bytes().expect("ffn gate mapped bytes");
+        let ffn_up_raw = ffn_up_storage.as_bytes().expect("ffn up mapped bytes");
+        let ffn_down_raw = ffn_down_storage.as_bytes().expect("ffn down mapped bytes");
         let view = |raw, rows, cols| PrefillAtnCoreWeightView {
             raw,
             quant: TensoropsQuant::Q4K,
             rows,
             cols,
         };
+        let attention_req = GemmaPrefillQkvOTailBackendRequest {
+            normed: &normed,
+            q_norm_w: &q_norm,
+            k_norm_w: &k_norm,
+            rope_freq_factors: rope_freq_factors.as_deref(),
+            v_from_k,
+            q_weight: view(q_raw, q_dim, hidden),
+            k_weight: view(k_raw, kv_dim, hidden),
+            v_weight: view(if v_from_k { k_raw } else { v_raw }, kv_dim, hidden),
+            o_weight: view(o_raw, hidden, q_dim),
+            seq_len: seq,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_dim: hidden,
+            q_dim,
+            kv_dim,
+            rope_theta: theta,
+            scale,
+            norm_eps: eps,
+            sliding_window,
+            softcap,
+        };
         let Some((actual_o, actual_k, actual_v)) = backend
-            .prefill_gemma_qkv_o_tail_if_supported(GemmaPrefillQkvOTailBackendRequest {
-                normed: &normed,
-                q_norm_w: &q_norm,
-                k_norm_w: &k_norm,
-                rope_freq_factors: rope_freq_factors.as_deref(),
-                v_from_k,
-                q_weight: view(q_raw, q_dim, hidden),
-                k_weight: view(k_raw, kv_dim, hidden),
-                v_weight: view(if v_from_k { k_raw } else { v_raw }, kv_dim, hidden),
-                o_weight: view(o_raw, hidden, q_dim),
-                seq_len: seq,
-                num_heads: nh,
-                num_kv_heads: nkv,
-                head_dim: hd,
-                hidden_dim: hidden,
-                q_dim,
-                kv_dim,
-                rope_theta: theta,
-                scale,
-                norm_eps: eps,
-                sliding_window,
-                softcap,
-            })
+            .prefill_gemma_qkv_o_tail_if_supported(attention_req)
             .expect("Gemma carrier dispatch")
         else {
             panic!("Gemma HD{hd} carrier unexpectedly unsupported");
         };
+        let Some((actual_full, full_k, full_v)) = backend
+            .prefill_gemma_full_layer_if_supported(GemmaPrefillFullLayerBackendRequest {
+                attention: attention_req,
+                hidden: &hidden_input,
+                post_attn_norm_w: &post_attn_norm,
+                ffn_norm_w: &ffn_norm,
+                post_ffn_norm_w: &post_ffn_norm,
+                ffn_gate_weight: view(ffn_gate_raw, ffn_dim, hidden),
+                ffn_up_weight: view(ffn_up_raw, ffn_dim, hidden),
+                ffn_down_weight: view(ffn_down_raw, hidden, ffn_dim),
+                ffn_dim,
+            })
+            .expect("Gemma full-layer carrier dispatch")
+        else {
+            panic!("Gemma HD{hd} full-layer carrier unexpectedly unsupported");
+        };
+        assert_eq!(full_k, actual_k);
+        assert_eq!(full_v, actual_v);
 
         let gemm_input = normed
             .iter()
@@ -15274,12 +15616,64 @@ kernel void coop_right_direct_fill_probe(
             .zip(&expected_o)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
+        let rms_rows = |values: &[f32], weight: &[f32]| {
+            let mut output = vec![0.0f32; values.len()];
+            for (input, output) in values
+                .chunks_exact(hidden)
+                .zip(output.chunks_exact_mut(hidden))
+            {
+                rnb_cpu::kernels::norm::rms_norm_into(input, weight, eps, output);
+            }
+            output
+        };
+        let post_attn = rms_rows(&expected_o, &post_attn_norm);
+        let hidden_after_attn = hidden_input
+            .iter()
+            .zip(post_attn)
+            .map(|(hidden, residual)| hidden + residual)
+            .collect::<Vec<_>>();
+        let ffn_normed = rms_rows(&hidden_after_attn, &ffn_norm);
+        let ffn_input = ffn_normed
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        let gate = cpu_q4k_gemm_reference(&ffn_gate_w, ffn_dim, hidden, &ffn_input, seq);
+        let up = cpu_q4k_gemm_reference(&ffn_up_w, ffn_dim, hidden, &ffn_input, seq);
+        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        let activated = gate
+            .iter()
+            .zip(up)
+            .map(|(&gate, up)| {
+                let gelu =
+                    0.5 * gate * (1.0 + (sqrt_2_over_pi * (gate + 0.044715 * gate.powi(3))).tanh());
+                half::f16::from_f32(gelu * up).to_f32()
+            })
+            .collect::<Vec<_>>();
+        let down = cpu_q4k_gemm_reference(&ffn_down_w, hidden, ffn_dim, &activated, seq);
+        let post_ffn = rms_rows(&down, &post_ffn_norm);
+        let expected_full = hidden_after_attn
+            .iter()
+            .zip(post_ffn)
+            .map(|(hidden, residual)| hidden + residual)
+            .collect::<Vec<_>>();
+        let full_max_abs = actual_full
+            .iter()
+            .zip(&expected_full)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
         eprintln!(
             "[pm189] Gemma HD{hd} QKV/O carrier oracle k_max_abs={k_max_abs:.3e} v_max_abs={v_max_abs:.3e} o_max_abs={o_max_abs:.3e}"
+        );
+        eprintln!(
+            "[pm190] Gemma HD{hd} full-layer carrier oracle hidden_max_abs={full_max_abs:.3e}"
         );
         assert!(k_max_abs < 0.1, "HD{hd} K max_abs={k_max_abs}");
         assert!(v_max_abs < 0.1, "HD{hd} V max_abs={v_max_abs}");
         assert!(o_max_abs < 0.5, "HD{hd} O max_abs={o_max_abs}");
+        assert!(
+            full_max_abs < 1.0,
+            "HD{hd} full-layer hidden max_abs={full_max_abs}"
+        );
     }
 
     #[cfg(target_os = "macos")]

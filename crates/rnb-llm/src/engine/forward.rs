@@ -552,8 +552,13 @@ fn forward_attention_layer_impl(
                     )
                     .map_err(crate::error::LlmError::Forward)?;
             }
-            prof("gemma_qkv+qknorm+rope+attn_o_metal", fused_t0);
-            PrefillAttentionStep::PostAttentionHidden(fused.hidden)
+            if fused.final_hidden {
+                prof("gemma_qkv+qknorm+rope+attn_o_ffn_full_metal", fused_t0);
+                PrefillAttentionStep::FinalHidden(fused.hidden)
+            } else {
+                prof("gemma_qkv+qknorm+rope+attn_o_metal", fused_t0);
+                PrefillAttentionStep::PostAttentionHidden(fused.hidden)
+            }
         } else if let Some(fused) = {
             if backend_runtime::metal_prefill_atn_o_tail_requested() {
                 backend_runtime::metal_prefill_atn_o_tail_expected_dense_layer();

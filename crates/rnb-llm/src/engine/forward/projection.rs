@@ -124,6 +124,12 @@ fn atn_kv_dual_metal(
     Ok(None)
 }
 
+pub(super) struct GemmaPrefillMetalLayer {
+    pub hidden: Tensor,
+    pub k_bits: Vec<u16>,
+    pub v_bits: Vec<u16>,
+    pub final_hidden: bool,
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
     metadata: &ModelMetadata,
@@ -138,7 +144,7 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
     seq_len: usize,
     pos_start: usize,
     norm_eps: f32,
-) -> crate::error::Result<Option<PrefillFullAttentionLayer>> {
+) -> crate::error::Result<Option<GemmaPrefillMetalLayer>> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
         let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
@@ -205,6 +211,99 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
                 )
             };
         let hidden_dim = kernels::tensor_as_f32_slice(hidden).len() / seq_len;
+        fn effective_norm(weight: &[f32], unit_offset: bool) -> std::borrow::Cow<'_, [f32]> {
+            if unit_offset {
+                std::borrow::Cow::Owned(weight.iter().map(|value| value + 1.0).collect())
+            } else {
+                std::borrow::Cow::Borrowed(weight)
+            }
+        }
+        let global_unit_offset = policy::gemma_unit_offset_attn_ffn_norm_enabled()
+            || policy::gemma_unit_offset_norm_enabled()
+            || policy::gemma_unit_offset_main_norm_enabled();
+        let post_attn_norm = w.post_attn_norm.as_ref().and_then(|weight| {
+            if gemma_skip_post_attn_enabled(layer_idx)
+                || gemma_effective_skip_post_attn_prefill_enabled(
+                    architecture,
+                    gemma_runtime_flavor,
+                    layer_idx,
+                )
+            {
+                None
+            } else {
+                Some(weight)
+            }
+        });
+        let full_out = if w.moe.is_none()
+            && w.shared_expert_moe.is_none()
+            && w.ffn_gate_up_fused.is_none()
+            && !gemma_effective_skip_ffn_enabled(architecture, gemma_runtime_flavor, layer_idx)
+        {
+            if let (Some(post_attn_norm), Some(post_ffn_norm)) =
+                (post_attn_norm, w.post_ffw_norm.as_ref())
+            {
+                let post_attn_norm = effective_norm(
+                    kernels::tensor_as_f32_slice(post_attn_norm),
+                    global_unit_offset
+                        || gemma_effective_unit_offset_post_attn_enabled(
+                            architecture,
+                            gemma_runtime_flavor,
+                            layer_idx,
+                        )
+                        || gemma_unit_offset_post_attn_prefill_enabled(layer_idx),
+                );
+                let ffn_norm = effective_norm(
+                    kernels::tensor_as_f32_slice(select_ffn_pre_norm_weight(w, architecture)),
+                    global_unit_offset || policy::gemma_unit_offset_ffn_pre_norm_enabled(layer_idx),
+                );
+                let post_ffn_norm = effective_norm(
+                    kernels::tensor_as_f32_slice(post_ffn_norm),
+                    global_unit_offset || policy::gemma_unit_offset_ffn_post_norm_enabled(),
+                );
+                backend_runtime::metal_gemma_prefill_full_layer_if_supported(
+                    kernels::tensor_as_f32_slice(hidden),
+                    kernels::tensor_as_f32_slice(&normed),
+                    q_norm_effective.as_ref(),
+                    k_norm_effective.as_ref(),
+                    freq_factors,
+                    w.v_proj_missing,
+                    post_attn_norm.as_ref(),
+                    ffn_norm.as_ref(),
+                    post_ffn_norm.as_ref(),
+                    &w.q_weight,
+                    &w.k_weight,
+                    &w.v_weight,
+                    &w.o_weight,
+                    &w.ffn_gate_weight,
+                    &w.ffn_up_weight,
+                    &w.ffn_down_weight,
+                    seq_len,
+                    layout.num_heads,
+                    layout.num_kv_heads,
+                    layout.head_dim,
+                    hidden_dim,
+                    layout.q_dim,
+                    layout.kv_dim,
+                    rope_theta,
+                    resolve_attention_scale(metadata, architecture),
+                    norm_eps,
+                    sliding_window,
+                    resolve_attention_softcap(architecture),
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(out) = full_out {
+            return Ok(Some(GemmaPrefillMetalLayer {
+                hidden: Tensor::from_vec(out.hidden, &[seq_len, hidden_dim]),
+                k_bits: out.k_bits,
+                v_bits: out.v_bits,
+                final_hidden: true,
+            }));
+        }
         let out = backend_runtime::metal_gemma_prefill_qkv_o_tail_if_supported(
             kernels::tensor_as_f32_slice(&normed),
             q_norm_effective.as_ref(),
@@ -243,10 +342,11 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
             seq_len,
             norm_eps,
         )?;
-        return Ok(Some(PrefillFullAttentionLayer {
+        return Ok(Some(GemmaPrefillMetalLayer {
             hidden,
             k_bits: out.k_bits,
             v_bits: out.v_bits,
+            final_hidden: false,
         }));
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
