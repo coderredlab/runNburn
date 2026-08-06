@@ -4252,6 +4252,24 @@ impl CudaState {
         gate_dev: u64,
         up_dev: u64,
     ) -> Result<(), String> {
+        if tuning::q4k_gate_up_q8dot_split_enabled() {
+            self.launch_q4k_gemv_q8dot_to_dev(
+                gate_weights,
+                rows,
+                blocks_per_row,
+                input_qs_dev,
+                input_ds_dev,
+                gate_dev,
+            )?;
+            return self.launch_q4k_gemv_q8dot_to_dev(
+                up_weights,
+                rows,
+                blocks_per_row,
+                input_qs_dev,
+                input_ds_dev,
+                up_dev,
+            );
+        }
         let gate_weights_dev = self.resident_q4k_weights_ptr(gate_weights)?;
         let up_weights_dev = self.resident_q4k_weights_ptr(up_weights)?;
         let mut gate_out_arg = gate_dev;

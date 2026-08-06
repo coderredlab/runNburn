@@ -161,6 +161,14 @@ pub fn q4k_gate_up_batch_seq2_q8dot_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_GATE_UP_BATCH_SEQ2_Q8DOT", false)
 }
 
+/// Q4_K dense gate/up decode는 같은 Q8_1 activation을 두 단일 projection launch가
+/// 재사용한다. cu206 RTX 3090 Qwen3.6 27B에서 fused 2-accumulator kernel보다
+/// register/live-state가 작아 100-token generation이 5.38% 빨랐고 출력은 exact였다.
+/// 진단 비교는 `RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT=0`으로 기존 fused kernel을 되켠다.
+pub fn q4k_gate_up_q8dot_split_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1141,6 +1149,7 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_PREFILL_F16_O_PROJ");
             std::env::remove_var("RNB_CUDA_Q4K_BATCH_RAW_SEQ4");
             std::env::remove_var("RNB_CUDA_Q6_PACKED_BATCH_WARP4");
+            std::env::remove_var("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1160,6 +1169,7 @@ mod tests {
         assert!(q6k_packed_batch_warp4_enabled(14));
         assert!(!q6k_packed_batch_warp4_enabled(7));
         assert!(q6k_gemv_batch_warp8_enabled());
+        assert!(q4k_gate_up_q8dot_split_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

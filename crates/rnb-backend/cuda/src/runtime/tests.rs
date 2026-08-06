@@ -13027,6 +13027,24 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
         .map(|(h, d)| h + d)
         .collect::<Vec<_>>();
 
+    let split_off = EnvVarGuard::set("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", "0");
+    let fused = dense_q4k_gelu_ffn_norm_residual(
+        &gate,
+        &up,
+        &down,
+        14,
+        &norm_weight,
+        None,
+        n_ff,
+        n_embd,
+        &hidden,
+        norm_eps,
+        false,
+        false,
+    )
+    .expect("CUDA dense Q4_K fused gate/up SiLU FFN norm residual");
+    drop(split_off);
+    let _split_on = EnvVarGuard::set("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", "1");
     let actual = dense_q4k_gelu_ffn_norm_residual(
         &gate,
         &up,
@@ -13041,7 +13059,11 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
         false,
         false,
     )
-    .expect("CUDA dense Q4_K SiLU FFN norm residual");
+    .expect("CUDA dense Q4_K split gate/up SiLU FFN norm residual");
+    assert_eq!(
+        actual, fused,
+        "split and fused Q4_K gate/up q8dot paths must be bitwise-identical"
+    );
     // 값 스케일이 1e5 대라 절대 오차 대신 결합 오차 계약을 쓴다. device rms_norm 의
     // rsqrtf 근사가 Q8 양자화 chunk 스케일(d)에 비선형 증폭돼 staged CPU reference 와
     // ~5e-3 상대까지 벌어질 수 있다. silu→gelu 오배선은 mutation 실측에서 이보다
