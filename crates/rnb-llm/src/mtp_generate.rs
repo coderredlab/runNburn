@@ -1569,8 +1569,13 @@ fn generate_stream_mtp_with_tokens(
 
             if n_accepted == draft_k {
                 if no_bonus_verify {
+                    // cu211: 이 순차 target forward 는 full-accept 라운드마다
+                    // 도는 실측 ~40ms 비용인데 phase 타이머 밖이어서
+                    // "비-phase 오버헤드"로 오귀속됐었다. verify 로 계측한다.
+                    let phase_start = Instant::now();
                     let (next_token, final_hidden_row) = engine
                         .forward_verify_argmax_sequential_collect_mtp(draft_tokens[draft_k - 1])?;
+                    phase.verify_ms += elapsed_ms(phase_start);
                     let next_token = replace_ignored_eos_target(
                         engine,
                         params,
