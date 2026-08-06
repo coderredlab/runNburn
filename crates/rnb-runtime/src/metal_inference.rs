@@ -97,6 +97,8 @@ pub struct MetalGemmaPrefillQkvOTailRequest<'a> {
     pub normed: &'a [f32],
     pub q_norm_w: &'a [f32],
     pub k_norm_w: &'a [f32],
+    pub rope_freq_factors: Option<&'a [f32]>,
+    pub v_from_k: bool,
     pub q_weight_ggml: GGMLType,
     pub q_weight_raw: &'a [u8],
     pub q_weight_rows: usize,
@@ -123,7 +125,7 @@ pub struct MetalGemmaPrefillQkvOTailRequest<'a> {
     pub rope_theta: f32,
     pub scale: f32,
     pub norm_eps: f32,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub softcap: Option<f32>,
 }
 
@@ -5270,6 +5272,9 @@ pub fn metal_gemma_prefill_qkv_o_tail_if_supported(
     if env_falsey("RNB_METAL_GEMMA_PREFILL_QKV_O_CHAIN") {
         return Ok(None);
     }
+    if req.head_dim == 512 && env_falsey("RNB_METAL_GEMMA_PREFILL_GLOBAL_QKV_O_CHAIN") {
+        return Ok(None);
+    }
     let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
         return Ok(None);
     };
@@ -5289,6 +5294,8 @@ pub fn metal_gemma_prefill_qkv_o_tail_if_supported(
                     normed: req.normed,
                     q_norm_w: req.q_norm_w,
                     k_norm_w: req.k_norm_w,
+                    rope_freq_factors: req.rope_freq_factors,
+                    v_from_k: req.v_from_k,
                     q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
                         raw: req.q_weight_raw,
                         quant: q_quant,

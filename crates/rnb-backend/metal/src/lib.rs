@@ -1354,7 +1354,7 @@ struct GemmaPrefillQkvOTailCarrierKey {
     rope_theta_bits: u32,
     scale_bits: u32,
     norm_eps_bits: u32,
-    sliding_window: usize,
+    sliding_window: Option<usize>,
     softcap_bits: Option<u32>,
     q_quant: TensoropsQuant,
     k_quant: TensoropsQuant,
@@ -1377,6 +1377,8 @@ pub struct GemmaPrefillQkvOTailBackendRequest<'a> {
     pub normed: &'a [f32],
     pub q_norm_w: &'a [f32],
     pub k_norm_w: &'a [f32],
+    pub rope_freq_factors: Option<&'a [f32]>,
+    pub v_from_k: bool,
     pub q_weight: PrefillAtnCoreWeightView<'a>,
     pub k_weight: PrefillAtnCoreWeightView<'a>,
     pub v_weight: PrefillAtnCoreWeightView<'a>,
@@ -1391,7 +1393,7 @@ pub struct GemmaPrefillQkvOTailBackendRequest<'a> {
     pub rope_theta: f32,
     pub scale: f32,
     pub norm_eps: f32,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub softcap: Option<f32>,
 }
 
@@ -1771,7 +1773,7 @@ pub struct MetalBackend {
     /// pm108: prefill dense gated ATN o-tail(q/k/v→flash→o_proj+residual) carrier.
     prefill_atn_o_tail_carriers:
         RefCell<HashMap<AtnOTailKey, prefill_atn_core_chain::PrefillAtnOTailCarrier>>,
-    /// Gemma local prefill Q/K/V→QK norm/RoPE→flash→O carrier.
+    /// Gemma prefill Q/K/V→QK norm/RoPE→flash→O carrier.
     gemma_prefill_qkv_o_tail_carriers: RefCell<
         HashMap<
             GemmaPrefillQkvOTailCarrierKey,
@@ -3778,7 +3780,7 @@ impl MetalBackend {
         }))
     }
 
-    /// Gemma local layer: Q/K/V projections, QK norm/NeoX RoPE, flash attention,
+    /// Gemma layer: Q/K/V projections, QK norm/NeoX RoPE, flash attention,
     /// and O projection in one command buffer.
     #[cfg(target_os = "macos")]
     pub fn prefill_gemma_qkv_o_tail_if_supported(
@@ -3788,7 +3790,12 @@ impl MetalBackend {
         let Some(ctx) = self.ctx.as_ref() else {
             return Ok(None);
         };
-        if ctx.flash_attn_prefill_tg_pipeline.is_none()
+        let flash_supported = match req.head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !flash_supported
             || ctx.cast_f32_f16_pipeline.is_none()
             || !Self::atn_core_tensorops_v2_ready(ctx, req.q_weight.quant)
             || !Self::atn_core_tensorops_v2_ready(ctx, req.k_weight.quant)
@@ -3803,8 +3810,7 @@ impl MetalBackend {
         if req.num_heads == 0 || req.num_kv_heads == 0 || req.num_heads % req.num_kv_heads != 0 {
             return Err("Metal Gemma prefill carrier: invalid GQA head counts".to_string());
         }
-        Self::atn_core_require_eq("head_dim", req.head_dim, 256)?;
-        if req.sliding_window == 0 {
+        if req.sliding_window.is_some_and(|window| window == 0) {
             return Err("Metal Gemma prefill carrier: sliding window must be > 0".to_string());
         }
         if !req.rope_theta.is_finite()
@@ -3828,6 +3834,17 @@ impl MetalBackend {
         Self::atn_core_require_eq("normed len", req.normed.len(), expected_normed)?;
         Self::atn_core_require_eq("q_norm_w len", req.q_norm_w.len(), req.head_dim)?;
         Self::atn_core_require_eq("k_norm_w len", req.k_norm_w.len(), req.head_dim)?;
+        if let Some(factors) = req.rope_freq_factors {
+            Self::atn_core_require_eq("rope_freq_factors len", factors.len(), req.head_dim / 2)?;
+            if factors
+                .iter()
+                .any(|factor| !factor.is_finite() || *factor <= 0.0)
+            {
+                return Err(
+                    "Metal Gemma prefill carrier: invalid RoPE frequency factor".to_string()
+                );
+            }
+        }
         for (role, weight, rows, cols) in [
             ("q", req.q_weight, req.q_dim, req.hidden_dim),
             ("k", req.k_weight, req.kv_dim, req.hidden_dim),
@@ -3894,6 +3911,8 @@ impl MetalBackend {
                 normed: req.normed,
                 q_norm_w: req.q_norm_w,
                 k_norm_w: req.k_norm_w,
+                rope_freq_factors: req.rope_freq_factors,
+                v_from_k: req.v_from_k,
                 q_w_buf: &q_w_buf,
                 q_w_off,
                 q_quant: req.q_weight.quant,
@@ -15086,16 +15105,36 @@ kernel void coop_right_direct_fill_probe(
     fn gemma_prefill_qkv_o_tail_matches_cpu_oracle() {
         let backend = MetalBackend::new();
         if backend.ctx.is_none() {
-            eprintln!("[pm188] no Metal ctx; skipping Gemma carrier oracle");
+            eprintln!("[pm189] no Metal ctx; skipping Gemma carrier oracle");
             return;
         }
-        let (seq, hidden, hd, nh, nkv) = (8usize, 256usize, 256usize, 1usize, 1usize);
+        for (head_dim, sliding_window, softcap) in [
+            (256usize, Some(4usize), None),
+            (512usize, None, Some(50.0f32)),
+        ] {
+            run_gemma_prefill_qkv_o_tail_oracle(&backend, head_dim, sliding_window, softcap);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_gemma_prefill_qkv_o_tail_oracle(
+        backend: &MetalBackend,
+        hd: usize,
+        sliding_window: Option<usize>,
+        softcap: Option<f32>,
+    ) {
+        let (seq, hidden, nh, nkv) = (8usize, 256usize, 1usize, 1usize);
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
         let eps = 1.0e-5f32;
         let theta = 1_000_000.0f32;
         let scale = 1.0f32;
-        let window = 4usize;
+        let v_from_k = hd == 512;
+        let rope_freq_factors = (hd == 512).then(|| {
+            (0..hd / 2)
+                .map(|index| 1.0 + (index % 7) as f32 * 0.125)
+                .collect::<Vec<_>>()
+        });
         let normed = det_vals(seq * hidden, 0.031);
         let q_norm = det_vals(hd, 0.013)
             .into_iter()
@@ -15128,9 +15167,11 @@ kernel void coop_right_direct_fill_probe(
                 normed: &normed,
                 q_norm_w: &q_norm,
                 k_norm_w: &k_norm,
+                rope_freq_factors: rope_freq_factors.as_deref(),
+                v_from_k,
                 q_weight: view(q_raw, q_dim, hidden),
                 k_weight: view(k_raw, kv_dim, hidden),
-                v_weight: view(v_raw, kv_dim, hidden),
+                v_weight: view(if v_from_k { k_raw } else { v_raw }, kv_dim, hidden),
                 o_weight: view(o_raw, hidden, q_dim),
                 seq_len: seq,
                 num_heads: nh,
@@ -15142,13 +15183,12 @@ kernel void coop_right_direct_fill_probe(
                 rope_theta: theta,
                 scale,
                 norm_eps: eps,
-                sliding_window: window,
-                softcap: None,
+                sliding_window,
+                softcap,
             })
             .expect("Gemma carrier dispatch")
         else {
-            eprintln!("[pm188] Gemma carrier unsupported; skipping oracle");
-            return;
+            panic!("Gemma HD{hd} carrier unexpectedly unsupported");
         };
 
         let gemm_input = normed
@@ -15157,7 +15197,11 @@ kernel void coop_right_direct_fill_probe(
             .collect::<Vec<_>>();
         let mut q = cpu_q4k_gemm_reference(&q_w, q_dim, hidden, &gemm_input, seq);
         let mut k = cpu_q4k_gemm_reference(&k_w, kv_dim, hidden, &gemm_input, seq);
-        let mut v = cpu_q4k_gemm_reference(&v_w, kv_dim, hidden, &gemm_input, seq);
+        let mut v = if v_from_k {
+            k.clone()
+        } else {
+            cpu_q4k_gemm_reference(&v_w, kv_dim, hidden, &gemm_input, seq)
+        };
         for (rows, weight) in [(&mut q, &q_norm), (&mut k, &k_norm)] {
             for row in rows.chunks_exact_mut(hd) {
                 let source = row.to_vec();
@@ -15165,15 +15209,19 @@ kernel void coop_right_direct_fill_probe(
             }
             let theta_scale = theta.powf(-2.0 / hd as f32);
             for (token, row) in rows.chunks_exact_mut(hd).enumerate() {
-                let mut angle = token as f32;
+                let mut theta_base = token as f32;
                 for pair in 0..hd / 2 {
+                    let factor = rope_freq_factors
+                        .as_ref()
+                        .map_or(1.0, |factors| factors[pair]);
+                    let angle = theta_base / factor;
                     let left = row[pair];
                     let right = row[hd / 2 + pair];
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     row[pair] = left * cos_a - right * sin_a;
                     row[hd / 2 + pair] = left * sin_a + right * cos_a;
-                    angle *= theta_scale;
+                    theta_base *= theta_scale;
                 }
             }
         }
@@ -15213,8 +15261,8 @@ kernel void coop_right_direct_fill_probe(
             nkv,
             hd,
             scale,
-            Some(window),
-            None,
+            sliding_window,
+            softcap,
         );
         let o_input = attn
             .iter()
@@ -15227,11 +15275,11 @@ kernel void coop_right_direct_fill_probe(
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
         eprintln!(
-            "[pm188] Gemma QKV/O carrier oracle k_max_abs={k_max_abs:.3e} v_max_abs={v_max_abs:.3e} o_max_abs={o_max_abs:.3e}"
+            "[pm189] Gemma HD{hd} QKV/O carrier oracle k_max_abs={k_max_abs:.3e} v_max_abs={v_max_abs:.3e} o_max_abs={o_max_abs:.3e}"
         );
-        assert!(k_max_abs < 0.1, "K max_abs={k_max_abs}");
-        assert!(v_max_abs < 0.1, "V max_abs={v_max_abs}");
-        assert!(o_max_abs < 0.5, "O max_abs={o_max_abs}");
+        assert!(k_max_abs < 0.1, "HD{hd} K max_abs={k_max_abs}");
+        assert!(v_max_abs < 0.1, "HD{hd} V max_abs={v_max_abs}");
+        assert!(o_max_abs < 0.5, "HD{hd} O max_abs={o_max_abs}");
     }
 
     #[cfg(target_os = "macos")]

@@ -141,15 +141,12 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
 ) -> crate::error::Result<Option<PrefillFullAttentionLayer>> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
-        let Some(sliding_window) = active_sliding_window(metadata, architecture, layer_idx) else {
-            return Ok(None);
-        };
+        let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
         if !matches!(architecture, ModelArchitecture::Gemma4)
             || !use_gemma_block_semantics(architecture)
             || gemma4_reuse_q_only
-            || w.v_proj_missing
             || layout.has_gated_attn
-            || layout.head_dim != 256
+            || !matches!(layout.head_dim, 256 | 512)
             || pos_start != 0
             || w.q_bias.is_some()
             || w.k_bias.is_some()
@@ -177,7 +174,6 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
         );
         if proportional_rope
             || rope_dim != layout.head_dim
-            || freq_factors.is_some()
             || gemma4_should_apply_k_rotation(architecture, w.k_weight.ggml_type, layout.head_dim)
             || gemma4_should_apply_v_rotation(architecture, w.v_weight.ggml_type, layout.head_dim)
         {
@@ -209,10 +205,12 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
                 )
             };
         let hidden_dim = kernels::tensor_as_f32_slice(hidden).len() / seq_len;
-        let Some(out) = backend_runtime::metal_gemma_prefill_qkv_o_tail_if_supported(
+        let out = backend_runtime::metal_gemma_prefill_qkv_o_tail_if_supported(
             kernels::tensor_as_f32_slice(&normed),
             q_norm_effective.as_ref(),
             k_norm_effective.as_ref(),
+            freq_factors,
+            w.v_proj_missing,
             &w.q_weight,
             &w.k_weight,
             &w.v_weight,
@@ -229,8 +227,8 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
             norm_eps,
             sliding_window,
             resolve_attention_softcap(architecture),
-        )?
-        else {
+        )?;
+        let Some(out) = out else {
             return Ok(None);
         };
         let projected = Tensor::from_vec(out.hidden, &[seq_len, hidden_dim]);

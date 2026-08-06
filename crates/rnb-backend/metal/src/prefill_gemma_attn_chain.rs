@@ -1,16 +1,16 @@
-//! Gemma 4 local-attention prefill carrier.
+//! Gemma 4 prefill attention carrier.
 //!
-//! The local layers own Q/K/V. This carrier keeps normalized-input cast, the
-//! three projections, Q/K norm + NeoX RoPE, flash attention, and O projection
-//! in one command buffer. Only O output and the K/V rows required by the host
-//! cache cross back after the command completes.
+//! Every layer owns Q/K/V. This carrier keeps normalized-input cast, the three
+//! projections, Q/K norm + NeoX RoPE, flash attention, and O projection in one
+//! command buffer. Only O output and the K/V rows required by the host cache
+//! cross back after the command completes.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
 
 use crate::compute::{
-    self, encode_cast_f32_to_f16, encode_flash_attn_prefill, encode_prefill_neox_qk_norm,
+    self, encode_cast_f32_to_f16, encode_flash_attn_prefill_gemma, encode_prefill_neox_qk_norm,
     MetalContext,
 };
 use crate::ffn_chain::{
@@ -35,6 +35,7 @@ pub(crate) struct GemmaPrefillQkvOTailCarrier {
     q_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     k_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     v_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    rope_freq_factors_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_rope_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     k_rope_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     v_norm_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -94,6 +95,7 @@ impl GemmaPrefillQkvOTailCarrier {
             q_norm_w_dev: empty_f32_buf(ctx, head_dim),
             k_norm_w_dev: empty_f32_buf(ctx, head_dim),
             v_norm_w_dev: shared_f32_buf(ctx, &vec![1.0; head_dim]),
+            rope_freq_factors_dev: shared_f32_buf(ctx, &vec![1.0; head_dim / 2]),
             q_rope_dev: empty_f32_buf(ctx, seq_len * q_dim),
             k_rope_dev: empty_f32_buf(ctx, kv_elems),
             v_norm_dev: empty_f32_buf(ctx, kv_elems),
@@ -121,13 +123,31 @@ impl GemmaPrefillQkvOTailCarrier {
         }
     }
 
-    fn upload(&self, normed: &[f32], q_norm_w: &[f32], k_norm_w: &[f32]) {
+    fn upload(
+        &self,
+        normed: &[f32],
+        q_norm_w: &[f32],
+        k_norm_w: &[f32],
+        rope_freq_factors: Option<&[f32]>,
+    ) {
         debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         debug_assert_eq!(q_norm_w.len(), self.head_dim);
         debug_assert_eq!(k_norm_w.len(), self.head_dim);
         copy_f32(normed, &self.normed_dev);
         copy_f32(q_norm_w, &self.q_norm_w_dev);
         copy_f32(k_norm_w, &self.k_norm_w_dev);
+        if let Some(factors) = rope_freq_factors {
+            debug_assert_eq!(factors.len(), self.head_dim / 2);
+            copy_f32(factors, &self.rope_freq_factors_dev);
+        } else {
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.rope_freq_factors_dev.contents().as_ptr().cast::<f32>(),
+                    self.head_dim / 2,
+                )
+                .fill(1.0);
+            }
+        }
     }
 }
 
@@ -138,6 +158,8 @@ pub(crate) struct GemmaPrefillQkvOTailDispatchRequest<'a> {
     pub k_norm_w: &'a [f32],
     pub q_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub q_w_off: u32,
+    pub rope_freq_factors: Option<&'a [f32]>,
+    pub v_from_k: bool,
     pub q_quant: TensoropsQuant,
     pub k_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub k_w_off: u32,
@@ -148,7 +170,7 @@ pub(crate) struct GemmaPrefillQkvOTailDispatchRequest<'a> {
     pub o_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub o_w_off: u32,
     pub o_quant: TensoropsQuant,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub softcap: Option<f32>,
 }
 
@@ -157,7 +179,12 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
     carrier: &GemmaPrefillQkvOTailCarrier,
     req: GemmaPrefillQkvOTailDispatchRequest<'_>,
 ) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
-    carrier.upload(req.normed, req.q_norm_w, req.k_norm_w);
+    carrier.upload(
+        req.normed,
+        req.q_norm_w,
+        req.k_norm_w,
+        req.rope_freq_factors,
+    );
 
     let command = ctx
         .queue
@@ -176,8 +203,9 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         carrier.seq_len * carrier.hidden_dim,
     );
     compute::chain_barrier(ctx, &encoder);
-    for (quant, weight, offset, output, output_dim, output_dim_buf) in [
+    for (enabled, quant, weight, offset, output, output_dim, output_dim_buf) in [
         (
+            true,
             req.q_quant,
             req.q_w_buf,
             req.q_w_off,
@@ -186,6 +214,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
             &carrier.q_dim_buf,
         ),
         (
+            true,
             req.k_quant,
             req.k_w_buf,
             req.k_w_off,
@@ -194,6 +223,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
             &carrier.kv_dim_buf,
         ),
         (
+            !req.v_from_k,
             req.v_quant,
             req.v_w_buf,
             req.v_w_off,
@@ -202,6 +232,9 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
             &carrier.kv_dim_buf,
         ),
     ] {
+        if !enabled {
+            continue;
+        }
         encode_quant_gemm_v2(
             ctx,
             &encoder,
@@ -230,6 +263,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         &carrier.theta_buf,
         &carrier.eps_buf,
         &carrier.pos_start_buf,
+        &carrier.rope_freq_factors_dev,
         carrier.seq_len,
         carrier.num_heads,
     );
@@ -245,13 +279,18 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         &carrier.theta_buf,
         &carrier.eps_buf,
         &carrier.pos_start_buf,
+        &carrier.rope_freq_factors_dev,
         carrier.seq_len,
         carrier.num_kv_heads,
     );
     encode_prefill_neox_qk_norm(
         ctx,
         &encoder,
-        &carrier.v_dev,
+        if req.v_from_k {
+            &carrier.k_dev
+        } else {
+            &carrier.v_dev
+        },
         &carrier.v_norm_w_dev,
         &carrier.v_norm_dev,
         &carrier.num_kv_heads_buf,
@@ -260,6 +299,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         &carrier.theta_buf,
         &carrier.eps_buf,
         &carrier.pos_start_buf,
+        &carrier.rope_freq_factors_dev,
         carrier.seq_len,
         carrier.num_kv_heads,
     );
@@ -281,7 +321,7 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         carrier.seq_len * carrier.kv_dim,
     );
     compute::chain_barrier(ctx, &encoder);
-    encode_flash_attn_prefill(
+    encode_flash_attn_prefill_gemma(
         ctx,
         &encoder,
         &carrier.q_rope_dev,
@@ -293,8 +333,9 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         &carrier.seq_buf,
         &carrier.seq_buf,
         &carrier.scale_buf,
-        Some(req.sliding_window),
+        req.sliding_window,
         req.softcap,
+        carrier.head_dim,
         carrier.num_heads,
         carrier.seq_len,
     );

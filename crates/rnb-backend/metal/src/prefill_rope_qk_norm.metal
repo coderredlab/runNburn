@@ -83,11 +83,11 @@ kernel void prefill_rope_qk_norm(
         out[base + i] = normed[i];
     }
 }
-// Gemma 4 local-attention path: per-head RMSNorm followed by full
-// NeoX split-half RoPE. The effective norm weight is supplied by the host,
-// so unit-offset models pass (1 + stored_weight) without changing this ABI.
-// One threadgroup owns one token/head. Each lane normalizes and rotates
-// independent split-half pairs after the shared mean-square reduction.
+// Gemma 4 attention path: per-head RMSNorm followed by full NeoX split-half
+// RoPE. The effective norm weight is supplied by the host, so unit-offset
+// models pass (1 + stored_weight); local layers use all-one frequency factors,
+// while global layers upload their GGUF factors. One threadgroup owns one
+// token/head and each lane rotates independent pairs after the shared reduction.
 kernel void prefill_neox_qk_norm(
     device const float* in        [[buffer(0)]],
     device const float* weight    [[buffer(1)]],
@@ -98,6 +98,7 @@ kernel void prefill_neox_qk_norm(
     constant float&     theta     [[buffer(6)]],
     constant float&     eps       [[buffer(7)]],
     constant uint&      pos_start [[buffer(8)]],
+    device const float* freq_factors [[buffer(9)]],
     uint group   [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]])
@@ -127,7 +128,7 @@ kernel void prefill_neox_qk_norm(
     for (uint pair = tid; pair < half_rot; pair += tg_size) {
         uint right = half_rot + pair;
         float frequency = pow(theta, -2.0f * (float)pair / (float)nr);
-        float angle = position * frequency;
+        float angle = position * frequency / freq_factors[pair];
         float cos_a = cos(angle);
         float sin_a = sin(angle);
         float x0 = in[base + pair] * inv_rms * weight[pair];

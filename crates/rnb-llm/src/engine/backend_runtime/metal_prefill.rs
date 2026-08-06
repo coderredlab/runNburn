@@ -11,6 +11,8 @@ pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
     normed: &[f32],
     q_norm_w: &[f32],
     k_norm_w: &[f32],
+    rope_freq_factors: Option<&[f32]>,
+    v_from_k: bool,
     q_weight: &QuantizedWeight,
     k_weight: &QuantizedWeight,
     v_weight: &QuantizedWeight,
@@ -25,7 +27,7 @@ pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
     rope_theta: f32,
     scale: f32,
     norm_eps: f32,
-    sliding_window: usize,
+    sliding_window: Option<usize>,
     softcap: Option<f32>,
 ) -> crate::error::Result<Option<metal_runtime::MetalPrefillAtnOTailOut>> {
     let (Some(q_view), Some(k_view), Some(v_view), Some(o_view)) = (
@@ -41,6 +43,8 @@ pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
             normed,
             q_norm_w,
             k_norm_w,
+            rope_freq_factors,
+            v_from_k,
             q_weight_ggml: backend_ggml_type(q_view.quant()),
             q_weight_raw: q_view.raw(),
             q_weight_rows: q_view.rows(),

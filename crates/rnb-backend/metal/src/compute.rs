@@ -4682,8 +4682,8 @@ fn encode_flash_attn_prefill_hd512_gemma(
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
     seq_buf: &ProtocolObject<dyn MTLBuffer>,
     scale_buf: &ProtocolObject<dyn MTLBuffer>,
-    window_buf: &ProtocolObject<dyn MTLBuffer>,
-    softcap_buf: &ProtocolObject<dyn MTLBuffer>,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
     num_heads: usize,
     seq_len: usize,
 ) {
@@ -4707,10 +4707,10 @@ fn encode_flash_attn_prefill_hd512_gemma(
         enc.setBuffer_offset_atIndex(Some(kv_buf), 0, 6);
         enc.setBuffer_offset_atIndex(Some(seq_buf), 0, 7);
         enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
-        enc.setBuffer_offset_atIndex(Some(window_buf), 0, 9);
-        enc.setBuffer_offset_atIndex(Some(softcap_buf), 0, 10);
         enc.setThreadgroupMemoryLength_atIndex(SCRATCH_BYTES, 0);
     }
+    set_u32_bytes(enc, sliding_window.unwrap_or(0) as u32, 9);
+    set_f32_bytes(enc, softcap.unwrap_or(0.0), 10);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: seq_len.div_ceil(QUERY_BLOCK),
@@ -4723,6 +4723,64 @@ fn encode_flash_attn_prefill_hd512_gemma(
             depth: 1,
         },
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_flash_attn_prefill_gemma(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    seq_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+    head_dim: usize,
+    num_heads: usize,
+    seq_len: usize,
+) {
+    match head_dim {
+        256 => encode_flash_attn_prefill(
+            ctx,
+            enc,
+            q_buf,
+            k_buf,
+            v_buf,
+            o_buf,
+            nh_buf,
+            nkv_buf,
+            kv_buf,
+            seq_buf,
+            scale_buf,
+            sliding_window,
+            softcap,
+            num_heads,
+            seq_len,
+        ),
+        512 => encode_flash_attn_prefill_hd512_gemma(
+            ctx,
+            enc,
+            q_buf,
+            k_buf,
+            v_buf,
+            o_buf,
+            nh_buf,
+            nkv_buf,
+            kv_buf,
+            seq_buf,
+            scale_buf,
+            sliding_window,
+            softcap,
+            num_heads,
+            seq_len,
+        ),
+        _ => unreachable!("Gemma prefill flash requires HD=256 or HD=512"),
+    }
 }
 
 /// Gemma 4 HD=256/512 flash attention의 host 입출력 seam. 반환값은 `(output, GPU-time ms)`다.
@@ -4796,8 +4854,6 @@ pub fn prefill_flash_attention_gemma_with_ctx(
     let nkv = num_kv_heads as u32;
     let kv = kv_len as u32;
     let seq = seq_len as u32;
-    let window_value = sliding_window.unwrap_or(0) as u32;
-    let softcap_value = softcap.unwrap_or(0.0);
     let nh_buf = mk(&nh as *const u32 as *const _, std::mem::size_of_val(&nh));
     let nkv_buf = mk(&nkv as *const u32 as *const _, std::mem::size_of_val(&nkv));
     let kv_buf = mk(&kv as *const u32 as *const _, std::mem::size_of_val(&kv));
@@ -4806,55 +4862,28 @@ pub fn prefill_flash_attention_gemma_with_ctx(
         &scale as *const f32 as *const _,
         std::mem::size_of_val(&scale),
     );
-    let window_buf = mk(
-        &window_value as *const u32 as *const _,
-        std::mem::size_of_val(&window_value),
-    );
-    let softcap_buf = mk(
-        &softcap_value as *const f32 as *const _,
-        std::mem::size_of_val(&softcap_value),
-    );
     let cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>> =
         ctx.queue.commandBuffer().expect("Metal: command buffer");
     let enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> =
         cmd.computeCommandEncoder().expect("Metal: compute encoder");
-    if head_dim == 256 {
-        encode_flash_attn_prefill(
-            ctx,
-            &enc,
-            &q_buf,
-            &k_buf,
-            &v_buf,
-            &o_buf,
-            &nh_buf,
-            &nkv_buf,
-            &kv_buf,
-            &seq_buf,
-            &scale_buf,
-            sliding_window,
-            softcap,
-            num_heads,
-            seq_len,
-        );
-    } else {
-        encode_flash_attn_prefill_hd512_gemma(
-            ctx,
-            &enc,
-            &q_buf,
-            &k_buf,
-            &v_buf,
-            &o_buf,
-            &nh_buf,
-            &nkv_buf,
-            &kv_buf,
-            &seq_buf,
-            &scale_buf,
-            &window_buf,
-            &softcap_buf,
-            num_heads,
-            seq_len,
-        );
-    }
+    encode_flash_attn_prefill_gemma(
+        ctx,
+        &enc,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &o_buf,
+        &nh_buf,
+        &nkv_buf,
+        &kv_buf,
+        &seq_buf,
+        &scale_buf,
+        sliding_window,
+        softcap,
+        head_dim,
+        num_heads,
+        seq_len,
+    );
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
@@ -13858,6 +13887,7 @@ pub(crate) fn encode_prefill_neox_qk_norm(
     theta_buf: &ProtocolObject<dyn MTLBuffer>,
     eps_buf: &ProtocolObject<dyn MTLBuffer>,
     pos_buf: &ProtocolObject<dyn MTLBuffer>,
+    freq_factors_buf: &ProtocolObject<dyn MTLBuffer>,
     seq_len: usize,
     num_heads: usize,
 ) {
@@ -13872,6 +13902,7 @@ pub(crate) fn encode_prefill_neox_qk_norm(
         enc.setBuffer_offset_atIndex(Some(theta_buf), 0, 6);
         enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 7);
         enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(freq_factors_buf), 0, 9);
     }
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
