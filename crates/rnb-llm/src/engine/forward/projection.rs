@@ -124,6 +124,153 @@ fn atn_kv_dual_metal(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    gemma_runtime_flavor: GemmaRuntimeFlavor,
+    hidden: &Tensor,
+    w: &AttentionLayerWeights,
+    rope_freqs: Option<&Tensor>,
+    layout: AttentionLayout,
+    gemma4_reuse_q_only: bool,
+    layer_idx: usize,
+    seq_len: usize,
+    pos_start: usize,
+    norm_eps: f32,
+) -> crate::error::Result<Option<PrefillFullAttentionLayer>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(sliding_window) = active_sliding_window(metadata, architecture, layer_idx) else {
+            return Ok(None);
+        };
+        if !matches!(architecture, ModelArchitecture::Gemma4)
+            || !use_gemma_block_semantics(architecture)
+            || gemma4_reuse_q_only
+            || w.v_proj_missing
+            || layout.has_gated_attn
+            || layout.head_dim != 256
+            || pos_start != 0
+            || w.q_bias.is_some()
+            || w.k_bias.is_some()
+            || w.v_bias.is_some()
+            || super::super::policy::gemma_qk_norm_disabled()
+            || !super::super::policy::gemma_neox_rope_enabled()
+            || !super::super::policy::gemma_v_norm_enabled()
+            || dump_bin_dir().is_some()
+            || attn_trace_enabled()
+            || targeted_attn_trace_enabled(layer_idx)
+        {
+            return Ok(None);
+        }
+        let (Some(q_norm), Some(k_norm)) = (&w.q_norm, &w.k_norm) else {
+            return Ok(None);
+        };
+        let (rope_dim, rope_theta, proportional_rope) =
+            resolve_rope_params(metadata, architecture, layer_idx, layout.head_dim);
+        let freq_factors = gemma_rope_freq_factors(
+            rope_freqs,
+            metadata,
+            architecture,
+            layer_idx,
+            layout.head_dim,
+        );
+        if proportional_rope
+            || rope_dim != layout.head_dim
+            || freq_factors.is_some()
+            || gemma4_should_apply_k_rotation(architecture, w.k_weight.ggml_type, layout.head_dim)
+            || gemma4_should_apply_v_rotation(architecture, w.v_weight.ggml_type, layout.head_dim)
+        {
+            return Ok(None);
+        }
+
+        let fwd = |e: rnb_core::error::RnbError| crate::error::LlmError::Forward(e.to_string());
+        let normed = if policy::gemma_unit_offset_attn_norm_enabled(layer_idx) {
+            apply_model_norm_unit_offset(hidden, &w.attn_norm, norm_eps).map_err(fwd)?
+        } else {
+            apply_model_norm(hidden, &w.attn_norm, norm_eps, architecture).map_err(fwd)?
+        };
+        let q_norm_data = kernels::tensor_as_f32_slice(q_norm);
+        let k_norm_data = kernels::tensor_as_f32_slice(k_norm);
+        let (q_norm_effective, k_norm_effective) =
+            if super::super::policy::gemma_unit_offset_norm_enabled() {
+                (
+                    std::borrow::Cow::Owned(
+                        q_norm_data.iter().map(|weight| weight + 1.0).collect(),
+                    ),
+                    std::borrow::Cow::Owned(
+                        k_norm_data.iter().map(|weight| weight + 1.0).collect(),
+                    ),
+                )
+            } else {
+                (
+                    std::borrow::Cow::Borrowed(q_norm_data),
+                    std::borrow::Cow::Borrowed(k_norm_data),
+                )
+            };
+        let hidden_dim = kernels::tensor_as_f32_slice(hidden).len() / seq_len;
+        let Some(out) = backend_runtime::metal_gemma_prefill_qkv_o_tail_if_supported(
+            kernels::tensor_as_f32_slice(&normed),
+            q_norm_effective.as_ref(),
+            k_norm_effective.as_ref(),
+            &w.q_weight,
+            &w.k_weight,
+            &w.v_weight,
+            &w.o_weight,
+            seq_len,
+            layout.num_heads,
+            layout.num_kv_heads,
+            layout.head_dim,
+            hidden_dim,
+            layout.q_dim,
+            layout.kv_dim,
+            rope_theta,
+            resolve_attention_scale(metadata, architecture),
+            norm_eps,
+            sliding_window,
+            resolve_attention_softcap(architecture),
+        )?
+        else {
+            return Ok(None);
+        };
+        let projected = Tensor::from_vec(out.hidden, &[seq_len, hidden_dim]);
+        let hidden = super::attention_output::finish_prefill_attention_projection(
+            metadata,
+            architecture,
+            gemma_runtime_flavor,
+            hidden.clone(),
+            w,
+            projected,
+            layer_idx,
+            seq_len,
+            norm_eps,
+        )?;
+        return Ok(Some(PrefillFullAttentionLayer {
+            hidden,
+            k_bits: out.k_bits,
+            v_bits: out.v_bits,
+        }));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (
+            metadata,
+            architecture,
+            gemma_runtime_flavor,
+            hidden,
+            w,
+            rope_freqs,
+            layout,
+            gemma4_reuse_q_only,
+            layer_idx,
+            seq_len,
+            pos_start,
+            norm_eps,
+        );
+        Ok(None)
+    }
+}
+
 /// pm70: dense Qwen gated attention prefill full-layer Metal carrier.
 /// attn core의 gated attention output을 host로 읽지 않고 o_proj+FFN까지 device에서 이어 간다.
 #[cfg(all(feature = "metal", not(feature = "cuda")))]

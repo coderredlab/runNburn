@@ -5,6 +5,74 @@ use crate::engine::quantized_weight_types::backend_ggml_type;
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 use crate::engine::quantized_weight_types::QuantizedWeight;
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
+    normed: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    q_weight: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    o_weight: &QuantizedWeight,
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    scale: f32,
+    norm_eps: f32,
+    sliding_window: usize,
+    softcap: Option<f32>,
+) -> crate::error::Result<Option<metal_runtime::MetalPrefillAtnOTailOut>> {
+    let (Some(q_view), Some(k_view), Some(v_view), Some(o_view)) = (
+        q_weight.backend_view(),
+        k_weight.backend_view(),
+        v_weight.backend_view(),
+        o_weight.backend_view(),
+    ) else {
+        return Ok(None);
+    };
+    metal_runtime::metal_gemma_prefill_qkv_o_tail_if_supported(
+        metal_runtime::MetalGemmaPrefillQkvOTailRequest {
+            normed,
+            q_norm_w,
+            k_norm_w,
+            q_weight_ggml: backend_ggml_type(q_view.quant()),
+            q_weight_raw: q_view.raw(),
+            q_weight_rows: q_view.rows(),
+            q_weight_cols: q_view.cols(),
+            k_weight_ggml: backend_ggml_type(k_view.quant()),
+            k_weight_raw: k_view.raw(),
+            k_weight_rows: k_view.rows(),
+            k_weight_cols: k_view.cols(),
+            v_weight_ggml: backend_ggml_type(v_view.quant()),
+            v_weight_raw: v_view.raw(),
+            v_weight_rows: v_view.rows(),
+            v_weight_cols: v_view.cols(),
+            o_weight_ggml: backend_ggml_type(o_view.quant()),
+            o_weight_raw: o_view.raw(),
+            o_weight_rows: o_view.rows(),
+            o_weight_cols: o_view.cols(),
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_dim,
+            q_dim,
+            kv_dim,
+            rope_theta,
+            scale,
+            norm_eps,
+            sliding_window,
+            softcap,
+        },
+    )
+    .map_err(crate::error::LlmError::Forward)
+}
 /// pm48 ②: Metal prefill attention 2차 device-resident chain seam(rope/qk_norm→cast→flash 단일
 /// command buffer). 입력(host): q_proj(gate split 후, norm 전), k_proj(norm 전), v(f32),
 /// q_norm/k_norm weight. 반환 `(attn_out, k_f16, v_f16)`. Metal 전용(CUDA 미지원 → None).

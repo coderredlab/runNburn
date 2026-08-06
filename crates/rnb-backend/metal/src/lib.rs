@@ -91,6 +91,8 @@ mod prefill_atn_core_chain;
 #[cfg(target_os = "macos")]
 mod prefill_attn_chain;
 #[cfg(target_os = "macos")]
+mod prefill_gemma_attn_chain;
+#[cfg(target_os = "macos")]
 pub use compute::GlmMlaLayerFusedOut;
 pub use gdn_proj_chain::{PrefillProjTrace, TensoropsQuant};
 
@@ -1341,12 +1343,56 @@ struct AtnOTailKey {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GemmaPrefillQkvOTailCarrierKey {
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    rope_theta_bits: u32,
+    scale_bits: u32,
+    norm_eps_bits: u32,
+    sliding_window: usize,
+    softcap_bits: Option<u32>,
+    q_quant: TensoropsQuant,
+    k_quant: TensoropsQuant,
+    v_quant: TensoropsQuant,
+    o_quant: TensoropsQuant,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillAtnCoreWeightView<'a> {
     pub raw: &'a [u8],
     pub quant: TensoropsQuant,
     pub rows: usize,
     pub cols: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct GemmaPrefillQkvOTailBackendRequest<'a> {
+    pub normed: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub q_weight: PrefillAtnCoreWeightView<'a>,
+    pub k_weight: PrefillAtnCoreWeightView<'a>,
+    pub v_weight: PrefillAtnCoreWeightView<'a>,
+    pub o_weight: PrefillAtnCoreWeightView<'a>,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub sliding_window: usize,
+    pub softcap: Option<f32>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1725,6 +1771,13 @@ pub struct MetalBackend {
     /// pm108: prefill dense gated ATN o-tail(q/k/v→flash→o_proj+residual) carrier.
     prefill_atn_o_tail_carriers:
         RefCell<HashMap<AtnOTailKey, prefill_atn_core_chain::PrefillAtnOTailCarrier>>,
+    /// Gemma local prefill Q/K/V→QK norm/RoPE→flash→O carrier.
+    gemma_prefill_qkv_o_tail_carriers: RefCell<
+        HashMap<
+            GemmaPrefillQkvOTailCarrierKey,
+            prefill_gemma_attn_chain::GemmaPrefillQkvOTailCarrier,
+        >,
+    >,
     qwen_prefill_gdn_carriers:
         RefCell<HashMap<QwenGdnPrefillCarrierKey, gdn_chain::QwenGdnPrefillCarrier>>,
     qwen_prefill_atn_o_tail_carriers:
@@ -1957,6 +2010,7 @@ impl MetalBackend {
                 prefill_atn_core_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
+                gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 qkv_carriers: RefCell::new(HashMap::new()),
@@ -2139,6 +2193,7 @@ impl MetalBackend {
             prefill_atn_core_carriers: RefCell::new(HashMap::new()),
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
             prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
+            gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             qkv_carriers: RefCell::new(HashMap::new()),
@@ -3721,6 +3776,141 @@ impl MetalBackend {
             hidden_readbacks: transfer_ledger.hidden_readbacks,
             intermediate_hidden_transfers: transfer_ledger.intermediate_hidden_transfers,
         }))
+    }
+
+    /// Gemma local layer: Q/K/V projections, QK norm/NeoX RoPE, flash attention,
+    /// and O projection in one command buffer.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_gemma_qkv_o_tail_if_supported(
+        &self,
+        req: GemmaPrefillQkvOTailBackendRequest<'_>,
+    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if ctx.flash_attn_prefill_tg_pipeline.is_none()
+            || ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.q_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.k_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.v_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.o_weight.quant)
+        {
+            return Ok(None);
+        }
+        if req.seq_len == 0 {
+            return Err("Metal Gemma prefill carrier: seq_len must be > 0".to_string());
+        }
+        if req.num_heads == 0 || req.num_kv_heads == 0 || req.num_heads % req.num_kv_heads != 0 {
+            return Err("Metal Gemma prefill carrier: invalid GQA head counts".to_string());
+        }
+        Self::atn_core_require_eq("head_dim", req.head_dim, 256)?;
+        if req.sliding_window == 0 {
+            return Err("Metal Gemma prefill carrier: sliding window must be > 0".to_string());
+        }
+        if !req.rope_theta.is_finite()
+            || req.rope_theta <= 0.0
+            || !req.scale.is_finite()
+            || !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+            || req
+                .softcap
+                .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+        {
+            return Err("Metal Gemma prefill carrier: invalid numeric parameter".to_string());
+        }
+
+        let expected_q_dim = Self::atn_core_checked_mul(req.num_heads, req.head_dim, "q_dim")?;
+        let expected_kv_dim = Self::atn_core_checked_mul(req.num_kv_heads, req.head_dim, "kv_dim")?;
+        let expected_normed =
+            Self::atn_core_checked_mul(req.seq_len, req.hidden_dim, "normed len")?;
+        Self::atn_core_require_eq("q_dim", req.q_dim, expected_q_dim)?;
+        Self::atn_core_require_eq("kv_dim", req.kv_dim, expected_kv_dim)?;
+        Self::atn_core_require_eq("normed len", req.normed.len(), expected_normed)?;
+        Self::atn_core_require_eq("q_norm_w len", req.q_norm_w.len(), req.head_dim)?;
+        Self::atn_core_require_eq("k_norm_w len", req.k_norm_w.len(), req.head_dim)?;
+        for (role, weight, rows, cols) in [
+            ("q", req.q_weight, req.q_dim, req.hidden_dim),
+            ("k", req.k_weight, req.kv_dim, req.hidden_dim),
+            ("v", req.v_weight, req.kv_dim, req.hidden_dim),
+            ("o", req.o_weight, req.hidden_dim, req.q_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} weight rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} weight cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+
+        let (q_w_buf, q_w_off, k_w_buf, k_w_off, v_w_buf, v_w_off, o_w_buf, o_w_off) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (q_w_buf, q_w_off) = wrap(req.q_weight.raw);
+            let (k_w_buf, k_w_off) = wrap(req.k_weight.raw);
+            let (v_w_buf, v_w_off) = wrap(req.v_weight.raw);
+            let (o_w_buf, o_w_off) = wrap(req.o_weight.raw);
+            (
+                q_w_buf, q_w_off, k_w_buf, k_w_off, v_w_buf, v_w_off, o_w_buf, o_w_off,
+            )
+        };
+        let key = GemmaPrefillQkvOTailCarrierKey {
+            seq_len: req.seq_len,
+            num_heads: req.num_heads,
+            num_kv_heads: req.num_kv_heads,
+            head_dim: req.head_dim,
+            hidden_dim: req.hidden_dim,
+            q_dim: req.q_dim,
+            rope_theta_bits: req.rope_theta.to_bits(),
+            scale_bits: req.scale.to_bits(),
+            norm_eps_bits: req.norm_eps.to_bits(),
+            sliding_window: req.sliding_window,
+            softcap_bits: req.softcap.map(f32::to_bits),
+            q_quant: req.q_weight.quant,
+            k_quant: req.k_weight.quant,
+            v_quant: req.v_weight.quant,
+            o_quant: req.o_weight.quant,
+        };
+        let mut carriers = self.gemma_prefill_qkv_o_tail_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_gemma_attn_chain::GemmaPrefillQkvOTailCarrier::new(
+                ctx,
+                req.seq_len,
+                req.num_heads,
+                req.num_kv_heads,
+                req.head_dim,
+                req.hidden_dim,
+                req.q_dim,
+                req.rope_theta,
+                req.scale,
+                req.norm_eps,
+            )
+        });
+        let output = prefill_gemma_attn_chain::prefill_gemma_qkv_o_tail_dispatch(
+            ctx,
+            carrier,
+            prefill_gemma_attn_chain::GemmaPrefillQkvOTailDispatchRequest {
+                normed: req.normed,
+                q_norm_w: req.q_norm_w,
+                k_norm_w: req.k_norm_w,
+                q_w_buf: &q_w_buf,
+                q_w_off,
+                q_quant: req.q_weight.quant,
+                k_w_buf: &k_w_buf,
+                k_w_off,
+                k_quant: req.k_weight.quant,
+                v_w_buf: &v_w_buf,
+                v_w_off,
+                v_quant: req.v_weight.quant,
+                o_w_buf: &o_w_buf,
+                o_w_off,
+                o_quant: req.o_weight.quant,
+                sliding_window: req.sliding_window,
+                softcap: req.softcap,
+            },
+        )?;
+        Ok(Some(output))
     }
 
     /// pm50 M1: dense gated ATN core carrier. Env policy is owned by runtime; backend only
@@ -14888,6 +15078,160 @@ kernel void coop_right_direct_fill_probe(
             s_med * 16.0,
             c_med * 16.0
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires M5 Metal device"]
+    fn gemma_prefill_qkv_o_tail_matches_cpu_oracle() {
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            eprintln!("[pm188] no Metal ctx; skipping Gemma carrier oracle");
+            return;
+        }
+        let (seq, hidden, hd, nh, nkv) = (8usize, 256usize, 256usize, 1usize, 1usize);
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        let eps = 1.0e-5f32;
+        let theta = 1_000_000.0f32;
+        let scale = 1.0f32;
+        let window = 4usize;
+        let normed = det_vals(seq * hidden, 0.031);
+        let q_norm = det_vals(hd, 0.013)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let k_norm = det_vals(hd, 0.011)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let q_w = quantize_rows_q4k(&det_vals(q_dim * hidden, 0.007), q_dim, hidden);
+        let k_w = quantize_rows_q4k(&det_vals(kv_dim * hidden, 0.009), kv_dim, hidden);
+        let v_w = quantize_rows_q4k(&det_vals(kv_dim * hidden, 0.005), kv_dim, hidden);
+        let o_w = quantize_rows_q4k(&det_vals(hidden * q_dim, 0.006), hidden, q_dim);
+        let q_storage = mapped_test_tensor(&q_w);
+        let k_storage = mapped_test_tensor(&k_w);
+        let v_storage = mapped_test_tensor(&v_w);
+        let o_storage = mapped_test_tensor(&o_w);
+        let q_raw = q_storage.as_bytes().expect("q mapped bytes");
+        let k_raw = k_storage.as_bytes().expect("k mapped bytes");
+        let v_raw = v_storage.as_bytes().expect("v mapped bytes");
+        let o_raw = o_storage.as_bytes().expect("o mapped bytes");
+        let view = |raw, rows, cols| PrefillAtnCoreWeightView {
+            raw,
+            quant: TensoropsQuant::Q4K,
+            rows,
+            cols,
+        };
+        let Some((actual_o, actual_k, actual_v)) = backend
+            .prefill_gemma_qkv_o_tail_if_supported(GemmaPrefillQkvOTailBackendRequest {
+                normed: &normed,
+                q_norm_w: &q_norm,
+                k_norm_w: &k_norm,
+                q_weight: view(q_raw, q_dim, hidden),
+                k_weight: view(k_raw, kv_dim, hidden),
+                v_weight: view(v_raw, kv_dim, hidden),
+                o_weight: view(o_raw, hidden, q_dim),
+                seq_len: seq,
+                num_heads: nh,
+                num_kv_heads: nkv,
+                head_dim: hd,
+                hidden_dim: hidden,
+                q_dim,
+                kv_dim,
+                rope_theta: theta,
+                scale,
+                norm_eps: eps,
+                sliding_window: window,
+                softcap: None,
+            })
+            .expect("Gemma carrier dispatch")
+        else {
+            eprintln!("[pm188] Gemma carrier unsupported; skipping oracle");
+            return;
+        };
+
+        let gemm_input = normed
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        let mut q = cpu_q4k_gemm_reference(&q_w, q_dim, hidden, &gemm_input, seq);
+        let mut k = cpu_q4k_gemm_reference(&k_w, kv_dim, hidden, &gemm_input, seq);
+        let mut v = cpu_q4k_gemm_reference(&v_w, kv_dim, hidden, &gemm_input, seq);
+        for (rows, weight) in [(&mut q, &q_norm), (&mut k, &k_norm)] {
+            for row in rows.chunks_exact_mut(hd) {
+                let source = row.to_vec();
+                rnb_cpu::kernels::norm::rms_norm_into(&source, weight, eps, row);
+            }
+            let theta_scale = theta.powf(-2.0 / hd as f32);
+            for (token, row) in rows.chunks_exact_mut(hd).enumerate() {
+                let mut angle = token as f32;
+                for pair in 0..hd / 2 {
+                    let left = row[pair];
+                    let right = row[hd / 2 + pair];
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    row[pair] = left * cos_a - right * sin_a;
+                    row[hd / 2 + pair] = left * sin_a + right * cos_a;
+                    angle *= theta_scale;
+                }
+            }
+        }
+        let ones = vec![1.0f32; hd];
+        for row in v.chunks_exact_mut(hd) {
+            let source = row.to_vec();
+            rnb_cpu::kernels::norm::rms_norm_into(&source, &ones, eps, row);
+        }
+        let expected_k = k
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits())
+            .collect::<Vec<_>>();
+        let expected_v = v
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits())
+            .collect::<Vec<_>>();
+        let max_f16_abs = |actual: &[u16], expected: &[u16]| {
+            actual
+                .iter()
+                .zip(expected)
+                .map(|(&actual, &expected)| {
+                    (half::f16::from_bits(actual).to_f32()
+                        - half::f16::from_bits(expected).to_f32())
+                    .abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        let k_max_abs = max_f16_abs(&actual_k, &expected_k);
+        let v_max_abs = max_f16_abs(&actual_v, &expected_v);
+        let attn = rnb_cpu::kernels::attention::attention_batch_f16(
+            &q,
+            &expected_k,
+            &expected_v,
+            seq,
+            seq,
+            nh,
+            nkv,
+            hd,
+            scale,
+            Some(window),
+            None,
+        );
+        let o_input = attn
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_f32())
+            .collect::<Vec<_>>();
+        let expected_o = cpu_q4k_gemm_reference(&o_w, hidden, q_dim, &o_input, seq);
+        let o_max_abs = actual_o
+            .iter()
+            .zip(&expected_o)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[pm188] Gemma QKV/O carrier oracle k_max_abs={k_max_abs:.3e} v_max_abs={v_max_abs:.3e} o_max_abs={o_max_abs:.3e}"
+        );
+        assert!(k_max_abs < 0.1, "K max_abs={k_max_abs}");
+        assert!(v_max_abs < 0.1, "V max_abs={v_max_abs}");
+        assert!(o_max_abs < 0.5, "O max_abs={o_max_abs}");
     }
 
     #[cfg(target_os = "macos")]

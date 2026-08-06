@@ -14,8 +14,6 @@ pub(in crate::engine) fn apply_prefill_attention_output(
     seq_len: usize,
     norm_eps: f32,
 ) -> crate::error::Result<Tensor> {
-    let fwd = |e: rnb_core::error::RnbError| crate::error::LlmError::Forward(e.to_string());
-    // pm37: o_proj seam. K=q_dim(attn_out 입력), N=hidden. residual(아래 :add)은 seam 밖 CPU.
     let attn_proj = if let Some(t) =
         super::projection::atn_proj_metal("o_proj", layer_idx, &w.o_weight, attn_out, seq_len)?
     {
@@ -23,6 +21,32 @@ pub(in crate::engine) fn apply_prefill_attention_output(
     } else {
         w.o_weight.gemv(attn_out)?
     };
+    finish_prefill_attention_projection(
+        metadata,
+        architecture,
+        gemma_runtime_flavor,
+        hidden,
+        w,
+        attn_proj,
+        layer_idx,
+        seq_len,
+        norm_eps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn finish_prefill_attention_projection(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    gemma_runtime_flavor: GemmaRuntimeFlavor,
+    hidden: Tensor,
+    w: &AttentionLayerWeights,
+    attn_proj: Tensor,
+    layer_idx: usize,
+    seq_len: usize,
+    norm_eps: f32,
+) -> crate::error::Result<Tensor> {
+    let fwd = |e: rnb_core::error::RnbError| crate::error::LlmError::Forward(e.to_string());
     if dump_bin_dir().is_some() {
         dump_bin(
             "prefill",

@@ -361,7 +361,9 @@ fn copy_f32(src: &[f32], dst: &ProtocolObject<dyn MTLBuffer>) {
     }
 }
 
-fn ensure_command_completed(cmd: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), String> {
+pub(crate) fn ensure_command_completed(
+    cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<(), String> {
     let status = cmd.status();
     if status == MTLCommandBufferStatus::Completed {
         return Ok(());
@@ -376,7 +378,7 @@ fn ensure_command_completed(cmd: &ProtocolObject<dyn MTLCommandBuffer>) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_quant_gemm_v2(
+pub(crate) fn encode_quant_gemm_v2(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
     quant: TensoropsQuant,

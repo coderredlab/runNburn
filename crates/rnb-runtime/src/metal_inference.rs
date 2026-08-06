@@ -93,6 +93,40 @@ pub struct MetalPrefillAtnOTailOut {
     pub v_bits: Vec<u16>,
 }
 
+pub struct MetalGemmaPrefillQkvOTailRequest<'a> {
+    pub normed: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub q_weight_ggml: GGMLType,
+    pub q_weight_raw: &'a [u8],
+    pub q_weight_rows: usize,
+    pub q_weight_cols: usize,
+    pub k_weight_ggml: GGMLType,
+    pub k_weight_raw: &'a [u8],
+    pub k_weight_rows: usize,
+    pub k_weight_cols: usize,
+    pub v_weight_ggml: GGMLType,
+    pub v_weight_raw: &'a [u8],
+    pub v_weight_rows: usize,
+    pub v_weight_cols: usize,
+    pub o_weight_ggml: GGMLType,
+    pub o_weight_raw: &'a [u8],
+    pub o_weight_rows: usize,
+    pub o_weight_cols: usize,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub sliding_window: usize,
+    pub softcap: Option<f32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35RouteAlgorithm {
     SelectedSoftmaxTopKLowerExpertTieV1,
@@ -5228,6 +5262,79 @@ fn tensorops_quant_from_ggml(ggml: GGMLType) -> Option<rnb_backend_metal::Tensor
         GGMLType::Q3_K => Some(rnb_backend_metal::TensoropsQuant::Q3K),
         _ => None,
     }
+}
+
+pub fn metal_gemma_prefill_qkv_o_tail_if_supported(
+    req: MetalGemmaPrefillQkvOTailRequest<'_>,
+) -> Result<Option<MetalPrefillAtnOTailOut>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_QKV_O_CHAIN") {
+        return Ok(None);
+    }
+    let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(k_quant) = tensorops_quant_from_ggml(req.k_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(v_quant) = tensorops_quant_from_ggml(req.v_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
+        return Ok(None);
+    };
+    METAL.with(|backend| {
+        backend
+            .prefill_gemma_qkv_o_tail_if_supported(
+                rnb_backend_metal::GemmaPrefillQkvOTailBackendRequest {
+                    normed: req.normed,
+                    q_norm_w: req.q_norm_w,
+                    k_norm_w: req.k_norm_w,
+                    q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.q_weight_raw,
+                        quant: q_quant,
+                        rows: req.q_weight_rows,
+                        cols: req.q_weight_cols,
+                    },
+                    k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.k_weight_raw,
+                        quant: k_quant,
+                        rows: req.k_weight_rows,
+                        cols: req.k_weight_cols,
+                    },
+                    v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.v_weight_raw,
+                        quant: v_quant,
+                        rows: req.v_weight_rows,
+                        cols: req.v_weight_cols,
+                    },
+                    o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.o_weight_raw,
+                        quant: o_quant,
+                        rows: req.o_weight_rows,
+                        cols: req.o_weight_cols,
+                    },
+                    seq_len: req.seq_len,
+                    num_heads: req.num_heads,
+                    num_kv_heads: req.num_kv_heads,
+                    head_dim: req.head_dim,
+                    hidden_dim: req.hidden_dim,
+                    q_dim: req.q_dim,
+                    kv_dim: req.kv_dim,
+                    rope_theta: req.rope_theta,
+                    scale: req.scale,
+                    norm_eps: req.norm_eps,
+                    sliding_window: req.sliding_window,
+                    softcap: req.softcap,
+                },
+            )
+            .map(|result| {
+                result.map(|(hidden, k_bits, v_bits)| MetalPrefillAtnOTailOut {
+                    hidden,
+                    k_bits,
+                    v_bits,
+                })
+            })
+    })
 }
 
 pub fn metal_prefill_atn_core_if_supported(

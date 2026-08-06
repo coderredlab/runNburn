@@ -193,9 +193,9 @@ pub(super) use metal_policy::{
 };
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(super) use metal_prefill::{
-    metal_prefill_atn_core_if_supported, metal_prefill_atn_full_layer_if_supported,
-    metal_prefill_atn_o_tail_if_supported, metal_prefill_atn_o_tail_record_adapter_reject,
-    MetalPrefillAtnCoreShape,
+    metal_gemma_prefill_qkv_o_tail_if_supported, metal_prefill_atn_core_if_supported,
+    metal_prefill_atn_full_layer_if_supported, metal_prefill_atn_o_tail_if_supported,
+    metal_prefill_atn_o_tail_record_adapter_reject, MetalPrefillAtnCoreShape,
 };
 pub(super) use metal_prefill::{
     metal_prefill_atn_full_counters_report, metal_prefill_atn_full_counters_reset,

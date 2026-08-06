@@ -38,7 +38,7 @@ pub(in crate::engine) use fused_qkv_chain::{
 use projection::{
     project_prefill_attention, try_prefill_atn_core_metal, try_prefill_atn_full_layer_metal,
     try_prefill_atn_o_tail_metal, try_prefill_attention_q4k_f16_qkv_attention_hd512,
-    try_prefill_attn_chain_metal,
+    try_prefill_attn_chain_metal, try_prefill_gemma_qkv_o_tail_metal,
 };
 use rope::apply_prefill_rope;
 
@@ -527,6 +527,33 @@ fn forward_attention_layer_impl(
             }
             prof("qkv+rope+qknorm+attn_o_ffn_full_metal", fused_t0);
             PrefillAttentionStep::FinalHidden(fused.hidden)
+        } else if let Some(fused) = try_prefill_gemma_qkv_o_tail_metal(
+            metadata,
+            architecture,
+            gemma_runtime_flavor,
+            &hidden,
+            w,
+            rope_freqs,
+            layout,
+            gemma4_reuse_q_only,
+            layer_idx,
+            seq_len,
+            pos_start,
+            norm_eps,
+        )? {
+            if owns_kv {
+                kv_cache
+                    .replace_layer_f16_range_compacted(
+                        kv_cache_layer,
+                        pos_start,
+                        seq_len,
+                        &fused.k_bits,
+                        &fused.v_bits,
+                    )
+                    .map_err(crate::error::LlmError::Forward)?;
+            }
+            prof("gemma_qkv+qknorm+rope+attn_o_metal", fused_t0);
+            PrefillAttentionStep::PostAttentionHidden(fused.hidden)
         } else if let Some(fused) = {
             if backend_runtime::metal_prefill_atn_o_tail_requested() {
                 backend_runtime::metal_prefill_atn_o_tail_expected_dense_layer();

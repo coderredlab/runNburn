@@ -83,6 +83,62 @@ kernel void prefill_rope_qk_norm(
         out[base + i] = normed[i];
     }
 }
+// Gemma 4 local-attention path: per-head RMSNorm followed by full
+// NeoX split-half RoPE. The effective norm weight is supplied by the host,
+// so unit-offset models pass (1 + stored_weight) without changing this ABI.
+// One threadgroup owns one token/head. Each lane normalizes and rotates
+// independent split-half pairs after the shared mean-square reduction.
+kernel void prefill_neox_qk_norm(
+    device const float* in        [[buffer(0)]],
+    device const float* weight    [[buffer(1)]],
+    device float*       out       [[buffer(2)]],
+    constant uint&      num_heads [[buffer(3)]],
+    constant uint&      head_dim  [[buffer(4)]],
+    constant uint&      n_rot     [[buffer(5)]],
+    constant float&     theta     [[buffer(6)]],
+    constant float&     eps       [[buffer(7)]],
+    constant uint&      pos_start [[buffer(8)]],
+    uint group   [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint token = group / num_heads;
+    uint base = group * head_dim;
+    threadgroup float partial[256];
+
+    float sum = 0.0f;
+    for (uint col = tid; col < head_dim; col += tg_size) {
+        float value = in[base + col];
+        sum += value * value;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(partial[0] / (float)head_dim + eps);
+    uint nr = min(n_rot, head_dim);
+    uint half_rot = nr / 2u;
+    float position = (float)(pos_start + token);
+    for (uint pair = tid; pair < half_rot; pair += tg_size) {
+        uint right = half_rot + pair;
+        float frequency = pow(theta, -2.0f * (float)pair / (float)nr);
+        float angle = position * frequency;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        float x0 = in[base + pair] * inv_rms * weight[pair];
+        float x1 = in[base + right] * inv_rms * weight[right];
+        out[base + pair] = x0 * cos_a - x1 * sin_a;
+        out[base + right] = x0 * sin_a + x1 * cos_a;
+    }
+    for (uint col = nr + tid; col < head_dim; col += tg_size) {
+        out[base + col] = in[base + col] * inv_rms * weight[col];
+    }
+}
 kernel void prefill_rope_only(
     device const float* in           [[buffer(0)]],
     device float*       out          [[buffer(1)]],
