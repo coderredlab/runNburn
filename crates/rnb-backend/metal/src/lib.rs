@@ -9201,6 +9201,78 @@ impl MetalBackend {
         ffn_chain::o_chain_dispatch(ctx, carrier, attn_out, hidden, &o_w, &o_off_buf)
     }
 
+    /// Gemma Q4_K attention output projection, post-attention norm/residual,
+    /// and dense GeGLU FFN in one command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_attention_o_ffn_chain_resident(
+        &self,
+        attn_out: &[f32],
+        hidden: &mut [f32],
+        o_raw: &[u8],
+        post_attn_norm_weight: &[f32],
+        ffn_norm_weight: &[f32],
+        post_ffn_norm_weight: Option<&[f32]>,
+        gate_raw: &[u8],
+        up_raw: &[u8],
+        down_raw: &[u8],
+        hidden_dim: usize,
+        q_dim: usize,
+        ffn_dim: usize,
+        norm_eps: f32,
+        down_is_q6k: bool,
+    ) {
+        let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
+        let resident_weight = |raw: &[u8]| {
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
+                .entry(resident_key(raw))
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
+            (entry.0.clone(), entry.1)
+        };
+        let (o_w, o_off) = resident_weight(o_raw);
+        let (gate_w, gate_off) = resident_weight(gate_raw);
+        let (up_w, up_off) = resident_weight(up_raw);
+        let (down_w, down_off) = resident_weight(down_raw);
+
+        let o_off_buf = ffn_chain::u32_buf(ctx, o_off);
+        let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
+        let up_off_buf = ffn_chain::u32_buf(ctx, up_off);
+        let down_off_buf = ffn_chain::u32_buf(ctx, down_off);
+        let post_attn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, post_attn_norm_weight);
+        let ffn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, ffn_norm_weight);
+        let post_ffn_norm_w_buf =
+            post_ffn_norm_weight.map(|weight| ffn_chain::shared_f32_buf(ctx, weight));
+
+        let mut o_carriers = self.o_chain_carriers.borrow_mut();
+        let o_carrier = o_carriers
+            .entry((hidden_dim, q_dim))
+            .or_insert_with(|| ffn_chain::OChainCarrier::new(ctx, hidden_dim, q_dim));
+        let mut ffn_carriers = self.ffn_carriers.borrow_mut();
+        let ffn_carrier = ffn_carriers
+            .entry((hidden_dim, ffn_dim))
+            .or_insert_with(|| ffn_chain::FfnCarrier::new(ctx, hidden_dim, ffn_dim, norm_eps));
+
+        ffn_chain::gemma_o_ffn_chain_dispatch(
+            ctx,
+            o_carrier,
+            ffn_carrier,
+            attn_out,
+            hidden,
+            &o_w,
+            &o_off_buf,
+            &post_attn_norm_w_buf,
+            &ffn_norm_w_buf,
+            post_ffn_norm_w_buf.as_deref(),
+            &gate_w,
+            &gate_off_buf,
+            &up_w,
+            &up_off_buf,
+            &down_w,
+            &down_off_buf,
+            down_is_q6k,
+        )
+    }
+
     /// GDN qkv+gate device-resident chain (Q4_K, 단일 command buffer 2 GEMV).
     /// norm_input(host)은 norm 완료된 것. qkv/gate weight raw 는 등록된 mmap storage 를
     /// resident cache 가 보유하는 NoCopy view 다. carrier shape 별 재사용. 반환: (qkv, gate).
@@ -9263,6 +9335,7 @@ impl MetalBackend {
         hidden_dim: usize,
         q_out_dim: usize,
         kv_dim: usize,
+        v_from_k: bool,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
 
@@ -9281,7 +9354,9 @@ impl MetalBackend {
                 .or_insert_with(|| resident_cache_entry(ctx, k_raw));
             (e.0.clone(), e.1)
         };
-        let (v_w, v_off) = {
+        let (v_w, v_off) = if v_from_k {
+            (k_w.clone(), k_off)
+        } else {
             let mut r = self.resident.borrow_mut();
             let e = r
                 .entry(resident_key(v_raw))
@@ -9299,6 +9374,7 @@ impl MetalBackend {
 
         ffn_chain::qkv_chain_dispatch(
             ctx, carrier, norm_input, &q_w, &q_off_buf, &k_w, &k_off_buf, &v_w, &v_off_buf,
+            v_from_k,
         )
     }
 

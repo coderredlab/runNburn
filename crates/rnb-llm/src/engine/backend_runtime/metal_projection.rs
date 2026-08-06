@@ -52,6 +52,61 @@ pub(in crate::engine) fn metal_ffn_chain_into_if_supported(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "metal"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn metal_gemma_attention_o_ffn_chain_into_if_supported(
+    attn_out: &[f32],
+    hidden: &mut [f32],
+    o_weight: &QuantizedWeight,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: Option<&[f32]>,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    hidden_dim: usize,
+    q_dim: usize,
+    ffn_dim: usize,
+    norm_eps: f32,
+) -> crate::error::Result<bool> {
+    let (Some(o_v), Some(gate_v), Some(up_v), Some(down_v)) = (
+        o_weight.backend_view(),
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    ) else {
+        return Ok(false);
+    };
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_gemma_attention_o_ffn_chain_into_if_supported(
+            backend_ggml_type(o_v.quant()),
+            backend_ggml_type(gate_v.quant()),
+            backend_ggml_type(up_v.quant()),
+            backend_ggml_type(down_v.quant()),
+            o_v.raw(),
+            gate_v.raw(),
+            up_v.raw(),
+            down_v.raw(),
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            attn_out,
+            hidden,
+            hidden_dim,
+            q_dim,
+            ffn_dim,
+            norm_eps,
+        )
+        .map_err(|error| crate::error::LlmError::Forward(error));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (o_v, gate_v, up_v, down_v);
+        Ok(false)
+    }
+}
+
 /// pm33: prefill FFN batch GEMM chain seam. `metal_ffn_chain_into_if_supported`(decode)의
 /// M>1 아날로그. norm 은 caller(normed 입력), residual 도 caller(out = down 결과, residual 전).
 #[cfg_attr(not(feature = "metal"), allow(dead_code, unused_variables))]

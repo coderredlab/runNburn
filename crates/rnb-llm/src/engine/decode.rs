@@ -627,6 +627,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             q_out_dim,
             kv_dim,
             gemma4_reuse_q_only,
+            use_gemma_block_semantics(architecture),
             verbose,
             rms_used_cuda,
             #[cfg(feature = "vulkan")]
@@ -1028,6 +1029,57 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // 7. Output projection + residual — try GPU first
     let t0 = std::time::Instant::now();
     let t_o_weight = std::time::Instant::now();
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if use_gemma_block_semantics(architecture)
+        && !mtp_finite_trace_enabled()
+        && !gemma_skip_post_attn_enabled(layer_idx)
+        && !gemma_skip_post_attn_decode_enabled(layer_idx)
+        && !gemma_effective_unit_offset_post_attn_enabled(
+            architecture,
+            gemma_runtime_flavor,
+            layer_idx,
+        )
+        && !gemma_post_attn_blend_source_decode_enabled(layer_idx)
+        && !gemma_pre_residual_blend_source_decode_enabled(layer_idx)
+        && !gemma_effective_skip_ffn_decode_enabled(architecture, gemma_runtime_flavor, layer_idx)
+        && !super::policy::gemma_unit_offset_attn_ffn_norm_enabled()
+        && !super::policy::gemma_unit_offset_norm_enabled()
+        && !super::policy::gemma_unit_offset_main_norm_enabled()
+        && !super::policy::gemma_unit_offset_ffn_pre_norm_enabled(layer_idx)
+        && !super::policy::gemma_unit_offset_ffn_post_norm_enabled()
+        && w.ffn_gate_up_fused.is_none()
+        && w.moe.is_none()
+        && w.shared_expert_moe.is_none()
+    {
+        if let Some(post_attn_norm) = &w.post_attn_norm {
+            let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+            let ffn_dim = w.ffn_gate_weight.rows;
+            if backend_runtime::metal_gemma_attention_o_ffn_chain_into_if_supported(
+                &scratch.attn_out[..q_dim],
+                &mut scratch.hidden[..hidden_dim],
+                &w.o_weight,
+                kernels::tensor_as_f32_slice(post_attn_norm),
+                kernels::tensor_as_f32_slice(ffn_norm),
+                w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice),
+                &w.ffn_gate_weight,
+                &w.ffn_up_weight,
+                &w.ffn_down_weight,
+                hidden_dim,
+                q_dim,
+                ffn_dim,
+                norm_eps,
+            )? {
+                prof!("o_proj+ffn_chain", t0);
+                emit_mtp_finite_trace(
+                    "decode-attn",
+                    layer_idx,
+                    "after_ffn",
+                    &scratch.hidden[..hidden_dim],
+                );
+                return Ok(false);
+            }
+        }
+    }
     // Metal attention O chain (RNB_METAL_O_CHAIN=1) — o_proj + residual 단일 command
     // buffer. non-gemma(qwen) 한정(gemma post-attn-norm 제외). 성공 시 두 함수 skip.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

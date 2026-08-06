@@ -11,6 +11,7 @@ pub(super) fn decode_attention_qkv_projection<F>(
     q_out_dim: usize,
     kv_dim: usize,
     gemma4_reuse_q_only: bool,
+    metal_chain_default: bool,
     verbose: bool,
     rms_used_cuda: bool,
     #[cfg(feature = "vulkan")] gpu_runtime: &mut Option<&mut backend_runtime::GpuRuntime>,
@@ -43,8 +44,8 @@ where
     if gpu_qkv_ok && backend_runtime::verify_attention_qkv_layer(layer_idx) {
         verify_decode_attention_qkv(layer_idx, scratch, w, hidden_dim, q_out_dim, kv_dim);
     }
-    // Metal QKV device-resident chain (RNB_METAL_QKV_CHAIN=1) — q/k/v 3 GEMV 를
-    // 단일 command buffer 로(per-op 3 commit/wait → 1). Q4_K q/k/v 한정.
+    // Metal QKV device-resident chain. Gemma Q4_K는 기본 활성이고 다른 모델은
+    // RNB_METAL_QKV_CHAIN=1 opt-in이다. V projection 부재 시 raw K를 그대로 재사용한다.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let gpu_qkv_ok = if !gpu_qkv_ok && !gemma4_reuse_q_only {
         backend_runtime::metal_attention_qkv_chain_into_if_supported(
@@ -58,6 +59,8 @@ where
             hidden_dim,
             q_out_dim,
             kv_dim,
+            metal_chain_default,
+            w.v_proj_missing,
         )?
     } else {
         gpu_qkv_ok
@@ -101,13 +104,17 @@ where
                 "attention k",
                 rms_used_cuda,
             )?;
-            let v_ok = gpu_gemv_into_if_supported(
-                &w.v_weight,
-                &scratch.norm_buf[..hidden_dim],
-                &mut scratch.v_buf[..kv_dim],
-                "attention v",
-                rms_used_cuda,
-            )?;
+            let v_ok = if w.v_proj_missing {
+                true
+            } else {
+                gpu_gemv_into_if_supported(
+                    &w.v_weight,
+                    &scratch.norm_buf[..hidden_dim],
+                    &mut scratch.v_buf[..kv_dim],
+                    "attention v",
+                    rms_used_cuda,
+                )?
+            };
             q_ok && k_ok && v_ok
         }
     } else {
@@ -140,6 +147,10 @@ where
                 |label, t| profile(label, t),
             )?;
         }
+    }
+
+    if w.v_proj_missing && !gemma4_reuse_q_only {
+        scratch.v_buf[..kv_dim].copy_from_slice(&scratch.k_buf[..kv_dim]);
     }
 
     Ok(())

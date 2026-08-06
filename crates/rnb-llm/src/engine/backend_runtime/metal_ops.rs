@@ -142,6 +142,8 @@ pub(in crate::engine) fn metal_attention_qkv_chain_into_if_supported(
     hidden_dim: usize,
     q_out_dim: usize,
     kv_dim: usize,
+    enabled_by_default: bool,
+    v_from_k: bool,
 ) -> crate::error::Result<bool> {
     let (Some(q_v), Some(k_v), Some(v_v)) = (
         q_weight.backend_view(),
@@ -166,6 +168,8 @@ pub(in crate::engine) fn metal_attention_qkv_chain_into_if_supported(
             hidden_dim,
             q_out_dim,
             kv_dim,
+            enabled_by_default,
+            v_from_k,
         )
         .map_err(|e| crate::error::LlmError::Forward(e));
     }

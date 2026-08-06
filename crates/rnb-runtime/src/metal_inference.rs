@@ -3488,9 +3488,9 @@ pub fn metal_gdn_inproj_chain_into_if_supported(
     Ok(true)
 }
 
-/// QKV projection device-resident chain. `RNB_METAL_QKV_CHAIN=1` 일 때만 활성.
-/// q/k/v 모두 Q4_K 일 때 단일 command buffer 3 GEMV(dispatch 3→1). norm_input 은
-/// chain 진입 전 norm 완료된 host slice. 성공 시 Ok(true) + q/k/v out 갱신.
+/// QKV projection device-resident chain. Gemma는 기본 활성이고
+/// `RNB_METAL_QKV_CHAIN=0`으로 끌 수 있다. 다른 모델은 `=1`로 명시해야 한다.
+/// q/k/v Q4_K projection을 한 command buffer로 묶고, V weight가 없으면 raw K를 재사용한다.
 #[allow(clippy::too_many_arguments)]
 pub fn metal_attention_qkv_chain_into_if_supported(
     q_ggml: GGMLType,
@@ -3506,8 +3506,14 @@ pub fn metal_attention_qkv_chain_into_if_supported(
     hidden_dim: usize,
     q_out_dim: usize,
     kv_dim: usize,
+    enabled_by_default: bool,
+    v_from_k: bool,
 ) -> Result<bool> {
-    if std::env::var("RNB_METAL_QKV_CHAIN").as_deref() != Ok("1") {
+    if if enabled_by_default {
+        env_falsey("RNB_METAL_QKV_CHAIN")
+    } else {
+        std::env::var("RNB_METAL_QKV_CHAIN").as_deref() != Ok("1")
+    } {
         return Ok(false);
     }
     if q_ggml != GGMLType::Q4_K || k_ggml != GGMLType::Q4_K || v_ggml != GGMLType::Q4_K {
@@ -3515,12 +3521,61 @@ pub fn metal_attention_qkv_chain_into_if_supported(
     }
     let (q, k, v) = METAL.with(|b| {
         b.attention_qkv_chain_resident(
-            norm_input, q_raw, k_raw, v_raw, hidden_dim, q_out_dim, kv_dim,
+            norm_input, q_raw, k_raw, v_raw, hidden_dim, q_out_dim, kv_dim, v_from_k,
         )
     });
     q_out.copy_from_slice(&q);
     k_out.copy_from_slice(&k);
     v_out.copy_from_slice(&v);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_gemma_attention_o_ffn_chain_into_if_supported(
+    o_ggml: GGMLType,
+    gate_ggml: GGMLType,
+    up_ggml: GGMLType,
+    down_ggml: GGMLType,
+    o_raw: &[u8],
+    gate_raw: &[u8],
+    up_raw: &[u8],
+    down_raw: &[u8],
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: Option<&[f32]>,
+    attn_out: &[f32],
+    hidden: &mut [f32],
+    hidden_dim: usize,
+    q_dim: usize,
+    ffn_dim: usize,
+    norm_eps: f32,
+) -> Result<bool> {
+    if o_ggml != GGMLType::Q4_K || gate_ggml != GGMLType::Q4_K || up_ggml != GGMLType::Q4_K {
+        return Ok(false);
+    }
+    let down_is_q6k = match down_ggml {
+        GGMLType::Q4_K => false,
+        GGMLType::Q6_K => true,
+        _ => return Ok(false),
+    };
+    METAL.with(|backend| {
+        backend.gemma_attention_o_ffn_chain_resident(
+            attn_out,
+            hidden,
+            o_raw,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            gate_raw,
+            up_raw,
+            down_raw,
+            hidden_dim,
+            q_dim,
+            ffn_dim,
+            norm_eps,
+            down_is_q6k,
+        )
+    });
     Ok(true)
 }
 
