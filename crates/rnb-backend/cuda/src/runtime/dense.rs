@@ -1935,8 +1935,11 @@ impl CudaState {
         }
         self.trace_dense_stage(trace_call, "cuda-dense-batch-dev", "gate_up", trace_stage)?;
 
-        let q8dot_down =
-            dense_q8dot_down_enabled(gelu && matches!(down_quant, 12 | 14) && n_ff >= 1024);
+        // cu210: Q8-down handoff 는 GELU(Gemma) 측정 시절 gelu 전용이었다.
+        // SiLU dense(Qwen ATN)의 MTP verify seq2 window 가 이 게이트에 막혀
+        // raw Q6 batch(445.9µs/call, 창의 22%)로 떨어졌다 — silu 도 허용한다.
+        // `RNB_CUDA_DENSE_Q8DOT_DOWN=0` opt-out 은 그대로다.
+        let q8dot_down = dense_q8dot_down_enabled(matches!(down_quant, 12 | 14) && n_ff >= 1024);
         let q6_down_plan = if down_quant == 14 {
             dense_q6_down_dispatch_plan(gelu, down_quant, seq_len, n_ff, n_embd, true)
         } else {
@@ -2083,7 +2086,11 @@ impl CudaState {
                             output_dev,
                         )
                     } else {
-                        self.launch_q6k_gemv_batch_q8dot_to_dev(
+                        // cu210: 구세대 byte 배치 q8dot 은 이 shape(seq2,
+                        // blocks 68)에서 708µs/call 로 raw(446µs)보다도 느렸다.
+                        // dev-input 경로(MTP verify 전용)는 cu207 half2 게이트를
+                        // 공유하는 paired launcher 로 보낸다.
+                        self.launch_q6k_gemv_batch_q8dot_paired_to_dev(
                             down_weights,
                             n_embd,
                             down_blocks,
