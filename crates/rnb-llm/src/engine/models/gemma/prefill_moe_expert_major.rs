@@ -4,7 +4,6 @@ use super::moe_view::select_experts_from_logits;
 #[cfg(target_arch = "aarch64")]
 use super::prefill_moe_expert_group::compute_expert_groups;
 use super::select_ffn_pre_norm_weight;
-#[cfg(feature = "cuda")]
 use crate::engine::backend_runtime;
 use crate::engine::cpu_runtime::kernels;
 use crate::engine::dense_dispatch;
@@ -189,15 +188,28 @@ fn compute_shared_output(
     profile_enabled: bool,
 ) -> crate::error::Result<Vec<f32>> {
     let shared_start = profile_enabled.then(Instant::now);
-    let (mut shared_gate, shared_up) = prefill_gate_up_vectors(
+    let mut shared_down = vec![0.0f32; seq_len * hidden_dim];
+    let used_metal = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
         &w.ffn_gate_weight,
         &w.ffn_up_weight,
-        w.ffn_gate_up_fused.as_ref(),
+        &w.ffn_down_weight,
         shared_norm,
+        &mut shared_down,
         seq_len,
+        hidden_dim,
+        true,
     )?;
-    apply_model_gate_mul_inplace(&mut shared_gate, &shared_up, architecture);
-    let shared_down = w.ffn_down_weight.gemv_vec(&shared_gate)?;
+    if !used_metal {
+        let (mut shared_gate, shared_up) = prefill_gate_up_vectors(
+            &w.ffn_gate_weight,
+            &w.ffn_up_weight,
+            w.ffn_gate_up_fused.as_ref(),
+            shared_norm,
+            seq_len,
+        )?;
+        apply_model_gate_mul_inplace(&mut shared_gate, &shared_up, architecture);
+        shared_down = w.ffn_down_weight.gemv_vec(&shared_gate)?;
+    }
     let mut shared_output = vec![0.0f32; seq_len * hidden_dim];
     apply_model_norm_into(
         &shared_down,

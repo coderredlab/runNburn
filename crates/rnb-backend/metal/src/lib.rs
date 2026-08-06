@@ -4906,10 +4906,10 @@ impl MetalBackend {
         );
     }
 
-    /// Prefill FFN chain(M>1). normed[seq_len*hidden] + gate/up(Q4_K)/
-    /// down(Q4_K|Q6_K) raw weight → down 결과[seq_len*hidden](residual 전).
-    /// `use_gelu`는 Gemma GeGLU, false는 SwiGLU를 선택한다. Weight는 source storage
-    /// lease와 함께 `(ptr,len)` 키로 resident wrap하고 carrier는 shape별로 재사용한다.
+    /// Prefill FFN chain(M>1). normed[seq_len*hidden] + gate/up/down(Q8_0), or
+    /// gate/up(Q4_K) + down(Q4_K|Q6_K), → down result[seq_len*hidden](before residual).
+    /// `use_gelu` selects Gemma GeGLU; false selects SwiGLU. Weights retain source
+    /// storage leases in the resident cache and carriers are reused by shape.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_ffn_chain(
         &self,
@@ -4918,6 +4918,7 @@ impl MetalBackend {
         up_w: &[u8],
         down_w: &[u8],
         down_is_q6k: bool,
+        q8_0: bool,
         seq_len: usize,
         hidden_dim: usize,
         ffn_dim: usize,
@@ -4934,30 +4935,36 @@ impl MetalBackend {
         let (gate_wb, gate_off) = wrap(gate_w);
         let (up_wb, up_off) = wrap(up_w);
         let (down_wb, down_off) = wrap(down_w);
-        let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
-        let up_off_buf = ffn_chain::u32_buf(ctx, up_off);
-        let down_off_buf = ffn_chain::u32_buf(ctx, down_off);
-
         let mut carriers = self.prefill_ffn_carriers.borrow_mut();
         let carrier = carriers
             .entry((hidden_dim, ffn_dim, seq_len))
             .or_insert_with(|| {
                 ffn_chain::PrefillFfnCarrier::new(ctx, hidden_dim, ffn_dim, seq_len)
             });
-        ffn_chain::prefill_ffn_chain_dispatch(
-            ctx,
-            carrier,
-            normed,
-            &gate_wb,
-            &gate_off_buf,
-            &up_wb,
-            &up_off_buf,
-            &down_wb,
-            &down_off_buf,
-            down_is_q6k,
-            use_gelu,
-            seq_len,
-        )
+        if q8_0 {
+            ffn_chain::prefill_ffn_q8_0_chain_dispatch(
+                ctx, carrier, normed, &gate_wb, gate_off, &up_wb, up_off, &down_wb, down_off,
+                use_gelu,
+            )
+        } else {
+            let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
+            let up_off_buf = ffn_chain::u32_buf(ctx, up_off);
+            let down_off_buf = ffn_chain::u32_buf(ctx, down_off);
+            ffn_chain::prefill_ffn_chain_dispatch(
+                ctx,
+                carrier,
+                normed,
+                &gate_wb,
+                &gate_off_buf,
+                &up_wb,
+                &up_off_buf,
+                &down_wb,
+                &down_off_buf,
+                down_is_q6k,
+                use_gelu,
+                seq_len,
+            )
+        }
     }
 
     pub fn qwen_moe_prefill_sparse_accum_supported(&self, down_is_q6k: bool) -> bool {
@@ -13510,7 +13517,7 @@ mod tests {
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m); // [m, hid]
 
         let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, true, m, hid, ffn, false,
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false,
         );
         assert_eq!(gpu.len(), m * hid);
         // pm34 M7: M5 default = tensorops(half staging) → global rel(half GEMM 표준). 비-M5 는
@@ -13558,7 +13565,7 @@ mod tests {
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m);
         let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, true, m, hid, ffn, false,
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false,
         );
         std::env::remove_var("RNB_METAL_PREFILL_FFN_KERNEL");
         assert_eq!(gpu.len(), m * hid);
@@ -13603,8 +13610,9 @@ mod tests {
             })
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m);
-        let gpu =
-            backend.prefill_ffn_chain(&normed, gate_raw, up_raw, down_raw, true, m, hid, ffn, true);
+        let gpu = backend.prefill_ffn_chain(
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, true,
+        );
         let mut max_abs = 0f32;
         let mut max_w = 0f32;
         for i in 0..m * hid {
@@ -13615,6 +13623,56 @@ mod tests {
         assert!(
             global_rel < 1e-2,
             "prefill GeGLU FFN mismatch: global_rel={global_rel}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn prefill_q8_0_gelu_ffn_chain_matches_cpu() {
+        let backend = MetalBackend::new();
+        let (hid, ffn, m) = (256usize, 512usize, 17usize);
+        let gate_w = build_q8_0_rows(ffn, hid);
+        let up_w = build_q8_0_rows(ffn, hid);
+        let down_w = build_q8_0_rows(hid, ffn);
+        let gate_mapped = mapped_test_tensor(&gate_w);
+        let up_mapped = mapped_test_tensor(&up_w);
+        let down_mapped = mapped_test_tensor(&down_w);
+        let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
+        let up_raw = up_mapped.as_bytes().expect("up bytes");
+        let down_raw = down_mapped.as_bytes().expect("down bytes");
+        let normed = det_vals(m * hid, 0.1);
+        let g = cpu_q8_0_gemm_reference(&gate_w, ffn, hid, &normed, m);
+        let u = cpu_q8_0_gemm_reference(&up_w, ffn, hid, &normed, m);
+        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        let act: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .map(|(&a, &b)| {
+                let gelu = if a >= 10.0 {
+                    a
+                } else if a <= -10.0 {
+                    0.0
+                } else {
+                    0.5 * a * (1.0 + (sqrt_2_over_pi * (a + 0.044715 * a.powi(3))).tanh())
+                };
+                gelu * b
+            })
+            .collect();
+        let cpu = cpu_q8_0_gemm_reference(&down_w, hid, ffn, &act, m);
+        let gpu = backend.prefill_ffn_chain(
+            &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
+        );
+        let mut max_abs = 0f32;
+        let mut max_w = 0f32;
+        for i in 0..m * hid {
+            max_abs = max_abs.max((gpu[i] - cpu[i]).abs());
+            max_w = max_w.max(cpu[i].abs());
+        }
+        let global_rel = max_abs / max_w.max(1e-3);
+        assert!(
+            global_rel < 1e-3,
+            "prefill Q8_0 GeGLU FFN mismatch: global_rel={global_rel}"
         );
     }
 
@@ -17131,7 +17189,7 @@ kernel void q4k_ro_vec4(
             }
         }
         let ffn_down = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, false, seq, hidden_dim, ffn_dim, false,
+            &normed, gate_raw, up_raw, down_raw, false, false, seq, hidden_dim, ffn_dim, false,
         );
         let mut expected = hidden_plus;
         for i in 0..expected.len() {

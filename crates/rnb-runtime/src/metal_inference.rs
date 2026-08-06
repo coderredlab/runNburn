@@ -3511,13 +3511,19 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     if std::env::var("RNB_METAL_PREFILL_FFN").as_deref() == Ok("0") {
         return Ok(false);
     }
-    if gate_ggml != GGMLType::Q4_K || up_ggml != GGMLType::Q4_K {
-        return Ok(false);
-    }
-    let down_is_q6k = match down_ggml {
-        GGMLType::Q4_K => false,
-        GGMLType::Q6_K => true,
-        _ => return Ok(false),
+    let q8_0 =
+        gate_ggml == GGMLType::Q8_0 && up_ggml == GGMLType::Q8_0 && down_ggml == GGMLType::Q8_0;
+    let down_is_q6k = if q8_0 {
+        false
+    } else {
+        if gate_ggml != GGMLType::Q4_K || up_ggml != GGMLType::Q4_K {
+            return Ok(false);
+        }
+        match down_ggml {
+            GGMLType::Q4_K => false,
+            GGMLType::Q6_K => true,
+            _ => return Ok(false),
+        }
     };
     let r = METAL.with(|b| {
         b.prefill_ffn_chain(
@@ -3526,6 +3532,7 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
             up_raw,
             down_raw,
             down_is_q6k,
+            q8_0,
             seq_len,
             hidden_dim,
             ffn_dim,
@@ -3699,6 +3706,7 @@ pub fn metal_qwen_moe_expert_ffn_into_if_supported(
             up_raw,
             down_raw,
             down_is_q6k,
+            false,
             group_len,
             hidden_dim,
             ffn_dim,

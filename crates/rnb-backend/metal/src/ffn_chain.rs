@@ -11600,6 +11600,93 @@ pub(crate) fn prefill_ffn_chain_v2_scatter_accum_encode_gather(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
+    ctx: &MetalContext,
+    carrier: &PrefillFfnCarrier,
+    normed: &[f32],
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_off: u32,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_off: u32,
+    down_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_off: u32,
+    use_gelu: bool,
+) -> Vec<f32> {
+    let hidden_dim = carrier.hidden_dim;
+    let ffn_dim = carrier.ffn_dim;
+    let seq_len = carrier.seq_len;
+    carrier.upload_normed(normed);
+
+    let cmd = ctx.queue.commandBuffer().expect("command buffer");
+    let enc = cmd.computeCommandEncoder().expect("compute encoder");
+    crate::compute::encode_gemm_q8_0_tensorops(
+        ctx,
+        &enc,
+        gate_w_buf,
+        gate_off,
+        &carrier.normed_dev,
+        &carrier.gate_dev,
+        &carrier.fdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.m_buf,
+        ffn_dim,
+        seq_len,
+    );
+    crate::compute::encode_gemm_q8_0_tensorops(
+        ctx,
+        &enc,
+        up_w_buf,
+        up_off,
+        &carrier.normed_dev,
+        &carrier.up_dev,
+        &carrier.fdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.m_buf,
+        ffn_dim,
+        seq_len,
+    );
+    crate::compute::chain_barrier(ctx, &enc);
+    if use_gelu {
+        encode_gelu_mul(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            &carrier.act_dim_buf,
+            seq_len * ffn_dim,
+        );
+    } else {
+        encode_silu_mul(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            &carrier.act_dim_buf,
+            seq_len * ffn_dim,
+        );
+    }
+    crate::compute::chain_barrier(ctx, &enc);
+    crate::compute::encode_gemm_q8_0_tensorops(
+        ctx,
+        &enc,
+        down_w_buf,
+        down_off,
+        &carrier.gate_dev,
+        &carrier.down_dev,
+        &carrier.hdim_buf,
+        &carrier.k_ffn_buf,
+        &carrier.m_buf,
+        hidden_dim,
+        seq_len,
+    );
+
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    readback(&carrier.down_dev, seq_len * hidden_dim)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_ffn_chain_dispatch(
     ctx: &MetalContext,
     carrier: &PrefillFfnCarrier,
