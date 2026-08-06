@@ -54,6 +54,8 @@ const GEMV_Q8_0_MLA_SLOTS_SRC: &str = include_str!("gemv_q8_0_mla_slots.metal");
 const GEMV_Q5K_MLA_SLOTS_SRC: &str = include_str!("gemv_q5k_mla_slots.metal");
 const GLM_MLA_PREFILL_ATTN_SRC: &str = include_str!("glm_mla_prefill_attn.metal");
 const PREFILL_FLASH_ATTN_TG_SRC: &str = include_str!("prefill_flash_attn_tg.metal");
+const PREFILL_FLASH_ATTN_HD512_GEMMA_SRC: &str =
+    include_str!("prefill_flash_attn_hd512_gemma.metal");
 const OUTPUT_ARGMAX_SRC: &str = include_str!("output_argmax.metal");
 
 /// Apple Silicon SIMD-group width. 32 고정(구조적 상수 — threadExecutionWidth 와 일치).
@@ -814,6 +816,9 @@ pub struct MetalContext {
     /// Dense causal GQA prefill attention with threadgroup-resident Q/scores/accumulator.
     /// HD=256, Q=8, C=64, 4 SIMD-groups.
     pub(crate) flash_attn_prefill_tg_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Gemma 4 causal GQA prefill attention. HD=512 with sliding-window mask and softcap.
+    pub(crate) flash_attn_prefill_hd512_gemma_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// pm48 ② prefill qk_norm→rope fused 커널(device-resident attention chain 부품).
     /// per-head RMSNorm → text M-RoPE(partial n_rot) 를 device q/k 에 in-chain 적용. 항상 build.
@@ -2009,6 +2014,17 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let flash_attn_prefill_hd512_gemma_pipeline: Option<
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    > = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            PREFILL_FLASH_ATTN_HD512_GEMMA_SRC,
+            "attn_prefill_flash_tg_hd512_gemma",
+        ))
+    } else {
+        None
+    };
     let q4k_pipeline = build_pipeline(&device, GEMV_Q4K_SRC, "gemv_q4k");
     let q4k_simd_pipeline = build_pipeline(&device, GEMV_Q4K_SIMD_SRC, "gemv_q4k_simd");
     let q4k_coalesced_pipeline =
@@ -2569,6 +2585,7 @@ pub fn build_metal_context_with_opts(
         cast_f32_f16_pipeline,
         delta_net_scan_chunk_step45gemm_pipeline,
         flash_attn_prefill_tg_pipeline,
+        flash_attn_prefill_hd512_gemma_pipeline,
         prefill_rope_qk_norm_pipeline,
         prefill_rope_only_pipeline,
         prefill_imrope_only_pipeline,
@@ -4496,6 +4513,8 @@ pub(crate) fn encode_flash_attn_prefill(
     kv_buf: &ProtocolObject<dyn MTLBuffer>,
     seq_buf: &ProtocolObject<dyn MTLBuffer>,
     scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
     num_heads: usize,
     seq_len: usize,
 ) {
@@ -4520,6 +4539,8 @@ pub(crate) fn encode_flash_attn_prefill(
         enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
         enc.setThreadgroupMemoryLength_atIndex(SCRATCH_BYTES, 0);
     }
+    set_u32_bytes(enc, sliding_window.unwrap_or(0) as u32, 9);
+    set_f32_bytes(enc, softcap.unwrap_or(0.0), 10);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: seq_len.div_ceil(QUERY_BLOCK),
@@ -4617,7 +4638,7 @@ pub fn prefill_flash_attention_with_ctx(
         cmd.computeCommandEncoder().expect("Metal: compute encoder");
     encode_flash_attn_prefill(
         ctx, &enc, &q_buf, &k_buf, &v_buf, &o_buf, &nh_buf, &nkv_buf, &kv_buf, &seq_buf,
-        &scale_buf, num_heads, seq_len,
+        &scale_buf, None, None, num_heads, seq_len,
     );
     enc.endEncoding();
     cmd.commit();
@@ -4629,6 +4650,216 @@ pub fn prefill_flash_attention_with_ctx(
             .map(|value| value.localizedDescription().to_string())
             .unwrap_or_else(|| "no NSError attached".to_string());
         panic!("Metal threadgroup flash command failed status={status:?} error={error}");
+    }
+    let gpu_ms = (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0;
+    let out = unsafe {
+        std::slice::from_raw_parts(
+            o_buf.contents().as_ptr() as *const f32,
+            seq_len * num_heads * head_dim,
+        )
+    }
+    .to_vec();
+    (out, gpu_ms)
+}
+
+/// Gemma 4 HD=512 causal GQA prefill attention을 encode한다. q[seq*nh*512] f32,
+/// k/v[kv*nkv*512] f16, out[seq*nh*512] f32. grid=(ceil(seq/8), num_heads), tg=128.
+#[allow(clippy::too_many_arguments)]
+fn encode_flash_attn_prefill_hd512_gemma(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    kv_buf: &ProtocolObject<dyn MTLBuffer>,
+    seq_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    window_buf: &ProtocolObject<dyn MTLBuffer>,
+    softcap_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+    seq_len: usize,
+) {
+    const QUERY_BLOCK: usize = 8;
+    const HEAD_DIM: usize = 512;
+    const SCRATCH_BYTES: usize = 8 * HEAD_DIM * std::mem::size_of::<u16>()
+        + 8 * HEAD_DIM * std::mem::size_of::<f32>()
+        + 8 * 64 * std::mem::size_of::<f32>();
+    let pipeline = ctx
+        .flash_attn_prefill_hd512_gemma_pipeline
+        .as_ref()
+        .expect("flash_attn_prefill_hd512_gemma_pipeline must be built");
+    enc.setComputePipelineState(pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(kv_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(seq_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(window_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(softcap_buf), 0, 10);
+        enc.setThreadgroupMemoryLength_atIndex(SCRATCH_BYTES, 0);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: seq_len.div_ceil(QUERY_BLOCK),
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Gemma 4 HD=256/512 flash attention의 host 입출력 seam. 반환값은 `(output, GPU-time ms)`다.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_flash_attention_gemma_with_ctx(
+    ctx: &MetalContext,
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> (Vec<f32>, f64) {
+    assert_eq!(q.len(), seq_len * num_heads * head_dim, "q len");
+    assert_eq!(k_f16.len(), kv_len * num_kv_heads * head_dim, "k len");
+    assert_eq!(v_f16.len(), kv_len * num_kv_heads * head_dim, "v len");
+    assert!(
+        matches!(head_dim, 256 | 512),
+        "Gemma flash kernel requires HD=256 or HD=512"
+    );
+    assert!(
+        num_kv_heads > 0 && num_heads % num_kv_heads == 0,
+        "Gemma flash kernel requires grouped-query heads"
+    );
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mk =
+        |data: *const std::ffi::c_void, len: usize| -> Retained<ProtocolObject<dyn MTLBuffer>> {
+            unsafe {
+                let ptr = NonNull::new(data as *mut std::ffi::c_void).expect("ptr null");
+                ctx.device
+                    .newBufferWithBytes_length_options(ptr, len, shared)
+                    .expect("Metal: buffer")
+            }
+        };
+    let padded_kv_elems = kv_len.next_multiple_of(64) * num_kv_heads * head_dim;
+    let mk_padded_f16 = |data: &[u16]| -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let buffer = ctx
+            .device
+            .newBufferWithLength_options(padded_kv_elems * std::mem::size_of::<u16>(), shared)
+            .expect("Metal: padded f16 buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buffer.contents().as_ptr() as *mut u16,
+                data.len(),
+            );
+            std::ptr::write_bytes(
+                (buffer.contents().as_ptr() as *mut u16).add(data.len()),
+                0,
+                padded_kv_elems - data.len(),
+            );
+        }
+        buffer
+    };
+    let q_buf = mk(q.as_ptr() as *const _, std::mem::size_of_val(q));
+    let k_buf = mk_padded_f16(k_f16);
+    let v_buf = mk_padded_f16(v_f16);
+    let o_buf = ctx
+        .device
+        .newBufferWithLength_options(
+            seq_len * num_heads * head_dim * std::mem::size_of::<f32>(),
+            shared,
+        )
+        .expect("Metal: output buffer");
+    let nh = num_heads as u32;
+    let nkv = num_kv_heads as u32;
+    let kv = kv_len as u32;
+    let seq = seq_len as u32;
+    let window_value = sliding_window.unwrap_or(0) as u32;
+    let softcap_value = softcap.unwrap_or(0.0);
+    let nh_buf = mk(&nh as *const u32 as *const _, std::mem::size_of_val(&nh));
+    let nkv_buf = mk(&nkv as *const u32 as *const _, std::mem::size_of_val(&nkv));
+    let kv_buf = mk(&kv as *const u32 as *const _, std::mem::size_of_val(&kv));
+    let seq_buf = mk(&seq as *const u32 as *const _, std::mem::size_of_val(&seq));
+    let scale_buf = mk(
+        &scale as *const f32 as *const _,
+        std::mem::size_of_val(&scale),
+    );
+    let window_buf = mk(
+        &window_value as *const u32 as *const _,
+        std::mem::size_of_val(&window_value),
+    );
+    let softcap_buf = mk(
+        &softcap_value as *const f32 as *const _,
+        std::mem::size_of_val(&softcap_value),
+    );
+    let cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>> =
+        ctx.queue.commandBuffer().expect("Metal: command buffer");
+    let enc: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> =
+        cmd.computeCommandEncoder().expect("Metal: compute encoder");
+    if head_dim == 256 {
+        encode_flash_attn_prefill(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &kv_buf,
+            &seq_buf,
+            &scale_buf,
+            sliding_window,
+            softcap,
+            num_heads,
+            seq_len,
+        );
+    } else {
+        encode_flash_attn_prefill_hd512_gemma(
+            ctx,
+            &enc,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &o_buf,
+            &nh_buf,
+            &nkv_buf,
+            &kv_buf,
+            &seq_buf,
+            &scale_buf,
+            &window_buf,
+            &softcap_buf,
+            num_heads,
+            seq_len,
+        );
+    }
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    let status = cmd.status();
+    if status != MTLCommandBufferStatus::Completed {
+        let error = cmd
+            .error()
+            .map(|value| value.localizedDescription().to_string())
+            .unwrap_or_else(|| "no NSError attached".to_string());
+        panic!("Metal Gemma prefill flash command failed status={status:?} error={error}");
     }
     let gpu_ms = (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0;
     let out = unsafe {

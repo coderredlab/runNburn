@@ -51,7 +51,8 @@ pub(super) use cuda_basic::{
 
 pub(super) use accelerator_basic::{
     decode_gemv_into_if_supported, prefill_attention_f16kv_dense_chain_if_supported,
-    prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
+    prefill_attention_f16kv_gemma_if_supported, prefill_attention_f16kv_if_supported,
+    prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported,
 };
 

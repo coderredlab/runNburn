@@ -5582,6 +5582,48 @@ pub fn metal_prefill_attention_flash_if_supported(
     })
 }
 
+/// Gemma 4 HD=256/512 causal GQA prefill attention. M5 Metal에서 기본 ON이며
+/// `RNB_METAL_GEMMA_PREFILL_FLASH_ATTN=0`으로 CPU f16 attention을 복원한다.
+#[allow(clippy::too_many_arguments)]
+pub fn metal_gemma_prefill_attention_flash_if_supported(
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> Option<Vec<f32>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_FLASH_ATTN")
+        || seq_len == 0
+        || kv_len < seq_len
+        || !matches!(head_dim, 256 | 512)
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+    {
+        return None;
+    }
+    METAL.with(|b| {
+        b.prefill_flash_attention_gemma(
+            q,
+            k_f16,
+            v_f16,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            softcap,
+        )
+    })
+}
+
 /// pm48 ②: prefill attention 2차 device-resident chain seam(rope/qk_norm→cast→flash 단일
 /// command buffer). 입력(host): q_proj(gate split 후, norm 전), k_proj(norm 전), v(f32),
 /// q_norm/k_norm weight. 반환 `(attn_out, k_f16, v_f16)` — k_f16/v_f16 은 device 에서 만든

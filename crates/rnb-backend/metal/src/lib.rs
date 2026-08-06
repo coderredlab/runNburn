@@ -2538,6 +2538,48 @@ impl MetalBackend {
         Some(out)
     }
 
+    /// Gemma 4 HD=256/512 causal GQA prefill attention. Sliding window와 softcap을 적용한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_attention_gemma(
+        &self,
+        q: &[f32],
+        k_f16: &[u16],
+        v_f16: &[u16],
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+        softcap: Option<f32>,
+    ) -> Option<Vec<f32>> {
+        let ctx = self.ctx.as_ref()?;
+        let supported = match head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !supported {
+            return None;
+        }
+        let (out, _gpu_ms) = compute::prefill_flash_attention_gemma_with_ctx(
+            ctx,
+            q,
+            k_f16,
+            v_f16,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            softcap,
+        );
+        Some(out)
+    }
+
     /// pm48 ②: prefill attention 2차 device-resident chain. rope/qk_norm(q,k) → cast(k,v→f16) →
     /// flash 를 단일 command buffer 로. 입력(host): q_proj(gate split 후, norm 전), k_proj(norm 전),
     /// v(f32), q_norm/k_norm weight. 반환 `(attn_out[seq*q_dim], k_f16[seq*kv_dim], v_f16)`.
@@ -14846,6 +14888,57 @@ kernel void coop_right_direct_fill_probe(
             s_med * 16.0,
             c_med * 16.0
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires M5 Metal device"]
+    fn gemma_prefill_flash_matches_cpu_window_softcap() {
+        let ctx = crate::compute::build_metal_context().expect("metal ctx");
+        if !ctx.tensorops_capable {
+            eprintln!("[pm187] not tensorops-capable; skipping Gemma flash oracle");
+            return;
+        }
+        let (seq, kv, nh, nkv) = (64usize, 80usize, 4usize, 2usize);
+        let scale = 1.0f32;
+        let window = Some(32usize);
+        let softcap = Some(50.0f32);
+        let r = |i: usize| -> f32 {
+            (((i as u64).wrapping_mul(2654435761) % 1000) as f32 / 500.0 - 1.0) * 0.25
+        };
+        for hd in [256usize, 512usize] {
+            let q: Vec<f32> = (0..seq * nh * hd).map(r).collect();
+            let k: Vec<u16> = (0..kv * nkv * hd)
+                .map(|i| half::f16::from_f32(r(i + 7)).to_bits())
+                .collect();
+            let v: Vec<u16> = (0..kv * nkv * hd)
+                .map(|i| half::f16::from_f32(r(i + 13)).to_bits())
+                .collect();
+            let (gpu, gpu_ms) = crate::compute::prefill_flash_attention_gemma_with_ctx(
+                &ctx, &q, &k, &v, seq, kv, nh, nkv, hd, scale, window, softcap,
+            );
+            let cpu = rnb_cpu::kernels::attention::attention_batch_f16(
+                &q, &k, &v, seq, kv, nh, nkv, hd, scale, window, softcap,
+            );
+            let max_abs = gpu
+                .iter()
+                .zip(&cpu)
+                .map(|(g, c)| (g - c).abs())
+                .fold(0.0f32, f32::max);
+            let dot: f64 = gpu
+                .iter()
+                .zip(&cpu)
+                .map(|(&g, &c)| g as f64 * c as f64)
+                .sum();
+            let gpu_norm: f64 = gpu.iter().map(|&x| (x as f64).powi(2)).sum();
+            let cpu_norm: f64 = cpu.iter().map(|&x| (x as f64).powi(2)).sum();
+            let cosine = dot / (gpu_norm * cpu_norm).sqrt();
+            eprintln!(
+                "[pm187] Gemma HD{hd} flash vs CPU: max_abs={max_abs:.3e} cosine={cosine:.9} gpu_ms={gpu_ms:.3}"
+            );
+            assert!(max_abs < 5e-3, "Gemma HD{hd} flash max_abs={max_abs}");
+            assert!(cosine > 0.99999, "Gemma HD{hd} flash cosine={cosine}");
+        }
     }
 
     /// pm47 ② STEP4+STEP5 GEMM 통합 커널이 CPU f32 oracle 과 의미동등 drift 내인지.

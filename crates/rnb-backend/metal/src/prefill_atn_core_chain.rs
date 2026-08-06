@@ -759,6 +759,8 @@ fn encode_atn_core_ops(
         &carrier.kv_len_buf,
         &carrier.seq_buf,
         &carrier.scale_buf,
+        None,
+        None,
         carrier.num_heads,
         carrier.seq_len,
     );

@@ -3,13 +3,15 @@ using namespace metal;
 
 constant constexpr uint Q = 8u;
 constant constexpr uint C = 64u;
-constant constexpr uint HD = 256u;
+constant constexpr uint HD = 512u;
 constant constexpr uint NSG = 4u;
 constant constexpr uint SIMD_WIDTH = 32u;
 
-// Dense causal GQA prefill attention for HD=256. Q, scores, and the f32 output
-// accumulator stay in threadgroup memory; K/V are read directly from the cache.
-kernel void attn_prefill_flash_tg(
+// Gemma 4 causal GQA prefill attention for HD=512. Sliding-window masking and
+// logit softcapping are applied before the online softmax. Q, scores, and the
+// f32 output accumulator stay in threadgroup memory; K/V are read directly
+// from the f16 cache.
+kernel void attn_prefill_flash_tg_hd512_gemma(
     device const float* q [[buffer(0)]],
     device const half* k_cache [[buffer(1)]],
     device const half* v_cache [[buffer(2)]],

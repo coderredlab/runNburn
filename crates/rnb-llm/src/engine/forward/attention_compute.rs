@@ -63,7 +63,26 @@ pub(super) fn compute_prefill_attention(
     }
     let f16_attention_out = if !non_causal && !force_tokenwise {
         if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
-            if has_sliding_window {
+            let gemma_flash = if matches!(architecture, ModelArchitecture::Gemma4) {
+                backend_runtime::prefill_attention_f16kv_gemma_if_supported(
+                    kernels::tensor_as_f32_slice(q),
+                    cached_k_f16,
+                    cached_v_f16,
+                    seq_len,
+                    kv_len,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    resolve_attention_scale(metadata, architecture),
+                    sliding_window,
+                    resolve_attention_softcap(architecture),
+                )?
+            } else {
+                None
+            };
+            if gemma_flash.is_some() {
+                gemma_flash
+            } else if has_sliding_window {
                 backend_runtime::prefill_attention_f16kv_window_if_supported(
                     kernels::tensor_as_f32_slice(q),
                     cached_k_f16,
@@ -277,6 +296,44 @@ pub(super) fn compute_prefill_attention(
                 );
             }
             Tensor::from_vec(out, &[seq_len, layout.q_dim])
+        } else if matches!(architecture, ModelArchitecture::Gemma4) {
+            if let Some(out) = backend_runtime::prefill_attention_f16kv_gemma_if_supported(
+                q_data,
+                k_f16,
+                v_f16,
+                seq_len,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                sliding_window,
+                softcap,
+            )? {
+                Tensor::from_vec(out, &[seq_len, layout.q_dim])
+            } else {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let out = kernels::attention::attention_batch_f16(
+                        q_data,
+                        k_f16,
+                        v_f16,
+                        seq_len,
+                        kv_len,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        scale,
+                        sliding_window,
+                        softcap,
+                    );
+                    Tensor::from_vec(out, &[seq_len, layout.q_dim])
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    unreachable!("simd_prefill_active requires aarch64");
+                }
+            }
         } else {
             // mc73 batch BR×BC f16 path (default for SIMD ON).
             #[cfg(target_arch = "aarch64")]

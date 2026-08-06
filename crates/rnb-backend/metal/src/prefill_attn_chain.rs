@@ -226,6 +226,8 @@ pub(crate) fn prefill_attn_chain_dispatch(
         &carrier.kv_len_buf,
         &carrier.seq_buf,
         &carrier.scale_buf,
+        None,
+        None,
         carrier.num_heads,
         seq,
     );
