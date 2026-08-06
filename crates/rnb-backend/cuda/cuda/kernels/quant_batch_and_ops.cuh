@@ -349,6 +349,117 @@ extern "C" __global__ void rnb_q4k_gemv_batch_q8dot_warp8(
     }
 }
 
+// cu216: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
+extern "C" __global__ void rnb_q4k_gemv_batch_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq = blockIdx.y;
+    const bool valid = row < rows && seq < seq_len;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* seq_qs = input_qs + seq * blocks_per_row * 256u;
+    const float* seq_ds = input_ds + seq * blocks_per_row * 8u;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ4WideLane w =
+                rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(seq_qs + x_off);
+            const float x_d = seq_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[seq * rows + row] = acc;
+    }
+}
+
+// cu216: wide-lane pair2 — weight-read-once 유지, 단일 wide 와 토큰별 순서 동일.
+extern "C" __global__ void rnb_q4k_gemv_q8dot_pair2_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ4WideLane w =
+                rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const float x_d0 = input_ds[b * 8u + j];
+            const float x_d1 = ds1[b * 8u + j];
+
+            const int2 x_raw0 = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const int dot00 = __dp4a(w.q_pack0, x_raw0.x, 0);
+            const int x_sum00 = __dp4a(0x01010101, x_raw0.x, 0);
+            acc0 += x_d0
+                * ((w.d * w.sc) * (float)dot00 - w.dmin * w.mn * (float)x_sum00);
+            const int dot01 = __dp4a(w.q_pack1, x_raw0.y, 0);
+            const int x_sum01 = __dp4a(0x01010101, x_raw0.y, 0);
+            acc0 += x_d0
+                * ((w.d * w.sc) * (float)dot01 - w.dmin * w.mn * (float)x_sum01);
+
+            const int2 x_raw1 = rnb_load_i32x2_aligned8(qs1 + x_off);
+            const int dot10 = __dp4a(w.q_pack0, x_raw1.x, 0);
+            const int x_sum10 = __dp4a(0x01010101, x_raw1.x, 0);
+            acc1 += x_d1
+                * ((w.d * w.sc) * (float)dot10 - w.dmin * w.mn * (float)x_sum10);
+            const int dot11 = __dp4a(w.q_pack1, x_raw1.y, 0);
+            const int x_sum11 = __dp4a(0x01010101, x_raw1.y, 0);
+            acc1 += x_d1
+                * ((w.d * w.sc) * (float)dot11 - w.dmin * w.mn * (float)x_sum11);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
+    }
+}
+
 // cu212: 2-token weight-read-once Q4_K q8dot GEMV. MTP verify 의 2-position
 // 창에서 weight block 을 한 번 해석해 두 토큰에 누산한다. 토큰별 누산 순서는
 // rnb_q4k_gemv_batch_q8dot_warp8 의 해당 seq CTA 와 동일하므로 출력은 per-token

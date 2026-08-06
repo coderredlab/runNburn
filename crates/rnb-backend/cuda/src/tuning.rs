@@ -202,6 +202,16 @@ pub fn q6k_q8dot_pair2_enabled() -> bool {
     env_bool("RNB_CUDA_Q6K_Q8DOT_PAIR2", true)
 }
 
+/// cu216: Q4_K q8dot family 의 wide-lane 세대(lane 당 8 elem, sc/mn·ds 반감,
+/// 64-bit q/x load). lane partial 배치가 바뀌므로 출력 low bits 가 기존 세대와
+/// 다르다 — 단일/batch/pair2/gate_up/qkv 5종이 이 게이트 하나로 함께 전환돼
+/// 상호 bitwise 계약이 유지된다. RTX 3090 27B에서 MTP verify −11%/round,
+/// 100-token 제품 hash 는 두 세대가 동일했다. `RNB_CUDA_Q4K_Q8DOT_WIDE=0`
+/// 은 기존 (j0,j1) 세대로 되돌리는 진단 opt-out 이다.
+pub fn q4k_q8dot_wide_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_Q8DOT_WIDE", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1188,6 +1198,7 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_PAIR2");
             std::env::remove_var("RNB_CUDA_Q5K_Q8DOT_PAIR2");
             std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_PAIR2");
+            std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_WIDE");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1213,6 +1224,7 @@ mod tests {
         assert!(q4k_q8dot_pair2_enabled());
         assert!(q5k_q8dot_pair2_enabled());
         assert!(q6k_q8dot_pair2_enabled());
+        assert!(q4k_q8dot_wide_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

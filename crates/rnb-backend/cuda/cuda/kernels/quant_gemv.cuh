@@ -524,6 +524,96 @@ extern "C" __global__ void rnb_q4k_gemv_q8dot_warp8(
     }
 }
 
+// cu216 wide-lane Q4_K q8dot family. lane 당 8 연속 element(1 sub-block j 안)를
+// 처리해 sc/mn 해석·ds load 를 반감하고 q/x 를 64-bit load 로 읽는다. lane 매핑:
+// j = lane>>2 (0..7), elem = (lane&3)*8. 블록당 누산 순서는 elem..+4 항 →
+// elem+4..+8 항이며, wide family 5종(단일/batch/pair2/gate_up/qkv)이 같은
+// 순서를 공유해 상호 bitwise 계약이 성립한다. 기존 (j0,j1) family 와는 lane
+// partial 배치가 달라 출력 low bits 가 다르다 — 전환은 5종 동시(all-or-nothing).
+struct RnbQ4WideLane {
+    float d;
+    float dmin;
+    float sc;
+    float mn;
+    int q_pack0;
+    int q_pack1;
+};
+
+__device__ __forceinline__ RnbQ4WideLane rnb_q4k_wide_lane_decode(
+    const unsigned char* __restrict__ block,
+    unsigned j,
+    unsigned elem) {
+    RnbQ4WideLane out;
+    const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+    const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+    out.d = __half2float(__ushort_as_half((unsigned short)raw_d));
+    out.dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+    unsigned sc;
+    unsigned mn;
+    if (j < 4u) {
+        sc = block[4u + j] & 63u;
+        mn = block[4u + j + 4u] & 63u;
+    } else {
+        sc = (block[4u + j + 4u] & 0x0fu) | ((block[4u + j - 4u] >> 6) << 4);
+        mn = (block[4u + j + 4u] >> 4) | ((block[4u + j] >> 6) << 4);
+    }
+    out.sc = (float)sc;
+    out.mn = (float)mn;
+    const unsigned char* q_ptr = block + 16u + (j >> 1) * 32u + elem;
+    const uint2 q_raw = *reinterpret_cast<const uint2*>(q_ptr);
+    const unsigned shift = (j & 1u) * 4u;
+    out.q_pack0 = (int)((q_raw.x >> shift) & 0x0f0f0f0fu);
+    out.q_pack1 = (int)((q_raw.y >> shift) & 0x0f0f0f0fu);
+    return out;
+}
+
+__device__ __forceinline__ int2 rnb_load_i32x2_aligned8(const void* ptr) {
+    return *reinterpret_cast<const int2*>(ptr);
+}
+
+extern "C" __global__ void rnb_q4k_gemv_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ4WideLane w =
+                rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const float x_d = input_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc;
+    }
+}
+
 extern "C" __global__ void rnb_q4k_gemv_gelu_mul_warp8(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -843,6 +933,66 @@ extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_warp8(
                 gate_acc += x_d * ((gate_d * (float)gate_sc) * (float)gate_dot - gate_dmin * (float)gate_mn * (float)x_sum);
                 up_acc += x_d * ((up_d * (float)up_sc) * (float)up_dot - up_dmin * (float)up_mn * (float)x_sum);
             }
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        gate_acc += __shfl_down_sync(0xffffffffu, gate_acc, offset);
+        up_acc += __shfl_down_sync(0xffffffffu, up_acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        gate_out[row] = gate_acc;
+        up_out[row] = up_acc;
+    }
+}
+
+// cu216: wide-lane fused gate/up. 단일 wide 커널과 토큰별 산술 순서 동일.
+extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_warp8(
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    const unsigned char* __restrict__ gate_weights,
+    const unsigned char* __restrict__ up_weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* gate_row_ptr = gate_weights + row * row_bytes;
+    const unsigned char* up_row_ptr = up_weights + row * row_bytes;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ4WideLane g =
+                rnb_q4k_wide_lane_decode(gate_row_ptr + b * 144u, j, elem);
+            const RnbQ4WideLane u =
+                rnb_q4k_wide_lane_decode(up_row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const float x_d = input_ds[b * 8u + j];
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            const int gate_dot0 = __dp4a(g.q_pack0, x_raw.x, 0);
+            gate_acc += x_d
+                * ((g.d * g.sc) * (float)gate_dot0 - g.dmin * g.mn * (float)x_sum0);
+            const int gate_dot1 = __dp4a(g.q_pack1, x_raw.y, 0);
+            gate_acc += x_d
+                * ((g.d * g.sc) * (float)gate_dot1 - g.dmin * g.mn * (float)x_sum1);
+            const int up_dot0 = __dp4a(u.q_pack0, x_raw.x, 0);
+            up_acc += x_d
+                * ((u.d * u.sc) * (float)up_dot0 - u.dmin * u.mn * (float)x_sum0);
+            const int up_dot1 = __dp4a(u.q_pack1, x_raw.y, 0);
+            up_acc += x_d
+                * ((u.d * u.sc) * (float)up_dot1 - u.dmin * u.mn * (float)x_sum1);
         }
     }
 
@@ -1259,6 +1409,72 @@ extern "C" __global__ void rnb_q4k_qkv_gemv_q8dot_warp8(
                 const float x_d = input_ds[b * 8u + j];
                 acc += x_d * ((d * (float)sc) * (float)dot - dmin * (float)mn * (float)x_sum);
             }
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc;
+    }
+}
+
+// cu216: wide-lane fused qkv. 단일 wide 커널과 산술 순서 동일.
+extern "C" __global__ void rnb_q4k_qkv_gemv_q8dot_wide_warp8(
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    const unsigned char* __restrict__ q_weights,
+    const unsigned char* __restrict__ k_weights,
+    const unsigned char* __restrict__ v_weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned q_rows,
+    unsigned kv_rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned logical_row = blockIdx.x * 8u + warp;
+    const unsigned total_rows = q_rows + kv_rows * 2u;
+    const bool valid = logical_row < total_rows;
+
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = nullptr;
+    float* out = nullptr;
+    unsigned row = logical_row;
+    if (valid) {
+        if (logical_row < q_rows) {
+            row_ptr = q_weights + logical_row * row_bytes;
+            out = q_out;
+        } else if (logical_row < q_rows + kv_rows) {
+            row = logical_row - q_rows;
+            row_ptr = k_weights + row * row_bytes;
+            out = k_out;
+        } else {
+            row = logical_row - q_rows - kv_rows;
+            row_ptr = v_weights + row * row_bytes;
+            out = v_out;
+        }
+    }
+
+    float acc = 0.0f;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ4WideLane w =
+                rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const float x_d = input_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
         }
     }
 

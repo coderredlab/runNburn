@@ -4660,6 +4660,8 @@ impl CudaState {
             let use_seq4 = q4k_q8dot_prefill_seq4_enabled(seq_len > 1);
             let kernel = if use_seq4 {
                 "rnb_q4k_gemv_batch_q8dot_seq4_warp8"
+            } else if crate::tuning::q4k_q8dot_wide_enabled() {
+                "rnb_q4k_gemv_batch_q8dot_wide_warp8"
             } else {
                 "rnb_q4k_gemv_batch_q8dot_warp8"
             };

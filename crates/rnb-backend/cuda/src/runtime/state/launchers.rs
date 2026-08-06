@@ -4147,7 +4147,11 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         self.launch_cached_gemv(
-            "rnb_q4k_gemv_q8dot_warp8",
+            if tuning::q4k_q8dot_wide_enabled() {
+                "rnb_q4k_gemv_q8dot_wide_warp8"
+            } else {
+                "rnb_q4k_gemv_q8dot_warp8"
+            },
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -4281,7 +4285,11 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         self.launch_cached_gemv(
-            "rnb_q4k_gate_up_gemv_q8dot_warp8",
+            if tuning::q4k_q8dot_wide_enabled() {
+                "rnb_q4k_gate_up_gemv_q8dot_wide_warp8"
+            } else {
+                "rnb_q4k_gate_up_gemv_q8dot_warp8"
+            },
             &[
                 (&mut gate_out_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut up_out_arg as *mut u64).cast::<libc::c_void>(),
@@ -4602,7 +4610,11 @@ impl CudaState {
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let total_rows = q_rows + kv_rows * 2;
         let result = self.launch_cached_gemv(
-            "rnb_q4k_qkv_gemv_q8dot_warp8",
+            if tuning::q4k_q8dot_wide_enabled() {
+                "rnb_q4k_qkv_gemv_q8dot_wide_warp8"
+            } else {
+                "rnb_q4k_qkv_gemv_q8dot_warp8"
+            },
             &[
                 (&mut q_out_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut k_out_arg as *mut u64).cast::<libc::c_void>(),
@@ -4981,7 +4993,11 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         self.launch_cached_gemv(
-            "rnb_q4k_gemv_q8dot_pair2_warp8",
+            if tuning::q4k_q8dot_wide_enabled() {
+                "rnb_q4k_gemv_q8dot_pair2_wide_warp8"
+            } else {
+                "rnb_q4k_gemv_q8dot_pair2_warp8"
+            },
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
