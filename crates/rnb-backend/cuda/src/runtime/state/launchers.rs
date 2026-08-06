@@ -4768,7 +4768,9 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
-        let kernel = if tuning::q6k_q8dot_half2_enabled() {
+        let kernel = if tuning::q6k_q8dot_wide_enabled() {
+            "rnb_q6k_gemv_q8dot_wide_warp8"
+        } else if tuning::q6k_q8dot_half2_enabled() {
             "rnb_q6k_gemv_q8dot_half2_warp8"
         } else {
             "rnb_q6k_gemv_q8dot_warp8"
@@ -4807,7 +4809,11 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         self.launch_cached_gemv(
-            "rnb_q5k_gemv_q8dot_warp8",
+            if tuning::q5k_q8dot_wide_enabled() {
+                "rnb_q5k_gemv_q8dot_wide_warp8"
+            } else {
+                "rnb_q5k_gemv_q8dot_warp8"
+            },
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -4936,7 +4942,11 @@ impl CudaState {
             let mut rows_arg = rows as u32;
             let mut blocks_per_row_arg = blocks_per_row as u32;
             return self.launch_cached_gemv(
-                "rnb_q5k_gemv_q8dot_pair2_warp8",
+                if crate::tuning::q5k_q8dot_wide_enabled() {
+                    "rnb_q5k_gemv_q8dot_pair2_wide_warp8"
+                } else {
+                    "rnb_q5k_gemv_q8dot_pair2_warp8"
+                },
                 &[
                     (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                     (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -4958,7 +4968,11 @@ impl CudaState {
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let mut seq_len_arg = seq_len as u32;
         self.launch_cached_gemv(
-            "rnb_q5k_gemv_batch_q8dot_warp8",
+            if crate::tuning::q5k_q8dot_wide_enabled() {
+                "rnb_q5k_gemv_batch_q8dot_wide_warp8"
+            } else {
+                "rnb_q5k_gemv_batch_q8dot_warp8"
+            },
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -5028,7 +5042,9 @@ impl CudaState {
         // cu212: 2-token 창은 weight-read-once pair2 커널이 기본이다.
         if seq_len == 2 && crate::tuning::q6k_q8dot_pair2_enabled() {
             let weights_dev = self.resident_q4k_weights_ptr(weights)?;
-            let kernel = if crate::tuning::q6k_q8dot_half2_enabled() {
+            let kernel = if crate::tuning::q6k_q8dot_wide_enabled() {
+                "rnb_q6k_gemv_q8dot_pair2_wide_warp8"
+            } else if crate::tuning::q6k_q8dot_half2_enabled() {
                 "rnb_q6k_gemv_q8dot_pair2_half2_warp8"
             } else {
                 "rnb_q6k_gemv_q8dot_pair2_byte_warp8"
@@ -5054,7 +5070,9 @@ impl CudaState {
             );
         }
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
-        let kernel = if crate::tuning::q6k_q8dot_half2_enabled() {
+        let kernel = if crate::tuning::q6k_q8dot_wide_enabled() {
+            "rnb_q6k_gemv_batch_q8dot_wide_warp8"
+        } else if crate::tuning::q6k_q8dot_half2_enabled() {
             "rnb_q6k_gemv_batch_q8dot_half2_warp8"
         } else {
             "rnb_q6k_gemv_batch_q8dot_byte_warp8"

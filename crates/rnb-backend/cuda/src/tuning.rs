@@ -212,6 +212,26 @@ pub fn q4k_q8dot_wide_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_Q8DOT_WIDE", true)
 }
 
+/// cu219: Q5_K q8dot family 의 wide-lane 세대. Q5_K 176-byte 블록은 qh/qs 가
+/// 8-byte 정렬이라 Q4 wide 의 uint2 패턴을 그대로 이식했다 (lane 당 8 elem,
+/// sc/mn·ds 해석 반감, qh 도 uint2 한 번). lane partial 배치가 바뀌므로 출력
+/// low bits 가 기존 (j0,j1) 세대와 다르다 — 단일/batch/pair2 3종이 이 게이트
+/// 하나로 함께 전환돼 상호 bitwise 계약이 유지된다.
+/// `RNB_CUDA_Q5K_Q8DOT_WIDE=0` 은 기존 세대로 되돌리는 진단 opt-out 이다.
+pub fn q5k_q8dot_wide_enabled() -> bool {
+    env_bool("RNB_CUDA_Q5K_Q8DOT_WIDE", true)
+}
+
+/// cu219: Q6_K q8dot family 의 wide-lane 세대. 210-byte 블록은 2-byte 정렬뿐이라
+/// ql/qh 는 cu207 halfword load 를 유지하고, lane 매핑만 8 연속 elem 으로 넓혀
+/// sc/ds 해석을 반감하고 x 를 64-bit 로 읽는다. wide 가 켜지면
+/// `RNB_CUDA_Q6K_Q8DOT_HALF2` 는 무시된다 (wide 커널은 항상 halfword load).
+/// 단일/batch/pair2 3종이 이 게이트 하나로 함께 전환된다.
+/// `RNB_CUDA_Q6K_Q8DOT_WIDE=0` 은 기존 half2/byte 세대로 되돌리는 진단 opt-out.
+pub fn q6k_q8dot_wide_enabled() -> bool {
+    env_bool("RNB_CUDA_Q6K_Q8DOT_WIDE", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1199,6 +1219,8 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q5K_Q8DOT_PAIR2");
             std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_PAIR2");
             std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_WIDE");
+            std::env::remove_var("RNB_CUDA_Q5K_Q8DOT_WIDE");
+            std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_WIDE");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1225,6 +1247,8 @@ mod tests {
         assert!(q5k_q8dot_pair2_enabled());
         assert!(q6k_q8dot_pair2_enabled());
         assert!(q4k_q8dot_wide_enabled());
+        assert!(q5k_q8dot_wide_enabled());
+        assert!(q6k_q8dot_wide_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

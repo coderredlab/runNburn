@@ -1343,6 +1343,198 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_pair2_byte_warp8(
         out, weights, input_qs, input_ds, rows, blocks_per_row);
 }
 
+// cu219 wide-lane Q6_K q8dot family. 210-byte 블록은 2-byte 정렬뿐이라 ql/qh
+// 는 cu207 halfword load 를 유지하고, lane 매핑만 8 연속 element 로 넓힌다:
+// elem = lane*8 이면 8 element 가 같은 n/quarter/scale-group/ds-group 안에
+// 있어 sc/ds 해석이 반감되고 x 를 64-bit 로 읽는다. 블록당 누산 순서는
+// elem..+4 항 → elem+4..+8 항이며 wide family 3종(단일/batch/pair2)이 같은
+// 순서를 공유해 상호 bitwise 계약이 성립한다. 기존 (g=0,1) family 와는 lane
+// partial 배치가 달라 출력 low bits 가 다르다 — 전환은 3종 동시(all-or-nothing).
+struct RnbQ6WideLane {
+    float d;
+    int sc;
+    int q_pack0;
+    int q_pack1;
+};
+
+__device__ __forceinline__ RnbQ6WideLane rnb_q6k_wide_lane_decode(
+    const unsigned char* __restrict__ block,
+    unsigned elem) {
+    RnbQ6WideLane out;
+    const unsigned raw_d = (unsigned)block[208] | ((unsigned)block[209] << 8);
+    out.d = __half2float(__ushort_as_half((unsigned short)raw_d));
+    const unsigned n = elem >> 7;
+    const unsigned rem = elem & 127u;
+    const unsigned l = rem & 31u;
+    const unsigned quarter = rem >> 5;
+    const unsigned ql_off = n * 64u + l + ((quarter & 1u) ? 32u : 0u);
+    const unsigned qh_off = 128u + n * 32u + l;
+    const unsigned qh_shift = quarter * 2u;
+    out.sc = (int)((signed char)block[192u + n * 8u + (l >> 4) + quarter * 2u]);
+    const unsigned ql_raw0 = (unsigned)rnb_load_i32_aligned2(block + ql_off);
+    const unsigned ql_raw1 = (unsigned)rnb_load_i32_aligned2(block + ql_off + 4u);
+    const unsigned qh_raw0 = (unsigned)rnb_load_i32_aligned2(block + qh_off);
+    const unsigned qh_raw1 = (unsigned)rnb_load_i32_aligned2(block + qh_off + 4u);
+    const unsigned low0 = (quarter < 2u)
+        ? (ql_raw0 & 0x0f0f0f0fu)
+        : ((ql_raw0 >> 4) & 0x0f0f0f0fu);
+    const unsigned low1 = (quarter < 2u)
+        ? (ql_raw1 & 0x0f0f0f0fu)
+        : ((ql_raw1 >> 4) & 0x0f0f0f0fu);
+    const unsigned high0 = ((qh_raw0 >> qh_shift) & 0x03030303u) << 4;
+    const unsigned high1 = ((qh_raw1 >> qh_shift) & 0x03030303u) << 4;
+    out.q_pack0 = (int)(low0 | high0);
+    out.q_pack1 = (int)(low1 | high1);
+    return out;
+}
+
+extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned elem = lane * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ6WideLane w =
+                rnb_q6k_wide_lane_decode(row_ptr + b * 210u, elem);
+            const int2 x_raw =
+                rnb_load_i32x2_aligned8(input_qs + b * 256u + elem);
+            const float x_d = input_ds[b * 8u + (elem >> 5)];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot0 - 32 * x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot1 - 32 * x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc;
+    }
+}
+
+// cu219: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
+extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq = blockIdx.y;
+    const bool valid = row < rows && seq < seq_len;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* seq_qs = input_qs + seq * blocks_per_row * 256u;
+    const float* seq_ds = input_ds + seq * blocks_per_row * 8u;
+    const unsigned elem = lane * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ6WideLane w =
+                rnb_q6k_wide_lane_decode(row_ptr + b * 210u, elem);
+            const int2 x_raw =
+                rnb_load_i32x2_aligned8(seq_qs + b * 256u + elem);
+            const float x_d = seq_ds[b * 8u + (elem >> 5)];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot0 - 32 * x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot1 - 32 * x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[seq * rows + row] = acc;
+    }
+}
+
+// cu219: wide-lane pair2 — weight-read-once 유지, 단일 wide 와 토큰별 순서 동일.
+extern "C" __global__ void rnb_q6k_gemv_q8dot_pair2_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+    const unsigned elem = lane * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ6WideLane w =
+                rnb_q6k_wide_lane_decode(row_ptr + b * 210u, elem);
+            const unsigned x_off = b * 256u + elem;
+            const float x_d0 = input_ds[b * 8u + (elem >> 5)];
+            const float x_d1 = ds1[b * 8u + (elem >> 5)];
+
+            const int2 x_raw0 = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const int dot00 = __dp4a(w.q_pack0, x_raw0.x, 0);
+            const int x_sum00 = __dp4a(0x01010101, x_raw0.x, 0);
+            acc0 += x_d0 * (w.d * (float)w.sc) * (float)(dot00 - 32 * x_sum00);
+            const int dot01 = __dp4a(w.q_pack1, x_raw0.y, 0);
+            const int x_sum01 = __dp4a(0x01010101, x_raw0.y, 0);
+            acc0 += x_d0 * (w.d * (float)w.sc) * (float)(dot01 - 32 * x_sum01);
+
+            const int2 x_raw1 = rnb_load_i32x2_aligned8(qs1 + x_off);
+            const int dot10 = __dp4a(w.q_pack0, x_raw1.x, 0);
+            const int x_sum10 = __dp4a(0x01010101, x_raw1.x, 0);
+            acc1 += x_d1 * (w.d * (float)w.sc) * (float)(dot10 - 32 * x_sum10);
+            const int dot11 = __dp4a(w.q_pack1, x_raw1.y, 0);
+            const int x_sum11 = __dp4a(0x01010101, x_raw1.y, 0);
+            acc1 += x_d1 * (w.d * (float)w.sc) * (float)(dot11 - 32 * x_sum11);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
+    }
+}
+
 // Q5_K GEMV with Q8_1-quantized activations, one warp per output row.
 //
 // Q5_K is Q4_K plus a 32-byte high-bit plane, and its 176-byte super-block
@@ -1576,6 +1768,207 @@ extern "C" __global__ void rnb_q5k_gemv_q8dot_pair2_warp8(
                 * ((d * (float)sc0) * (float)t1_dot0 - dmin * (float)mn0 * (float)t1_sum0);
             acc1 += ds1[b * 8u + j1]
                 * ((d * (float)sc1) * (float)t1_dot1 - dmin * (float)mn1 * (float)t1_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
+    }
+}
+
+// cu219 wide-lane Q5_K q8dot family. Q5_K 176-byte 블록은 qh(16)/qs(48) 필드와
+// 블록 크기가 모두 8-byte 정렬이라 Q4 wide 의 uint2 64-bit load 패턴을 그대로
+// 쓴다. lane 매핑 j = lane>>2, elem = (lane&3)*8 — sc/mn 해석·ds load 를
+// 반감하고 qh 도 uint2 한 번으로 두 half 를 얻는다. 블록당 누산 순서는
+// elem..+4 항 → elem+4..+8 항이며 wide family 3종(단일/batch/pair2)이 같은
+// 순서를 공유해 상호 bitwise 계약이 성립한다. 기존 (j0,j1) family 와는 lane
+// partial 배치가 달라 출력 low bits 가 다르다 — 전환은 3종 동시(all-or-nothing).
+struct RnbQ5WideLane {
+    float d;
+    float dmin;
+    float sc;
+    float mn;
+    int q_pack0;
+    int q_pack1;
+};
+
+__device__ __forceinline__ RnbQ5WideLane rnb_q5k_wide_lane_decode(
+    const unsigned char* __restrict__ block,
+    unsigned j,
+    unsigned elem) {
+    RnbQ5WideLane out;
+    const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+    const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+    out.d = __half2float(__ushort_as_half((unsigned short)raw_d));
+    out.dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+    unsigned sc;
+    unsigned mn;
+    if (j < 4u) {
+        sc = block[4u + j] & 63u;
+        mn = block[4u + j + 4u] & 63u;
+    } else {
+        sc = (block[4u + j + 4u] & 0x0fu) | ((block[4u + j - 4u] >> 6) << 4);
+        mn = (block[4u + j + 4u] >> 4) | ((block[4u + j] >> 6) << 4);
+    }
+    out.sc = (float)sc;
+    out.mn = (float)mn;
+    const unsigned char* q_ptr = block + 48u + (j >> 1) * 32u + elem;
+    const uint2 q_raw = *reinterpret_cast<const uint2*>(q_ptr);
+    const uint2 qh_raw = *reinterpret_cast<const uint2*>(block + 16u + elem);
+    const unsigned shift = (j & 1u) * 4u;
+    out.q_pack0 = (int)(((q_raw.x >> shift) & 0x0f0f0f0fu)
+        | (((qh_raw.x >> j) & 0x01010101u) << 4));
+    out.q_pack1 = (int)(((q_raw.y >> shift) & 0x0f0f0f0fu)
+        | (((qh_raw.y >> j) & 0x01010101u) << 4));
+    return out;
+}
+
+extern "C" __global__ void rnb_q5k_gemv_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 176u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ5WideLane w =
+                rnb_q5k_wide_lane_decode(row_ptr + b * 176u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const float x_d = input_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc;
+    }
+}
+
+// cu219: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
+extern "C" __global__ void rnb_q5k_gemv_batch_q8dot_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq = blockIdx.y;
+    const bool valid = row < rows && seq < seq_len;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 176u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* seq_qs = input_qs + seq * blocks_per_row * 256u;
+    const float* seq_ds = input_ds + seq * blocks_per_row * 8u;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ5WideLane w =
+                rnb_q5k_wide_lane_decode(row_ptr + b * 176u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(seq_qs + x_off);
+            const float x_d = seq_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[seq * rows + row] = acc;
+    }
+}
+
+// cu219: wide-lane pair2 — weight-read-once 유지, 단일 wide 와 토큰별 순서 동일.
+extern "C" __global__ void rnb_q5k_gemv_q8dot_pair2_wide_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 176u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const RnbQ5WideLane w =
+                rnb_q5k_wide_lane_decode(row_ptr + b * 176u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const float x_d0 = input_ds[b * 8u + j];
+            const float x_d1 = ds1[b * 8u + j];
+
+            const int2 x_raw0 = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const int dot00 = __dp4a(w.q_pack0, x_raw0.x, 0);
+            const int x_sum00 = __dp4a(0x01010101, x_raw0.x, 0);
+            acc0 += x_d0
+                * ((w.d * w.sc) * (float)dot00 - w.dmin * w.mn * (float)x_sum00);
+            const int dot01 = __dp4a(w.q_pack1, x_raw0.y, 0);
+            const int x_sum01 = __dp4a(0x01010101, x_raw0.y, 0);
+            acc0 += x_d0
+                * ((w.d * w.sc) * (float)dot01 - w.dmin * w.mn * (float)x_sum01);
+
+            const int2 x_raw1 = rnb_load_i32x2_aligned8(qs1 + x_off);
+            const int dot10 = __dp4a(w.q_pack0, x_raw1.x, 0);
+            const int x_sum10 = __dp4a(0x01010101, x_raw1.x, 0);
+            acc1 += x_d1
+                * ((w.d * w.sc) * (float)dot10 - w.dmin * w.mn * (float)x_sum10);
+            const int dot11 = __dp4a(w.q_pack1, x_raw1.y, 0);
+            const int x_sum11 = __dp4a(0x01010101, x_raw1.y, 0);
+            acc1 += x_d1
+                * ((w.d * w.sc) * (float)dot11 - w.dmin * w.mn * (float)x_sum11);
         }
     }
 

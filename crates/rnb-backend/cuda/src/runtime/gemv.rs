@@ -1081,7 +1081,9 @@ impl CudaState {
             }
             let mut qs_arg = qs_dev;
             let mut ds_arg = ds_dev;
-            let kernel = if tuning::q6k_q8dot_half2_enabled() {
+            let kernel = if tuning::q6k_q8dot_wide_enabled() {
+                "rnb_q6k_gemv_q8dot_wide_warp8"
+            } else if tuning::q6k_q8dot_half2_enabled() {
                 "rnb_q6k_gemv_q8dot_half2_warp8"
             } else {
                 "rnb_q6k_gemv_q8dot_warp8"
@@ -1713,7 +1715,11 @@ impl CudaState {
             let mut qs_arg = qs_dev;
             let mut ds_arg = ds_dev;
             return self.launch_cached_gemv(
-                "rnb_q5k_gemv_q8dot_warp8",
+                if tuning::q5k_q8dot_wide_enabled() {
+                    "rnb_q5k_gemv_q8dot_wide_warp8"
+                } else {
+                    "rnb_q5k_gemv_q8dot_warp8"
+                },
                 &[
                     (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                     (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
