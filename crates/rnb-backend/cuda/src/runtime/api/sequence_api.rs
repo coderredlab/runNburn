@@ -118,6 +118,167 @@ pub fn ssm_conv1d_silu(
         .ssm_conv1d_silu(input, kernel, seq_len, channels, kernel_size)
 }
 
+/// cu203: Qwen GDN decode 층 core 를 device chain 으로 실행한다. `hidden` 은
+/// residual add 까지 반영돼 돌아오고, conv/delta host 사본은 갱신되지 않는다
+/// (resident 계약 — sync 는 `sync_delta_state_cache`/materialize 가 담당).
+#[allow(clippy::too_many_arguments)]
+pub struct QwenGdnDecodeChainArgs<'a> {
+    pub hidden: &'a mut [f32],
+    pub conv_state: &'a mut [f32],
+    pub delta_state: &'a mut [f32],
+    pub attn_norm: &'a [f32],
+    pub qkv_weights: &'a [u8],
+    pub qkv_quant: u32,
+    pub gate_weights: &'a [u8],
+    pub alpha_weights: &'a [f32],
+    pub beta_weights: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub ssm_a: &'a [f32],
+    pub conv_kernel_weights: &'a [f32],
+    pub ssm_norm: &'a [f32],
+    pub ssm_out_weights: &'a [u8],
+    pub ssm_out_quant: u32,
+    pub n_embd: usize,
+    pub conv_channels: usize,
+    pub conv_kernel: usize,
+    pub d_inner: usize,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub norm_eps: f32,
+}
+
+pub fn qwen35_gdn_decode_core_chain(args: QwenGdnDecodeChainArgs<'_>) -> Result<(), String> {
+    let heads = args.num_v_heads;
+    if args.hidden.len() != args.n_embd {
+        return Err(format!(
+            "GDN chain hidden len mismatch: got {}, expected {}",
+            args.hidden.len(),
+            args.n_embd
+        ));
+    }
+    if args.n_embd % 256 != 0 || args.d_inner % 256 != 0 {
+        return Err(format!(
+            "GDN chain dims must be divisible by 256: n_embd={}, d_inner={}",
+            args.n_embd, args.d_inner
+        ));
+    }
+    if args.conv_kernel < 2 {
+        return Err(format!(
+            "GDN chain conv kernel too small: {}",
+            args.conv_kernel
+        ));
+    }
+    if args.conv_state.len() != (args.conv_kernel - 1) * args.conv_channels {
+        return Err(format!(
+            "GDN chain conv state len mismatch: got {}, expected {}",
+            args.conv_state.len(),
+            (args.conv_kernel - 1) * args.conv_channels
+        ));
+    }
+    if args.delta_state.len() != heads * args.head_v_dim * args.head_k_dim {
+        return Err(format!(
+            "GDN chain delta state len mismatch: got {}, expected {}",
+            args.delta_state.len(),
+            heads * args.head_v_dim * args.head_k_dim
+        ));
+    }
+    if heads == 0 || args.num_k_heads == 0 || heads % args.num_k_heads != 0 {
+        return Err(format!(
+            "GDN chain head config invalid: v={heads}, k={}",
+            args.num_k_heads
+        ));
+    }
+    let q_dim = args.num_k_heads * args.head_k_dim;
+    if args.conv_channels != 2 * q_dim + heads * args.head_v_dim
+        || heads * args.head_v_dim != args.d_inner
+    {
+        return Err(format!(
+            "GDN chain channel layout mismatch: conv_channels={}, q_dim={q_dim}, d_inner={}",
+            args.conv_channels, args.d_inner
+        ));
+    }
+    if args.attn_norm.len() != args.n_embd
+        || args.ssm_norm.len() != args.head_v_dim
+        || args.dt_bias.len() != heads
+        || args.ssm_a.len() != heads
+        || args.alpha_weights.len() != heads * args.n_embd
+        || args.beta_weights.len() != heads * args.n_embd
+        || args.conv_kernel_weights.len() != args.conv_kernel * args.conv_channels
+    {
+        return Err("GDN chain F32 weight length mismatch".to_string());
+    }
+    let qkv_row_bytes = |quant: u32, cols: usize| -> Result<usize, String> {
+        let blocks = cols / 256;
+        match quant {
+            12 => Ok(blocks * 144),
+            13 => Ok(blocks * 176),
+            14 => Ok(blocks * 210),
+            other => Err(format!("GDN chain unsupported quant code {other}")),
+        }
+    };
+    if args.qkv_weights.len() != args.conv_channels * qkv_row_bytes(args.qkv_quant, args.n_embd)? {
+        return Err(format!(
+            "GDN chain qkv byte mismatch: got {}, quant {}",
+            args.qkv_weights.len(),
+            args.qkv_quant
+        ));
+    }
+    if args.gate_weights.len() != args.d_inner * qkv_row_bytes(12, args.n_embd)? {
+        return Err(format!(
+            "GDN chain gate byte mismatch: got {}",
+            args.gate_weights.len()
+        ));
+    }
+    if args.ssm_out_weights.len() != args.n_embd * qkv_row_bytes(args.ssm_out_quant, args.d_inner)?
+    {
+        return Err(format!(
+            "GDN chain ssm_out byte mismatch: got {}, quant {}",
+            args.ssm_out_weights.len(),
+            args.ssm_out_quant
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .qwen35_gdn_decode_core_chain(
+            crate::runtime::gdn_decode_chain::QwenGdnDecodeChainRequest {
+                hidden: args.hidden,
+                conv_state: args.conv_state,
+                delta_state: args.delta_state,
+                attn_norm: args.attn_norm,
+                qkv_weights: args.qkv_weights,
+                qkv_quant: args.qkv_quant,
+                gate_weights: args.gate_weights,
+                alpha_weights: args.alpha_weights,
+                beta_weights: args.beta_weights,
+                dt_bias: args.dt_bias,
+                ssm_a: args.ssm_a,
+                conv_kernel_weights: args.conv_kernel_weights,
+                ssm_norm: args.ssm_norm,
+                ssm_out_weights: args.ssm_out_weights,
+                ssm_out_quant: args.ssm_out_quant,
+                n_embd: args.n_embd,
+                conv_channels: args.conv_channels,
+                conv_kernel: args.conv_kernel,
+                d_inner: args.d_inner,
+                num_k_heads: args.num_k_heads,
+                num_v_heads: args.num_v_heads,
+                head_k_dim: args.head_k_dim,
+                head_v_dim: args.head_v_dim,
+                norm_eps: args.norm_eps,
+            },
+        )
+}
+
 pub fn gdn_gated_norm_silu(
     delta_out: &[f32],
     z: &[f32],

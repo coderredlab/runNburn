@@ -353,6 +353,8 @@ impl CudaState {
             qwen35_mtp_expert_history: HashMap::new(),
             qwen35_mtp_expert_observations: HashMap::new(),
             resident_delta_states: HashMap::new(),
+            qwen_gdn_decode_chain_workspace: None,
+            qwen_gdn_decode_chain_workspace_capacity: 0,
             mtp_verify_snapshot_pool: Vec::new(),
             nemotron_decode_sparse_calls: 0,
             q4k_gemv_module: None,
@@ -727,6 +729,10 @@ impl Drop for CudaState {
         }
         for (_, entry) in self.resident_delta_states.drain() {
             let _ = unsafe { self.api.mem_free(entry.ptr) };
+        }
+        if let Some(ptr) = self.qwen_gdn_decode_chain_workspace.take() {
+            let _ = unsafe { self.api.mem_free(ptr) };
+            self.qwen_gdn_decode_chain_workspace_capacity = 0;
         }
         for (_, graph) in self.qwen35_sparse_graphs.drain() {
             let _ = unsafe { self.api.graph_exec_destroy(graph.exec as *mut libc::c_void) };

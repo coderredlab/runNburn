@@ -13052,6 +13052,249 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
     );
 }
 
+// cu203: Qwen GDN decode core chain 이 기존 부품(같은 CUDA 커널) staged 실행과
+// 2 스텝 연속에서 일치함을 방어한다. staged reference 는 conv/delta/gated-norm 을
+// 같은 공개 api 커널로 실행하므로, chain 고유 계약 — 조립 순서, conv state 의
+// DtoD shift+append 갱신, resident state 재사용 — 이 깨지면 step2 출력과 최종
+// state 가 어긋난다. rms/l2/prepare/GQA rep 만 CPU 모사라 결합 오차로 흡수한다.
+#[test]
+fn cuda_qwen_gdn_decode_core_chain_matches_staged_reference_two_steps() {
+    let _guard = runtime_test_lock();
+    let _q4_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "1");
+    let _q5_q8dot = EnvVarGuard::set("RNB_CUDA_Q5K_GEMV_Q8DOT", "1");
+    let _q6_q8dot = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "1");
+
+    let n_embd = 1024usize;
+    let d_inner = 1024usize;
+    let num_v_heads = 8usize;
+    let num_k_heads = 4usize;
+    let head_k_dim = 128usize;
+    let head_v_dim = d_inner / num_v_heads;
+    let conv_channels = d_inner + 2 * num_k_heads * head_k_dim;
+    let conv_kernel = 4usize;
+    let norm_eps = 1e-6f32;
+    let q_dim = num_k_heads * head_k_dim;
+
+    let qkv = make_test_q4k_weights(1, conv_channels, n_embd / 256, 211)
+        .pop()
+        .unwrap();
+    let gate = make_test_q4k_weights(1, d_inner, n_embd / 256, 223)
+        .pop()
+        .unwrap();
+    let ssm_out = make_test_q5k_weights(n_embd, d_inner / 256, 227);
+    let attn_norm = (0..n_embd)
+        .map(|i| 0.02 + ((i as f32 % 11.0) * 0.001))
+        .collect::<Vec<_>>();
+    let alpha_w = (0..num_v_heads * n_embd)
+        .map(|i| (((i as f32 % 37.0) - 18.0) * 0.0005))
+        .collect::<Vec<_>>();
+    let beta_w = (0..num_v_heads * n_embd)
+        .map(|i| (((i as f32 % 41.0) - 20.0) * 0.0005))
+        .collect::<Vec<_>>();
+    let dt_bias = (0..num_v_heads)
+        .map(|i| -0.5 + (i as f32) * 0.1)
+        .collect::<Vec<_>>();
+    let ssm_a = (0..num_v_heads)
+        .map(|i| -0.4 - (i as f32) * 0.05)
+        .collect::<Vec<_>>();
+    let conv_w = (0..conv_kernel * conv_channels)
+        .map(|i| (((i as f32 % 29.0) - 14.0) * 0.02))
+        .collect::<Vec<_>>();
+    let ssm_norm = (0..head_v_dim)
+        .map(|i| 0.8 + ((i as f32 % 7.0) * 0.02))
+        .collect::<Vec<_>>();
+    let hidden0 = (0..n_embd)
+        .map(|i| (((i as f32 % 59.0) - 29.0) * 0.00390625))
+        .collect::<Vec<_>>();
+    let conv_state0 = (0..(conv_kernel - 1) * conv_channels)
+        .map(|i| (((i as f32 % 23.0) - 11.0) * 0.01))
+        .collect::<Vec<_>>();
+    let delta_state0 = (0..num_v_heads * head_v_dim * head_k_dim)
+        .map(|i| (((i as f32 % 17.0) - 8.0) * 0.005))
+        .collect::<Vec<_>>();
+
+    // -------- staged reference (기존 공개 api 부품, 2 스텝) --------
+    let cpu_rms = |input: &[f32], weight: &[f32]| -> Vec<f32> {
+        let sum_sq: f32 = input.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (sum_sq / input.len() as f32 + norm_eps).sqrt();
+        input
+            .iter()
+            .zip(weight.iter())
+            .map(|(x, w)| x * inv * w)
+            .collect()
+    };
+    let mut staged_hidden = hidden0.clone();
+    let mut staged_conv = conv_state0.clone();
+    let mut staged_delta = delta_state0.clone();
+    let mut staged_outputs = Vec::new();
+    for _step in 0..2 {
+        let normed = cpu_rms(&staged_hidden, &attn_norm);
+        let mut qkv_out = vec![0.0f32; conv_channels];
+        q4k_gemv_into(&qkv, conv_channels, n_embd, &normed, &mut qkv_out).expect("staged qkv");
+        if std::env::var("RNB_GDN_CHAIN_DIAG").is_ok() {
+            eprintln!("STAGED normed: {:?}", &normed[..8]);
+            eprintln!("STAGED qkv: {:?}", &qkv_out[..8]);
+        }
+        let mut z = vec![0.0f32; d_inner];
+        q4k_gemv_into(&gate, d_inner, n_embd, &normed, &mut z).expect("staged gate");
+        let mut alpha = vec![0.0f32; num_v_heads];
+        let mut beta = vec![0.0f32; num_v_heads];
+        for h in 0..num_v_heads {
+            alpha[h] = normed
+                .iter()
+                .zip(&alpha_w[h * n_embd..(h + 1) * n_embd])
+                .map(|(x, w)| x * w)
+                .sum();
+            beta[h] = normed
+                .iter()
+                .zip(&beta_w[h * n_embd..(h + 1) * n_embd])
+                .map(|(x, w)| x * w)
+                .sum();
+        }
+        for h in 0..num_v_heads {
+            let biased = alpha[h] + dt_bias[h];
+            alpha[h] = (1.0 + biased.exp()).ln() * ssm_a[h];
+            beta[h] = 1.0 / (1.0 + (-beta[h]).exp());
+        }
+        if std::env::var("RNB_GDN_CHAIN_DIAG").is_ok() {
+            eprintln!("STAGED z: {:?}", &z[..8]);
+            eprintln!("STAGED gate_prep: {:?}", &alpha[..8]);
+            eprintln!("STAGED beta_prep: {:?}", &beta[..8]);
+        }
+        let mut conv_input = vec![0.0f32; conv_kernel * conv_channels];
+        conv_input[..staged_conv.len()].copy_from_slice(&staged_conv);
+        conv_input[staged_conv.len()..].copy_from_slice(&qkv_out);
+        let conv_out =
+            ssm_conv1d_silu(&conv_input, &conv_w, 1, conv_channels, conv_kernel).expect("conv");
+        staged_conv.copy_from_slice(&conv_input[conv_channels..]);
+        // l2 norm + scale + GQA rep (prepare 커널과 같은 수식: 1/sqrt(sum+eps))
+        let mut q_rep = vec![0.0f32; num_v_heads * head_k_dim];
+        let mut k_rep = vec![0.0f32; num_v_heads * head_k_dim];
+        let q_scale = 1.0 / (head_k_dim as f32).sqrt();
+        for vh in 0..num_v_heads {
+            let kh = vh % num_k_heads;
+            let q_base = kh * head_k_dim;
+            let k_base = q_dim + kh * head_k_dim;
+            let q_sum: f32 = conv_out[q_base..q_base + head_k_dim]
+                .iter()
+                .map(|v| v * v)
+                .sum();
+            let k_sum: f32 = conv_out[k_base..k_base + head_k_dim]
+                .iter()
+                .map(|v| v * v)
+                .sum();
+            let q_inv = 1.0 / (q_sum + norm_eps).sqrt();
+            let k_inv = 1.0 / (k_sum + norm_eps).sqrt();
+            for d in 0..head_k_dim {
+                q_rep[vh * head_k_dim + d] = conv_out[q_base + d] * q_inv * q_scale;
+                k_rep[vh * head_k_dim + d] = conv_out[k_base + d] * k_inv;
+            }
+        }
+        if std::env::var("RNB_GDN_CHAIN_DIAG").is_ok() {
+            eprintln!("STAGED conv_out: {:?}", &conv_out[..8]);
+            eprintln!("STAGED q_rep: {:?}", &q_rep[..8]);
+        }
+        let v = &conv_out[2 * q_dim..2 * q_dim + d_inner];
+        let delta_out = delta_net_decode(
+            &mut staged_delta,
+            &q_rep,
+            &k_rep,
+            v,
+            &alpha,
+            &beta,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        .expect("staged delta");
+        let gated =
+            gdn_gated_norm_silu(&delta_out, &z, &ssm_norm, num_v_heads, head_v_dim, norm_eps)
+                .expect("staged gated norm");
+        if std::env::var("RNB_GDN_CHAIN_DIAG").is_ok() {
+            eprintln!("STAGED delta_out: {:?}", &delta_out[..8]);
+            eprintln!("STAGED gated: {:?}", &gated[..8]);
+        }
+        let mut proj = vec![0.0f32; n_embd];
+        q5k_gemv_into(&ssm_out, n_embd, d_inner, &gated, &mut proj).expect("staged ssm_out");
+        if std::env::var("RNB_GDN_CHAIN_DIAG").is_ok() {
+            eprintln!("STAGED ssm_proj: {:?}", &proj[..8]);
+        }
+        for (h, p) in staged_hidden.iter_mut().zip(proj.iter()) {
+            *h += p;
+        }
+        staged_outputs.push(staged_hidden.clone());
+    }
+
+    // -------- chain (2 스텝, resident state) --------
+    let mut chain_hidden = hidden0.clone();
+    let mut chain_conv = conv_state0.clone();
+    let mut chain_delta = delta_state0.clone();
+    let mut chain_outputs = Vec::new();
+    for _step in 0..2 {
+        qwen35_gdn_decode_core_chain(QwenGdnDecodeChainArgs {
+            hidden: &mut chain_hidden,
+            conv_state: &mut chain_conv,
+            delta_state: &mut chain_delta,
+            attn_norm: &attn_norm,
+            qkv_weights: &qkv,
+            qkv_quant: 12,
+            gate_weights: &gate,
+            alpha_weights: &alpha_w,
+            beta_weights: &beta_w,
+            dt_bias: &dt_bias,
+            ssm_a: &ssm_a,
+            conv_kernel_weights: &conv_w,
+            ssm_norm: &ssm_norm,
+            ssm_out_weights: &ssm_out,
+            ssm_out_quant: 13,
+            n_embd,
+            conv_channels,
+            conv_kernel,
+            d_inner,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            norm_eps,
+        })
+        .expect("GDN decode chain");
+        chain_outputs.push(chain_hidden.clone());
+    }
+    assert!(
+        sync_delta_state_cache(&mut chain_conv).expect("sync conv state"),
+        "chain conv state must be resident"
+    );
+    assert!(
+        sync_delta_state_cache(&mut chain_delta).expect("sync delta state"),
+        "chain delta state must be resident"
+    );
+
+    // 결합 오차는 실측 정상 분포에서 정한다. fixture 는 값이 스텝마다 커지는
+    // 발산계라 gated 의 ~4e-4 상대 차이(device vs host Q8 양자화, CPU vs 커널
+    // rms/l2)가 Q8 chunk 격자 이동과 큰 weight 스케일로 증폭된다. 실측 max_rel:
+    // hidden step0 18.3%, step1 1.02%, conv 33.6%(abs 0.256), delta 는 잡음 규모
+    // 원소라 rel 무의미(abs 0.0091). 방어 대상 결함(조립 오프셋, conv state
+    // shift+append 누락, head 매핑)은 mutation 실측에서 이 경계를 크게 초과한다.
+    // 제품 27B 는 chain off/on 100-token exact 로 별도 검증됐다.
+    for step in 0..2 {
+        assert_close_rows_abs_rel(
+            &format!("GDN chain hidden step {step}"),
+            &chain_outputs[step],
+            &staged_outputs[step],
+            0.05,
+            0.25,
+        );
+    }
+    assert_close_rows_abs_rel("GDN chain conv state", &chain_conv, &staged_conv, 0.05, 0.5);
+    assert_close_rows_abs_rel(
+        "GDN chain delta state",
+        &chain_delta,
+        &staged_delta,
+        0.02,
+        0.0,
+    );
+}
+
 #[test]
 fn cuda_dense_q4k_gelu_ffn_batch_raw_q4_down_matches_cpu_reference() {
     let _guard = runtime_test_lock();

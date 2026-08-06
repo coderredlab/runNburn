@@ -611,6 +611,9 @@ pub(super) struct CudaState {
     pub(super) qwen35_mtp_expert_history: HashMap<usize, HashSet<u32>>,
     pub(super) qwen35_mtp_expert_observations: HashMap<usize, usize>,
     pub(super) resident_delta_states: HashMap<(usize, usize), ResidentDeltaState>,
+    // cu203: Qwen GDN decode chain 전용 workspace (단일 할당, 층별 재사용).
+    pub(super) qwen_gdn_decode_chain_workspace: Option<u64>,
+    pub(super) qwen_gdn_decode_chain_workspace_capacity: usize,
     pub(super) mtp_verify_snapshot_pool: Vec<MtpVerifySnapshotPoolEntry>,
     pub(super) nemotron_decode_sparse_calls: usize,
     pub(super) q4k_gemv_module: Option<usize>,

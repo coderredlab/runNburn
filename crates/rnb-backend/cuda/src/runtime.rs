@@ -31,6 +31,7 @@ pub(in crate::runtime) use dense::{
     DenseQ4ProjectionDispatchPlanForTest, DenseQ4ProjectionKindForTest,
 };
 mod gdn;
+mod gdn_decode_chain;
 mod gdn_prefill_chain;
 mod gemv;
 mod moe;

@@ -106,9 +106,9 @@ pub use runtime::{
     q8_0_gemv_argmax, q8_0_gemv_argmax_q8dot, q8_0_gemv_batch, q8_0_head_gemv_batch, q8_1_gemv,
     q8_1_gemv_batch, quant_embedding_gather, qwen35_admit_expert_misses_async,
     qwen35_configure_moe_layer_cache, qwen35_decode_moe_shared_sparse_into, qwen35_expert,
-    qwen35_mtp_device_draft_step, qwen35_mtp_device_verify_window, qwen35_mtp_verify_buffer_plan,
-    qwen35_prefill_attention_device_input, qwen35_prefill_device_topk_route_slots,
-    qwen35_prefill_moe_f32_shared_sparse_by_token,
+    qwen35_gdn_decode_core_chain, qwen35_mtp_device_draft_step, qwen35_mtp_device_verify_window,
+    qwen35_mtp_verify_buffer_plan, qwen35_prefill_attention_device_input,
+    qwen35_prefill_device_topk_route_slots, qwen35_prefill_moe_f32_shared_sparse_by_token,
     qwen35_prefill_moe_f32_shared_sparse_device_topk_selected_base_by_token,
     qwen35_prefill_moe_f32_shared_sparse_device_topk_selected_base_device_input,
     qwen35_prefill_moe_f32_shared_sparse_device_topk_selected_base_device_input_reuse_residual,
@@ -140,7 +140,7 @@ pub use runtime::{
     Qwen35MtpDeviceVerifyGdnMoeLayer, Qwen35MtpDeviceVerifyLayerKind,
     Qwen35MtpDeviceVerifyPrefixState, Qwen35MtpDeviceVerifyRequest, Qwen35MtpDeviceVerifyResult,
     Qwen35MtpDeviceVerifySsmLayerFinalState, Qwen35MtpDeviceVerifySsmLayerPrefixState,
-    Qwen35PrefillAttentionDeviceOutput,
+    Qwen35PrefillAttentionDeviceOutput, QwenGdnDecodeChainArgs,
 };
 
 #[cfg(test)]

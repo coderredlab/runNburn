@@ -477,3 +477,63 @@ pub fn try_delta_step_if_supported(
         )
     })
 }
+
+/// cu203: Qwen GDN decode 층 core device chain. GGMLType 을 backend quant code 로
+/// 변환해 넘긴다. conv/delta host 사본은 갱신되지 않는다 (resident 계약).
+#[allow(clippy::too_many_arguments)]
+pub struct QwenGdnDecodeChainCall<'a> {
+    pub hidden: &'a mut [f32],
+    pub conv_state: &'a mut [f32],
+    pub delta_state: &'a mut [f32],
+    pub attn_norm: &'a [f32],
+    pub qkv_weights: &'a [u8],
+    pub qkv_quant: GGMLType,
+    pub gate_weights: &'a [u8],
+    pub alpha_weights: &'a [f32],
+    pub beta_weights: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub ssm_a: &'a [f32],
+    pub conv_kernel_weights: &'a [f32],
+    pub ssm_norm: &'a [f32],
+    pub ssm_out_weights: &'a [u8],
+    pub ssm_out_quant: GGMLType,
+    pub n_embd: usize,
+    pub conv_channels: usize,
+    pub conv_kernel: usize,
+    pub d_inner: usize,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub norm_eps: f32,
+}
+
+pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<()> {
+    backend::qwen35_gdn_decode_core_chain(backend::QwenGdnDecodeChainArgs {
+        hidden: call.hidden,
+        conv_state: call.conv_state,
+        delta_state: call.delta_state,
+        attn_norm: call.attn_norm,
+        qkv_weights: call.qkv_weights,
+        qkv_quant: call.qkv_quant as u32,
+        gate_weights: call.gate_weights,
+        alpha_weights: call.alpha_weights,
+        beta_weights: call.beta_weights,
+        dt_bias: call.dt_bias,
+        ssm_a: call.ssm_a,
+        conv_kernel_weights: call.conv_kernel_weights,
+        ssm_norm: call.ssm_norm,
+        ssm_out_weights: call.ssm_out_weights,
+        ssm_out_quant: call.ssm_out_quant as u32,
+        n_embd: call.n_embd,
+        conv_channels: call.conv_channels,
+        conv_kernel: call.conv_kernel,
+        d_inner: call.d_inner,
+        num_k_heads: call.num_k_heads,
+        num_v_heads: call.num_v_heads,
+        head_k_dim: call.head_k_dim,
+        head_v_dim: call.head_v_dim,
+        norm_eps: call.norm_eps,
+    })
+    .map_err(|err| format!("CUDA Qwen GDN decode chain failed: {err}"))
+}

@@ -1,5 +1,6 @@
 mod accelerator_basic;
 mod cuda_basic;
+mod cuda_gdn_chain;
 mod engine_ext;
 mod glm_moe;
 mod gpu_gdn;
@@ -53,6 +54,7 @@ pub(super) use accelerator_basic::{
     prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported,
 };
+
 #[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{
     cuda_activation_mul_inplace, cuda_add_f32_inplace, cuda_add_rows_f32_inplace,
@@ -123,6 +125,7 @@ pub(super) use cuda_basic::{
 };
 #[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{nemotron_q5_q8_register_layer, nemotron_q5_register_layer};
+pub(super) use cuda_gdn_chain::{try_gdn_decode_core_chain_if_supported, GdnDecodeChainStates};
 pub(super) use glm_moe::{
     glm_moe_decode_shared_expert_q5k_q6k, glm_moe_decode_sparse_experts_iq2xxs_iq3xxs,
 };

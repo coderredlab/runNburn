@@ -57,6 +57,13 @@ pub fn qwen35_dense_ffn_chain_enabled() -> bool {
     env_flag_default_on("RNB_CUDA_QWEN35_DENSE_FFN_CHAIN")
 }
 
+// cu203: Qwen3.6 GDN decode 층 core (norm→qkv/gate→alpha/beta→conv→delta→
+// gated norm→ssm_out→residual) device chain. 층당 수십 회의 host↔device 왕복을
+// hidden 1왕복으로 줄인다. env="0" 시 기존 단계별 경로로 복귀.
+pub fn qwen35_gdn_decode_chain_enabled() -> bool {
+    env_flag_default_on("RNB_CUDA_QWEN35_GDN_DECODE_CHAIN")
+}
+
 // cu52 step 51 + cu57: K/V projection 의 device output + f16 pack + attention
 // 의 last_token_{k,v}_dev 전달. cu57 default ON 승격. KV cache 의 host f16
 // 변환 + H2D round-trip 제거. CHAIN + OUT_SCALE 함께 활성 필요 (carrier-readiness).

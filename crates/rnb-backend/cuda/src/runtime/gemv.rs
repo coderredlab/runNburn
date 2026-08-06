@@ -59,7 +59,7 @@ impl Q4kF16QkvInput<'_> {
     }
 }
 
-fn q4k_q8dot_decode_enabled(default: bool) -> bool {
+pub(in crate::runtime) fn q4k_q8dot_decode_enabled(default: bool) -> bool {
     match std::env::var("RNB_CUDA_Q4K_GEMV_Q8DOT") {
         Ok(value) => {
             let value = value.to_ascii_lowercase();
@@ -71,7 +71,7 @@ fn q4k_q8dot_decode_enabled(default: bool) -> bool {
 
 // Q6_K decode GEMV activation quantization gate. Mirrors the Q4_K switch above
 // so both quant formats share one opt-out convention.
-fn q6k_q8dot_decode_enabled(default: bool) -> bool {
+pub(in crate::runtime) fn q6k_q8dot_decode_enabled(default: bool) -> bool {
     match std::env::var("RNB_CUDA_Q6K_GEMV_Q8DOT") {
         Ok(value) => {
             let value = value.to_ascii_lowercase();
@@ -82,7 +82,7 @@ fn q6k_q8dot_decode_enabled(default: bool) -> bool {
 }
 
 // Q5_K decode GEMV activation quantization gate.
-fn q5k_q8dot_decode_enabled(default: bool) -> bool {
+pub(in crate::runtime) fn q5k_q8dot_decode_enabled(default: bool) -> bool {
     match std::env::var("RNB_CUDA_Q5K_GEMV_Q8DOT") {
         Ok(value) => {
             let value = value.to_ascii_lowercase();

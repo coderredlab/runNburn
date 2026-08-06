@@ -4753,6 +4753,88 @@ impl CudaState {
         )
     }
 
+    // cu203: GDN decode chain 의 Q5_K ssm_out q8dot device-input launch.
+    // upload_and_launch_q5k_gemv 의 q8dot 분기와 같은 커널·grid 를 device 입력으로 쓴다.
+    pub(in crate::runtime) fn launch_q5k_gemv_q8dot_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        self.launch_cached_gemv(
+            "rnb_q5k_gemv_q8dot_warp8",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
+    // cu203: GDN decode chain 의 delta-net device-input launch. target-only decode 가
+    // 쓰는 rnb_delta_net_decode 커널·grid 를 그대로 유지해 (predecay 변형과 달리)
+    // 기존 host-input 경로와 같은 리덕션 순서를 보존한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_delta_net_decode_dev(
+        &mut self,
+        output_dev: u64,
+        state_dev: u64,
+        q_dev: u64,
+        k_dev: u64,
+        v_dev: u64,
+        gate_dev: u64,
+        beta_dev: u64,
+        num_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Result<(), String> {
+        let mut output_arg = output_dev;
+        let mut state_arg = state_dev;
+        let mut q_arg = q_dev;
+        let mut k_arg = k_dev;
+        let mut v_arg = v_dev;
+        let mut gate_arg = gate_dev;
+        let mut beta_arg = beta_dev;
+        let mut heads_arg = u32::try_from(num_heads)
+            .map_err(|_| format!("GDN delta num_heads exceeds u32: {num_heads}"))?;
+        let mut head_k_arg = u32::try_from(head_k_dim)
+            .map_err(|_| format!("GDN delta head_k_dim exceeds u32: {head_k_dim}"))?;
+        let mut head_v_arg = u32::try_from(head_v_dim)
+            .map_err(|_| format!("GDN delta head_v_dim exceeds u32: {head_v_dim}"))?;
+        self.launch_cached_gemv(
+            "rnb_delta_net_decode",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut state_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut gate_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut beta_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut head_k_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut head_v_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (head_v_dim as u32, num_heads as u32, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_q6k_gemv_batch_q8dot_to_dev(
         &mut self,
         weights: &[u8],

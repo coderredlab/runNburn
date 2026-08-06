@@ -279,6 +279,69 @@ fn decode_gdn_layer_qwen_impl(
         }
     }
 
+    // cu203: GDN core device chain — norm→qkv/gate→alpha/beta→conv→delta→
+    // gated norm→ssm_out→residual 를 backend 한 번의 호출(hidden 1왕복)로 실행.
+    // 성공 시 FFN 만 이어서 실행한다. 미지원 조합은 기존 단계별 경로로 후퇴.
+    // 주의: chain 경로에서는 RNB_DEBUG_GDN_STAGE_TRACE 의 중간 단계가 찍히지
+    // 않는다 — 단계별 진단은 RNB_CUDA_QWEN35_GDN_DECODE_CHAIN=0 으로 내려서 한다.
+    #[cfg(feature = "cuda")]
+    if !trace_gdn_stages {
+        let chained = {
+            let ssm_state = kv_cache.get_ssm_state_mut(layer_idx).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "SSM state not initialized for layer {layer_idx}"
+                ))
+            })?;
+            backend_runtime::try_gdn_decode_core_chain_if_supported(
+                metadata,
+                w,
+                backend_runtime::GdnDecodeChainStates {
+                    conv_state: &mut ssm_state.conv_state,
+                    delta_state: &mut ssm_state.delta_state,
+                },
+                &mut scratch.hidden[..hidden_dim],
+            )?
+        };
+        if chained {
+            if profiling && (verbose || layer_idx == 0) {
+                eprintln!("  [DEC-GDN L{}] {:20} gpu", layer_idx, "gdn_core_chain");
+            }
+            if !run_ffn {
+                return Ok(());
+            }
+            let t0 = std::time::Instant::now();
+            if let Some(moe_w) = &w.shared_expert_moe {
+                decode_shared_expert_moe(
+                    scratch,
+                    ModelArchitecture::Qwen35MoE,
+                    &w.post_attn_norm,
+                    moe_w,
+                    hidden_dim,
+                    norm_eps,
+                    layer_idx,
+                )?;
+            } else {
+                decode_ffn(
+                    scratch,
+                    ModelArchitecture::Qwen35,
+                    &w.post_attn_norm,
+                    &None,
+                    &w.ffn_gate_weight,
+                    &w.ffn_up_weight,
+                    &w.ffn_down_weight,
+                    &w.ffn_gate_up_fused,
+                    hidden_dim,
+                    norm_eps,
+                    layer_idx,
+                    #[cfg(feature = "vulkan")]
+                    gpu_runtime.as_mut().map(|v| &mut **v),
+                )?;
+            }
+            prof!("ffn_total", t0);
+            return Ok(());
+        }
+    }
+
     let t0 = std::time::Instant::now();
     let attn_norm_data = kernels::tensor_as_f32_slice(&w.attn_norm);
     apply_plain_rms_norm_into(
