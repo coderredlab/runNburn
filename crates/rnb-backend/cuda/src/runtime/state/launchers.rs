@@ -4913,6 +4913,30 @@ impl CudaState {
         input_ds_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        // cu212: 2-token 창은 weight-read-once pair2 커널이 기본이다
+        // (토큰별 bitwise 동일, weight bytes 절반).
+        if seq_len == 2 && crate::tuning::q5k_q8dot_pair2_enabled() {
+            let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+            let mut output_arg = output_dev;
+            let mut weights_arg = weights_dev;
+            let mut input_qs_arg = input_qs_dev;
+            let mut input_ds_arg = input_ds_dev;
+            let mut rows_arg = rows as u32;
+            let mut blocks_per_row_arg = blocks_per_row as u32;
+            return self.launch_cached_gemv(
+                "rnb_q5k_gemv_q8dot_pair2_warp8",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            );
+        }
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
@@ -4937,6 +4961,40 @@ impl CudaState {
         )
     }
 
+    // cu212: 2-token weight-read-once Q4_K q8dot launch. grid 는 (rows/8, 1)
+    // 이고 커널이 두 토큰 output 을 모두 쓴다.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q4k_gemv_q8dot_pair2_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        self.launch_cached_gemv(
+            "rnb_q4k_gemv_q8dot_pair2_warp8",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     // cu209: 짧은 window 의 Q6_K batch projection q8dot launch. 커널은 단일
     // 토큰 rnb_q6k_gemv_q8dot_{half2_,}warp8 과 토큰별 bitwise 동일 산술이며,
     // half2/byte 선택은 cu207 단일 커널과 같은 opt-out 을 공유한다.
@@ -4951,6 +5009,34 @@ impl CudaState {
         input_ds_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        // cu212: 2-token 창은 weight-read-once pair2 커널이 기본이다.
+        if seq_len == 2 && crate::tuning::q6k_q8dot_pair2_enabled() {
+            let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+            let kernel = if crate::tuning::q6k_q8dot_half2_enabled() {
+                "rnb_q6k_gemv_q8dot_pair2_half2_warp8"
+            } else {
+                "rnb_q6k_gemv_q8dot_pair2_byte_warp8"
+            };
+            let mut output_arg = output_dev;
+            let mut weights_arg = weights_dev;
+            let mut input_qs_arg = input_qs_dev;
+            let mut input_ds_arg = input_ds_dev;
+            let mut rows_arg = rows as u32;
+            let mut blocks_per_row_arg = blocks_per_row as u32;
+            return self.launch_cached_gemv(
+                kernel,
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            );
+        }
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let kernel = if crate::tuning::q6k_q8dot_half2_enabled() {
             "rnb_q6k_gemv_batch_q8dot_half2_warp8"

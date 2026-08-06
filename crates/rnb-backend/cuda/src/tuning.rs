@@ -186,6 +186,22 @@ pub fn gdn_delta_warp128_enabled() -> bool {
     env_bool("RNB_CUDA_GDN_DELTA_WARP128", true)
 }
 
+/// cu212: 2-token verify window 의 weight-read-once q8dot GEMV. 토큰별 산술
+/// 순서가 배치 커널의 해당 seq CTA 와 동일해 per-token bitwise 로 같고, weight
+/// bytes 만 절반을 읽는다. `RNB_CUDA_Q{4,5,6}K_Q8DOT_PAIR2=0` 은 per-token CTA
+/// 배치 커널로 되돌리는 진단 opt-out 이다.
+pub fn q4k_q8dot_pair2_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_Q8DOT_PAIR2", true)
+}
+
+pub fn q5k_q8dot_pair2_enabled() -> bool {
+    env_bool("RNB_CUDA_Q5K_Q8DOT_PAIR2", true)
+}
+
+pub fn q6k_q8dot_pair2_enabled() -> bool {
+    env_bool("RNB_CUDA_Q6K_Q8DOT_PAIR2", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1169,6 +1185,9 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT");
             std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_HALF2");
             std::env::remove_var("RNB_CUDA_GDN_DELTA_WARP128");
+            std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_PAIR2");
+            std::env::remove_var("RNB_CUDA_Q5K_Q8DOT_PAIR2");
+            std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_PAIR2");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1191,6 +1210,9 @@ mod tests {
         assert!(q4k_gate_up_q8dot_split_enabled());
         assert!(q6k_q8dot_half2_enabled());
         assert!(gdn_delta_warp128_enabled());
+        assert!(q4k_q8dot_pair2_enabled());
+        assert!(q5k_q8dot_pair2_enabled());
+        assert!(q6k_q8dot_pair2_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

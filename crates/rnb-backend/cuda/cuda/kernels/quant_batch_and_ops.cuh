@@ -349,6 +349,83 @@ extern "C" __global__ void rnb_q4k_gemv_batch_q8dot_warp8(
     }
 }
 
+// cu212: 2-token weight-read-once Q4_K q8dot GEMV. MTP verify 의 2-position
+// 창에서 weight block 을 한 번 해석해 두 토큰에 누산한다. 토큰별 누산 순서는
+// rnb_q4k_gemv_batch_q8dot_warp8 의 해당 seq CTA 와 동일하므로 출력은 per-token
+// bitwise 로 같고, 다른 점은 weight bytes 를 절반만 읽는 것뿐이다. 실패한
+// 전례(cu198 seq2 gate/up, cu206 fused, seq4@seq2)와 달리 weight 스트림이
+// 하나라 추가 live-state 는 accumulator/x_pack 각 1개다 (cu137 pair2 형태).
+extern "C" __global__ void rnb_q4k_gemv_q8dot_pair2_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const unsigned char* block = row_ptr + b * 144u;
+            const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+            const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            const float dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+
+            for (unsigned chunk = lane; chunk < 64u; chunk += 32u) {
+                const unsigned j = chunk >> 3;
+                unsigned sc;
+                unsigned mn;
+                if (j < 4u) {
+                    sc = block[4u + j] & 63u;
+                    mn = block[4u + j + 4u] & 63u;
+                } else {
+                    sc = (block[4u + j + 4u] & 0x0fu) | ((block[4u + j - 4u] >> 6) << 4);
+                    mn = (block[4u + j + 4u] >> 4) | ((block[4u + j] >> 6) << 4);
+                }
+
+                const unsigned elem = (chunk & 7u) * 4u;
+                const unsigned q_index = (j >> 1) * 32u + elem;
+                const unsigned char* q_ptr = block + 16u + q_index;
+                const unsigned x_off = b * 256u + j * 32u + elem;
+                const int q_pack = rnb_q4_pack4(q_ptr, j);
+
+                const int x_pack0 = rnb_load_i32_aligned4(input_qs + x_off);
+                const int dot0 = __dp4a(q_pack, x_pack0, 0);
+                const int x_sum0 = __dp4a(0x01010101, x_pack0, 0);
+                acc0 += input_ds[b * 8u + j]
+                    * ((d * (float)sc) * (float)dot0 - dmin * (float)mn * (float)x_sum0);
+
+                const int x_pack1 = rnb_load_i32_aligned4(qs1 + x_off);
+                const int dot1 = __dp4a(q_pack, x_pack1, 0);
+                const int x_sum1 = __dp4a(0x01010101, x_pack1, 0);
+                acc1 += ds1[b * 8u + j]
+                    * ((d * (float)sc) * (float)dot1 - dmin * (float)mn * (float)x_sum1);
+            }
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
+    }
+}
+
 extern "C" __global__ void rnb_iq4_xs_gemv_batch_warp8(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -1043,6 +1120,118 @@ extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_byte_warp8(
         out, weights, input_qs, input_ds, rows, blocks_per_row, seq_len);
 }
 
+// cu212: 2-token weight-read-once Q6_K q8dot GEMV. impl2 와 같은 group 매핑에서
+// ql/qh/q_pack 을 한 번 해석해 두 토큰에 누산한다. 토큰별 누산 순서는 impl2 의
+// 해당 seq CTA 와 동일해 per-token bitwise 로 같다.
+template <bool HALFWORD_LOADS>
+static __device__ __forceinline__ void rnb_q6k_gemv_q8dot_pair2_warp8_impl(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const unsigned char* block = row_ptr + b * 210u;
+            const unsigned raw_d = (unsigned)block[208] | ((unsigned)block[209] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            const signed char* x_base0 = input_qs + b * 256u;
+            const signed char* x_base1 = qs1 + b * 256u;
+            const float* ds_base0 = input_ds + b * 8u;
+            const float* ds_base1 = ds1 + b * 8u;
+
+            #pragma unroll
+            for (unsigned g = 0; g < 2u; ++g) {
+                const unsigned tid = (lane + g * 32u) * 4u;
+                const unsigned n = tid >> 7;
+                const unsigned rem = tid & 127u;
+                const unsigned l = rem & 31u;
+                const unsigned quarter = rem >> 5;
+                const unsigned ql_off = n * 64u + l + ((quarter & 1u) ? 32u : 0u);
+                const unsigned qh_shift = quarter * 2u;
+                const unsigned sc_index = 192u + n * 8u + (l >> 4) + quarter * 2u;
+
+                unsigned ql_raw;
+                unsigned qh_raw;
+                int x_pack0;
+                int x_pack1;
+                if constexpr (HALFWORD_LOADS) {
+                    ql_raw = (unsigned)rnb_load_i32_aligned2(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_aligned2(block + 128u + n * 32u + l);
+                    x_pack0 = rnb_load_i32_aligned4(x_base0 + tid);
+                    x_pack1 = rnb_load_i32_aligned4(x_base1 + tid);
+                } else {
+                    ql_raw = (unsigned)rnb_load_i32_unaligned(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_unaligned(block + 128u + n * 32u + l);
+                    x_pack0 = rnb_load_i32_unaligned(x_base0 + tid);
+                    x_pack1 = rnb_load_i32_unaligned(x_base1 + tid);
+                }
+                const unsigned low = (quarter < 2u)
+                    ? (ql_raw & 0x0f0f0f0fu)
+                    : ((ql_raw >> 4) & 0x0f0f0f0fu);
+                const unsigned high = ((qh_raw >> qh_shift) & 0x03030303u) << 4;
+                const int q_pack = (int)(low | high);
+                const int sc = (int)((signed char)block[sc_index]);
+
+                const int dot0 = __dp4a(q_pack, x_pack0, 0);
+                const int x_sum0 = __dp4a(0x01010101, x_pack0, 0);
+                acc0 += ds_base0[tid >> 5]
+                    * (d * (float)sc) * (float)(dot0 - 32 * x_sum0);
+
+                const int dot1 = __dp4a(q_pack, x_pack1, 0);
+                const int x_sum1 = __dp4a(0x01010101, x_pack1, 0);
+                acc1 += ds_base1[tid >> 5]
+                    * (d * (float)sc) * (float)(dot1 - 32 * x_sum1);
+            }
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
+    }
+}
+
+extern "C" __global__ void rnb_q6k_gemv_q8dot_pair2_half2_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    rnb_q6k_gemv_q8dot_pair2_warp8_impl<true>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row);
+}
+
+extern "C" __global__ void rnb_q6k_gemv_q8dot_pair2_byte_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    rnb_q6k_gemv_q8dot_pair2_warp8_impl<false>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row);
+}
+
 // Q5_K GEMV with Q8_1-quantized activations, one warp per output row.
 //
 // Q5_K is Q4_K plus a 32-byte high-bit plane, and its 176-byte super-block
@@ -1197,6 +1386,96 @@ extern "C" __global__ void rnb_q5k_gemv_batch_q8dot_warp8(
 
     if (valid && lane == 0u) {
         out[seq * rows + row] = acc;
+    }
+}
+
+// cu212: 2-token weight-read-once Q5_K q8dot GEMV. batch 커널과 같은 sub-block
+// 매핑에서 weight q_pack 두 half 를 한 번 만들고 두 토큰에 누산한다. 토큰별
+// 누산 순서는 rnb_q5k_gemv_batch_q8dot_warp8 의 해당 seq CTA 와 동일하다.
+extern "C" __global__ void rnb_q5k_gemv_q8dot_pair2_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const bool valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 176u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* qs1 = input_qs + blocks_per_row * 256u;
+    const float* ds1 = input_ds + blocks_per_row * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const unsigned char* block = row_ptr + b * 176u;
+            const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+            const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            const float dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+
+            const unsigned j0 = lane >> 3;
+            const unsigned j1 = j0 + 4u;
+            const unsigned elem = (lane & 7u) * 4u;
+            const unsigned sc0 = block[4u + j0] & 63u;
+            const unsigned mn0 = block[8u + j0] & 63u;
+            const unsigned sc1 =
+                (block[8u + j1] & 0x0fu) | ((block[j1] >> 6) << 4);
+            const unsigned mn1 =
+                (block[8u + j1] >> 4) | ((block[4u + j1] >> 6) << 4);
+
+            const unsigned char* q_ptr0 =
+                block + 48u + (j0 >> 1) * 32u + elem;
+            const unsigned char* q_ptr1 = q_ptr0 + 64u;
+            const unsigned qh_raw =
+                (unsigned)rnb_load_i32_aligned4(block + 16u + elem);
+            const int q_pack0 = rnb_q4_pack4(q_ptr0, j0)
+                | (int)(((qh_raw >> j0) & 0x01010101u) << 4);
+            const int q_pack1 = rnb_q4_pack4(q_ptr1, j1)
+                | (int)(((qh_raw >> j1) & 0x01010101u) << 4);
+
+            const unsigned x_off0 = b * 256u + j0 * 32u + elem;
+            const signed char* t0_qs0 = input_qs + x_off0;
+            const signed char* t0_qs1 = t0_qs0 + 128u;
+            const int t0_pack0 = rnb_load_i32_aligned4(t0_qs0);
+            const int t0_pack1 = rnb_load_i32_aligned4(t0_qs1);
+            const int t0_dot0 = __dp4a(q_pack0, t0_pack0, 0);
+            const int t0_dot1 = __dp4a(q_pack1, t0_pack1, 0);
+            const int t0_sum0 = __dp4a(0x01010101, t0_pack0, 0);
+            const int t0_sum1 = __dp4a(0x01010101, t0_pack1, 0);
+            acc0 += input_ds[b * 8u + j0]
+                * ((d * (float)sc0) * (float)t0_dot0 - dmin * (float)mn0 * (float)t0_sum0);
+            acc0 += input_ds[b * 8u + j1]
+                * ((d * (float)sc1) * (float)t0_dot1 - dmin * (float)mn1 * (float)t0_sum1);
+
+            const signed char* t1_qs0 = qs1 + x_off0;
+            const signed char* t1_qs1 = t1_qs0 + 128u;
+            const int t1_pack0 = rnb_load_i32_aligned4(t1_qs0);
+            const int t1_pack1 = rnb_load_i32_aligned4(t1_qs1);
+            const int t1_dot0 = __dp4a(q_pack0, t1_pack0, 0);
+            const int t1_dot1 = __dp4a(q_pack1, t1_pack1, 0);
+            const int t1_sum0 = __dp4a(0x01010101, t1_pack0, 0);
+            const int t1_sum1 = __dp4a(0x01010101, t1_pack1, 0);
+            acc1 += ds1[b * 8u + j0]
+                * ((d * (float)sc0) * (float)t1_dot0 - dmin * (float)mn0 * (float)t1_sum0);
+            acc1 += ds1[b * 8u + j1]
+                * ((d * (float)sc1) * (float)t1_dot1 - dmin * (float)mn1 * (float)t1_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[row] = acc0;
+        out[rows + row] = acc1;
     }
 }
 

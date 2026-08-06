@@ -12280,8 +12280,87 @@ fn cuda_q4k_batch_dev_input_q8dot_matches_cpu_reference() {
     state
         .stream_synchronize()
         .expect("synchronize Q4_K dev-input test");
-    restore_env_var("RNB_CUDA_Q4K_BATCH_Q8DOT_DEV", prev);
     assert_close_rows("Q4_K dev-input batch Q8 dot", &actual, &expected, 0.08);
+
+    // cu212: seq2 기본 경로(pair2)와 plain batch 커널은 토큰별 bitwise 동일
+    // 해야 한다. 직접 pair2 launcher 실행으로 실제 커널 경로도 고정한다.
+    std::env::set_var("RNB_CUDA_Q4K_Q8DOT_PAIR2", "0");
+    state
+        .q4k_batch_dev_input_to_dev(
+            &weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_dev,
+            output_dev,
+        )
+        .expect("CUDA Q4_K dev-input plain batch Q8 dot GEMV");
+    std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_PAIR2");
+    let mut plain = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                plain.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q4_K plain batch output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q4_K plain batch run");
+    for (i, (pair, one)) in actual.iter().zip(&plain).enumerate() {
+        assert_eq!(
+            pair.to_bits(),
+            one.to_bits(),
+            "Q4_K pair2 row {i} diverges from plain batch kernel: pair2 {pair}, plain {one}"
+        );
+    }
+
+    let qs_dev = state
+        .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+        .expect("allocate Q4_K test qs");
+    let ds_dev = state
+        .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+        .expect("allocate Q4_K test ds");
+    state
+        .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+        .expect("quantize Q4_K test input");
+    state
+        .launch_q4k_gemv_q8dot_pair2_to_dev(
+            &weights,
+            rows,
+            blocks_per_row,
+            qs_dev,
+            ds_dev,
+            output_dev,
+        )
+        .expect("CUDA Q4_K pair2 direct launch");
+    let mut direct = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                direct.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q4_K pair2 direct output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q4_K pair2 direct run");
+    restore_env_var("RNB_CUDA_Q4K_BATCH_Q8DOT_DEV", prev);
+    for (i, (direct, one)) in direct.iter().zip(&plain).enumerate() {
+        assert_eq!(
+            direct.to_bits(),
+            one.to_bits(),
+            "Q4_K direct pair2 row {i} diverges from plain batch kernel: pair2 {direct}, plain {one}"
+        );
+    }
 }
 
 // cu209: Q5_K batch dev-input 이 q8dot 게이트에서 실제로 새 커널을 타는지와

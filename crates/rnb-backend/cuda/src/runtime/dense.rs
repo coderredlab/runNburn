@@ -922,6 +922,20 @@ impl CudaState {
             );
         }
 
+        // cu212: 2-token 창은 weight-read-once pair2 커널이 기본이다 —
+        // 토큰별 산술이 plain batch 커널과 bitwise 동일하고 weight bytes 만
+        // 절반을 읽는다. 진단 대조는 `RNB_CUDA_Q4K_Q8DOT_PAIR2=0`.
+        if seq_len == 2 && tuning::q4k_q8dot_pair2_enabled() {
+            return self.launch_q4k_gemv_q8dot_pair2_to_dev(
+                weights,
+                rows,
+                blocks_per_row,
+                input_qs_dev,
+                input_ds_dev,
+                output_dev,
+            );
+        }
+
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
