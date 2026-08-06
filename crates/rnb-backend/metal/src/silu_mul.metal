@@ -14,6 +14,23 @@ kernel void silu_mul(
     gate[gid] = (g / (1.0f + exp(-g))) * up[gid];
 }
 
+// GeGLU in-place: exact tanh approximation used by rnb-cpu fused_gelu_mul_inplace.
+kernel void gelu_mul(
+    device float*       gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    constant uint&      dim  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float g = gate[gid];
+    float gelu = g >= 10.0f
+        ? g
+        : (g <= -10.0f
+            ? 0.0f
+            : 0.5f * g * (1.0f + tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))));
+    gate[gid] = gelu * up[gid];
+}
+
 // DeepSeek4 SwiGLU: routed/shared slots may use different clamp limits.
 kernel void silu_mul_clamped_slots(
     device float*       gate        [[buffer(0)]],
@@ -43,6 +60,23 @@ kernel void silu_mul_to_f16(
     if (gid >= dim) return;
     float g = gate[gid];
     out[gid] = (half)((g / (1.0f + exp(-g))) * up[gid]);
+}
+
+kernel void gelu_mul_to_f16(
+    device const float* gate [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    device half*        out  [[buffer(2)]],
+    constant uint&      dim  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    float g = gate[gid];
+    float gelu = g >= 10.0f
+        ? g
+        : (g <= -10.0f
+            ? 0.0f
+            : 0.5f * g * (1.0f + tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))));
+    out[gid] = (half)(gelu * up[gid]);
 }
 
 kernel void silu_mul_half_to_f16(

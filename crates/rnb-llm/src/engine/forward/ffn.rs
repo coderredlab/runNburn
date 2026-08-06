@@ -81,13 +81,10 @@ pub(in crate::engine) fn forward_prefill_ffn(
     #[cfg(not(feature = "cuda"))]
     let cuda_down: Option<Tensor> = None;
 
-    // pm33: Metal prefill FFN batch GEMM chain. non-Gemma(SiLU) + gate/up 분리(fused 제외) 한정,
-    // RNB_METAL_PREFILL_FFN env opt-in. shim 이 quant/shape 미지원 시 used=false → CPU fallback.
+    // Metal prefill FFN batch GEMM chain. Dense gate/up/down only; the backend selects
+    // SwiGLU for non-Gemma blocks and GeGLU for Gemma blocks.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let metal_down: Option<Tensor> = if !use_gemma_block_semantics(architecture)
-        && w.ffn_gate_up_fused.is_none()
-        && dump_bin_dir().is_none()
-    {
+    let metal_down: Option<Tensor> = if w.ffn_gate_up_fused.is_none() && dump_bin_dir().is_none() {
         let mut out = vec![0f32; seq_len * metadata.hidden_dim];
         let used = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
             &w.ffn_gate_weight,
@@ -97,6 +94,7 @@ pub(in crate::engine) fn forward_prefill_ffn(
             &mut out,
             seq_len,
             metadata.hidden_dim,
+            use_gemma_block_semantics(architecture),
         )?;
         if used {
             Some(Tensor::from_vec(out, &[seq_len, metadata.hidden_dim]))

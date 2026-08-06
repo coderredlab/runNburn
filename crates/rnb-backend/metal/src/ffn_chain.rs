@@ -338,6 +338,35 @@ pub(crate) fn encode_silu_mul(
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+/// GeGLU in-place: gate = gelu_tanh(gate) * up.
+pub(crate) fn encode_gelu_mul(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim: usize,
+) {
+    enc.setComputePipelineState(&ctx.gelu_mul_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(up_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 2);
+    }
+    let tg_width = ctx.gelu_mul_pipeline.threadExecutionWidth().max(1);
+    let grid = MTLSize {
+        width: dim.div_ceil(tg_width),
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_width,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
 pub(crate) fn encode_silu_mul_clamped_slots(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -11555,6 +11584,7 @@ pub(crate) fn prefill_ffn_chain_dispatch(
     down_w_buf: &ProtocolObject<dyn MTLBuffer>,
     down_off_buf: &ProtocolObject<dyn MTLBuffer>,
     down_is_q6k: bool,
+    use_gelu: bool,
     m: usize,
 ) -> Vec<f32> {
     let hidden_dim = carrier.hidden_dim;
@@ -11714,17 +11744,37 @@ pub(crate) fn prefill_ffn_chain_dispatch(
         );
     }
     if use_tensorops_v2 {
-        crate::compute::encode_silu_mul_to_f16(
+        if use_gelu {
+            crate::compute::encode_gelu_mul_to_f16(
+                ctx,
+                &enc,
+                &carrier.gate_dev,
+                &carrier.up_dev,
+                &carrier.act_f16_dev,
+                &carrier.act_dim_buf,
+                m * ffn_dim,
+            );
+        } else {
+            crate::compute::encode_silu_mul_to_f16(
+                ctx,
+                &enc,
+                &carrier.gate_dev,
+                &carrier.up_dev,
+                &carrier.act_f16_dev,
+                &carrier.act_dim_buf,
+                m * ffn_dim,
+            );
+        }
+    } else if use_gelu {
+        encode_gelu_mul(
             ctx,
             &enc,
             &carrier.gate_dev,
             &carrier.up_dev,
-            &carrier.act_f16_dev,
             &carrier.act_dim_buf,
             m * ffn_dim,
         );
     } else {
-        // silu_mul: gate = silu(gate)*up (in-place, dim = m*ffn_dim)
         encode_silu_mul(
             ctx,
             &enc,

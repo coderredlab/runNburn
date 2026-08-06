@@ -1362,6 +1362,7 @@ pub(in crate::engine) fn forward_gdn_layer_impl(
             &mut out,
             seq_len,
             metadata.hidden_dim,
+            false,
         )?;
         if used {
             Some(Tensor::from_vec(out, &[seq_len, metadata.hidden_dim]))

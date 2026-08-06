@@ -512,8 +512,10 @@ pub struct MetalContext {
     /// pm43: GDN prefill gated RMSNorm+SiLU(batch, rows>1). rmsnorm(out)*silu(z) fused per-row.
     pub gated_rmsnorm_silu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub gelu_mul_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_clamped_slots_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub gelu_mul_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_half_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub residual_add_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_gather_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2068,9 +2070,11 @@ pub fn build_metal_context_with_opts(
     let gated_rmsnorm_silu_pipeline =
         build_pipeline(&device, RMS_NORM_SRC, "gated_rmsnorm_silu_batch");
     let silu_mul_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul");
+    let gelu_mul_pipeline = build_pipeline(&device, SILU_MUL_SRC, "gelu_mul");
     let silu_mul_clamped_slots_pipeline =
         build_pipeline(&device, SILU_MUL_SRC, "silu_mul_clamped_slots");
     let silu_mul_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul_to_f16");
+    let gelu_mul_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "gelu_mul_to_f16");
     let silu_mul_half_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul_half_to_f16");
     let residual_add_pipeline = build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add");
     let qwen_moe_prefill_gather_pipeline = build_pipeline(
@@ -2414,8 +2418,10 @@ pub fn build_metal_context_with_opts(
         rms_norm_batch_pipeline,
         gated_rmsnorm_silu_pipeline,
         silu_mul_pipeline,
+        gelu_mul_pipeline,
         silu_mul_clamped_slots_pipeline,
         silu_mul_f16_pipeline,
+        gelu_mul_f16_pipeline,
         silu_mul_half_f16_pipeline,
         residual_add_pipeline,
         qwen_moe_prefill_gather_pipeline,
@@ -7306,6 +7312,37 @@ pub(crate) fn encode_silu_mul_to_f16(
         enc.setBuffer_offset_atIndex(Some(n_buf), 0, 3);
     }
     let tgw = ctx.silu_mul_f16_pipeline.threadExecutionWidth().max(1);
+    let grid = MTLSize {
+        width: n.div_ceil(tgw),
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tgw,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+/// gelu_tanh(gate) * up → f16 device buffer for Gemma GeGLU.
+pub(crate) fn encode_gelu_mul_to_f16(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_buf: &ProtocolObject<dyn MTLBuffer>,
+    dst_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) {
+    enc.setComputePipelineState(&ctx.gelu_mul_f16_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(up_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(dst_f16_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 3);
+    }
+    let tgw = ctx.gelu_mul_f16_pipeline.threadExecutionWidth().max(1);
     let grid = MTLSize {
         width: n.div_ceil(tgw),
         height: 1,

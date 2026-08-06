@@ -3481,10 +3481,9 @@ pub fn metal_ffn_chain_into_if_supported(
     Ok(true)
 }
 
-/// pm33: prefill FFN batch GEMM chain. `RNB_METAL_PREFILL_FFN=1` 일 때만 활성.
-/// `metal_ffn_chain_into_if_supported`(decode, single-token)의 M>1 아날로그.
-/// norm 은 caller 가 적용(`normed` 입력), residual 도 caller 처리(`out` = down 결과, residual 전).
-/// gate/up 은 Q4_K, down 은 Q4_K 또는 Q6_K raw mmap bytes. 성공 시 Ok(true) + out 채움.
+/// Prefill FFN batch GEMM chain. `metal_ffn_chain_into_if_supported`의 M>1 아날로그.
+/// norm은 caller가 적용하고 residual도 caller가 처리한다. `use_gelu`는 Gemma GeGLU,
+/// false는 기존 SwiGLU 산술을 선택한다.
 #[allow(clippy::too_many_arguments)]
 pub fn metal_prefill_ffn_chain_into_if_supported(
     gate_ggml: GGMLType,
@@ -3498,6 +3497,7 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     seq_len: usize,
     hidden_dim: usize,
     ffn_dim: usize,
+    use_gelu: bool,
 ) -> Result<bool> {
     // pm37: default ON(metal prefill GPU 승격, 27B token-identical 검증). opt-out=RNB_METAL_PREFILL_FFN=0.
     if std::env::var("RNB_METAL_PREFILL_FFN").as_deref() == Ok("0") {
@@ -3521,6 +3521,7 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
             seq_len,
             hidden_dim,
             ffn_dim,
+            use_gelu,
         )
     });
     out.copy_from_slice(&r);
@@ -3693,6 +3694,7 @@ pub fn metal_qwen_moe_expert_ffn_into_if_supported(
             group_len,
             hidden_dim,
             ffn_dim,
+            false,
         )
     });
     out.copy_from_slice(&r);
