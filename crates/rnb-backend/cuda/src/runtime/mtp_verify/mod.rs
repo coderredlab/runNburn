@@ -2190,6 +2190,27 @@ impl super::CudaState {
             (GGML_Q6_K, 1) => {
                 self.q6k_gemv_device_to_device(weights, rows, blocks_per_row, input_dev, output_dev)
             }
+            // cu209: verify window 의 Q5/Q6 batch projection 은 기본으로
+            // Q8_1 q8dot 세대를 탄다. raw F32 batch 커널은 target chain 의
+            // q8dot 단일 커널 대비 12 배까지 느렸고(nsys 310µs/call),
+            // q8dot 승격 후 verify 는 target-only 와 같은 100-token stream
+            // 을 유지했다. `RNB_CUDA_Q5K_BATCH_Q8DOT=0` 은 raw 대조 경로.
+            (GGML_Q5_K, _)
+                if super::dense::dense_q5_batch_dev_input_q8dot_enabled(
+                    seq_len,
+                    rows,
+                    blocks_per_row,
+                ) =>
+            {
+                self.q5k_batch_dev_input_q8dot_to_dev(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    input_dev,
+                    output_dev,
+                )
+            }
             (GGML_Q5_K, _) => self.q5k_batch_dev_input_to_dev(
                 weights,
                 rows,
@@ -2206,6 +2227,22 @@ impl super::CudaState {
                 input_dev,
                 output_dev,
             ),
+            (GGML_Q6_K, _)
+                if super::dense::dense_q6_batch_dev_input_q8dot_enabled(
+                    seq_len,
+                    rows,
+                    blocks_per_row,
+                ) =>
+            {
+                self.q6k_batch_dev_input_q8dot_to_dev(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    input_dev,
+                    output_dev,
+                )
+            }
             (GGML_Q6_K, _) => self.q6k_batch_dev_input_to_dev(
                 weights,
                 rows,

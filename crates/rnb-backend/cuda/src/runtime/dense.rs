@@ -570,6 +570,37 @@ fn dense_q4_batch_dev_input_q8dot_enabled(
         .unwrap_or(default)
 }
 
+// cu209: MTP verify 짧은 window 의 Q5_K batch projection q8dot 승격 게이트.
+// dense FFN down 은 자체 q8dot 정책(RNB_CUDA_DENSE_Q8DOT_DOWN)을 소유하므로
+// 이 게이트는 verify dispatch 에서만 판정한다. `RNB_CUDA_Q5K_BATCH_Q8DOT`
+// opt-out 은 기존 raw F32 경로를 되살린다.
+pub(in crate::runtime) fn dense_q5_batch_dev_input_q8dot_enabled(
+    seq_len: usize,
+    rows: usize,
+    blocks_per_row: usize,
+) -> bool {
+    let shape_supported = seq_len > 0 && rows > 0 && blocks_per_row > 0;
+    if !shape_supported {
+        return false;
+    }
+    let default = (2..=4).contains(&seq_len) && rows >= 1024 && blocks_per_row >= 4;
+    env_flag_value("RNB_CUDA_Q5K_BATCH_Q8DOT").unwrap_or(default)
+}
+
+// cu209: Q6_K verify batch projection 의 q8dot 승격 게이트 — Q5 와 같은 관례.
+pub(in crate::runtime) fn dense_q6_batch_dev_input_q8dot_enabled(
+    seq_len: usize,
+    rows: usize,
+    blocks_per_row: usize,
+) -> bool {
+    let shape_supported = seq_len > 0 && rows > 0 && blocks_per_row > 0;
+    if !shape_supported {
+        return false;
+    }
+    let default = (2..=4).contains(&seq_len) && rows >= 1024 && blocks_per_row >= 4;
+    env_flag_value("RNB_CUDA_Q6K_BATCH_Q8DOT").unwrap_or(default)
+}
+
 fn dense_combined_norms_enabled(default: bool) -> bool {
     env_flag_or("RNB_CUDA_DENSE_COMBINED_NORMS", default)
 }
@@ -899,7 +930,11 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let mut seq_len_arg = seq_len as u32;
-        let use_seq4 = dense_q4_batch_q8dot_seq4_enabled(seq_len > 1);
+        // cu209: seq_len=2(MTP verify k=1)에서는 4-token weight 공유 커널이
+        // register 압박으로 plain per-token 커널(단일 q8dot 과 bitwise 동일
+        // 산술)의 2회분보다 느렸다 — nsys 178µs vs 2×73µs. 3-token 이상만
+        // seq4 로 보낸다. 진단 대조는 `RNB_CUDA_Q4K_BATCH_Q8DOT_SEQ4=1`.
+        let use_seq4 = dense_q4_batch_q8dot_seq4_enabled(seq_len > 2);
         let kernel = if use_seq4 {
             "rnb_q4k_gemv_batch_q8dot_seq4_warp8"
         } else {
@@ -943,6 +978,60 @@ impl CudaState {
             blocks_per_row,
             seq_len,
             input_dev,
+            output_dev,
+        )
+    }
+
+    // cu209: verify dispatch 전용 Q5_K batch q8dot 실행 — device 에서 Q8_1
+    // 양자화 후 단일 커널과 토큰별 bitwise 동일한 batch 커널을 launch 한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn q5k_batch_dev_input_q8dot_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let qs_dev = self.compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)?;
+        let ds_dev =
+            self.compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())?;
+        self.launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)?;
+        self.launch_q5k_gemv_batch_q8dot_to_dev(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            qs_dev,
+            ds_dev,
+            output_dev,
+        )
+    }
+
+    // cu209: verify dispatch 전용 Q6_K batch q8dot 실행. half2/byte 는
+    // launcher 가 cu207 단일 커널 게이트를 공유한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn q6k_batch_dev_input_q8dot_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let qs_dev = self.compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)?;
+        let ds_dev =
+            self.compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())?;
+        self.launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)?;
+        self.launch_q6k_gemv_batch_q8dot_paired_to_dev(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            qs_dev,
+            ds_dev,
             output_dev,
         )
     }

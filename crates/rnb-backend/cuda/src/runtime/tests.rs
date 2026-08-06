@@ -12284,6 +12284,376 @@ fn cuda_q4k_batch_dev_input_q8dot_matches_cpu_reference() {
     assert_close_rows("Q4_K dev-input batch Q8 dot", &actual, &expected, 0.08);
 }
 
+// cu209: Q5_K batch dev-input 이 q8dot 게이트에서 실제로 새 커널을 타는지와
+// CPU reference 근접, 그리고 단일 토큰 q8dot 커널과의 토큰별 bitwise 일치를
+// 방어한다. bitwise 계약은 배치 커널이 단일 커널과 같은 accumulation 순서를
+// 유지함을 증명하므로, 리덕션 순서 변화 회귀를 즉시 잡는다.
+#[test]
+fn cuda_q5k_batch_dev_input_q8dot_matches_cpu_and_single_kernel() {
+    let _guard = runtime_test_lock();
+    let prev = std::env::var("RNB_CUDA_Q5K_BATCH_Q8DOT").ok();
+    std::env::set_var("RNB_CUDA_Q5K_BATCH_Q8DOT", "1");
+    let rows = 1024usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 2usize;
+    let weights = make_test_q5k_weights(rows, blocks_per_row, 227);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 41.0) - 20.0) * 0.0048828125)
+        .collect::<Vec<_>>();
+    // cu199 관례: q8dot 커널은 양자화 입력 reference 와 타이트하게 비교해
+    // 양자화 오차를 허용오차에서 제거한다.
+    let mut expected_q8 = Vec::with_capacity(seq_len * rows);
+    let mut expected_raw = Vec::with_capacity(seq_len * rows);
+    for token in 0..seq_len {
+        let token_input = &input[token * cols..(token + 1) * cols];
+        let (qs, ds) = test_support::quantize_q8_1_by_32_for_test(token_input, blocks_per_row);
+        let quantized_input = dequantize_q8_1_by_32(&qs, &ds);
+        expected_q8.extend(cpu_q5k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            &quantized_input,
+        ));
+        expected_raw.extend(cpu_q5k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            token_input,
+        ));
+    }
+
+    let mut state = CudaState::open().expect("open CUDA state");
+    let input_dev = state
+        .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+        .expect("allocate Q5_K dev-input test input");
+    let output_bytes = seq_len * rows * std::mem::size_of::<f32>();
+    let output_dev = state
+        .compute_output_ptr(output_bytes)
+        .expect("allocate Q5_K dev-input test output");
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                input_dev,
+                input.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(input.as_slice()),
+                state.stream,
+            )
+            .expect("copy Q5_K dev-input test input");
+    }
+    // 제품 경로인 verify dispatch 를 그대로 태워 게이트 라우팅까지 검증한다.
+    state
+        .stage_mtp_verify_k_quant_projection_to_dev(
+            "test Q5 batch",
+            13,
+            &weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_dev,
+            output_dev,
+        )
+        .expect("CUDA Q5_K dev-input batch Q8 dot GEMV");
+    let mut actual = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                actual.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q5_K dev-input test output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q5_K dev-input test");
+    assert_close_rows_abs_rel(
+        "Q5_K dev-input batch Q8 dot",
+        &actual,
+        &expected_q8,
+        1e-3,
+        1e-5,
+    );
+
+    // 같은 qs/ds 로 단일 토큰 q8dot 커널을 토큰별로 실행하면 bitwise 일치해야
+    // 한다. 양자화는 256-element 블록 단위 결정론이라 배치 양자화와 동일하다.
+    let qs_dev = state
+        .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+        .expect("allocate Q5_K test qs");
+    let ds_dev = state
+        .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+        .expect("allocate Q5_K test ds");
+    state
+        .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+        .expect("quantize Q5_K test input");
+    let single_bytes = rows * std::mem::size_of::<f32>();
+    let mut single = vec![0.0f32; seq_len * rows];
+    for token in 0..seq_len {
+        let token_qs = qs_dev + (token * blocks_per_row * 256) as u64;
+        let token_ds = ds_dev + (token * blocks_per_row * 8 * std::mem::size_of::<f32>()) as u64;
+        state
+            .launch_q5k_gemv_q8dot_to_dev(
+                &weights,
+                rows,
+                blocks_per_row,
+                token_qs,
+                token_ds,
+                output_dev,
+            )
+            .expect("CUDA Q5_K single-token q8dot GEMV");
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    single[token * rows..(token + 1) * rows]
+                        .as_mut_ptr()
+                        .cast::<libc::c_void>(),
+                    output_dev,
+                    single_bytes,
+                    state.stream,
+                )
+                .expect("copy Q5_K single-token output");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize Q5_K single-token run");
+    }
+    for (i, (batch, one)) in actual.iter().zip(&single).enumerate() {
+        assert_eq!(
+            batch.to_bits(),
+            one.to_bits(),
+            "Q5_K batch q8dot row {i} diverges from single-token kernel: batch {batch}, single {one}"
+        );
+    }
+
+    // 게이트 opt-out 은 기존 raw F32 경로를 되살려야 하고, 두 경로의 출력이
+    // 완전히 같으면 q8dot 경로가 실행되지 않은 것이다.
+    std::env::set_var("RNB_CUDA_Q5K_BATCH_Q8DOT", "0");
+    state
+        .stage_mtp_verify_k_quant_projection_to_dev(
+            "test Q5 batch raw",
+            13,
+            &weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_dev,
+            output_dev,
+        )
+        .expect("CUDA Q5_K dev-input raw batch GEMV");
+    let mut raw = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                raw.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q5_K raw batch output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q5_K raw batch run");
+    restore_env_var("RNB_CUDA_Q5K_BATCH_Q8DOT", prev);
+    assert_close_rows("Q5_K dev-input raw batch", &raw, &expected_raw, 0.08);
+    assert!(
+        actual
+            .iter()
+            .zip(&raw)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "q8dot and raw batch outputs are bitwise identical — q8dot path not exercised"
+    );
+}
+
+// cu209: Q6_K batch dev-input q8dot 게이트가 실제 새 커널을 타는지, 양자화
+// 입력 reference 근접(cu199 관례), 단일 half2 커널과의 토큰별 bitwise 일치,
+// raw seq2 경로 보존을 함께 방어한다.
+#[test]
+fn cuda_q6k_batch_dev_input_q8dot_matches_cpu_and_single_kernel() {
+    let _guard = runtime_test_lock();
+    let prev = std::env::var("RNB_CUDA_Q6K_BATCH_Q8DOT").ok();
+    std::env::set_var("RNB_CUDA_Q6K_BATCH_Q8DOT", "1");
+    let rows = 1024usize;
+    let cols = 1280usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 2usize;
+    let weights = make_test_q6k_weights(1, rows, blocks_per_row, 211)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 37.0) - 18.0) * 0.0048828125)
+        .collect::<Vec<_>>();
+    let mut expected_q8 = Vec::with_capacity(seq_len * rows);
+    let mut expected_raw = Vec::with_capacity(seq_len * rows);
+    for token in 0..seq_len {
+        let token_input = &input[token * cols..(token + 1) * cols];
+        let (qs, ds) = test_support::quantize_q8_1_by_32_for_test(token_input, blocks_per_row);
+        let quantized_input = dequantize_q8_1_by_32(&qs, &ds);
+        expected_q8.extend(cpu_q6k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            &quantized_input,
+        ));
+        expected_raw.extend(cpu_q6k_gemv_rows(
+            &weights,
+            rows,
+            blocks_per_row,
+            token_input,
+        ));
+    }
+
+    let mut state = CudaState::open().expect("open CUDA state");
+    let input_dev = state
+        .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+        .expect("allocate Q6_K dev-input test input");
+    let output_bytes = seq_len * rows * std::mem::size_of::<f32>();
+    let output_dev = state
+        .compute_output_ptr(output_bytes)
+        .expect("allocate Q6_K dev-input test output");
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                input_dev,
+                input.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(input.as_slice()),
+                state.stream,
+            )
+            .expect("copy Q6_K dev-input test input");
+    }
+    // 제품 경로인 verify dispatch 를 그대로 태워 게이트 라우팅까지 검증한다.
+    state
+        .stage_mtp_verify_k_quant_projection_to_dev(
+            "test Q6 batch",
+            14,
+            &weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_dev,
+            output_dev,
+        )
+        .expect("CUDA Q6_K dev-input batch Q8 dot GEMV");
+    let mut actual = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                actual.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q6_K dev-input test output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q6_K dev-input test");
+    assert_close_rows_abs_rel(
+        "Q6_K dev-input batch Q8 dot",
+        &actual,
+        &expected_q8,
+        1e-3,
+        1e-5,
+    );
+
+    // 같은 qs/ds 의 단일 토큰 q8dot 커널과 bitwise 일치해야 한다. half2/byte
+    // 선택은 단일·배치가 같은 tuning 게이트를 공유한다.
+    let qs_dev = state
+        .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+        .expect("allocate Q6_K test qs");
+    let ds_dev = state
+        .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+        .expect("allocate Q6_K test ds");
+    state
+        .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+        .expect("quantize Q6_K test input");
+    let single_bytes = rows * std::mem::size_of::<f32>();
+    let mut single = vec![0.0f32; seq_len * rows];
+    for token in 0..seq_len {
+        let token_qs = qs_dev + (token * blocks_per_row * 256) as u64;
+        let token_ds = ds_dev + (token * blocks_per_row * 8 * std::mem::size_of::<f32>()) as u64;
+        state
+            .launch_q6k_gemv_q8dot_to_dev(
+                &weights,
+                rows,
+                blocks_per_row,
+                token_qs,
+                token_ds,
+                output_dev,
+            )
+            .expect("CUDA Q6_K single-token q8dot GEMV");
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    single[token * rows..(token + 1) * rows]
+                        .as_mut_ptr()
+                        .cast::<libc::c_void>(),
+                    output_dev,
+                    single_bytes,
+                    state.stream,
+                )
+                .expect("copy Q6_K single-token output");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize Q6_K single-token run");
+    }
+    for (i, (batch, one)) in actual.iter().zip(&single).enumerate() {
+        assert_eq!(
+            batch.to_bits(),
+            one.to_bits(),
+            "Q6_K batch q8dot row {i} diverges from single-token kernel: batch {batch}, single {one}"
+        );
+    }
+
+    // opt-out 은 기존 raw seq2 경로를 되살려야 한다.
+    std::env::set_var("RNB_CUDA_Q6K_BATCH_Q8DOT", "0");
+    state
+        .stage_mtp_verify_k_quant_projection_to_dev(
+            "test Q6 batch raw",
+            14,
+            &weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_dev,
+            output_dev,
+        )
+        .expect("CUDA Q6_K dev-input raw batch GEMV");
+    let mut raw = vec![0.0f32; seq_len * rows];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                raw.as_mut_ptr().cast::<libc::c_void>(),
+                output_dev,
+                output_bytes,
+                state.stream,
+            )
+            .expect("copy Q6_K raw batch output");
+    }
+    state
+        .stream_synchronize()
+        .expect("synchronize Q6_K raw batch run");
+    restore_env_var("RNB_CUDA_Q6K_BATCH_Q8DOT", prev);
+    assert_close_rows("Q6_K dev-input raw batch", &raw, &expected_raw, 0.08);
+    assert!(
+        actual
+            .iter()
+            .zip(&raw)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "q8dot and raw batch outputs are bitwise identical — q8dot path not exercised"
+    );
+}
+
 #[test]
 fn cuda_q6k_gemv_batch_matches_cpu_reference() {
     let _guard = runtime_test_lock();

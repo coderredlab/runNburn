@@ -939,6 +939,110 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_half2_warp8(
         out, weights, input_qs, input_ds, rows, blocks_per_row);
 }
 
+// cu209: batch variant of rnb_q6k_gemv_q8dot_warp8_impl. blockIdx.y selects
+// the token; per-token arithmetic (group mapping, accumulation order, warp
+// reduction) is identical to the single-token impl, so per-token outputs are
+// bitwise equal to rnb_q6k_gemv_q8dot_{half2_,}warp8 given the same qs/ds.
+template <bool HALFWORD_LOADS>
+static __device__ __forceinline__ void rnb_q6k_gemv_batch_q8dot_warp8_impl2(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq = blockIdx.y;
+    const bool valid = row < rows && seq < seq_len;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* seq_qs = input_qs + seq * blocks_per_row * 256u;
+    const float* seq_ds = input_ds + seq * blocks_per_row * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const unsigned char* block = row_ptr + b * 210u;
+            const unsigned raw_d = (unsigned)block[208] | ((unsigned)block[209] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            const signed char* x_base = seq_qs + b * 256u;
+            const float* ds_base = seq_ds + b * 8u;
+
+            #pragma unroll
+            for (unsigned g = 0; g < 2u; ++g) {
+                const unsigned tid = (lane + g * 32u) * 4u;
+                const unsigned n = tid >> 7;
+                const unsigned rem = tid & 127u;
+                const unsigned l = rem & 31u;
+                const unsigned quarter = rem >> 5;
+                const unsigned ql_off = n * 64u + l + ((quarter & 1u) ? 32u : 0u);
+                const unsigned qh_shift = quarter * 2u;
+                const unsigned sc_index = 192u + n * 8u + (l >> 4) + quarter * 2u;
+
+                unsigned ql_raw;
+                unsigned qh_raw;
+                int x_pack;
+                if constexpr (HALFWORD_LOADS) {
+                    ql_raw = (unsigned)rnb_load_i32_aligned2(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_aligned2(block + 128u + n * 32u + l);
+                    x_pack = rnb_load_i32_aligned4(x_base + tid);
+                } else {
+                    ql_raw = (unsigned)rnb_load_i32_unaligned(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_unaligned(block + 128u + n * 32u + l);
+                    x_pack = rnb_load_i32_unaligned(x_base + tid);
+                }
+                const unsigned low = (quarter < 2u)
+                    ? (ql_raw & 0x0f0f0f0fu)
+                    : ((ql_raw >> 4) & 0x0f0f0f0fu);
+                const unsigned high = ((qh_raw >> qh_shift) & 0x03030303u) << 4;
+                const int q_pack = (int)(low | high);
+
+                const int dot = __dp4a(q_pack, x_pack, 0);
+                const int x_sum = __dp4a(0x01010101, x_pack, 0);
+                const int sc = (int)((signed char)block[sc_index]);
+                acc += ds_base[tid >> 5]
+                    * (d * (float)sc) * (float)(dot - 32 * x_sum);
+            }
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[seq * rows + row] = acc;
+    }
+}
+
+extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_half2_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    rnb_q6k_gemv_batch_q8dot_warp8_impl2<true>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row, seq_len);
+}
+
+extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_byte_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    rnb_q6k_gemv_batch_q8dot_warp8_impl2<false>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row, seq_len);
+}
+
 // Q5_K GEMV with Q8_1-quantized activations, one warp per output row.
 //
 // Q5_K is Q4_K plus a 32-byte high-bit plane, and its 176-byte super-block
@@ -1015,6 +1119,84 @@ extern "C" __global__ void rnb_q5k_gemv_q8dot_warp8(
 
     if (valid && lane == 0u) {
         out[row] = acc;
+    }
+}
+
+// Q5_K batch GEMV with Q8_1-quantized activations. Mirrors
+// rnb_q5k_gemv_q8dot_warp8 exactly per token (same sub-block mapping, same
+// accumulation order, same warp reduction), with blockIdx.y selecting the
+// token like rnb_q4k_gemv_batch_q8dot_warp8. Given identical qs/ds inputs the
+// per-token output is bitwise equal to the single-token kernel.
+extern "C" __global__ void rnb_q5k_gemv_batch_q8dot_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq = blockIdx.y;
+    const bool valid = row < rows && seq < seq_len;
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 176u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const signed char* seq_qs = input_qs + seq * blocks_per_row * 256u;
+    const float* seq_ds = input_ds + seq * blocks_per_row * 8u;
+
+    if (valid) {
+        for (unsigned b = 0; b < blocks_per_row; ++b) {
+            const unsigned char* block = row_ptr + b * 176u;
+            const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
+            const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            const float dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
+
+            const unsigned j0 = lane >> 3;
+            const unsigned j1 = j0 + 4u;
+            const unsigned elem = (lane & 7u) * 4u;
+            const unsigned sc0 = block[4u + j0] & 63u;
+            const unsigned mn0 = block[8u + j0] & 63u;
+            const unsigned sc1 =
+                (block[8u + j1] & 0x0fu) | ((block[j1] >> 6) << 4);
+            const unsigned mn1 =
+                (block[8u + j1] >> 4) | ((block[4u + j1] >> 6) << 4);
+
+            const unsigned char* q_ptr0 =
+                block + 48u + (j0 >> 1) * 32u + elem;
+            const unsigned char* q_ptr1 = q_ptr0 + 64u;
+            const unsigned qh_raw =
+                (unsigned)rnb_load_i32_aligned4(block + 16u + elem);
+            const int q_pack0 = rnb_q4_pack4(q_ptr0, j0)
+                | (int)(((qh_raw >> j0) & 0x01010101u) << 4);
+            const int q_pack1 = rnb_q4_pack4(q_ptr1, j1)
+                | (int)(((qh_raw >> j1) & 0x01010101u) << 4);
+
+            const signed char* x_qs0 =
+                seq_qs + b * 256u + j0 * 32u + elem;
+            const signed char* x_qs1 = x_qs0 + 128u;
+            const int x_pack0 = rnb_load_i32_aligned4(x_qs0);
+            const int x_pack1 = rnb_load_i32_aligned4(x_qs1);
+            const int dot0 = __dp4a(q_pack0, x_pack0, 0);
+            const int dot1 = __dp4a(q_pack1, x_pack1, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_pack0, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_pack1, 0);
+            acc += seq_ds[b * 8u + j0]
+                * ((d * (float)sc0) * (float)dot0 - dmin * (float)mn0 * (float)x_sum0);
+            acc += seq_ds[b * 8u + j1]
+                * ((d * (float)sc1) * (float)dot1 - dmin * (float)mn1 * (float)x_sum1);
+        }
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (valid && lane == 0u) {
+        out[seq * rows + row] = acc;
     }
 }
 

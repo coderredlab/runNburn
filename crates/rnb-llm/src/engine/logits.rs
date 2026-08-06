@@ -71,9 +71,16 @@ impl super::Engine {
         hidden: &[f32],
         excluded_token: u32,
     ) -> crate::error::Result<u32> {
-        if self.architecture != ModelArchitecture::Qwen35MoE {
+        // Qwen 계열은 output_norm 이 plain RMSNorm 이라 apply_model_norm +
+        // output projection 이 그대로 유효하다. dense Qwen35 는 ignore_eos
+        // verify target 교체에서 이 경로를 밟는다 (cu209 에서 노출된 잠재 결함).
+        if !matches!(
+            self.architecture,
+            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+        ) {
             return Err(crate::error::LlmError::Forward(
-                "excluded-token target projection is only implemented for Qwen35MoE".to_string(),
+                "excluded-token target projection is only implemented for Qwen35 and Qwen35MoE"
+                    .to_string(),
             ));
         }
         if hidden.len() != self.metadata.hidden_dim {

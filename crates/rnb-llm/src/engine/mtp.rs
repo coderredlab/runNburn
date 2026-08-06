@@ -772,6 +772,10 @@ fn mtp_auto_policy_for_model(
         // 8.9 tok/s로 target-only를 1.24배 앞서고, 이는 resident cache 상한 수정 이전
         // 코드에서도 동일하다. 즉 auto 경로 개선분은 전부 window 크기에서 온다.
         // 35B-A3B는 89.9~91.3 tok/s로 회귀가 없다.
+        // cu209: cu203~208 이 target-only decode 만 −30%+ 빨라지며 이 분기가
+        // 한때 +6.7% 회귀로 뒤집혔었다. verify batch GEMV 를 q8dot 세대로
+        // 올린 뒤(27B, 15/100 ABABAB) MTP on 이 target-only 대비 −5.52%
+        // (same-index 3/3, 100-token hash 동일)로 복귀해 auto-on 을 유지한다.
         ModelArchitecture::Qwen35 => MtpAutoPolicy {
             enabled: true,
             spec_k: dense_spec_k,
