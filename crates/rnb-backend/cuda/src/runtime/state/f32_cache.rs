@@ -20,6 +20,25 @@ impl CudaState {
         };
         self.resident_f32_ptr_for_key(data, key)
     }
+    pub(in crate::runtime) fn clear_stable_resident_f32_sources(&mut self) -> Result<(), String> {
+        let keys = self
+            .resident_f32
+            .keys()
+            .copied()
+            .filter(|key| key.ptr != 0 && key.bit_hash == 0)
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.set_current()?;
+        self.stream_synchronize()?;
+        for key in keys {
+            if let Some(entry) = self.resident_f32.remove(&key) {
+                unsafe { self.api.mem_free(entry.ptr)? };
+            }
+        }
+        Ok(())
+    }
 
     fn resident_f32_ptr_for_key(&mut self, data: &[f32], key: F32Key) -> Result<u64, String> {
         if data.is_empty() {

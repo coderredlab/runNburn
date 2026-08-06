@@ -9,7 +9,7 @@ pub struct SpecCheckpoint {
     mtp: Option<crate::engine::mtp::EngineMtpCheckpoint>,
     sequence_cursor: Option<crate::multimodal::SequenceCursor>,
     #[cfg(feature = "cuda")]
-    resident_delta_snapshots: Vec<ResidentDeltaSnapshot>,
+    resident_state_snapshots: Vec<ResidentSsmSnapshot>,
 }
 
 #[derive(Clone)]
@@ -21,15 +21,19 @@ struct SsmLayerCheckpoint {
 }
 
 #[cfg(feature = "cuda")]
-struct ResidentDeltaSnapshot {
+struct ResidentSsmSnapshot {
     layer_idx: usize,
-    snapshot: Option<crate::engine::cuda_runtime::DeltaStateSnapshot>,
+    conv_snapshot: Option<crate::engine::cuda_runtime::DeltaStateSnapshot>,
+    delta_snapshot: Option<crate::engine::cuda_runtime::DeltaStateSnapshot>,
 }
 
 #[cfg(feature = "cuda")]
-impl Drop for ResidentDeltaSnapshot {
+impl Drop for ResidentSsmSnapshot {
     fn drop(&mut self) {
-        if let Some(snapshot) = self.snapshot.take() {
+        if let Some(snapshot) = self.conv_snapshot.take() {
+            let _ = crate::engine::cuda_runtime::free_delta_state_snapshot(snapshot);
+        }
+        if let Some(snapshot) = self.delta_snapshot.take() {
             let _ = crate::engine::cuda_runtime::free_delta_state_snapshot(snapshot);
         }
     }
@@ -46,16 +50,17 @@ impl SpecCheckpoint {
             mtp: None,
             sequence_cursor: None,
             #[cfg(feature = "cuda")]
-            resident_delta_snapshots: Vec::new(),
+            resident_state_snapshots: Vec::new(),
         }
     }
 
     pub fn save_engine(engine: &mut Engine) -> crate::error::Result<Self> {
         #[cfg(feature = "cuda")]
-        let resident_delta_snapshots = save_resident_delta_snapshots(&mut engine.kv_cache)?;
+        let resident_state_snapshots = save_resident_state_snapshots(&mut engine.kv_cache)?;
         #[cfg(feature = "cuda")]
-        let resident_delta_layers = resident_delta_snapshots
+        let resident_delta_layers = resident_state_snapshots
             .iter()
+            .filter(|snapshot| snapshot.delta_snapshot.is_some())
             .map(|snapshot| snapshot.layer_idx)
             .collect::<Vec<_>>();
         #[cfg(not(feature = "cuda"))]
@@ -73,7 +78,7 @@ impl SpecCheckpoint {
             mtp: engine.mtp_checkpoint(),
             sequence_cursor: engine.sequence_cursor_checkpoint(),
             #[cfg(feature = "cuda")]
-            resident_delta_snapshots,
+            resident_state_snapshots,
         })
     }
 
@@ -92,9 +97,9 @@ impl SpecCheckpoint {
         engine.mtp_restore_checkpoint(self.mtp.as_ref());
         #[cfg(feature = "cuda")]
         {
-            let restored_resident = restore_resident_delta_snapshots(
+            let restored_resident = restore_resident_state_snapshots(
                 &mut engine.kv_cache,
-                &self.resident_delta_snapshots,
+                &self.resident_state_snapshots,
             )?;
             engine.finalize_resident_sequence_state_after_restore(restored_resident)?;
         }
@@ -105,59 +110,77 @@ impl SpecCheckpoint {
 }
 
 #[cfg(feature = "cuda")]
-fn save_resident_delta_snapshots(
+fn save_resident_state_snapshots(
     kv_cache: &mut KVCache,
-) -> crate::error::Result<Vec<ResidentDeltaSnapshot>> {
+) -> crate::error::Result<Vec<ResidentSsmSnapshot>> {
     let mut snapshots = Vec::new();
     for (layer_idx, ssm) in kv_cache.ssm_states.iter_mut().enumerate() {
         let Some(state) = ssm.as_mut() else {
             continue;
         };
-        let snapshot =
+        let mut snapshot = ResidentSsmSnapshot {
+            layer_idx,
+            conv_snapshot: crate::engine::cuda_runtime::snapshot_delta_state_cache(
+                &mut state.conv_state,
+            )
+            .map_err(crate::error::LlmError::Forward)?,
+            delta_snapshot: None,
+        };
+        snapshot.delta_snapshot =
             crate::engine::cuda_runtime::snapshot_delta_state_cache(&mut state.delta_state)
                 .map_err(crate::error::LlmError::Forward)?;
-        if snapshot.is_some() {
-            snapshots.push(ResidentDeltaSnapshot {
-                layer_idx,
-                snapshot,
-            });
+        if snapshot.conv_snapshot.is_some() || snapshot.delta_snapshot.is_some() {
+            snapshots.push(snapshot);
         }
     }
     Ok(snapshots)
 }
 
 #[cfg(feature = "cuda")]
-fn restore_resident_delta_snapshots(
+fn restore_resident_state_snapshots(
     kv_cache: &mut KVCache,
-    snapshots: &[ResidentDeltaSnapshot],
+    snapshots: &[ResidentSsmSnapshot],
 ) -> crate::error::Result<bool> {
     let mut restored_any = false;
     for snapshot in snapshots {
-        let Some(snapshot_state) = snapshot.snapshot.as_ref() else {
-            continue;
-        };
         let state = kv_cache
             .ssm_states
             .get_mut(snapshot.layer_idx)
             .and_then(Option::as_mut)
             .ok_or_else(|| {
                 crate::error::LlmError::Forward(format!(
-                    "missing SSM state for resident delta snapshot layer {}",
+                    "missing SSM state for resident snapshot layer {}",
                     snapshot.layer_idx
                 ))
             })?;
-        let restored = crate::engine::cuda_runtime::restore_delta_state_cache(
-            &mut state.delta_state,
-            snapshot_state,
-        )
-        .map_err(crate::error::LlmError::Forward)?;
-        if !restored {
-            return Err(crate::error::LlmError::Forward(format!(
-                "missing resident delta state for snapshot layer {}",
-                snapshot.layer_idx
-            )));
+        if let Some(conv_snapshot) = snapshot.conv_snapshot.as_ref() {
+            let restored = crate::engine::cuda_runtime::restore_delta_state_cache(
+                &mut state.conv_state,
+                conv_snapshot,
+            )
+            .map_err(crate::error::LlmError::Forward)?;
+            if !restored {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "missing resident conv state for snapshot layer {}",
+                    snapshot.layer_idx
+                )));
+            }
+            restored_any = true;
         }
-        restored_any = true;
+        if let Some(delta_snapshot) = snapshot.delta_snapshot.as_ref() {
+            let restored = crate::engine::cuda_runtime::restore_delta_state_cache(
+                &mut state.delta_state,
+                delta_snapshot,
+            )
+            .map_err(crate::error::LlmError::Forward)?;
+            if !restored {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "missing resident delta state for snapshot layer {}",
+                    snapshot.layer_idx
+                )));
+            }
+            restored_any = true;
+        }
     }
     Ok(restored_any)
 }
@@ -1756,7 +1779,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn engine_checkpoint_restore_keeps_cuda_resident_delta_snapshot() {
+    fn engine_checkpoint_restore_keeps_cuda_resident_conv_and_delta_snapshots() {
         let _sequence_state_guard = crate::cuda_sequence_state_test_lock();
         let _ = crate::engine::cuda_runtime::reset_state_for_engine_init();
         let mut engine = make_spec_test_engine(9);
@@ -1771,7 +1794,35 @@ mod tests {
             *value = ((i as f32 % 23.0) - 11.0) * 0.00390625;
         }
 
-        let mut expected_state = state.delta_state.clone();
+        let conv_num_heads = 1usize;
+        let conv_head_k_dim = state.conv_state.len();
+        let conv_head_v_dim = 1usize;
+        let conv_q = (0..conv_head_k_dim)
+            .map(|i| ((i as f32) - 3.0) * 0.03125)
+            .collect::<Vec<_>>();
+        let conv_k = (0..conv_head_k_dim)
+            .map(|i| (4.0 - i as f32) * 0.0234375)
+            .collect::<Vec<_>>();
+        let conv_v = vec![0.1875f32];
+        let conv_gate = vec![-0.0625f32];
+        let conv_beta = vec![0.375f32];
+        let mut expected_conv_state = state.conv_state.clone();
+        let mut expected_conv_out = vec![0.0f32; conv_head_v_dim];
+        crate::engine::cpu_runtime::kernels::delta_net::delta_net_scan_into(
+            &conv_q,
+            &conv_k,
+            &conv_v,
+            &conv_gate,
+            &conv_beta,
+            &mut expected_conv_state,
+            &mut expected_conv_out,
+            1,
+            conv_num_heads,
+            conv_head_k_dim,
+            conv_head_v_dim,
+        );
+
+        let mut expected_delta_state = state.delta_state.clone();
         let mut q = vec![0.0f32; num_heads * head_k_dim];
         let mut k = vec![0.0f32; num_heads * head_k_dim];
         let mut v = vec![0.0f32; num_heads * head_v_dim];
@@ -1786,22 +1837,40 @@ mod tests {
         }
         let gate = vec![-0.03125f32, -0.0625f32];
         let beta = vec![0.25f32, 0.5f32];
-        let mut expected_out = vec![0.0f32; num_heads * head_v_dim];
+        let mut expected_delta_out = vec![0.0f32; num_heads * head_v_dim];
         crate::engine::cpu_runtime::kernels::delta_net::delta_net_scan_into(
             &q,
             &k,
             &v,
             &gate,
             &beta,
-            &mut expected_state,
-            &mut expected_out,
+            &mut expected_delta_state,
+            &mut expected_delta_out,
             1,
             num_heads,
             head_k_dim,
             head_v_dim,
         );
 
-        let first = crate::engine::cuda_runtime::try_delta_step_resident_if_supported(
+        let first_conv = crate::engine::cuda_runtime::try_delta_step_resident_if_supported(
+            &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().conv_state,
+            &conv_q,
+            &conv_k,
+            &conv_v,
+            &conv_gate,
+            &conv_beta,
+            conv_num_heads,
+            conv_head_k_dim,
+            conv_head_v_dim,
+        );
+        let Some(first_conv) = first_conv else {
+            return;
+        };
+        if let Err(err) = first_conv {
+            eprintln!("skipping CUDA resident checkpoint test: {err}");
+            return;
+        }
+        crate::engine::cuda_runtime::try_delta_step_resident_if_supported(
             &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().delta_state,
             &q,
             &k,
@@ -1811,16 +1880,24 @@ mod tests {
             num_heads,
             head_k_dim,
             head_v_dim,
-        );
-        let Some(first) = first else {
-            return;
-        };
-        if let Err(err) = first {
-            eprintln!("skipping CUDA resident checkpoint test: {err}");
-            return;
-        }
+        )
+        .expect("CUDA resident delta should be enabled")
+        .expect("first resident delta call");
 
         let checkpoint = SpecCheckpoint::save_engine(&mut engine).unwrap();
+        crate::engine::cuda_runtime::try_delta_step_resident_if_supported(
+            &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().conv_state,
+            &conv_q,
+            &conv_k,
+            &conv_v,
+            &conv_gate,
+            &conv_beta,
+            conv_num_heads,
+            conv_head_k_dim,
+            conv_head_v_dim,
+        )
+        .expect("CUDA resident conv should be enabled")
+        .expect("second resident conv call");
         crate::engine::cuda_runtime::try_delta_step_resident_if_supported(
             &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().delta_state,
             &q,
@@ -1841,14 +1918,42 @@ mod tests {
         unrelated_mock.clear_sequence_state().unwrap();
 
         checkpoint.restore_engine(&mut engine).unwrap();
-        let restored = crate::engine::cuda_runtime::sync_delta_state_cache(
+        let conv_restored = crate::engine::cuda_runtime::sync_delta_state_cache(
+            &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().conv_state,
+        )
+        .unwrap();
+        assert!(
+            conv_restored,
+            "restore should keep CUDA resident conv state"
+        );
+        let delta_restored = crate::engine::cuda_runtime::sync_delta_state_cache(
             &mut engine.kv_cache.get_ssm_state_mut(0).unwrap().delta_state,
         )
         .unwrap();
-        assert!(restored, "restore should keep CUDA resident delta state");
+        assert!(
+            delta_restored,
+            "restore should keep CUDA resident delta state"
+        );
 
         let state = engine.kv_cache.get_ssm_state(0).unwrap();
-        for (i, (actual, expected)) in state.delta_state.iter().zip(&expected_state).enumerate() {
+        for (i, (actual, expected)) in state
+            .conv_state
+            .iter()
+            .zip(&expected_conv_state)
+            .enumerate()
+        {
+            let diff = (actual - expected).abs();
+            assert!(
+                diff < 0.001,
+                "restored engine conv state {i} mismatch: expected {expected}, actual {actual}, diff {diff}"
+            );
+        }
+        for (i, (actual, expected)) in state
+            .delta_state
+            .iter()
+            .zip(&expected_delta_state)
+            .enumerate()
+        {
             let diff = (actual - expected).abs();
             assert!(
                 diff < 0.001,

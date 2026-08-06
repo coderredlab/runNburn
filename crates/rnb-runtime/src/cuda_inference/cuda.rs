@@ -10,7 +10,7 @@ pub use attention::{
     prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported, prefill_attention_hd256_if_supported,
     prefill_attention_non_causal_if_supported, qwen35_gdn_decode_core_chain,
-    try_delta_step_if_supported, QwenGdnDecodeChainCall,
+    qwen35_gdn_decode_core_chain_admitted, try_delta_step_if_supported, QwenGdnDecodeChainCall,
 };
 pub use gdn::{
     begin_nemotron_prefill_workspace, end_nemotron_prefill_workspace,
@@ -839,10 +839,7 @@ fn dequant_type(ggml_type: GGMLType) -> DequantType {
 }
 
 pub fn reset_state_for_engine_init() -> Result<()> {
-    backend::clear_moe_layer_cache().map_err(|err| err)?;
-    backend::clear_q4k_cache().map_err(|err| err)?;
-    backend::clear_moe_expert_slice_cache().map_err(|err| err)?;
-    backend::reset_delta_state_cache().map_err(|err| err)
+    backend::reset_state_for_engine_init()
 }
 
 pub fn cuda_memory_info() -> Result<CudaMemoryInfo> {

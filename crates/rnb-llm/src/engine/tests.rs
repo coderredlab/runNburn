@@ -6970,3 +6970,87 @@ fn make_zero_quantized_weight() -> QuantizedWeight {
     use rnb_core::tensor::Tensor;
     QuantizedWeight::new(Tensor::from_slice(&[0.0f32; 1], &[1]), GGMLType::F32, 1, 1)
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn qwen_dense_chain_actual_admission_respects_opt_out_and_down_quant() {
+    use super::forward::chain_args::{
+        chain_function_active, compute_chain_function_args, ChainCallerCtx,
+    };
+    use super::models::gemma::GemmaRuntimeFlavor;
+    use rnb_core::tensor::Tensor;
+
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    let env_keys = [
+        "RNB_CU58_HELPER_DISABLE",
+        "RNB_CUDA_DECODE_DEVICE_CHAIN",
+        "RNB_CUDA_DECODE_DEVICE_OUT_SCALE",
+        "RNB_CUDA_QWEN35_DENSE_FFN_CHAIN",
+    ];
+    let previous = env_keys.map(std::env::var_os);
+    unsafe {
+        std::env::remove_var("RNB_CU58_HELPER_DISABLE");
+        std::env::set_var("RNB_CUDA_DECODE_DEVICE_CHAIN", "1");
+        std::env::set_var("RNB_CUDA_DECODE_DEVICE_OUT_SCALE", "1");
+        std::env::set_var("RNB_CUDA_QWEN35_DENSE_FFN_CHAIN", "0");
+    }
+
+    let hidden = 256usize;
+    let ffn = 256usize;
+    let supported_layer = cuda_product_prewarm_attention_layer_for_test(
+        hidden,
+        ffn,
+        make_cuda_product_prewarm_quant_weight_for_test(GGMLType::Q6_K, hidden, ffn, 0x91),
+    );
+    let metadata = make_gemma_per_layer_metadata();
+    let make_ctx = |w| ChainCallerCtx {
+        architecture: rnb_loader::Architecture::Qwen35,
+        layer_idx: 0,
+        hidden_dim: hidden,
+        num_layers: 1,
+        w,
+        gemma_runtime_flavor: GemmaRuntimeFlavor::Generic,
+        ple_fusion: None,
+        ple_input_device_offset: None,
+        metadata: &metadata,
+        attn_on_device: false,
+        attn_out_carrier_dev: None,
+        has_gated_attn: false,
+        gemma4_reuse_q_only: false,
+        gemma4_attn_rot_active: false,
+        has_sliding_window: false,
+        long_kv_split_preferred: false,
+    };
+
+    let disabled_ctx = make_ctx(&supported_layer);
+    assert!(!chain_function_active(&disabled_ctx));
+    assert!(compute_chain_function_args(&disabled_ctx).is_none());
+
+    unsafe {
+        std::env::set_var("RNB_CUDA_QWEN35_DENSE_FFN_CHAIN", "1");
+    }
+    let enabled_ctx = make_ctx(&supported_layer);
+    assert!(chain_function_active(&enabled_ctx));
+
+    let unsupported_down = QuantizedWeight::new(
+        Tensor::from_vec(vec![0u8; 1], &[1]),
+        GGMLType::Q8_0,
+        hidden,
+        ffn,
+    );
+    let unsupported_layer =
+        cuda_product_prewarm_attention_layer_for_test(hidden, ffn, unsupported_down);
+    let unsupported_ctx = make_ctx(&unsupported_layer);
+    assert!(!chain_function_active(&unsupported_ctx));
+    assert!(compute_chain_function_args(&unsupported_ctx).is_none());
+
+    unsafe {
+        for (key, value) in env_keys.into_iter().zip(previous) {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}

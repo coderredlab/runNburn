@@ -4147,6 +4147,35 @@ fn qwen35_q6_down_q8dot_stays_opt_in() {
     let _on = EnvVarGuard::set(key, "1");
     assert!(crate::tuning::qwen35_q6_down_q8dot_enabled());
 }
+#[test]
+fn qwen_gdn_chain_respects_quant_q8dot_opt_outs() {
+    let _env_lock = cuda_test_env_lock();
+    let _q4_on = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "1");
+    let _q5_on = EnvVarGuard::set("RNB_CUDA_Q5K_GEMV_Q8DOT", "1");
+    let _q6_on = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "1");
+
+    assert!(qwen35_gdn_decode_core_chain_admitted(
+        14, 13, 1024, 2048, 1024,
+    ));
+    {
+        let _q4_off = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "0");
+        assert!(!qwen35_gdn_decode_core_chain_admitted(
+            14, 13, 1024, 2048, 1024,
+        ));
+    }
+    {
+        let _q5_off = EnvVarGuard::set("RNB_CUDA_Q5K_GEMV_Q8DOT", "0");
+        assert!(!qwen35_gdn_decode_core_chain_admitted(
+            14, 13, 1024, 2048, 1024,
+        ));
+    }
+    {
+        let _q6_off = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "0");
+        assert!(!qwen35_gdn_decode_core_chain_admitted(
+            14, 13, 1024, 2048, 1024,
+        ));
+    }
+}
 
 #[test]
 fn qwen35_q6_down_run_batched_ref_stays_opt_in() {
@@ -13060,6 +13089,7 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
 #[test]
 fn cuda_qwen_gdn_decode_core_chain_matches_staged_reference_two_steps() {
     let _guard = runtime_test_lock();
+    reset_delta_state_cache().expect("reset CUDA runtime cache");
     let _q4_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "1");
     let _q5_q8dot = EnvVarGuard::set("RNB_CUDA_Q5K_GEMV_Q8DOT", "1");
     let _q6_q8dot = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "1");

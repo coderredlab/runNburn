@@ -118,6 +118,45 @@ pub fn ssm_conv1d_silu(
         .ssm_conv1d_silu(input, kernel, seq_len, channels, kernel_size)
 }
 
+/// Returns whether the GDN device chain can honor the same quant-specific
+/// decode GEMV policy as the staged fallback.
+pub fn qwen35_gdn_decode_core_chain_admitted(
+    qkv_quant: u32,
+    ssm_out_quant: u32,
+    n_embd: usize,
+    conv_channels: usize,
+    d_inner: usize,
+) -> bool {
+    if n_embd % 256 != 0 || d_inner % 256 != 0 {
+        return false;
+    }
+    let qkv_blocks = n_embd / 256;
+    let out_blocks = d_inner / 256;
+    let q4_enabled = |rows: usize, blocks: usize| {
+        crate::runtime::gemv::q4k_q8dot_decode_enabled(rows >= 1024 && blocks >= 4)
+    };
+    let q5_enabled = |rows: usize, blocks: usize| {
+        crate::runtime::gemv::q5k_q8dot_decode_enabled(rows >= 1024 && blocks >= 4)
+    };
+    let q6_enabled = |rows: usize, blocks: usize| {
+        crate::runtime::gemv::q6k_q8dot_decode_enabled(rows >= 1024 && blocks >= 4)
+    };
+
+    let qkv_enabled = match qkv_quant {
+        12 => q4_enabled(conv_channels, qkv_blocks),
+        14 => q6_enabled(conv_channels, qkv_blocks),
+        _ => false,
+    };
+    let gate_enabled = q4_enabled(d_inner, qkv_blocks);
+    let out_enabled = match ssm_out_quant {
+        12 => q4_enabled(n_embd, out_blocks),
+        13 => q5_enabled(n_embd, out_blocks),
+        14 => q6_enabled(n_embd, out_blocks),
+        _ => false,
+    };
+    qkv_enabled && gate_enabled && out_enabled
+}
+
 /// cu203: Qwen GDN decode 층 core 를 device chain 으로 실행한다. `hidden` 은
 /// residual add 까지 반영돼 돌아오고, conv/delta host 사본은 갱신되지 않는다
 /// (resident 계약 — sync 는 `sync_delta_state_cache`/materialize 가 담당).
@@ -163,6 +202,15 @@ pub fn qwen35_gdn_decode_core_chain(args: QwenGdnDecodeChainArgs<'_>) -> Result<
             "GDN chain dims must be divisible by 256: n_embd={}, d_inner={}",
             args.n_embd, args.d_inner
         ));
+    }
+    if !qwen35_gdn_decode_core_chain_admitted(
+        args.qkv_quant,
+        args.ssm_out_quant,
+        args.n_embd,
+        args.conv_channels,
+        args.d_inner,
+    ) {
+        return Err("GDN chain disabled by quant-specific decode GEMV policy".to_string());
     }
     if args.conv_kernel < 2 {
         return Err(format!(

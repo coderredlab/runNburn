@@ -508,6 +508,22 @@ pub struct QwenGdnDecodeChainCall<'a> {
     pub norm_eps: f32,
 }
 
+pub fn qwen35_gdn_decode_core_chain_admitted(
+    qkv_quant: GGMLType,
+    ssm_out_quant: GGMLType,
+    n_embd: usize,
+    conv_channels: usize,
+    d_inner: usize,
+) -> bool {
+    backend::qwen35_gdn_decode_core_chain_admitted(
+        qkv_quant as u32,
+        ssm_out_quant as u32,
+        n_embd,
+        conv_channels,
+        d_inner,
+    )
+}
+
 pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<()> {
     backend::qwen35_gdn_decode_core_chain(backend::QwenGdnDecodeChainArgs {
         hidden: call.hidden,

@@ -691,6 +691,7 @@ mod mtp_device_verify_tests {
             output_cols: 256,
             output_norm: &output_norm,
             norm_eps: 1.0e-5,
+            collect_output_logits: false,
         };
 
         let err = qwen35_mtp_device_verify_window(request).unwrap_err();
@@ -801,6 +802,7 @@ mod mtp_device_verify_tests {
             output_cols: 256,
             output_norm: &output_norm,
             norm_eps: 1.0e-5,
+            collect_output_logits: false,
         };
 
         let err = qwen35_mtp_device_verify_window(request).unwrap_err();
@@ -909,6 +911,7 @@ mod mtp_device_verify_tests {
             output_cols: 256,
             output_norm: &output_norm,
             norm_eps: 1.0e-5,
+            collect_output_logits: false,
         };
 
         let err = qwen35_mtp_device_verify_window(request).unwrap_err();

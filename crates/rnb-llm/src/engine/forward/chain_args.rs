@@ -96,11 +96,16 @@ pub(in crate::engine) struct ChainCallerCtx<'a> {
     pub long_kv_split_preferred: bool,
 }
 
-fn dense_chain_projection_types_supported(output: GGMLType, gate: GGMLType, up: GGMLType) -> bool {
+fn dense_chain_projection_types_supported(
+    output: GGMLType,
+    gate: GGMLType,
+    up: GGMLType,
+    down: GGMLType,
+) -> bool {
     matches!(
         (output, gate, up),
         (GGMLType::Q4_K, GGMLType::Q4_K, GGMLType::Q4_K)
-    )
+    ) && matches!(down, GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K)
 }
 
 fn dense_chain_weights_supported(ctx: &ChainCallerCtx<'_>) -> bool {
@@ -108,7 +113,15 @@ fn dense_chain_weights_supported(ctx: &ChainCallerCtx<'_>) -> bool {
         ctx.w.o_weight.ggml_type,
         ctx.w.ffn_gate_weight.ggml_type,
         ctx.w.ffn_up_weight.ggml_type,
+        ctx.w.ffn_down_weight.ggml_type,
     )
+}
+
+fn dense_chain_architecture_enabled(
+    architecture: ModelArchitecture,
+    qwen35_chain_enabled: bool,
+) -> bool {
+    !matches!(architecture, ModelArchitecture::Qwen35) || qwen35_chain_enabled
 }
 
 fn ple_dense_chain_types_supported(gate: GGMLType, proj: GGMLType) -> bool {
@@ -156,6 +169,12 @@ pub(in crate::engine) fn chain_function_active(ctx: &ChainCallerCtx<'_>) -> bool
             return false;
         }
         if !ple_dense_chain_supported(ctx) {
+            return false;
+        }
+        if !dense_chain_architecture_enabled(
+            ctx.architecture,
+            crate::engine::policy::qwen35_dense_ffn_chain_enabled(),
+        ) {
             return false;
         }
         let chain_env_on = crate::engine::policy::cuda_decode_device_chain_enabled()
@@ -246,6 +265,12 @@ pub(in crate::engine) fn compute_chain_function_args<'a>(
             return None;
         }
         if !ple_dense_chain_supported(ctx) {
+            return None;
+        }
+        if !dense_chain_architecture_enabled(
+            ctx.architecture,
+            crate::engine::policy::qwen35_dense_ffn_chain_enabled(),
+        ) {
             return None;
         }
         let chain_env_on = crate::engine::policy::cuda_decode_device_chain_enabled()
@@ -592,16 +617,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dense_chain_rejects_q4_0_weights() {
+    fn dense_chain_rejects_unsupported_projection_weights() {
         assert!(dense_chain_projection_types_supported(
             GGMLType::Q4_K,
             GGMLType::Q4_K,
-            GGMLType::Q4_K
+            GGMLType::Q4_K,
+            GGMLType::Q6_K,
+        ));
+        assert!(!dense_chain_projection_types_supported(
+            GGMLType::Q4_K,
+            GGMLType::Q4_K,
+            GGMLType::Q4_K,
+            GGMLType::Q8_0,
         ));
         assert!(!dense_chain_projection_types_supported(
             GGMLType::Q4_0,
             GGMLType::Q4_0,
-            GGMLType::Q4_0
+            GGMLType::Q4_0,
+            GGMLType::Q4_0,
         ));
         assert!(ple_dense_chain_types_supported(
             GGMLType::Q4_K,

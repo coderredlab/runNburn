@@ -10,11 +10,13 @@
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 
+#[cfg(feature = "cuda")]
 use super::super::cpu_runtime::kernels;
 use super::super::layer_weights::GdnLayerWeights;
 use super::super::ModelMetadata;
 #[cfg(feature = "cuda")]
 use super::super::{cuda_runtime, policy};
+#[cfg(feature = "cuda")]
 use rnb_loader::GGMLType;
 
 pub(in crate::engine) struct GdnDecodeChainStates<'a> {
@@ -70,6 +72,15 @@ pub(in crate::engine) fn try_gdn_decode_core_chain_if_supported(
             || n_embd / 256 < 4
             || d_inner / 256 < 4
         {
+            return Ok(false);
+        }
+        if !cuda_runtime::qwen35_gdn_decode_core_chain_admitted(
+            w.qkv_weight.ggml_type,
+            w.ssm_out.ggml_type,
+            n_embd,
+            conv_channels,
+            d_inner,
+        ) {
             return Ok(false);
         }
         let (Some(qkv_bytes), Some(gate_bytes), Some(ssm_out_bytes)) = (

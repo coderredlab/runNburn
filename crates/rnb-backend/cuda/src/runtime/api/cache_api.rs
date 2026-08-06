@@ -91,6 +91,24 @@ pub fn cuda_weight_residency_counters() -> Result<CudaWeightResidencyCounters, S
         .unwrap_or_default())
 }
 
+/// Ends model-owned CUDA cache lifetimes while preserving the loaded CUDA
+/// context and modules. Allocation-identity F32 entries are removed explicitly
+/// so a later engine cannot reuse weights from the previous model generation.
+pub fn reset_state_for_engine_init() -> Result<(), String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    let Some(state) = guard.as_mut() else {
+        return Ok(());
+    };
+    state.clear_resident_moe_layer_cache()?;
+    state.clear_resident_q4k_cache()?;
+    state.clear_moe_slice_cache()?;
+    state.clear_stable_resident_f32_sources()?;
+    state.clear_resident_delta_states()
+}
+
 pub fn clear_q4k_cache() -> Result<(), String> {
     let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
     let mut guard = compute
@@ -183,7 +201,9 @@ pub fn release_q8_0_prefill_f32_after_prefill() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::selected_moe_transient_required_bytes;
+    use super::{reset_state_for_engine_init, selected_moe_transient_required_bytes};
+    use crate::runtime::{cuda_test_env_lock, CudaState, DEFAULT_CUDA_COMPUTE};
+    use std::sync::Mutex;
 
     #[test]
     fn selected_moe_transient_budget_uses_largest_weight_and_shape_scaled_scratch() {
@@ -195,5 +215,49 @@ mod tests {
             selected_moe_transient_required_bytes(7_000, 5_000, 300, 100),
             7_000 + 300 * 4 + 300 * 4
         );
+    }
+
+    #[test]
+    fn engine_init_reset_ends_stable_f32_source_generation() {
+        let _guard = cuda_test_env_lock();
+        reset_state_for_engine_init().expect("reset CUDA state before test");
+
+        fn read_stable_source(data: &[f32]) -> Result<Vec<f32>, String> {
+            let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+            let mut guard = compute
+                .lock()
+                .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+            if guard.is_none() {
+                *guard = Some(CudaState::open()?);
+            }
+            let state = guard.as_mut().expect("cuda compute state initialized");
+            let ptr = state.resident_f32_ptr_stable_source(data)?;
+            let mut output = vec![0.0f32; data.len()];
+            unsafe {
+                state.api.memcpy_dtoh_async(
+                    output.as_mut_ptr().cast::<libc::c_void>(),
+                    ptr,
+                    std::mem::size_of_val(data),
+                    state.stream,
+                )?;
+            }
+            state.stream_synchronize()?;
+            Ok(output)
+        }
+
+        let mut source = vec![1.0f32, 2.0, 3.0, 4.0];
+        let first = match read_stable_source(&source) {
+            Ok(values) => values,
+            Err(err) => {
+                eprintln!("skipping CUDA stable F32 reset test: {err}");
+                return;
+            }
+        };
+        assert_eq!(first, source);
+
+        source.copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        reset_state_for_engine_init().expect("reset CUDA state between model generations");
+        let second = read_stable_source(&source).expect("reload stable F32 source");
+        assert_eq!(second, source);
     }
 }
