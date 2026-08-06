@@ -729,6 +729,8 @@ pub(crate) fn ffn_chain_dispatch(
     down_w_buf: &ProtocolObject<dyn MTLBuffer>,
     down_off_buf: &ProtocolObject<dyn MTLBuffer>,
     down_is_q6k: bool,
+    use_gelu: bool,
+    post_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
 ) -> Vec<f32> {
     let hidden_dim = carrier.hidden_dim;
     let ffn_dim = carrier.ffn_dim;
@@ -748,7 +750,7 @@ pub(crate) fn ffn_chain_dispatch(
         &carrier.eps_buf,
     );
     // ② gate: normed_dev → gate_dev  (N=ffn_dim, K=hidden_dim)
-    crate::compute::encode_gemv_q4k(
+    crate::compute::encode_gemv_q4k_auto(
         ctx,
         &enc,
         gate_w_buf,
@@ -760,7 +762,7 @@ pub(crate) fn ffn_chain_dispatch(
         ffn_dim,
     );
     // ③ up: normed_dev → up_dev
-    crate::compute::encode_gemv_q4k(
+    crate::compute::encode_gemv_q4k_auto(
         ctx,
         &enc,
         up_w_buf,
@@ -771,19 +773,30 @@ pub(crate) fn ffn_chain_dispatch(
         up_off_buf,
         ffn_dim,
     );
-    // ④ silu_mul: gate_dev = silu(gate_dev)*up_dev (in-place)
-    encode_silu_mul(
-        ctx,
-        &enc,
-        &carrier.gate_dev,
-        &carrier.up_dev,
-        &carrier.fdim_buf,
-        ffn_dim,
-    );
+    // ④ gated activation in-place.
+    if use_gelu {
+        encode_gelu_mul(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            &carrier.fdim_buf,
+            ffn_dim,
+        );
+    } else {
+        encode_silu_mul(
+            ctx,
+            &enc,
+            &carrier.gate_dev,
+            &carrier.up_dev,
+            &carrier.fdim_buf,
+            ffn_dim,
+        );
+    }
     // ⑤ down: gate_dev → down_dev (N=hidden_dim, K=ffn_dim).
     //    down weight quant 에 맞는 GEMV 커널 선택(Q4_K 144B / Q6_K 210B).
     if down_is_q6k {
-        crate::compute::encode_gemv_q6k(
+        crate::compute::encode_gemv_q6k_auto(
             ctx,
             &enc,
             down_w_buf,
@@ -795,7 +808,7 @@ pub(crate) fn ffn_chain_dispatch(
             hidden_dim,
         );
     } else {
-        crate::compute::encode_gemv_q4k(
+        crate::compute::encode_gemv_q4k_auto(
             ctx,
             &enc,
             down_w_buf,
@@ -807,12 +820,26 @@ pub(crate) fn ffn_chain_dispatch(
             hidden_dim,
         );
     }
-    // ⑥ residual_add: hidden_dev += down_dev (in-place)
+    // ⑥ optional post-FFW norm, then residual add.
+    let residual = if let Some(post_norm_w_buf) = post_norm_w_buf {
+        encode_rms_norm(
+            ctx,
+            &enc,
+            &carrier.down_dev,
+            post_norm_w_buf,
+            &carrier.normed_dev,
+            &carrier.hdim_buf,
+            &carrier.eps_buf,
+        );
+        &carrier.normed_dev
+    } else {
+        &carrier.down_dev
+    };
     encode_residual_add(
         ctx,
         &enc,
         &carrier.hidden_dev,
-        &carrier.down_dev,
+        residual,
         &carrier.hdim_buf,
         hidden_dim,
     );
@@ -16258,6 +16285,8 @@ mod tests {
             &down_w_buf,
             &zero_off,
             false,
+            false,
+            None,
         );
 
         for i in 0..hidden_dim {
@@ -16357,12 +16386,105 @@ mod tests {
             &down_w_buf,
             &zero_off,
             true,
+            false,
+            None,
         );
 
         for i in 0..hidden_dim {
             let rel = (gpu_out[i] - cpu_out[i]).abs() / cpu_out[i].abs().max(1e-6);
             assert!(
                 rel < 1e-3,
+                "i={i} gpu={} cpu={} rel={rel}",
+                gpu_out[i],
+                cpu_out[i]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn ffn_chain_gelu_post_norm_matches_cpu() {
+        let ctx = build_metal_context().expect("no metal device");
+        let hidden_dim = 256usize;
+        let ffn_dim = 512usize;
+        let eps = 1e-5f32;
+        let hidden: Vec<f32> = (0..hidden_dim)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.04)
+            .collect();
+        let norm_w: Vec<f32> = (0..hidden_dim)
+            .map(|i| 0.7 + (i % 7) as f32 * 0.01)
+            .collect();
+        let post_norm_w: Vec<f32> = (0..hidden_dim)
+            .map(|i| 0.8 + (i % 5) as f32 * 0.01)
+            .collect();
+        let block = crate::tests_fixture::q4k_block_fixed();
+        let gate_w: Vec<u8> = block
+            .iter()
+            .cycle()
+            .take(ffn_dim * (hidden_dim / 256) * 144)
+            .copied()
+            .collect();
+        let up_w = gate_w.clone();
+        let down_w: Vec<u8> = block
+            .iter()
+            .cycle()
+            .take(hidden_dim * (ffn_dim / 256) * 144)
+            .copied()
+            .collect();
+        let rms_norm = |input: &[f32], weight: &[f32]| {
+            let rms = (input.iter().map(|v| v * v).sum::<f32>() / input.len() as f32 + eps).sqrt();
+            input
+                .iter()
+                .zip(weight)
+                .map(|(&value, &scale)| value / rms * scale)
+                .collect::<Vec<f32>>()
+        };
+        let normed = rms_norm(&hidden, &norm_w);
+        let gate = crate::compute::gemv_q4k_with_ctx(&ctx, &gate_w, &normed, ffn_dim, hidden_dim);
+        let up = crate::compute::gemv_q4k_with_ctx(&ctx, &up_w, &normed, ffn_dim, hidden_dim);
+        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        let act = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let gelu = 0.5 * g * (1.0 + (sqrt_2_over_pi * (g + 0.044715 * g.powi(3))).tanh());
+                gelu * u
+            })
+            .collect::<Vec<f32>>();
+        let down = crate::compute::gemv_q4k_with_ctx(&ctx, &down_w, &act, hidden_dim, ffn_dim);
+        let post_normed = rms_norm(&down, &post_norm_w);
+        let cpu_out = hidden
+            .iter()
+            .zip(&post_normed)
+            .map(|(&residual, &ffn)| residual + ffn)
+            .collect::<Vec<f32>>();
+
+        let carrier = FfnCarrier::new(&ctx, hidden_dim, ffn_dim, eps);
+        let norm_w_buf = shared_f32_buf(&ctx, &norm_w);
+        let post_norm_w_buf = shared_f32_buf(&ctx, &post_norm_w);
+        let gate_w_buf = shared_u8_buf(&ctx, &gate_w);
+        let up_w_buf = shared_u8_buf(&ctx, &up_w);
+        let down_w_buf = shared_u8_buf(&ctx, &down_w);
+        let zero_off = u32_buf(&ctx, 0);
+        let gpu_out = ffn_chain_dispatch(
+            &ctx,
+            &carrier,
+            &hidden,
+            &norm_w_buf,
+            &gate_w_buf,
+            &zero_off,
+            &up_w_buf,
+            &zero_off,
+            &down_w_buf,
+            &zero_off,
+            false,
+            true,
+            Some(&post_norm_w_buf),
+        );
+        for i in 0..hidden_dim {
+            let rel = (gpu_out[i] - cpu_out[i]).abs() / cpu_out[i].abs().max(1e-6);
+            assert!(
+                rel < 2e-3,
                 "i={i} gpu={} cpu={} rel={rel}",
                 gpu_out[i],
                 cpu_out[i]
@@ -16632,6 +16754,8 @@ mod tests {
             &down_w_buf,
             &zero_off,
             false,
+            false,
+            None,
         );
         let r2 = ffn_chain_dispatch(
             &ctx,
@@ -16645,6 +16769,8 @@ mod tests {
             &down_w_buf,
             &zero_off,
             false,
+            false,
+            None,
         );
         assert_eq!(r1, r2, "carrier 재사용 시 동일 입력 → 동일 출력이어야 함");
     }

@@ -8401,15 +8401,14 @@ impl MetalBackend {
         )
     }
 
-    /// FFN device-resident chain (Q4_K gate/up + Q4_K|Q6_K down + RMSNorm/SiLU/residual).
-    /// weight raw 의 등록된 mmap storage 를 resident NoCopy cache 가 보유한다.
-    /// norm weight 는 작아서 복사 업로드. carrier 는 (hidden_dim, ffn_dim) 별 재사용.
-    /// `down_is_q6k`: down weight 가 Q6_K(block 210B) 면 true, Q4_K(144B) 면 false.
+    /// FFN device-resident chain: Q4_K gate/up + Q4_K|Q6_K down +
+    /// RMSNorm/(SiLU|GELU)/optional post-norm/residual.
     #[allow(clippy::too_many_arguments)]
     pub fn ffn_chain_q4k_resident(
         &self,
         hidden: &[f32],
         norm_weight: &[f32],
+        post_norm_weight: Option<&[f32]>,
         gate_raw: &[u8],
         up_raw: &[u8],
         down_raw: &[u8],
@@ -8417,6 +8416,7 @@ impl MetalBackend {
         ffn_dim: usize,
         norm_eps: f32,
         down_is_q6k: bool,
+        use_gelu: bool,
     ) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
 
@@ -8445,6 +8445,7 @@ impl MetalBackend {
 
         // norm weight: 작아서(hidden_dim f32) 매 호출 복사 업로드.
         let norm_w_buf = ffn_chain::shared_f32_buf(ctx, norm_weight);
+        let post_norm_w_buf = post_norm_weight.map(|weight| ffn_chain::shared_f32_buf(ctx, weight));
 
         // scalar offset buffer(작음 — 매 호출 생성).
         let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
@@ -8469,6 +8470,8 @@ impl MetalBackend {
             &down_w,
             &down_off_buf,
             down_is_q6k,
+            use_gelu,
+            post_norm_w_buf.as_deref(),
         )
     }
 

@@ -3434,9 +3434,9 @@ pub fn metal_attention_qkv_chain_into_if_supported(
 }
 
 /// FFN device-resident chain. `RNB_METAL_FFN_CHAIN=1` 일 때만 활성.
-/// gate/up 은 Q4_K, down 은 Q4_K 또는 Q6_K raw mmap bytes(loader 소유).
-/// 본선 dense 모델(qwen3.5-9B 등)은 down 이 Q6_K 라 mixed quant 를 허용한다.
-/// 성공 시 Ok(true) + hidden 갱신.
+/// gate/up은 Q4_K, down은 Q4_K 또는 Q6_K raw mmap bytes다. Gemma는 GeGLU와
+/// 선택적 post-FFW norm을 같은 command buffer에 넣고 기본 활성화한다. 비-Gemma
+/// SwiGLU는 기존처럼 `RNB_METAL_FFN_CHAIN=1`에서만 활성화한다.
 #[allow(clippy::too_many_arguments)]
 pub fn metal_ffn_chain_into_if_supported(
     gate_ggml: GGMLType,
@@ -3446,12 +3446,18 @@ pub fn metal_ffn_chain_into_if_supported(
     up_raw: &[u8],
     down_raw: &[u8],
     norm_weight: &[f32],
+    post_norm_weight: Option<&[f32]>,
     hidden: &mut [f32],
     hidden_dim: usize,
     ffn_dim: usize,
     norm_eps: f32,
+    use_gelu: bool,
 ) -> Result<bool> {
-    if std::env::var("RNB_METAL_FFN_CHAIN").as_deref() != Ok("1") {
+    let requested = match std::env::var("RNB_METAL_FFN_CHAIN") {
+        Ok(value) => value != "0" && (use_gelu || value == "1"),
+        Err(_) => use_gelu,
+    };
+    if !requested {
         return Ok(false);
     }
     // gate/up 은 Q4_K(silu chain GEMV 커널 한정). down 은 Q4_K 또는 Q6_K 허용.
@@ -3468,6 +3474,7 @@ pub fn metal_ffn_chain_into_if_supported(
         b.ffn_chain_q4k_resident(
             hidden,
             norm_weight,
+            post_norm_weight,
             gate_raw,
             up_raw,
             down_raw,
@@ -3475,6 +3482,7 @@ pub fn metal_ffn_chain_into_if_supported(
             ffn_dim,
             norm_eps,
             down_is_q6k,
+            use_gelu,
         )
     });
     hidden.copy_from_slice(&out);

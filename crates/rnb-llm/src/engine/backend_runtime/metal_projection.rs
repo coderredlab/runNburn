@@ -9,6 +9,7 @@ use rnb_core::tensor::Tensor;
 #[cfg_attr(not(feature = "metal"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn metal_ffn_chain_into_if_supported(
     norm_weight: &[f32],
+    post_norm_weight: Option<&[f32]>,
     gate_weight: &QuantizedWeight,
     up_weight: &QuantizedWeight,
     down_weight: &QuantizedWeight,
@@ -16,6 +17,7 @@ pub(in crate::engine) fn metal_ffn_chain_into_if_supported(
     hidden_dim: usize,
     ffn_dim: usize,
     norm_eps: f32,
+    use_gelu: bool,
 ) -> crate::error::Result<bool> {
     let (Some(gate_v), Some(up_v), Some(down_v)) = (
         gate_weight.backend_view(),
@@ -34,16 +36,18 @@ pub(in crate::engine) fn metal_ffn_chain_into_if_supported(
             up_v.raw(),
             down_v.raw(),
             norm_weight,
+            post_norm_weight,
             hidden,
             hidden_dim,
             ffn_dim,
             norm_eps,
+            use_gelu,
         )
         .map_err(|e| crate::error::LlmError::Forward(e));
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
-        let _ = (gate_v, up_v, down_v);
+        let _ = (gate_v, up_v, down_v, post_norm_weight, use_gelu);
         Ok(false)
     }
 }

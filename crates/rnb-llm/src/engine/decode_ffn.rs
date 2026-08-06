@@ -96,19 +96,25 @@ pub(super) fn decode_ffn(
         }
     }
 
-    // Metal FFN device-resident chain (RNB_METAL_FFN_CHAIN=1). 성공 시 FFN 전체 완료.
+    // Dense Metal FFN carrier. Gemma GeGLU + post-FFW norm is default-on; diagnostic
+    // unit-offset norm modes retain the host path because this carrier consumes raw weights.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
-        // Gemma post-norm/fused gate-up 미지원 — dense SwiGLU 만.
-        if post_ffw_norm_weight.is_none()
-            && ffn_gate_up_fused.is_none()
-            && !use_gemma_block_semantics(architecture)
-        {
+        let gemma = use_gemma_block_semantics(architecture);
+        let unit_offset_norm = gemma
+            && (super::policy::gemma_unit_offset_attn_ffn_norm_enabled()
+                || super::policy::gemma_unit_offset_norm_enabled()
+                || super::policy::gemma_unit_offset_main_norm_enabled());
+        if ffn_gate_up_fused.is_none() && !unit_offset_norm {
             let norm_w = kernels::tensor_as_f32_slice(ffn_norm_weight);
+            let post_norm_w = post_ffw_norm_weight
+                .as_ref()
+                .map(kernels::tensor_as_f32_slice);
             let ffn_dim = ffn_gate_weight.rows;
             let t_chain = std::time::Instant::now();
             let done = backend_runtime::metal_ffn_chain_into_if_supported(
                 norm_w,
+                post_norm_w,
                 ffn_gate_weight,
                 ffn_up_weight,
                 ffn_down_weight,
@@ -116,6 +122,7 @@ pub(super) fn decode_ffn(
                 hidden_dim,
                 ffn_dim,
                 norm_eps,
+                gemma,
             )?;
             if done {
                 prof!("ffn_chain_metal", t_chain);
