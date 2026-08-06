@@ -13125,6 +13125,7 @@ fn cuda_qwen_gdn_decode_core_chain_matches_staged_reference_two_steps() {
     let _q4_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "1");
     let _q5_q8dot = EnvVarGuard::set("RNB_CUDA_Q5K_GEMV_Q8DOT", "1");
     let _q6_q8dot = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "1");
+    let _shared_delta = EnvVarGuard::set("RNB_CUDA_GDN_DELTA_WARP128", "0");
 
     let n_embd = 1024usize;
     let d_inner = 1024usize;
@@ -13354,6 +13355,84 @@ fn cuda_qwen_gdn_decode_core_chain_matches_staged_reference_two_steps() {
         &staged_delta,
         0.02,
         0.0,
+    );
+
+    // cu208: warp reduction은 합산 순서를 바꾸므로 기존 shared-memory reduction과
+    // 직접 대조한다. 서로 다른 결과가 실제 candidate kernel 실행을 증명하고,
+    // tight bound가 두 스텝 state/output drift를 제한한다.
+    reset_delta_state_cache().expect("reset CUDA runtime cache before warp comparison");
+    let _warp128 = EnvVarGuard::set("RNB_CUDA_GDN_DELTA_WARP128", "1");
+    let mut warp_hidden = hidden0.clone();
+    let mut warp_conv = conv_state0.clone();
+    let mut warp_delta = delta_state0.clone();
+    let mut warp_outputs = Vec::new();
+    for _step in 0..2 {
+        qwen35_gdn_decode_core_chain(QwenGdnDecodeChainArgs {
+            hidden: &mut warp_hidden,
+            conv_state: &mut warp_conv,
+            delta_state: &mut warp_delta,
+            attn_norm: &attn_norm,
+            qkv_weights: &qkv,
+            qkv_quant: 12,
+            gate_weights: &gate,
+            alpha_weights: &alpha_w,
+            beta_weights: &beta_w,
+            dt_bias: &dt_bias,
+            ssm_a: &ssm_a,
+            conv_kernel_weights: &conv_w,
+            ssm_norm: &ssm_norm,
+            ssm_out_weights: &ssm_out,
+            ssm_out_quant: 13,
+            n_embd,
+            conv_channels,
+            conv_kernel,
+            d_inner,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            norm_eps,
+        })
+        .expect("GDN decode chain warp reduction");
+        warp_outputs.push(warp_hidden.clone());
+    }
+    assert!(
+        sync_delta_state_cache(&mut warp_conv).expect("sync warp conv state"),
+        "warp chain conv state must be resident"
+    );
+    assert!(
+        sync_delta_state_cache(&mut warp_delta).expect("sync warp delta state"),
+        "warp chain delta state must be resident"
+    );
+    for step in 0..2 {
+        assert_close_rows_abs_rel(
+            &format!("GDN warp/shared hidden step {step}"),
+            &warp_outputs[step],
+            &chain_outputs[step],
+            1e-4,
+            1e-4,
+        );
+    }
+    assert_close_rows_abs_rel(
+        "GDN warp/shared conv state",
+        &warp_conv,
+        &chain_conv,
+        1e-4,
+        1e-4,
+    );
+    assert_close_rows_abs_rel(
+        "GDN warp/shared delta state",
+        &warp_delta,
+        &chain_delta,
+        1e-4,
+        1e-4,
+    );
+    assert!(
+        warp_delta
+            .iter()
+            .zip(chain_delta.iter())
+            .any(|(warp, shared)| warp.to_bits() != shared.to_bits()),
+        "warp/shared delta states are bitwise identical — warp kernel not exercised"
     );
 }
 

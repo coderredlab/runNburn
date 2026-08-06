@@ -4809,9 +4809,9 @@ impl CudaState {
         )
     }
 
-    // cu203: GDN decode chain 의 delta-net device-input launch. target-only decode 가
-    // 쓰는 rnb_delta_net_decode 커널·grid 를 그대로 유지해 (predecay 변형과 달리)
-    // 기존 host-input 경로와 같은 리덕션 순서를 보존한다.
+    // GDN decode chain 의 device-input launch. head_k_dim=128 기본 경로는
+    // 4-warp reduction이고, 진단 대조는 target-only decode 와 같은
+    // shared-memory reduction을 유지한다.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn launch_delta_net_decode_dev(
         &mut self,
@@ -4822,6 +4822,7 @@ impl CudaState {
         v_dev: u64,
         gate_dev: u64,
         beta_dev: u64,
+        warp128: bool,
         num_heads: usize,
         head_k_dim: usize,
         head_v_dim: usize,
@@ -4839,8 +4840,14 @@ impl CudaState {
             .map_err(|_| format!("GDN delta head_k_dim exceeds u32: {head_k_dim}"))?;
         let mut head_v_arg = u32::try_from(head_v_dim)
             .map_err(|_| format!("GDN delta head_v_dim exceeds u32: {head_v_dim}"))?;
+        let use_warp128 = warp128 && head_k_dim == 128;
+        let (kernel, block_x) = if use_warp128 {
+            ("rnb_delta_net_decode_predecay_hd128", 128)
+        } else {
+            ("rnb_delta_net_decode", 256)
+        };
         self.launch_cached_gemv(
-            "rnb_delta_net_decode",
+            kernel,
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut state_arg as *mut u64).cast::<libc::c_void>(),
@@ -4854,7 +4861,7 @@ impl CudaState {
                 (&mut head_v_arg as *mut u32).cast::<libc::c_void>(),
             ],
             (head_v_dim as u32, num_heads as u32, 1),
-            (256, 1, 1),
+            (block_x, 1, 1),
         )
     }
 

@@ -10,8 +10,8 @@
 //! `clear_resident_delta_states` 가 registry 를 비운다.
 //!
 //! 커널 선택 계약: qkv/gate/ssm_out 은 기존 decode q8dot 커널
-//! (`rnb_q{4,5,6}k_gemv_q8dot_warp8`), delta 는 target-only 가 쓰던
-//! `rnb_delta_net_decode` (verify 의 predecay 변형이 아님) 를 유지한다.
+//! (`rnb_q{4,5,6}k_gemv_q8dot_warp8`), head_k_dim=128 delta 는 같은 수식의
+//! 4-warp reduction을 쓰고 진단 대조에서만 기존 shared-memory reduction으로 돌아간다.
 
 use super::*;
 
@@ -229,6 +229,7 @@ impl CudaState {
         )?;
 
         // 10. delta-net decode (resident state 갱신 포함)
+        let warp128 = tuning::gdn_delta_warp128_enabled();
         self.launch_delta_net_decode_dev(
             at(delta_out_off),
             delta_state_dev,
@@ -237,6 +238,7 @@ impl CudaState {
             at(v_off),
             at(gate_prep_off),
             at(beta_prep_off),
+            warp128,
             heads,
             req.head_k_dim,
             req.head_v_dim,

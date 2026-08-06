@@ -177,6 +177,15 @@ pub fn q6k_q8dot_half2_enabled() -> bool {
     env_bool("RNB_CUDA_Q6K_Q8DOT_HALF2", true)
 }
 
+/// Qwen3.6 GDN의 head_k_dim=128 decode는 4-warp reduction으로 두 번의
+/// 256-thread shared-memory tree를 대체한다. cu208 RTX 3090에서 delta kernel
+/// 합계가 70.514→18.747ms/32 tokens로 줄고 100-token generation은 1.72%
+/// 개선됐으며 raw/chat 출력 hash가 각각 exact였다. 진단 대조는
+/// `RNB_CUDA_GDN_DELTA_WARP128=0`으로 기존 reduction을 되켠다.
+pub fn gdn_delta_warp128_enabled() -> bool {
+    env_bool("RNB_CUDA_GDN_DELTA_WARP128", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1159,6 +1168,7 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q6_PACKED_BATCH_WARP4");
             std::env::remove_var("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT");
             std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_HALF2");
+            std::env::remove_var("RNB_CUDA_GDN_DELTA_WARP128");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1180,6 +1190,7 @@ mod tests {
         assert!(q6k_gemv_batch_warp8_enabled());
         assert!(q4k_gate_up_q8dot_split_enabled());
         assert!(q6k_q8dot_half2_enabled());
+        assert!(gdn_delta_warp128_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));
