@@ -130,6 +130,143 @@ pub(super) struct GemmaPrefillMetalLayer {
     pub v_bits: Vec<u16>,
     pub final_hidden: bool,
 }
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn build_prefill_gemma_layer_range_spec<'a>(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    gemma_runtime_flavor: GemmaRuntimeFlavor,
+    w: &'a AttentionLayerWeights,
+    rope_freqs: Option<&Tensor>,
+    layout: AttentionLayout,
+    gemma4_reuse_q_only: bool,
+    layer_idx: usize,
+    seq_len: usize,
+    pos_start: usize,
+    norm_eps: f32,
+) -> crate::error::Result<Option<backend_runtime::GemmaPrefillLayerRangeSpec<'a>>> {
+    let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
+    if !matches!(architecture, ModelArchitecture::Gemma4)
+        || !use_gemma_block_semantics(architecture)
+        || gemma4_reuse_q_only
+        || layout.has_gated_attn
+        || !matches!(layout.head_dim, 256 | 512)
+        || pos_start != 0
+        || w.q_bias.is_some()
+        || w.k_bias.is_some()
+        || w.v_bias.is_some()
+        || super::super::policy::gemma_qk_norm_disabled()
+        || !super::super::policy::gemma_neox_rope_enabled()
+        || !super::super::policy::gemma_v_norm_enabled()
+        || dump_bin_dir().is_some()
+        || attn_trace_enabled()
+        || targeted_attn_trace_enabled(layer_idx)
+        || w.moe.is_some()
+        || w.shared_expert_moe.is_some()
+        || w.ffn_gate_up_fused.is_some()
+        || gemma_effective_skip_ffn_enabled(architecture, gemma_runtime_flavor, layer_idx)
+    {
+        return Ok(None);
+    }
+    let (Some(q_norm), Some(k_norm)) = (&w.q_norm, &w.k_norm) else {
+        return Ok(None);
+    };
+    let post_attn_norm = w.post_attn_norm.as_ref().filter(|_| {
+        !gemma_skip_post_attn_enabled(layer_idx)
+            && !gemma_effective_skip_post_attn_prefill_enabled(
+                architecture,
+                gemma_runtime_flavor,
+                layer_idx,
+            )
+    });
+    let (Some(post_attn_norm), Some(post_ffn_norm)) = (post_attn_norm, w.post_ffw_norm.as_ref())
+    else {
+        return Ok(None);
+    };
+    let (rope_dim, rope_theta, proportional_rope) =
+        resolve_rope_params(metadata, architecture, layer_idx, layout.head_dim);
+    if proportional_rope
+        || rope_dim != layout.head_dim
+        || gemma4_should_apply_k_rotation(architecture, w.k_weight.ggml_type, layout.head_dim)
+        || gemma4_should_apply_v_rotation(architecture, w.v_weight.ggml_type, layout.head_dim)
+    {
+        return Ok(None);
+    }
+    let effective_norm = |weight: &Tensor, unit_offset: bool| {
+        kernels::tensor_as_f32_slice(weight)
+            .iter()
+            .map(|value| if unit_offset { value + 1.0 } else { *value })
+            .collect::<Vec<_>>()
+    };
+    let global_unit_offset = policy::gemma_unit_offset_attn_ffn_norm_enabled()
+        || policy::gemma_unit_offset_norm_enabled()
+        || policy::gemma_unit_offset_main_norm_enabled();
+    let attn_norm_w = effective_norm(
+        &w.attn_norm,
+        global_unit_offset || policy::gemma_unit_offset_attn_norm_enabled(layer_idx),
+    );
+    let q_norm_w = effective_norm(q_norm, policy::gemma_unit_offset_norm_enabled());
+    let k_norm_w = effective_norm(k_norm, policy::gemma_unit_offset_norm_enabled());
+    let post_attn_norm_w = effective_norm(
+        post_attn_norm,
+        global_unit_offset
+            || gemma_effective_unit_offset_post_attn_enabled(
+                architecture,
+                gemma_runtime_flavor,
+                layer_idx,
+            )
+            || gemma_unit_offset_post_attn_prefill_enabled(layer_idx),
+    );
+    let ffn_norm_w = effective_norm(
+        select_ffn_pre_norm_weight(w, architecture),
+        global_unit_offset || policy::gemma_unit_offset_ffn_pre_norm_enabled(layer_idx),
+    );
+    let post_ffn_norm_w = effective_norm(
+        post_ffn_norm,
+        global_unit_offset || policy::gemma_unit_offset_ffn_post_norm_enabled(),
+    );
+    let rope_freq_factors = gemma_rope_freq_factors(
+        rope_freqs,
+        metadata,
+        architecture,
+        layer_idx,
+        layout.head_dim,
+    )
+    .map(<[f32]>::to_vec);
+    Ok(Some(backend_runtime::GemmaPrefillLayerRangeSpec {
+        layer_idx,
+        attn_norm_w,
+        q_norm_w,
+        k_norm_w,
+        rope_freq_factors,
+        v_from_k: w.v_proj_missing,
+        q_weight: &w.q_weight,
+        k_weight: &w.k_weight,
+        v_weight: &w.v_weight,
+        o_weight: &w.o_weight,
+        post_attn_norm_w,
+        ffn_norm_w,
+        post_ffn_norm_w,
+        out_scale: active_layer_output_scale(w.out_scale.as_ref(), layer_idx).map(|scale| scale[0]),
+        ffn_gate_weight: &w.ffn_gate_weight,
+        ffn_up_weight: &w.ffn_up_weight,
+        ffn_down_weight: &w.ffn_down_weight,
+        seq_len,
+        num_heads: layout.num_heads,
+        num_kv_heads: layout.num_kv_heads,
+        head_dim: layout.head_dim,
+        hidden_dim: metadata.hidden_dim,
+        q_dim: layout.q_dim,
+        kv_dim: layout.kv_dim,
+        ffn_dim: w.ffn_gate_weight.rows,
+        rope_theta,
+        scale: resolve_attention_scale(metadata, architecture),
+        norm_eps,
+        sliding_window,
+        softcap: resolve_attention_softcap(architecture),
+    }))
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
     metadata: &ModelMetadata,

@@ -1007,6 +1007,49 @@ fn metal_qwen_prefill_chain_fallback(
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_gemma_prefill_layer_range_enabled() -> bool {
+    crate::engine::policy::env_string("RNB_METAL_GEMMA_PREFILL_LAYER_RANGE_CHAIN")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_gemma_prefill_layer_range_trace_enabled() -> bool {
+    crate::engine::policy::env_string("RNB_METAL_GEMMA_PREFILL_LAYER_RANGE_TRACE").is_some_and(
+        |value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        },
+    )
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_gemma_prefill_layer_range_fallback(
+    reason: &'static str,
+    seq_len: usize,
+    layer_range: &Range<usize>,
+    layer_idx: Option<usize>,
+) -> crate::error::Result<Option<Tensor>> {
+    if metal_gemma_prefill_layer_range_trace_enabled() {
+        let layer = layer_idx
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "[metal:gemma-prefill-range] eligible_hit=0 reason={reason} seq_len={seq_len} layers={}..{} layer={layer}",
+            layer_range.start, layer_range.end
+        );
+    }
+    Ok(None)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 fn metal_qwen_route_sort_enabled() -> bool {
     crate::engine::policy::env_string("RNB_QWEN35_MOE_ROUTE_SORT")
         .map(|value| {
@@ -1414,6 +1457,197 @@ fn apply_metal_qwen_prefill_chain_output(
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
+fn try_run_metal_gemma_prefill_layer_range(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    hidden: &Tensor,
+    layer_range: &Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
+    non_causal: bool,
+    norm_eps: f32,
+    profiler_enabled: bool,
+) -> crate::error::Result<Option<Tensor>> {
+    if !metal_gemma_prefill_layer_range_enabled() {
+        return metal_gemma_prefill_layer_range_fallback("disabled", seq_len, layer_range, None);
+    }
+    if architecture != ModelArchitecture::Gemma4 {
+        return metal_gemma_prefill_layer_range_fallback(
+            "unsupported_architecture",
+            seq_len,
+            layer_range,
+            None,
+        );
+    }
+    if non_causal || imrope_positions.is_some() {
+        return metal_gemma_prefill_layer_range_fallback(
+            "nonstandard_attention",
+            seq_len,
+            layer_range,
+            None,
+        );
+    }
+    if pos_start != 0 {
+        return metal_gemma_prefill_layer_range_fallback(
+            "nonzero_pos_start",
+            seq_len,
+            layer_range,
+            None,
+        );
+    }
+    if profiler_enabled || crate::engine::policy::profiling_enabled() {
+        return metal_gemma_prefill_layer_range_fallback("profiler", seq_len, layer_range, None);
+    }
+    if layer_range.start >= layer_range.end || layer_range.end > weights.layers.len() {
+        return metal_gemma_prefill_layer_range_fallback(
+            "invalid_layer_range",
+            seq_len,
+            layer_range,
+            None,
+        );
+    }
+    let Some(expected_hidden_len) = seq_len.checked_mul(metadata.hidden_dim) else {
+        return metal_gemma_prefill_layer_range_fallback(
+            "hidden_length_overflow",
+            seq_len,
+            layer_range,
+            None,
+        );
+    };
+    if kernels::tensor_as_f32_slice(hidden).len() != expected_hidden_len {
+        return metal_gemma_prefill_layer_range_fallback(
+            "hidden_length_mismatch",
+            seq_len,
+            layer_range,
+            None,
+        );
+    }
+    let gemma_runtime_flavor = if metadata.num_layers == 35
+        && metadata.hidden_dim == 1536
+        && metadata.num_heads == 8
+        && metadata.num_kv_heads == 1
+        && metadata.head_dim == 512
+        && metadata.embedding_length_per_layer_input == 256
+    {
+        GemmaRuntimeFlavor::Gemma4E2BIt
+    } else {
+        GemmaRuntimeFlavor::Generic
+    };
+    let mut layers = Vec::with_capacity(layer_range.end - layer_range.start);
+    for layer_idx in layer_range.clone() {
+        let Some(LayerType::Attention(w)) = weights.layers.get(layer_idx) else {
+            return metal_gemma_prefill_layer_range_fallback(
+                "unsupported_layer_kind",
+                seq_len,
+                layer_range,
+                Some(layer_idx),
+            );
+        };
+        if gemma_ple_disable_attention_layer(layer_idx) {
+            return metal_gemma_prefill_layer_range_fallback(
+                "attention_disabled",
+                seq_len,
+                layer_range,
+                Some(layer_idx),
+            );
+        }
+        let layer_kv_override = metadata
+            .head_count_kv_per_layer
+            .as_ref()
+            .and_then(|values| values.get(layer_idx).copied());
+        let kv_source_layer = shared_kv_source_layer(metadata, architecture, layer_idx);
+        let layout = if kv_source_layer.is_some() {
+            resolve_attention_layout_gemma4_reuse(metadata, w, layer_kv_override)?
+        } else {
+            resolve_attention_layout(metadata, w, layer_kv_override)?
+        };
+        let Some(layer) = crate::engine::forward::build_prefill_gemma_layer_range_spec(
+            metadata,
+            architecture,
+            gemma_runtime_flavor,
+            w,
+            weights.rope_freqs.as_ref(),
+            layout,
+            kv_source_layer.is_some(),
+            layer_idx,
+            seq_len,
+            pos_start,
+            norm_eps,
+        )?
+        else {
+            return metal_gemma_prefill_layer_range_fallback(
+                "unsupported_layer_spec",
+                seq_len,
+                layer_range,
+                Some(layer_idx),
+            );
+        };
+        layers.push(layer);
+    }
+    let Some(output) = backend_runtime::metal_gemma_prefill_layer_range_if_supported(
+        kernels::tensor_as_f32_slice(hidden),
+        &layers,
+    )?
+    else {
+        return metal_gemma_prefill_layer_range_fallback(
+            "runtime_or_backend_preflight_none",
+            seq_len,
+            layer_range,
+            None,
+        );
+    };
+    if output.hidden_uploads != 1
+        || output.hidden_readbacks != 1
+        || output.intermediate_hidden_transfers != 0
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "Metal Gemma prefill range ownership mismatch: uploads={} readbacks={} intermediate={}",
+            output.hidden_uploads, output.hidden_readbacks, output.intermediate_hidden_transfers
+        )));
+    }
+    if output.hidden.len() != expected_hidden_len || output.attention_kv.len() != layers.len() {
+        return Err(crate::error::LlmError::Forward(
+            "Metal Gemma prefill range output shape mismatch".to_string(),
+        ));
+    }
+    for ((layer_idx, k_bits, v_bits), spec) in output.attention_kv.iter().zip(&layers) {
+        let expected_kv_len = seq_len.checked_mul(spec.kv_dim).ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "Metal Gemma prefill range KV length overflow".to_string(),
+            )
+        })?;
+        if *layer_idx != spec.layer_idx
+            || k_bits.len() != expected_kv_len
+            || v_bits.len() != expected_kv_len
+        {
+            return Err(crate::error::LlmError::Forward(format!(
+                "Metal Gemma prefill range layer {} KV shape mismatch",
+                spec.layer_idx
+            )));
+        }
+    }
+    for (layer_idx, k_bits, v_bits) in output.attention_kv {
+        kv_cache
+            .replace_layer_f16_range_compacted(layer_idx, pos_start, seq_len, &k_bits, &v_bits)
+            .map_err(crate::error::LlmError::Forward)?;
+    }
+    if metal_gemma_prefill_layer_range_trace_enabled() {
+        eprintln!(
+            "[metal:gemma-prefill-range] eligible_hit=1 seq_len={seq_len} layers={}..{} hidden_uploads=1 hidden_readbacks=1 intermediate_hidden_transfers=0",
+            layer_range.start, layer_range.end
+        );
+    }
+    Ok(Some(Tensor::from_vec(
+        output.hidden,
+        &[seq_len, metadata.hidden_dim],
+    )))
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
 fn try_run_metal_qwen_prefill_chain(
     kv_cache: &mut KVCache,
     metadata: &ModelMetadata,
@@ -1721,6 +1955,29 @@ fn run_prefill_layers_cpu_range_impl(
     let mut profiler = super::profile::PrefillLayerProfiler::new(weights.layers.len());
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
+        crate::generate::check_generation_cancellation()?;
+        let chain_input = hidden
+            .as_host()
+            .expect("Metal Gemma prefill range input must be host-resident");
+        if let Some(chain_hidden) = try_run_metal_gemma_prefill_layer_range(
+            kv_cache,
+            metadata,
+            architecture,
+            weights,
+            chain_input,
+            &layer_range,
+            seq_len,
+            pos_start,
+            imrope_positions,
+            non_causal,
+            norm_eps,
+            profiler.enabled(),
+        )? {
+            return Ok(hidden_carrier::PrefillHidden::Host(chain_hidden));
+        }
+    }
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
         let chain_end = match metal_qwen_prefill_chain_diag_layers() {

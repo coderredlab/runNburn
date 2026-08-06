@@ -417,6 +417,39 @@ pub(crate) fn encode_residual_add(
     encode_residual_add_bound(ctx, enc, hidden_buf, down_buf, dim);
 }
 
+pub(crate) fn encode_residual_add_scaled(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    hidden_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim: usize,
+) {
+    enc.setComputePipelineState(&ctx.residual_add_scaled_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(hidden_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(down_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 3);
+    }
+    let tg_width = ctx
+        .residual_add_scaled_pipeline
+        .threadExecutionWidth()
+        .max(1);
+    let grid = MTLSize {
+        width: dim.div_ceil(tg_width),
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_width,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
 fn encode_residual_add_inline_dim(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,

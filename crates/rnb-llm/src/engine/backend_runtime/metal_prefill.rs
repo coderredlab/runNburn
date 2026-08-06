@@ -6,6 +6,40 @@ use crate::engine::quantized_weight_types::backend_ggml_type;
 use crate::engine::quantized_weight_types::QuantizedWeight;
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(in crate::engine) struct GemmaPrefillLayerRangeSpec<'a> {
+    pub layer_idx: usize,
+    pub attn_norm_w: Vec<f32>,
+    pub q_norm_w: Vec<f32>,
+    pub k_norm_w: Vec<f32>,
+    pub rope_freq_factors: Option<Vec<f32>>,
+    pub v_from_k: bool,
+    pub q_weight: &'a QuantizedWeight,
+    pub k_weight: &'a QuantizedWeight,
+    pub v_weight: &'a QuantizedWeight,
+    pub o_weight: &'a QuantizedWeight,
+    pub post_attn_norm_w: Vec<f32>,
+    pub ffn_norm_w: Vec<f32>,
+    pub post_ffn_norm_w: Vec<f32>,
+    pub out_scale: Option<f32>,
+    pub ffn_gate_weight: &'a QuantizedWeight,
+    pub ffn_up_weight: &'a QuantizedWeight,
+    pub ffn_down_weight: &'a QuantizedWeight,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub sliding_window: Option<usize>,
+    pub softcap: Option<f32>,
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
     normed: &[f32],
@@ -194,6 +228,80 @@ pub(in crate::engine) fn metal_gemma_prefill_full_layer_if_supported(
     )
     .map_err(crate::error::LlmError::Forward)
 }
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(in crate::engine) fn metal_gemma_prefill_layer_range_if_supported(
+    hidden: &[f32],
+    layers: &[GemmaPrefillLayerRangeSpec<'_>],
+) -> crate::error::Result<Option<metal_runtime::MetalGemmaPrefillLayerRangeOut>> {
+    fn runtime_view(weight: &QuantizedWeight) -> Option<metal_runtime::MetalQuantWeightRef<'_>> {
+        let view = weight.backend_view()?;
+        Some(metal_runtime::MetalQuantWeightRef {
+            ggml_type: backend_ggml_type(view.quant()),
+            raw: view.raw(),
+            rows: view.rows(),
+            cols: view.cols(),
+        })
+    }
+
+    let mut runtime_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let (
+            Some(q_weight),
+            Some(k_weight),
+            Some(v_weight),
+            Some(o_weight),
+            Some(ffn_gate_weight),
+            Some(ffn_up_weight),
+            Some(ffn_down_weight),
+        ) = (
+            runtime_view(layer.q_weight),
+            runtime_view(layer.k_weight),
+            runtime_view(layer.v_weight),
+            runtime_view(layer.o_weight),
+            runtime_view(layer.ffn_gate_weight),
+            runtime_view(layer.ffn_up_weight),
+            runtime_view(layer.ffn_down_weight),
+        )
+        else {
+            return Ok(None);
+        };
+        runtime_layers.push(metal_runtime::MetalGemmaPrefillLayerRangeLayer {
+            layer_idx: layer.layer_idx,
+            attn_norm_w: &layer.attn_norm_w,
+            q_norm_w: &layer.q_norm_w,
+            k_norm_w: &layer.k_norm_w,
+            rope_freq_factors: layer.rope_freq_factors.as_deref(),
+            v_from_k: layer.v_from_k,
+            q_weight,
+            k_weight,
+            v_weight,
+            o_weight,
+            post_attn_norm_w: &layer.post_attn_norm_w,
+            ffn_norm_w: &layer.ffn_norm_w,
+            post_ffn_norm_w: &layer.post_ffn_norm_w,
+            out_scale: layer.out_scale,
+            ffn_gate_weight,
+            ffn_up_weight,
+            ffn_down_weight,
+            seq_len: layer.seq_len,
+            num_heads: layer.num_heads,
+            num_kv_heads: layer.num_kv_heads,
+            head_dim: layer.head_dim,
+            hidden_dim: layer.hidden_dim,
+            q_dim: layer.q_dim,
+            kv_dim: layer.kv_dim,
+            ffn_dim: layer.ffn_dim,
+            rope_theta: layer.rope_theta,
+            scale: layer.scale,
+            norm_eps: layer.norm_eps,
+            sliding_window: layer.sliding_window,
+            softcap: layer.softcap,
+        });
+    }
+    metal_runtime::metal_gemma_prefill_layer_range_if_supported(hidden, &runtime_layers)
+        .map_err(crate::error::LlmError::Forward)
+}
+
 /// pm48 ②: Metal prefill attention 2차 device-resident chain seam(rope/qk_norm→cast→flash 단일
 /// command buffer). 입력(host): q_proj(gate split 후, norm 전), k_proj(norm 전), v(f32),
 /// q_norm/k_norm weight. 반환 `(attn_out, k_f16, v_f16)`. Metal 전용(CUDA 미지원 → None).

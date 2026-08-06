@@ -35,6 +35,8 @@ pub(in crate::engine) use fused_qkv_chain::{
     try_prefill_q4k_f16_reuse_q_hd256_window_dense_chain_from_device,
     try_prefill_q4k_f16_reuse_q_hd512_dense_chain_from_device,
 };
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(in crate::engine) use projection::build_prefill_gemma_layer_range_spec;
 use projection::{
     project_prefill_attention, try_prefill_atn_core_metal, try_prefill_atn_full_layer_metal,
     try_prefill_atn_o_tail_metal, try_prefill_attention_q4k_f16_qkv_attention_hd512,

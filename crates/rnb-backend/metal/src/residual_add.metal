@@ -12,3 +12,15 @@ kernel void residual_add(
     if (gid >= dim) return;
     hidden[gid] += down[gid];
 }
+
+// Gemma layer output scale: hidden = (hidden + down) * scale.
+kernel void residual_add_scaled(
+    device float*       hidden [[buffer(0)]],
+    device const float* down   [[buffer(1)]],
+    constant uint&      dim    [[buffer(2)]],
+    constant float&     scale  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) return;
+    hidden[gid] = (hidden[gid] + down[gid]) * scale;
+}

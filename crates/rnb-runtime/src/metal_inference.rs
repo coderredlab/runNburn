@@ -141,6 +141,47 @@ pub struct MetalGemmaPrefillFullLayerRequest<'a> {
     pub ffn_dim: usize,
 }
 
+pub struct MetalGemmaPrefillLayerRangeLayer<'a> {
+    pub layer_idx: usize,
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub rope_freq_factors: Option<&'a [f32]>,
+    pub v_from_k: bool,
+    pub q_weight: MetalQuantWeightRef<'a>,
+    pub k_weight: MetalQuantWeightRef<'a>,
+    pub v_weight: MetalQuantWeightRef<'a>,
+    pub o_weight: MetalQuantWeightRef<'a>,
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub out_scale: Option<f32>,
+    pub ffn_gate_weight: MetalQuantWeightRef<'a>,
+    pub ffn_up_weight: MetalQuantWeightRef<'a>,
+    pub ffn_down_weight: MetalQuantWeightRef<'a>,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub sliding_window: Option<usize>,
+    pub softcap: Option<f32>,
+}
+
+pub struct MetalGemmaPrefillLayerRangeOut {
+    pub hidden: Vec<f32>,
+    pub attention_kv: Vec<(usize, Vec<u16>, Vec<u16>)>,
+    pub hidden_uploads: usize,
+    pub hidden_readbacks: usize,
+    pub intermediate_hidden_transfers: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen35RouteAlgorithm {
     SelectedSoftmaxTopKLowerExpertTieV1,
@@ -5470,6 +5511,103 @@ pub fn metal_gemma_prefill_full_layer_if_supported(
                     hidden,
                     k_bits,
                     v_bits,
+                })
+            })
+    })
+}
+
+pub fn metal_gemma_prefill_layer_range_if_supported(
+    hidden: &[f32],
+    layers: &[MetalGemmaPrefillLayerRangeLayer<'_>],
+) -> Result<Option<MetalGemmaPrefillLayerRangeOut>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_LAYER_RANGE_CHAIN")
+        || env_falsey("RNB_METAL_GEMMA_PREFILL_FULL_LAYER_CHAIN")
+        || env_falsey("RNB_METAL_GEMMA_PREFILL_QKV_O_CHAIN")
+    {
+        return Ok(None);
+    }
+    let mut backend_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        if layer.head_dim == 512 && env_falsey("RNB_METAL_GEMMA_PREFILL_GLOBAL_QKV_O_CHAIN") {
+            return Ok(None);
+        }
+        let Some(q_quant) = tensorops_quant_from_ggml(layer.q_weight.ggml_type) else {
+            return Ok(None);
+        };
+        let Some(k_quant) = tensorops_quant_from_ggml(layer.k_weight.ggml_type) else {
+            return Ok(None);
+        };
+        let Some(v_quant) = tensorops_quant_from_ggml(layer.v_weight.ggml_type) else {
+            return Ok(None);
+        };
+        let Some(o_quant) = tensorops_quant_from_ggml(layer.o_weight.ggml_type) else {
+            return Ok(None);
+        };
+        let Some(ffn_gate_quant) = tensorops_quant_from_ggml(layer.ffn_gate_weight.ggml_type)
+        else {
+            return Ok(None);
+        };
+        let Some(ffn_up_quant) = tensorops_quant_from_ggml(layer.ffn_up_weight.ggml_type) else {
+            return Ok(None);
+        };
+        let Some(ffn_down_quant) = tensorops_quant_from_ggml(layer.ffn_down_weight.ggml_type)
+        else {
+            return Ok(None);
+        };
+        fn view<'a>(
+            weight: &MetalQuantWeightRef<'a>,
+            quant: rnb_backend_metal::TensoropsQuant,
+        ) -> rnb_backend_metal::PrefillAtnCoreWeightView<'a> {
+            rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: weight.raw,
+                quant,
+                rows: weight.rows,
+                cols: weight.cols,
+            }
+        }
+        backend_layers.push(rnb_backend_metal::GemmaPrefillLayerRangeBackendLayer {
+            layer_idx: layer.layer_idx,
+            attn_norm_w: layer.attn_norm_w,
+            q_norm_w: layer.q_norm_w,
+            k_norm_w: layer.k_norm_w,
+            rope_freq_factors: layer.rope_freq_factors,
+            v_from_k: layer.v_from_k,
+            q_weight: view(&layer.q_weight, q_quant),
+            k_weight: view(&layer.k_weight, k_quant),
+            v_weight: view(&layer.v_weight, v_quant),
+            o_weight: view(&layer.o_weight, o_quant),
+            post_attn_norm_w: layer.post_attn_norm_w,
+            ffn_norm_w: layer.ffn_norm_w,
+            post_ffn_norm_w: layer.post_ffn_norm_w,
+            out_scale: layer.out_scale,
+            ffn_gate_weight: view(&layer.ffn_gate_weight, ffn_gate_quant),
+            ffn_up_weight: view(&layer.ffn_up_weight, ffn_up_quant),
+            ffn_down_weight: view(&layer.ffn_down_weight, ffn_down_quant),
+            seq_len: layer.seq_len,
+            num_heads: layer.num_heads,
+            num_kv_heads: layer.num_kv_heads,
+            head_dim: layer.head_dim,
+            hidden_dim: layer.hidden_dim,
+            q_dim: layer.q_dim,
+            kv_dim: layer.kv_dim,
+            ffn_dim: layer.ffn_dim,
+            rope_theta: layer.rope_theta,
+            scale: layer.scale,
+            norm_eps: layer.norm_eps,
+            sliding_window: layer.sliding_window,
+            softcap: layer.softcap,
+        });
+    }
+    METAL.with(|backend| {
+        backend
+            .prefill_gemma_layer_range_if_supported(hidden, &backend_layers)
+            .map(|result| {
+                result.map(|output| MetalGemmaPrefillLayerRangeOut {
+                    hidden: output.hidden,
+                    attention_kv: output.attention_kv,
+                    hidden_uploads: output.hidden_uploads,
+                    hidden_readbacks: output.hidden_readbacks,
+                    intermediate_hidden_transfers: output.intermediate_hidden_transfers,
                 })
             })
     })

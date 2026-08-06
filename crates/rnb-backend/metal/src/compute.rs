@@ -520,6 +520,7 @@ pub struct MetalContext {
     pub gelu_mul_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub silu_mul_half_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub residual_add_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub residual_add_scaled_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_gather_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_gather_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_scatter_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2095,6 +2096,8 @@ pub fn build_metal_context_with_opts(
     let gelu_mul_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "gelu_mul_to_f16");
     let silu_mul_half_f16_pipeline = build_pipeline(&device, SILU_MUL_SRC, "silu_mul_half_to_f16");
     let residual_add_pipeline = build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add");
+    let residual_add_scaled_pipeline =
+        build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add_scaled");
     let qwen_moe_prefill_gather_pipeline = build_pipeline(
         &device,
         QWEN_MOE_PREFILL_SCATTER_SRC,
@@ -2444,6 +2447,7 @@ pub fn build_metal_context_with_opts(
         gelu_mul_f16_pipeline,
         silu_mul_half_f16_pipeline,
         residual_add_pipeline,
+        residual_add_scaled_pipeline,
         qwen_moe_prefill_gather_pipeline,
         qwen_moe_prefill_gather_f16_pipeline,
         qwen_moe_prefill_scatter_pipeline,

@@ -1423,6 +1423,50 @@ pub struct GemmaPrefillFullLayerBackendRequest<'a> {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
+pub struct GemmaPrefillLayerRangeBackendLayer<'a> {
+    pub layer_idx: usize,
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub rope_freq_factors: Option<&'a [f32]>,
+    pub v_from_k: bool,
+    pub q_weight: PrefillAtnCoreWeightView<'a>,
+    pub k_weight: PrefillAtnCoreWeightView<'a>,
+    pub v_weight: PrefillAtnCoreWeightView<'a>,
+    pub o_weight: PrefillAtnCoreWeightView<'a>,
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub out_scale: Option<f32>,
+    pub ffn_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub sliding_window: Option<usize>,
+    pub softcap: Option<f32>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct GemmaPrefillLayerRangeBackendOut {
+    pub hidden: Vec<f32>,
+    pub attention_kv: Vec<(usize, Vec<u16>, Vec<u16>)>,
+    pub hidden_uploads: usize,
+    pub hidden_readbacks: usize,
+    pub intermediate_hidden_transfers: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
 pub struct PrefillAtnCoreBackendRequest<'a> {
     pub hidden: &'a [f32],
     pub attn_norm_w: &'a [f32],
@@ -3942,24 +3986,26 @@ impl MetalBackend {
             carrier,
             prefill_gemma_attn_chain::GemmaPrefillQkvOTailDispatchRequest {
                 normed: req.normed,
-                q_norm_w: req.q_norm_w,
-                k_norm_w: req.k_norm_w,
-                rope_freq_factors: req.rope_freq_factors,
-                v_from_k: req.v_from_k,
-                q_w_buf: &q_w_buf,
-                q_w_off,
-                q_quant: req.q_weight.quant,
-                k_w_buf: &k_w_buf,
-                k_w_off,
-                k_quant: req.k_weight.quant,
-                v_w_buf: &v_w_buf,
-                v_w_off,
-                v_quant: req.v_weight.quant,
-                o_w_buf: &o_w_buf,
-                o_w_off,
-                o_quant: req.o_weight.quant,
-                sliding_window: req.sliding_window,
-                softcap: req.softcap,
+                spec: prefill_gemma_attn_chain::GemmaPrefillQkvODispatchSpec {
+                    q_norm_w: req.q_norm_w,
+                    k_norm_w: req.k_norm_w,
+                    rope_freq_factors: req.rope_freq_factors,
+                    v_from_k: req.v_from_k,
+                    q_w_buf: &q_w_buf,
+                    q_w_off,
+                    q_quant: req.q_weight.quant,
+                    k_w_buf: &k_w_buf,
+                    k_w_off,
+                    k_quant: req.k_weight.quant,
+                    v_w_buf: &v_w_buf,
+                    v_w_off,
+                    v_quant: req.v_weight.quant,
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: req.o_weight.quant,
+                    sliding_window: req.sliding_window,
+                    softcap: req.softcap,
+                },
             },
         )?;
         Ok(Some(output))
@@ -4195,41 +4241,307 @@ impl MetalBackend {
             prefill_gemma_attn_chain::GemmaPrefillFullLayerDispatchRequest {
                 attention: prefill_gemma_attn_chain::GemmaPrefillQkvOTailDispatchRequest {
                     normed: attention.normed,
-                    q_norm_w: attention.q_norm_w,
-                    k_norm_w: attention.k_norm_w,
-                    rope_freq_factors: attention.rope_freq_factors,
-                    v_from_k: attention.v_from_k,
-                    q_w_buf: &q_w_buf,
-                    q_w_off,
-                    q_quant: attention.q_weight.quant,
-                    k_w_buf: &k_w_buf,
-                    k_w_off,
-                    k_quant: attention.k_weight.quant,
-                    v_w_buf: &v_w_buf,
-                    v_w_off,
-                    v_quant: attention.v_weight.quant,
-                    o_w_buf: &o_w_buf,
-                    o_w_off,
-                    o_quant: attention.o_weight.quant,
-                    sliding_window: attention.sliding_window,
-                    softcap: attention.softcap,
+                    spec: prefill_gemma_attn_chain::GemmaPrefillQkvODispatchSpec {
+                        q_norm_w: attention.q_norm_w,
+                        k_norm_w: attention.k_norm_w,
+                        rope_freq_factors: attention.rope_freq_factors,
+                        v_from_k: attention.v_from_k,
+                        q_w_buf: &q_w_buf,
+                        q_w_off,
+                        q_quant: attention.q_weight.quant,
+                        k_w_buf: &k_w_buf,
+                        k_w_off,
+                        k_quant: attention.k_weight.quant,
+                        v_w_buf: &v_w_buf,
+                        v_w_off,
+                        v_quant: attention.v_weight.quant,
+                        o_w_buf: &o_w_buf,
+                        o_w_off,
+                        o_quant: attention.o_weight.quant,
+                        sliding_window: attention.sliding_window,
+                        softcap: attention.softcap,
+                    },
                 },
                 hidden: req.hidden,
                 post_attn_norm_w: req.post_attn_norm_w,
                 ffn_norm_w: req.ffn_norm_w,
                 post_ffn_norm_w: req.post_ffn_norm_w,
-                ffn_gate_w_buf: &ffn_gate_w_buf,
-                ffn_gate_w_off,
-                ffn_gate_quant: req.ffn_gate_weight.quant,
-                ffn_up_w_buf: &ffn_up_w_buf,
-                ffn_up_w_off,
-                ffn_up_quant: req.ffn_up_weight.quant,
-                ffn_down_w_buf: &ffn_down_w_buf,
-                ffn_down_w_off,
-                ffn_down_quant: req.ffn_down_weight.quant,
+                ffn: prefill_gemma_attn_chain::GemmaPrefillFfnDispatchSpec {
+                    ffn_gate_w_buf: &ffn_gate_w_buf,
+                    ffn_gate_w_off,
+                    ffn_gate_quant: req.ffn_gate_weight.quant,
+                    ffn_up_w_buf: &ffn_up_w_buf,
+                    ffn_up_w_off,
+                    ffn_up_quant: req.ffn_up_weight.quant,
+                    ffn_down_w_buf: &ffn_down_w_buf,
+                    ffn_down_w_off,
+                    ffn_down_quant: req.ffn_down_weight.quant,
+                },
             },
         )?;
         Ok(Some(output))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn gemma_prefill_layer_range_layer_preflight(
+        ctx: &compute::MetalContext,
+        req: GemmaPrefillLayerRangeBackendLayer<'_>,
+    ) -> Result<bool, String> {
+        let flash_supported = match req.head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !flash_supported
+            || ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.q_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.k_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.v_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.o_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_gate_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_up_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_down_weight.quant)
+        {
+            return Ok(false);
+        }
+        if req.seq_len == 0 || req.ffn_dim == 0 {
+            return Err("Metal Gemma prefill range: seq_len and ffn_dim must be > 0".to_string());
+        }
+        if req.num_heads == 0 || req.num_kv_heads == 0 || req.num_heads % req.num_kv_heads != 0 {
+            return Err("Metal Gemma prefill range: invalid GQA head counts".to_string());
+        }
+        if req.sliding_window.is_some_and(|window| window == 0) {
+            return Err("Metal Gemma prefill range: sliding window must be > 0".to_string());
+        }
+        if !req.rope_theta.is_finite()
+            || req.rope_theta <= 0.0
+            || !req.scale.is_finite()
+            || !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+            || req
+                .softcap
+                .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+        {
+            return Err("Metal Gemma prefill range: invalid numeric parameter".to_string());
+        }
+
+        let expected_q_dim = Self::atn_core_checked_mul(req.num_heads, req.head_dim, "q_dim")?;
+        let expected_kv_dim = Self::atn_core_checked_mul(req.num_kv_heads, req.head_dim, "kv_dim")?;
+        Self::atn_core_require_eq("q_dim", req.q_dim, expected_q_dim)?;
+        Self::atn_core_require_eq("kv_dim", req.kv_dim, expected_kv_dim)?;
+        Self::atn_core_require_eq("attn_norm len", req.attn_norm_w.len(), req.hidden_dim)?;
+        Self::atn_core_require_eq("q_norm len", req.q_norm_w.len(), req.head_dim)?;
+        Self::atn_core_require_eq("k_norm len", req.k_norm_w.len(), req.head_dim)?;
+        for (role, norm) in [
+            ("post_attn_norm", req.post_attn_norm_w),
+            ("ffn_norm", req.ffn_norm_w),
+            ("post_ffn_norm", req.post_ffn_norm_w),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} len"), norm.len(), req.hidden_dim)?;
+        }
+        if let Some(factors) = req.rope_freq_factors {
+            Self::atn_core_require_eq("rope_freq_factors len", factors.len(), req.head_dim / 2)?;
+            if factors
+                .iter()
+                .any(|factor| !factor.is_finite() || *factor <= 0.0)
+            {
+                return Err("Metal Gemma prefill range: invalid RoPE frequency factor".to_string());
+            }
+        }
+        for (role, weight, rows, cols) in [
+            ("q", req.q_weight, req.q_dim, req.hidden_dim),
+            ("k", req.k_weight, req.kv_dim, req.hidden_dim),
+            ("v", req.v_weight, req.kv_dim, req.hidden_dim),
+            ("o", req.o_weight, req.hidden_dim, req.q_dim),
+            ("ffn gate", req.ffn_gate_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn up", req.ffn_up_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn down", req.ffn_down_weight, req.hidden_dim, req.ffn_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} weight rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} weight cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+        Ok(true)
+    }
+
+    /// Gemma dense prefill range with one hidden upload/readback and no intermediate
+    /// host materialization. K/V remains host-visible after each layer.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_gemma_layer_range_if_supported(
+        &self,
+        hidden: &[f32],
+        layers: &[GemmaPrefillLayerRangeBackendLayer<'_>],
+    ) -> Result<Option<GemmaPrefillLayerRangeBackendOut>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        let Some(first) = layers.first().copied() else {
+            return Ok(None);
+        };
+        for pair in layers.windows(2) {
+            if pair[1].layer_idx != pair[0].layer_idx + 1 {
+                return Err(format!(
+                    "Metal Gemma prefill range: non-contiguous layer indices {} -> {}",
+                    pair[0].layer_idx, pair[1].layer_idx
+                ));
+            }
+        }
+        let hidden_elements =
+            Self::atn_core_checked_mul(first.seq_len, first.hidden_dim, "hidden len")?;
+        Self::atn_core_require_eq("hidden len", hidden.len(), hidden_elements)?;
+        for layer in layers.iter().copied() {
+            Self::atn_core_require_eq("range seq_len", layer.seq_len, first.seq_len)?;
+            Self::atn_core_require_eq("range hidden_dim", layer.hidden_dim, first.hidden_dim)?;
+            if !Self::gemma_prefill_layer_range_layer_preflight(ctx, layer)? {
+                return Ok(None);
+            }
+        }
+
+        let state = prefill_gemma_attn_chain::GemmaPrefillLayerRangeState::new(
+            ctx,
+            prefill_gemma_attn_chain::GemmaPrefillLayerRangeDispatchRequest { hidden },
+        );
+        let mut attention_kv = Vec::with_capacity(layers.len());
+        for layer in layers.iter().copied() {
+            let (
+                q_w_buf,
+                q_w_off,
+                k_w_buf,
+                k_w_off,
+                v_w_buf,
+                v_w_off,
+                o_w_buf,
+                o_w_off,
+                ffn_gate_w_buf,
+                ffn_gate_w_off,
+                ffn_up_w_buf,
+                ffn_up_w_off,
+                ffn_down_w_buf,
+                ffn_down_w_off,
+            ) = {
+                let mut resident = self.resident.borrow_mut();
+                let mut wrap = |raw: &[u8]| {
+                    let entry = resident
+                        .entry(resident_key(raw))
+                        .or_insert_with(|| resident_cache_entry(ctx, raw));
+                    (entry.0.clone(), entry.1)
+                };
+                let (q_w_buf, q_w_off) = wrap(layer.q_weight.raw);
+                let (k_w_buf, k_w_off) = wrap(layer.k_weight.raw);
+                let (v_w_buf, v_w_off) = wrap(layer.v_weight.raw);
+                let (o_w_buf, o_w_off) = wrap(layer.o_weight.raw);
+                let (ffn_gate_w_buf, ffn_gate_w_off) = wrap(layer.ffn_gate_weight.raw);
+                let (ffn_up_w_buf, ffn_up_w_off) = wrap(layer.ffn_up_weight.raw);
+                let (ffn_down_w_buf, ffn_down_w_off) = wrap(layer.ffn_down_weight.raw);
+                (
+                    q_w_buf,
+                    q_w_off,
+                    k_w_buf,
+                    k_w_off,
+                    v_w_buf,
+                    v_w_off,
+                    o_w_buf,
+                    o_w_off,
+                    ffn_gate_w_buf,
+                    ffn_gate_w_off,
+                    ffn_up_w_buf,
+                    ffn_up_w_off,
+                    ffn_down_w_buf,
+                    ffn_down_w_off,
+                )
+            };
+            let attention_key = GemmaPrefillQkvOTailCarrierKey {
+                seq_len: layer.seq_len,
+                num_heads: layer.num_heads,
+                num_kv_heads: layer.num_kv_heads,
+                head_dim: layer.head_dim,
+                hidden_dim: layer.hidden_dim,
+                q_dim: layer.q_dim,
+                rope_theta_bits: layer.rope_theta.to_bits(),
+                scale_bits: layer.scale.to_bits(),
+                norm_eps_bits: layer.norm_eps.to_bits(),
+                sliding_window: layer.sliding_window,
+                softcap_bits: layer.softcap.map(f32::to_bits),
+                q_quant: layer.q_weight.quant,
+                k_quant: layer.k_weight.quant,
+                v_quant: layer.v_weight.quant,
+                o_quant: layer.o_weight.quant,
+            };
+            let key = GemmaPrefillFullLayerCarrierKey {
+                attention: attention_key,
+                ffn_dim: layer.ffn_dim,
+                ffn_gate_quant: layer.ffn_gate_weight.quant,
+                ffn_up_quant: layer.ffn_up_weight.quant,
+                ffn_down_quant: layer.ffn_down_weight.quant,
+            };
+            let mut carriers = self.gemma_prefill_full_layer_carriers.borrow_mut();
+            let carrier = carriers.entry(key).or_insert_with(|| {
+                prefill_gemma_attn_chain::GemmaPrefillFullLayerCarrier::new(
+                    ctx,
+                    layer.seq_len,
+                    layer.num_heads,
+                    layer.num_kv_heads,
+                    layer.head_dim,
+                    layer.hidden_dim,
+                    layer.q_dim,
+                    layer.ffn_dim,
+                    layer.rope_theta,
+                    layer.scale,
+                    layer.norm_eps,
+                )
+            });
+            let (k_bits, v_bits) = prefill_gemma_attn_chain::prefill_gemma_layer_range_dispatch(
+                ctx,
+                &state,
+                carrier,
+                prefill_gemma_attn_chain::GemmaPrefillLayerRangeLayerDispatchRequest {
+                    attn_norm_w: layer.attn_norm_w,
+                    attention: prefill_gemma_attn_chain::GemmaPrefillQkvODispatchSpec {
+                        q_norm_w: layer.q_norm_w,
+                        k_norm_w: layer.k_norm_w,
+                        q_w_buf: &q_w_buf,
+                        q_w_off,
+                        rope_freq_factors: layer.rope_freq_factors,
+                        v_from_k: layer.v_from_k,
+                        q_quant: layer.q_weight.quant,
+                        k_w_buf: &k_w_buf,
+                        k_w_off,
+                        k_quant: layer.k_weight.quant,
+                        v_w_buf: &v_w_buf,
+                        v_w_off,
+                        v_quant: layer.v_weight.quant,
+                        o_w_buf: &o_w_buf,
+                        o_w_off,
+                        o_quant: layer.o_weight.quant,
+                        sliding_window: layer.sliding_window,
+                        softcap: layer.softcap,
+                    },
+                    post_attn_norm_w: layer.post_attn_norm_w,
+                    ffn_norm_w: layer.ffn_norm_w,
+                    post_ffn_norm_w: layer.post_ffn_norm_w,
+                    out_scale: layer.out_scale,
+                    ffn: prefill_gemma_attn_chain::GemmaPrefillFfnDispatchSpec {
+                        ffn_gate_w_buf: &ffn_gate_w_buf,
+                        ffn_gate_w_off,
+                        ffn_gate_quant: layer.ffn_gate_weight.quant,
+                        ffn_up_w_buf: &ffn_up_w_buf,
+                        ffn_up_w_off,
+                        ffn_up_quant: layer.ffn_up_weight.quant,
+                        ffn_down_w_buf: &ffn_down_w_buf,
+                        ffn_down_w_off,
+                        ffn_down_quant: layer.ffn_down_weight.quant,
+                    },
+                },
+            )?;
+            attention_kv.push((layer.layer_idx, k_bits, v_bits));
+        }
+        Ok(Some(GemmaPrefillLayerRangeBackendOut {
+            hidden: state.finish(),
+            attention_kv,
+            hidden_uploads: 1,
+            hidden_readbacks: 1,
+            intermediate_hidden_transfers: 0,
+        }))
     }
 
     /// pm50 M1: dense gated ATN core carrier. Env policy is owned by runtime; backend only
@@ -15661,6 +15973,108 @@ kernel void coop_right_direct_fill_probe(
             .zip(&expected_full)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
+        let attn_norm = det_vals(hidden, 0.0065)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let first_normed = rms_rows(&hidden_input, &attn_norm);
+        let sequential_layer = |layer_hidden: &[f32], normed: &[f32]| {
+            backend
+                .prefill_gemma_full_layer_if_supported(GemmaPrefillFullLayerBackendRequest {
+                    attention: GemmaPrefillQkvOTailBackendRequest {
+                        normed,
+                        ..attention_req
+                    },
+                    hidden: layer_hidden,
+                    post_attn_norm_w: &post_attn_norm,
+                    ffn_norm_w: &ffn_norm,
+                    post_ffn_norm_w: &post_ffn_norm,
+                    ffn_gate_weight: view(ffn_gate_raw, ffn_dim, hidden),
+                    ffn_up_weight: view(ffn_up_raw, ffn_dim, hidden),
+                    ffn_down_weight: view(ffn_down_raw, hidden, ffn_dim),
+                    ffn_dim,
+                })
+                .expect("Gemma sequential full-layer dispatch")
+                .expect("Gemma sequential full-layer support")
+        };
+        let (mut sequential_first, sequential_k0, sequential_v0) =
+            sequential_layer(&hidden_input, &first_normed);
+        sequential_first.iter_mut().for_each(|value| *value *= 0.75);
+        let second_normed = rms_rows(&sequential_first, &attn_norm);
+        let (mut sequential_second, sequential_k1, sequential_v1) =
+            sequential_layer(&sequential_first, &second_normed);
+        sequential_second
+            .iter_mut()
+            .for_each(|value| *value *= 0.75);
+        let range_layer0 = GemmaPrefillLayerRangeBackendLayer {
+            layer_idx: 0,
+            attn_norm_w: &attn_norm,
+            q_norm_w: &q_norm,
+            k_norm_w: &k_norm,
+            rope_freq_factors: rope_freq_factors.as_deref(),
+            v_from_k,
+            q_weight: view(q_raw, q_dim, hidden),
+            k_weight: view(k_raw, kv_dim, hidden),
+            v_weight: view(if v_from_k { k_raw } else { v_raw }, kv_dim, hidden),
+            o_weight: view(o_raw, hidden, q_dim),
+            post_attn_norm_w: &post_attn_norm,
+            ffn_norm_w: &ffn_norm,
+            post_ffn_norm_w: &post_ffn_norm,
+            out_scale: Some(0.75),
+            ffn_gate_weight: view(ffn_gate_raw, ffn_dim, hidden),
+            ffn_up_weight: view(ffn_up_raw, ffn_dim, hidden),
+            ffn_down_weight: view(ffn_down_raw, hidden, ffn_dim),
+            seq_len: seq,
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_dim: hidden,
+            q_dim,
+            kv_dim,
+            ffn_dim,
+            rope_theta: theta,
+            scale,
+            norm_eps: eps,
+            sliding_window,
+            softcap,
+        };
+        let range_layer1 = GemmaPrefillLayerRangeBackendLayer {
+            layer_idx: 1,
+            ..range_layer0
+        };
+        let range_out = backend
+            .prefill_gemma_layer_range_if_supported(&hidden_input, &[range_layer0, range_layer1])
+            .expect("Gemma layer-range dispatch")
+            .expect("Gemma layer-range support");
+        assert_eq!(range_out.hidden_uploads, 1);
+        assert_eq!(range_out.hidden_readbacks, 1);
+        assert_eq!(range_out.intermediate_hidden_transfers, 0);
+        assert_eq!(range_out.attention_kv.len(), 2);
+        let range_hidden_max_abs = range_out
+            .hidden
+            .iter()
+            .zip(&sequential_second)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        let range_k0_max_abs = max_f16_abs(&range_out.attention_kv[0].1, &sequential_k0);
+        let range_v0_max_abs = max_f16_abs(&range_out.attention_kv[0].2, &sequential_v0);
+        let range_k1_max_abs = max_f16_abs(&range_out.attention_kv[1].1, &sequential_k1);
+        let range_v1_max_abs = max_f16_abs(&range_out.attention_kv[1].2, &sequential_v1);
+        eprintln!(
+            "[pm191] Gemma HD{hd} two-layer range oracle hidden_max_abs={range_hidden_max_abs:.3e} k0={range_k0_max_abs:.3e} v0={range_v0_max_abs:.3e} k1={range_k1_max_abs:.3e} v1={range_v1_max_abs:.3e}"
+        );
+        assert!(
+            range_hidden_max_abs < 1.0,
+            "HD{hd} range hidden max_abs={range_hidden_max_abs}"
+        );
+        for (role, max_abs) in [
+            ("K0", range_k0_max_abs),
+            ("V0", range_v0_max_abs),
+            ("K1", range_k1_max_abs),
+            ("V1", range_v1_max_abs),
+        ] {
+            assert!(max_abs < 0.1, "HD{hd} range {role} max_abs={max_abs}");
+        }
         eprintln!(
             "[pm189] Gemma HD{hd} QKV/O carrier oracle k_max_abs={k_max_abs:.3e} v_max_abs={v_max_abs:.3e} o_max_abs={o_max_abs:.3e}"
         );
