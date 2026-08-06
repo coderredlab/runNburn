@@ -1587,9 +1587,37 @@ fn try_run_metal_gemma_prefill_layer_range(
         };
         layers.push(layer);
     }
+    let range_trace = metal_gemma_prefill_layer_range_trace_enabled();
+    let backend_start = range_trace.then(std::time::Instant::now);
+    let mut streamed_layers = 0usize;
+    let mut cache_callback_ms = 0.0f64;
     let Some(output) = backend_runtime::metal_gemma_prefill_layer_range_if_supported(
         kernels::tensor_as_f32_slice(hidden),
         &layers,
+        |layer_idx, k_bits, v_bits| {
+            let spec = layers.get(streamed_layers).ok_or_else(|| {
+                "Metal Gemma prefill range streamed too many KV layers".to_string()
+            })?;
+            let expected_kv_len = seq_len
+                .checked_mul(spec.kv_dim)
+                .ok_or_else(|| "Metal Gemma prefill range KV length overflow".to_string())?;
+            if layer_idx != spec.layer_idx
+                || k_bits.len() != expected_kv_len
+                || v_bits.len() != expected_kv_len
+            {
+                return Err(format!(
+                    "Metal Gemma prefill range layer {} KV shape mismatch",
+                    spec.layer_idx
+                ));
+            }
+            let cache_start = range_trace.then(std::time::Instant::now);
+            kv_cache
+                .replace_layer_f16_range_compacted(layer_idx, pos_start, seq_len, k_bits, v_bits)?;
+            cache_callback_ms +=
+                cache_start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
+            streamed_layers += 1;
+            Ok(())
+        },
     )?
     else {
         return metal_gemma_prefill_layer_range_fallback(
@@ -1599,45 +1627,38 @@ fn try_run_metal_gemma_prefill_layer_range(
             None,
         );
     };
+    let backend_ms = backend_start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
     if output.hidden_uploads != 1
         || output.hidden_readbacks != 1
         || output.intermediate_hidden_transfers != 0
+        || output.kv_layers_streamed != layers.len()
+        || output.kv_layers_streamed != streamed_layers
+        || output.accumulated_kv_bytes != 0
+        || !(1..=2).contains(&output.max_in_flight_layers)
     {
         return Err(crate::error::LlmError::Forward(format!(
-            "Metal Gemma prefill range ownership mismatch: uploads={} readbacks={} intermediate={}",
-            output.hidden_uploads, output.hidden_readbacks, output.intermediate_hidden_transfers
+            "Metal Gemma prefill range ownership mismatch: uploads={} readbacks={} intermediate={} streamed={}/{} accumulated_kv_bytes={} max_in_flight={}",
+            output.hidden_uploads,
+            output.hidden_readbacks,
+            output.intermediate_hidden_transfers,
+            output.kv_layers_streamed,
+            streamed_layers,
+            output.accumulated_kv_bytes,
+            output.max_in_flight_layers,
         )));
     }
-    if output.hidden.len() != expected_hidden_len || output.attention_kv.len() != layers.len() {
+    if output.hidden.len() != expected_hidden_len {
         return Err(crate::error::LlmError::Forward(
             "Metal Gemma prefill range output shape mismatch".to_string(),
         ));
     }
-    for ((layer_idx, k_bits, v_bits), spec) in output.attention_kv.iter().zip(&layers) {
-        let expected_kv_len = seq_len.checked_mul(spec.kv_dim).ok_or_else(|| {
-            crate::error::LlmError::Forward(
-                "Metal Gemma prefill range KV length overflow".to_string(),
-            )
-        })?;
-        if *layer_idx != spec.layer_idx
-            || k_bits.len() != expected_kv_len
-            || v_bits.len() != expected_kv_len
-        {
-            return Err(crate::error::LlmError::Forward(format!(
-                "Metal Gemma prefill range layer {} KV shape mismatch",
-                spec.layer_idx
-            )));
-        }
-    }
-    for (layer_idx, k_bits, v_bits) in output.attention_kv {
-        kv_cache
-            .replace_layer_f16_range_compacted(layer_idx, pos_start, seq_len, &k_bits, &v_bits)
-            .map_err(crate::error::LlmError::Forward)?;
-    }
-    if metal_gemma_prefill_layer_range_trace_enabled() {
+    if range_trace {
         eprintln!(
-            "[metal:gemma-prefill-range] eligible_hit=1 seq_len={seq_len} layers={}..{} hidden_uploads=1 hidden_readbacks=1 intermediate_hidden_transfers=0",
-            layer_range.start, layer_range.end
+            "[metal:gemma-prefill-range] eligible_hit=1 seq_len={seq_len} layers={}..{} hidden_uploads=1 hidden_readbacks=1 intermediate_hidden_transfers=0 kv_layers_streamed={} accumulated_kv_bytes=0 max_in_flight_layers={} backend_ms={backend_ms:.3} cache_callback_ms={cache_callback_ms:.3}",
+            layer_range.start,
+            layer_range.end,
+            output.kv_layers_streamed,
+            output.max_in_flight_layers,
         );
     }
     Ok(Some(Tensor::from_vec(

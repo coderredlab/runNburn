@@ -232,6 +232,7 @@ pub(in crate::engine) fn metal_gemma_prefill_full_layer_if_supported(
 pub(in crate::engine) fn metal_gemma_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[GemmaPrefillLayerRangeSpec<'_>],
+    mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
 ) -> crate::error::Result<Option<metal_runtime::MetalGemmaPrefillLayerRangeOut>> {
     fn runtime_view(weight: &QuantizedWeight) -> Option<metal_runtime::MetalQuantWeightRef<'_>> {
         let view = weight.backend_view()?;
@@ -298,8 +299,12 @@ pub(in crate::engine) fn metal_gemma_prefill_layer_range_if_supported(
             softcap: layer.softcap,
         });
     }
-    metal_runtime::metal_gemma_prefill_layer_range_if_supported(hidden, &runtime_layers)
-        .map_err(crate::error::LlmError::Forward)
+    metal_runtime::metal_gemma_prefill_layer_range_if_supported(
+        hidden,
+        &runtime_layers,
+        |layer_idx, k_bits, v_bits| on_kv(layer_idx, k_bits, v_bits),
+    )
+    .map_err(crate::error::LlmError::Forward)
 }
 
 /// pm48 ②: Metal prefill attention 2차 device-resident chain seam(rope/qk_norm→cast→flash 단일

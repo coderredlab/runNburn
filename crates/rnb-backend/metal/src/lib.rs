@@ -1459,10 +1459,12 @@ pub struct GemmaPrefillLayerRangeBackendLayer<'a> {
 #[cfg(target_os = "macos")]
 pub struct GemmaPrefillLayerRangeBackendOut {
     pub hidden: Vec<f32>,
-    pub attention_kv: Vec<(usize, Vec<u16>, Vec<u16>)>,
     pub hidden_uploads: usize,
     pub hidden_readbacks: usize,
     pub intermediate_hidden_transfers: usize,
+    pub kv_layers_streamed: usize,
+    pub accumulated_kv_bytes: usize,
+    pub max_in_flight_layers: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -4367,11 +4369,16 @@ impl MetalBackend {
     /// Gemma dense prefill range with one hidden upload/readback and no intermediate
     /// host materialization. K/V remains host-visible after each layer.
     #[cfg(target_os = "macos")]
-    pub fn prefill_gemma_layer_range_if_supported(
+    pub fn prefill_gemma_layer_range_if_supported<F>(
         &self,
         hidden: &[f32],
         layers: &[GemmaPrefillLayerRangeBackendLayer<'_>],
-    ) -> Result<Option<GemmaPrefillLayerRangeBackendOut>, String> {
+        pipeline: bool,
+        mut on_kv: F,
+    ) -> Result<Option<GemmaPrefillLayerRangeBackendOut>, String>
+    where
+        F: FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
+    {
         let Some(ctx) = self.ctx.as_ref() else {
             return Ok(None);
         };
@@ -4401,8 +4408,9 @@ impl MetalBackend {
             ctx,
             prefill_gemma_attn_chain::GemmaPrefillLayerRangeDispatchRequest { hidden },
         );
-        let mut attention_kv = Vec::with_capacity(layers.len());
-        for layer in layers.iter().copied() {
+        let mut pending: Option<prefill_gemma_attn_chain::GemmaPrefillLayerRangePending> = None;
+        let mut kv_layers_streamed = 0usize;
+        for (layer_offset, layer) in layers.iter().copied().enumerate() {
             let (
                 q_w_buf,
                 q_w_off,
@@ -4490,11 +4498,14 @@ impl MetalBackend {
                     layer.norm_eps,
                 )
             });
-            let (k_bits, v_bits) = prefill_gemma_attn_chain::prefill_gemma_layer_range_dispatch(
+            let slot = if pipeline { layer_offset & 1 } else { 0 };
+            let next_pending = prefill_gemma_attn_chain::prefill_gemma_layer_range_submit(
                 ctx,
                 &state,
                 carrier,
+                slot,
                 prefill_gemma_attn_chain::GemmaPrefillLayerRangeLayerDispatchRequest {
+                    layer_idx: layer.layer_idx,
                     attn_norm_w: layer.attn_norm_w,
                     attention: prefill_gemma_attn_chain::GemmaPrefillQkvODispatchSpec {
                         q_norm_w: layer.q_norm_w,
@@ -4533,14 +4544,34 @@ impl MetalBackend {
                     },
                 },
             )?;
-            attention_kv.push((layer.layer_idx, k_bits, v_bits));
+            drop(carriers);
+            if pipeline {
+                if let Some(previous) = pending.replace(next_pending) {
+                    prefill_gemma_attn_chain::prefill_gemma_layer_range_complete(
+                        previous, &mut on_kv,
+                    )?;
+                    kv_layers_streamed += 1;
+                }
+            } else {
+                prefill_gemma_attn_chain::prefill_gemma_layer_range_complete(
+                    next_pending,
+                    &mut on_kv,
+                )?;
+                kv_layers_streamed += 1;
+            }
+        }
+        if let Some(previous) = pending {
+            prefill_gemma_attn_chain::prefill_gemma_layer_range_complete(previous, &mut on_kv)?;
+            kv_layers_streamed += 1;
         }
         Ok(Some(GemmaPrefillLayerRangeBackendOut {
             hidden: state.finish(),
-            attention_kv,
             hidden_uploads: 1,
             hidden_readbacks: 1,
             intermediate_hidden_transfers: 0,
+            kv_layers_streamed,
+            accumulated_kv_bytes: 0,
+            max_in_flight_layers: usize::from(pipeline && layers.len() > 1) + 1,
         }))
     }
 
@@ -16042,26 +16073,47 @@ kernel void coop_right_direct_fill_probe(
             layer_idx: 1,
             ..range_layer0
         };
-        let range_out = backend
-            .prefill_gemma_layer_range_if_supported(&hidden_input, &[range_layer0, range_layer1])
-            .expect("Gemma layer-range dispatch")
-            .expect("Gemma layer-range support");
+        let range_layers = [range_layer0, range_layer1];
+        let run_range = |pipeline| {
+            let mut attention_kv = Vec::new();
+            let output = backend
+                .prefill_gemma_layer_range_if_supported(
+                    &hidden_input,
+                    &range_layers,
+                    pipeline,
+                    |layer_idx, k_bits, v_bits| {
+                        attention_kv.push((layer_idx, k_bits.to_vec(), v_bits.to_vec()));
+                        Ok(())
+                    },
+                )
+                .expect("Gemma layer-range dispatch")
+                .expect("Gemma layer-range support");
+            (output, attention_kv)
+        };
+        let (serial_out, serial_kv) = run_range(false);
+        let (range_out, range_kv) = run_range(true);
+        assert_eq!(serial_out.hidden, range_out.hidden);
+        assert_eq!(serial_kv, range_kv);
+        assert_eq!(serial_out.max_in_flight_layers, 1);
         assert_eq!(range_out.hidden_uploads, 1);
         assert_eq!(range_out.hidden_readbacks, 1);
         assert_eq!(range_out.intermediate_hidden_transfers, 0);
-        assert_eq!(range_out.attention_kv.len(), 2);
+        assert_eq!(range_out.kv_layers_streamed, 2);
+        assert_eq!(range_out.accumulated_kv_bytes, 0);
+        assert_eq!(range_out.max_in_flight_layers, 2);
+        assert_eq!(range_kv.len(), 2);
         let range_hidden_max_abs = range_out
             .hidden
             .iter()
             .zip(&sequential_second)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
-        let range_k0_max_abs = max_f16_abs(&range_out.attention_kv[0].1, &sequential_k0);
-        let range_v0_max_abs = max_f16_abs(&range_out.attention_kv[0].2, &sequential_v0);
-        let range_k1_max_abs = max_f16_abs(&range_out.attention_kv[1].1, &sequential_k1);
-        let range_v1_max_abs = max_f16_abs(&range_out.attention_kv[1].2, &sequential_v1);
+        let range_k0_max_abs = max_f16_abs(&range_kv[0].1, &sequential_k0);
+        let range_v0_max_abs = max_f16_abs(&range_kv[0].2, &sequential_v0);
+        let range_k1_max_abs = max_f16_abs(&range_kv[1].1, &sequential_k1);
+        let range_v1_max_abs = max_f16_abs(&range_kv[1].2, &sequential_v1);
         eprintln!(
-            "[pm191] Gemma HD{hd} two-layer range oracle hidden_max_abs={range_hidden_max_abs:.3e} k0={range_k0_max_abs:.3e} v0={range_v0_max_abs:.3e} k1={range_k1_max_abs:.3e} v1={range_v1_max_abs:.3e}"
+            "[pm192] Gemma HD{hd} serial/pipelined two-layer range oracle hidden_max_abs={range_hidden_max_abs:.3e} k0={range_k0_max_abs:.3e} v0={range_v0_max_abs:.3e} k1={range_k1_max_abs:.3e} v1={range_v1_max_abs:.3e}"
         );
         assert!(
             range_hidden_max_abs < 1.0,

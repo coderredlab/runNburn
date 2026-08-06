@@ -176,10 +176,12 @@ pub struct MetalGemmaPrefillLayerRangeLayer<'a> {
 
 pub struct MetalGemmaPrefillLayerRangeOut {
     pub hidden: Vec<f32>,
-    pub attention_kv: Vec<(usize, Vec<u16>, Vec<u16>)>,
     pub hidden_uploads: usize,
     pub hidden_readbacks: usize,
     pub intermediate_hidden_transfers: usize,
+    pub kv_layers_streamed: usize,
+    pub accumulated_kv_bytes: usize,
+    pub max_in_flight_layers: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5519,6 +5521,7 @@ pub fn metal_gemma_prefill_full_layer_if_supported(
 pub fn metal_gemma_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[MetalGemmaPrefillLayerRangeLayer<'_>],
+    mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<()>,
 ) -> Result<Option<MetalGemmaPrefillLayerRangeOut>> {
     if env_falsey("RNB_METAL_GEMMA_PREFILL_LAYER_RANGE_CHAIN")
         || env_falsey("RNB_METAL_GEMMA_PREFILL_FULL_LAYER_CHAIN")
@@ -5600,14 +5603,21 @@ pub fn metal_gemma_prefill_layer_range_if_supported(
     }
     METAL.with(|backend| {
         backend
-            .prefill_gemma_layer_range_if_supported(hidden, &backend_layers)
+            .prefill_gemma_layer_range_if_supported(
+                hidden,
+                &backend_layers,
+                true,
+                |layer_idx, k_bits, v_bits| on_kv(layer_idx, k_bits, v_bits),
+            )
             .map(|result| {
                 result.map(|output| MetalGemmaPrefillLayerRangeOut {
                     hidden: output.hidden,
-                    attention_kv: output.attention_kv,
                     hidden_uploads: output.hidden_uploads,
                     hidden_readbacks: output.hidden_readbacks,
                     intermediate_hidden_transfers: output.intermediate_hidden_transfers,
+                    kv_layers_streamed: output.kv_layers_streamed,
+                    accumulated_kv_bytes: output.accumulated_kv_bytes,
+                    max_in_flight_layers: output.max_in_flight_layers,
                 })
             })
     })
