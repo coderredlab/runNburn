@@ -169,6 +169,14 @@ pub fn q4k_gate_up_q8dot_split_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", true)
 }
 
+/// Q6_K blocks are 210 bytes, so ql/qh pointers are always 2-byte aligned but
+/// alternate between 4-byte aligned and +2. cu207 replaced four byte loads with
+/// two halfword loads and cut the 32-token Q6 q8dot kernel sum by 34.97%.
+/// `RNB_CUDA_Q6K_Q8DOT_HALF2=0` restores the byte-load diagnostic path.
+pub fn q6k_q8dot_half2_enabled() -> bool {
+    env_bool("RNB_CUDA_Q6K_Q8DOT_HALF2", true)
+}
+
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
     expanded_env_bool("RNB_CUDA_Q4K_PREFILL_F32_GEMM", false)
 }
@@ -1150,6 +1158,7 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_BATCH_RAW_SEQ4");
             std::env::remove_var("RNB_CUDA_Q6_PACKED_BATCH_WARP4");
             std::env::remove_var("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT");
+            std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_HALF2");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1170,6 +1179,7 @@ mod tests {
         assert!(!q6k_packed_batch_warp4_enabled(7));
         assert!(q6k_gemv_batch_warp8_enabled());
         assert!(q4k_gate_up_q8dot_split_enabled());
+        assert!(q6k_q8dot_half2_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

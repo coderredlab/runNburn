@@ -11340,8 +11340,18 @@ fn cuda_q6k_gemv_q8dot_matches_quantized_reference() {
     let (qs, ds) = test_support::quantize_q8_1_by_32_for_test(&input, blocks_per_row);
     let quantized_input = dequantize_q8_1_by_32(&qs, &ds);
     let expected = cpu_q6k_gemv_rows(&weights, rows, blocks_per_row, &quantized_input);
-    let actual = q6k_gemv_for_test(&weights, rows, cols, &input).expect("CUDA Q6_K q8dot GEMV");
+    let half2_off = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_HALF2", "0");
+    let byte_loads =
+        q6k_gemv_for_test(&weights, rows, cols, &input).expect("CUDA Q6_K byte-load q8dot GEMV");
+    drop(half2_off);
+    let _half2_on = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_HALF2", "1");
+    let actual =
+        q6k_gemv_for_test(&weights, rows, cols, &input).expect("CUDA Q6_K half2-load q8dot GEMV");
 
+    assert_eq!(
+        actual, byte_loads,
+        "Q6_K half2 and byte-load q8dot paths must be bitwise-identical"
+    );
     assert_close_rows_abs_rel("Q6_K q8dot GEMV", &actual, &expected, 1e-3, 1e-5);
 }
 

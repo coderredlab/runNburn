@@ -7,6 +7,11 @@ __device__ __forceinline__ int rnb_load_i32_unaligned(const void* ptr) {
     return (int)((unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24));
 }
 
+__device__ __forceinline__ int rnb_load_i32_aligned2(const void* ptr) {
+    const unsigned short* p = reinterpret_cast<const unsigned short*>(ptr);
+    return (int)((unsigned)p[0] | ((unsigned)p[1] << 16));
+}
+
 __device__ __forceinline__ int rnb_q4_pack4(const unsigned char* ptr, unsigned j) {
     const unsigned raw = *reinterpret_cast<const unsigned*>(ptr);
     const unsigned unpacked = ((j & 1u) == 0u ? raw : (raw >> 4)) & 0x0f0f0f0fu;

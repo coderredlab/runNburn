@@ -4756,8 +4756,13 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
+        let kernel = if tuning::q6k_q8dot_half2_enabled() {
+            "rnb_q6k_gemv_q8dot_half2_warp8"
+        } else {
+            "rnb_q6k_gemv_q8dot_warp8"
+        };
         self.launch_cached_gemv(
-            "rnb_q6k_gemv_q8dot_warp8",
+            kernel,
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),

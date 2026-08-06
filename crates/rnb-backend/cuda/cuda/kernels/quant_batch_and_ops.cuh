@@ -838,12 +838,15 @@ static __device__ __forceinline__ float2 rnb_q6k_block_dot_f32x2_lane(
 //
 // Mirrors rnb_q4k_gemv_q8dot_warp8: no __syncthreads, no shared staging, and
 // __dp4a over 4-element groups. Each lane owns two groups (lane, lane + 32),
-// covering the 256 elements of a super-block. Q6_K super-blocks are 210 bytes
-// so the weight pointer is not 4-byte aligned; the unaligned loader is used.
+// covering the 256 elements of a super-block. Q6_K super-blocks are 210 bytes:
+// every field used here is at least 2-byte aligned, but alternating blocks are
+// not 4-byte aligned. The halfword variant reconstructs each int from two
+// naturally aligned 16-bit loads; the byte-load variant remains for A/B.
 //
 // A group's 4 consecutive element indices share one 16-element Q6_K scale and
 // one 32-element activation scale because the base index is a multiple of 4.
-extern "C" __global__ void rnb_q6k_gemv_q8dot_warp8(
+template <bool HALFWORD_LOADS>
+static __device__ __forceinline__ void rnb_q6k_gemv_q8dot_warp8_impl(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
     const signed char* __restrict__ input_qs,
@@ -878,17 +881,24 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_warp8(
                 const unsigned qh_shift = quarter * 2u;
                 const unsigned sc_index = 192u + n * 8u + (l >> 4) + quarter * 2u;
 
-                const unsigned ql_raw =
-                    (unsigned)rnb_load_i32_unaligned(block + ql_off);
-                const unsigned qh_raw =
-                    (unsigned)rnb_load_i32_unaligned(block + 128u + n * 32u + l);
+                unsigned ql_raw;
+                unsigned qh_raw;
+                int x_pack;
+                if constexpr (HALFWORD_LOADS) {
+                    ql_raw = (unsigned)rnb_load_i32_aligned2(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_aligned2(block + 128u + n * 32u + l);
+                    x_pack = rnb_load_i32_aligned4(x_base + tid);
+                } else {
+                    ql_raw = (unsigned)rnb_load_i32_unaligned(block + ql_off);
+                    qh_raw = (unsigned)rnb_load_i32_unaligned(block + 128u + n * 32u + l);
+                    x_pack = rnb_load_i32_unaligned(x_base + tid);
+                }
                 const unsigned low = (quarter < 2u)
                     ? (ql_raw & 0x0f0f0f0fu)
                     : ((ql_raw >> 4) & 0x0f0f0f0fu);
                 const unsigned high = ((qh_raw >> qh_shift) & 0x03030303u) << 4;
                 const int q_pack = (int)(low | high);
 
-                const int x_pack = rnb_load_i32_unaligned(x_base + tid);
                 const int dot = __dp4a(q_pack, x_pack, 0);
                 const int x_sum = __dp4a(0x01010101, x_pack, 0);
                 const int sc = (int)((signed char)block[sc_index]);
@@ -905,6 +915,28 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_warp8(
     if (valid && lane == 0u) {
         out[row] = acc;
     }
+}
+
+extern "C" __global__ void rnb_q6k_gemv_q8dot_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    rnb_q6k_gemv_q8dot_warp8_impl<false>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row);
+}
+
+extern "C" __global__ void rnb_q6k_gemv_q8dot_half2_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    rnb_q6k_gemv_q8dot_warp8_impl<true>(
+        out, weights, input_qs, input_ds, rows, blocks_per_row);
 }
 
 // Q5_K GEMV with Q8_1-quantized activations, one warp per output row.
