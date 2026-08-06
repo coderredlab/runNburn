@@ -346,6 +346,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
     hidden: &[f32],
     norm_eps: f32,
     unit_offset_norm: bool,
+    gelu: bool,
 ) -> Result<Vec<f32>, String> {
     if hidden.len() != n_embd {
         return Err(format!(
@@ -426,6 +427,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
             hidden,
             norm_eps,
             unit_offset_norm,
+            gelu,
         )
 }
 

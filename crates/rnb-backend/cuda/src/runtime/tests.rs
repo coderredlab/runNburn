@@ -12922,6 +12922,136 @@ fn cuda_dense_q4k_silu_ffn_batch_q8dot_matches_separate_batch_path() {
     assert_close_rows("dense Q4_K SiLU FFN batch q8dot", &actual, &expected, 0.2);
 }
 
+// cu203: Qwen3.6 dense decode FFN device chain — silu 모드가 gelu 산술을 타지 않고,
+// silu 에서도 q8dot down 경로가 실제 실행됨을 방어한다. expected 는 staged 부품
+// (CPU rms_norm → CUDA q8dot gate/up → CPU silu+Q8 재양자화 → CUDA q8dot down →
+// residual)으로 계산하므로, silu 가 gelu 로 바뀌거나 down 이 Q8 재양자화 없이 raw 로
+// 실행되면 실패한다.
+#[test]
+fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
+    let _guard = runtime_test_lock();
+    let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "1");
+    let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "1");
+    let _q4_decode_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_GEMV_Q8DOT", "1");
+    let _q6_decode_q8dot = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_Q8DOT", "1");
+    let _q4_packed = EnvVarGuard::set("RNB_CUDA_DENSE_Q4_PACKED_Q8DOT", "0");
+    let _q6_packed = EnvVarGuard::set("RNB_CUDA_DENSE_Q6_PACKED_Q8DOT", "0");
+
+    let n_embd = 1024usize;
+    let n_ff = 1024usize;
+    let gate_blocks = n_embd / 256;
+    let down_blocks = n_ff / 256;
+    let norm_eps = 1e-6f32;
+    let gate = make_test_q4k_weights(1, n_ff, gate_blocks, 151)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, gate_blocks, 157)
+        .pop()
+        .unwrap();
+    let down = make_test_q6k_weights(1, n_embd, down_blocks, 163)
+        .pop()
+        .unwrap();
+    let hidden = (0..n_embd)
+        .map(|i| ((i as f32 % 59.0) - 29.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    // norm_weight 를 작게 잡아 gate 출력이 silu 유효 구간(O(1)~O(10))에 오도록 한다.
+    // rms_norm 은 스케일 불변이라 hidden 이 아니라 norm_weight 로 조절해야 한다.
+    // 값이 크면 silu/gelu 모두 포화(≈x 또는 ≈0)돼 mutation 검출력이 사라진다.
+    let norm_weight = (0..n_embd)
+        .map(|i| 0.02 + ((i as f32 % 13.0) * 0.0009765625))
+        .collect::<Vec<_>>();
+
+    // Staged reference. CPU rms_norm — device rsqrtf 근사와의 차이는 허용오차로 흡수.
+    let sum_sq: f32 = hidden.iter().map(|v| v * v).sum();
+    let inv_rms = 1.0 / (sum_sq / n_embd as f32 + norm_eps).sqrt();
+    let normed = hidden
+        .iter()
+        .zip(norm_weight.iter())
+        .map(|(x, w)| x * inv_rms * w)
+        .collect::<Vec<_>>();
+    let mut gate_out = vec![0.0f32; n_ff];
+    q4k_gemv_into(&gate, n_ff, n_embd, &normed, &mut gate_out).expect("CUDA Q4_K gate GEMV");
+    let mut up_out = vec![0.0f32; n_ff];
+    q4k_gemv_into(&up, n_ff, n_embd, &normed, &mut up_out).expect("CUDA Q4_K up GEMV");
+    for (gate_value, up_value) in gate_out.iter_mut().zip(up_out.iter()) {
+        let x = *gate_value;
+        *gate_value = (x / (1.0 + (-x).exp())) * *up_value;
+    }
+    // q8dot down 계약: activation 출력이 32-chunk Q8_1 로 재양자화된 뒤 down GEMV 에
+    // 들어간다. raw down 이 실행되면 이 손실이 없어 어긋난다.
+    for chunk in gate_out.chunks_mut(32) {
+        let max_abs = chunk.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+        if max_abs == 0.0 {
+            continue;
+        }
+        let d = max_abs / 127.0;
+        for value in chunk {
+            let q = (*value / d).round().clamp(-127.0, 127.0);
+            *value = q * d;
+        }
+    }
+    let mut down_out = vec![0.0f32; n_embd];
+    q6k_gemv_into(&down, n_embd, n_ff, &gate_out, &mut down_out).expect("CUDA Q6_K down GEMV");
+    let expected = hidden
+        .iter()
+        .zip(down_out.iter())
+        .map(|(h, d)| h + d)
+        .collect::<Vec<_>>();
+
+    let actual = dense_q4k_gelu_ffn_norm_residual(
+        &gate,
+        &up,
+        &down,
+        14,
+        &norm_weight,
+        None,
+        n_ff,
+        n_embd,
+        &hidden,
+        norm_eps,
+        false,
+        false,
+    )
+    .expect("CUDA dense Q4_K SiLU FFN norm residual");
+    // 값 스케일이 1e5 대라 절대 오차 대신 결합 오차 계약을 쓴다. device rms_norm 의
+    // rsqrtf 근사가 Q8 양자화 chunk 스케일(d)에 비선형 증폭돼 staged CPU reference 와
+    // ~5e-3 상대까지 벌어질 수 있다. silu→gelu 오배선은 mutation 실측에서 이보다
+    // 크게 어긋나 검출된다 (아래 경로 분리 assert 와 함께 계약을 방어).
+    assert_close_rows_abs_rel(
+        "dense Q4_K SiLU FFN norm residual q8dot",
+        &actual,
+        &expected,
+        1.0,
+        1e-2,
+    );
+
+    // 경로 분리 증명 — q8dot down off 는 같은 입력에서 다른 값을 내야 한다
+    // (동일하면 이 테스트는 q8dot 경로를 실행하지 않은 것).
+    let _down_q8dot_off = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let raw_down = dense_q4k_gelu_ffn_norm_residual(
+        &gate,
+        &up,
+        &down,
+        14,
+        &norm_weight,
+        None,
+        n_ff,
+        n_embd,
+        &hidden,
+        norm_eps,
+        false,
+        false,
+    )
+    .expect("CUDA dense Q4_K SiLU FFN norm residual raw down");
+    assert!(
+        actual
+            .iter()
+            .zip(raw_down.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-7),
+        "q8dot down and raw down outputs are identical — q8dot path not exercised"
+    );
+}
+
 #[test]
 fn cuda_dense_q4k_gelu_ffn_batch_raw_q4_down_matches_cpu_reference() {
     let _guard = runtime_test_lock();

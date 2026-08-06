@@ -50,6 +50,13 @@ pub fn cuda_decode_device_out_scale_enabled() -> bool {
     env_flag_default_on("RNB_CUDA_DECODE_DEVICE_OUT_SCALE")
 }
 
+// cu203: Qwen3.6 dense decode FFN device chain (norm→gate/up silu→down→residual
+// 1왕복). 기존 GEMV별 host↔device 왕복이 토큰당 수천 memcpy + GPU idle 44%의
+// 주범이라 device chain 으로 대체. env="0" 시 기존 개별 GEMV 경로로 복귀.
+pub fn qwen35_dense_ffn_chain_enabled() -> bool {
+    env_flag_default_on("RNB_CUDA_QWEN35_DENSE_FFN_CHAIN")
+}
+
 // cu52 step 51 + cu57: K/V projection 의 device output + f16 pack + attention
 // 의 last_token_{k,v}_dev 전달. cu57 default ON 승격. KV cache 의 host f16
 // 변환 + H2D round-trip 제거. CHAIN + OUT_SCALE 함께 활성 필요 (carrier-readiness).

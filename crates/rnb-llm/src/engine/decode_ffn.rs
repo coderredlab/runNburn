@@ -59,6 +59,36 @@ pub(super) fn decode_ffn(
             &scratch.hidden[..hidden_dim],
             norm_eps,
             unit_offset_norm,
+            true,
+        )? {
+            scratch.hidden[..hidden_dim].copy_from_slice(&output[..hidden_dim]);
+            prof!("ffn_resident_chain", t_chain);
+            return Ok(());
+        }
+    }
+
+    // cu203: Qwen3.6 dense(27B 등) decode FFN device chain — norm→gate/up(silu)→down→residual
+    // 를 device 1왕복으로 실행한다. 기존 경로는 GEMV마다 host↔device 왕복(층당 H2D/D2H
+    // 다발)이라 토큰당 수천 memcpy가 GPU idle 44%의 주범이었다. gate/up Q4_K + down
+    // Q4/Q5/Q6_K 만 진입하고, 그 밖은 기존 개별 GEMV 경로로 폴백한다.
+    #[cfg(feature = "cuda")]
+    if matches!(architecture, ModelArchitecture::Qwen35)
+        && post_ffw_norm_weight.is_none()
+        && ffn_gate_up_fused.is_none()
+        && super::policy::qwen35_dense_ffn_chain_enabled()
+    {
+        let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
+        let t_chain = std::time::Instant::now();
+        if let Some(output) = backend_runtime::dense_q4k_gelu_ffn_norm_residual_if_supported(
+            ffn_gate_weight,
+            ffn_up_weight,
+            ffn_down_weight,
+            norm_weight_data,
+            None,
+            &scratch.hidden[..hidden_dim],
+            norm_eps,
+            false,
+            false,
         )? {
             scratch.hidden[..hidden_dim].copy_from_slice(&output[..hidden_dim]);
             prof!("ffn_resident_chain", t_chain);

@@ -1155,6 +1155,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
     hidden: &[f32],
     norm_eps: f32,
     unit_offset_norm: bool,
+    gelu: bool,
 ) -> Result<Vec<f32>> {
     backend::dense_q4k_gelu_ffn_norm_residual(
         gate,
@@ -1168,6 +1169,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
         hidden,
         norm_eps,
         unit_offset_norm,
+        gelu,
     )
     .map_err(|err| format!("CUDA dense Q4_K GELU FFN norm residual failed: {err}"))
 }

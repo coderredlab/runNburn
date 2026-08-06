@@ -2144,6 +2144,7 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
     hidden: &[f32],
     norm_eps: f32,
     unit_offset_norm: bool,
+    ffn_uses_gelu: bool,
 ) -> crate::error::Result<Option<Vec<f32>>> {
     let (Some(gate), Some(up), Some(down)) = (
         gate_weight.backend_view(),
@@ -2153,6 +2154,12 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
         return Ok(None);
     };
     if gate.quant() != QuantFormat::Q4K || up.quant() != QuantFormat::Q4K {
+        return Ok(None);
+    }
+    if !matches!(
+        down.quant(),
+        QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K
+    ) {
         return Ok(None);
     }
     #[cfg(feature = "cuda")]
@@ -2169,6 +2176,7 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
             hidden,
             norm_eps,
             unit_offset_norm,
+            ffn_uses_gelu,
         )
         .map(Some)
         .map_err(cuda_error);

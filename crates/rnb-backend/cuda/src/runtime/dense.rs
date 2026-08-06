@@ -3650,8 +3650,13 @@ impl CudaState {
         let trace_call = dense_expert_trace_call();
         let trace_total = trace_call.map(|_| std::time::Instant::now());
         let mut trace_stage = std::time::Instant::now();
-        let q8dot_gate_up = dense_q8dot_gate_up_enabled(gelu);
-        let packed_q4_gate_up = if q8dot_gate_up && dense_q4_packed_q8dot_enabled(true) {
+        let q8dot_gate_up = dense_q8dot_gate_up_enabled(true);
+        // packed 사본 admission 은 gelu(Gemma) 경로에서만 시도한다. silu 대형 dense
+        // (Qwen 27B: 층당 gate/up/down ~50MB × 64층)는 원본 resident weight 와 packed
+        // 사본이 VRAM 을 초과해 admit-evict 스래싱을 일으킨다 (cu203 실측: decode
+        // 75→5600 ms/tok). silu 는 non-packed q8dot 커널로 원본 resident weight 를
+        // 그대로 읽는다 (추가 VRAM 0).
+        let packed_q4_gate_up = if gelu && q8dot_gate_up && dense_q4_packed_q8dot_enabled(true) {
             let gate = self.resident_q4k_packed_ptrs(gate_weights, n_ff, n_embd / 256)?;
             let up = self.resident_q4k_packed_ptrs(up_weights, n_ff, n_embd / 256)?;
             match (gate, up) {
@@ -3671,8 +3676,9 @@ impl CudaState {
         } else {
             None
         };
-        let q8dot_down =
-            dense_q8dot_down_enabled(gelu && (down_quant == 12 || packed_q6_down.is_some()));
+        // Q4_K(12)/Q6_K(14) down 은 packed 없이도 q8dot 커널이 있다 (cu199: q8dot 이
+        // raw warp8 대비 2~2.7x). Q5_K(13)은 이 dispatch 에 q8dot arm 이 없어 제외.
+        let q8dot_down = dense_q8dot_down_enabled(matches!(down_quant, 12 | 14));
         let gate_dev = self.compute_mid_a_ptr(n_ff * std::mem::size_of::<f32>())?;
         let up_dev = self.compute_mid_b_ptr(n_ff * std::mem::size_of::<f32>())?;
         let prequantized_q8 = if q8dot_gate_up { prequantized_q8 } else { None };
@@ -3911,7 +3917,7 @@ impl CudaState {
             if gelu {
                 self.launch_gelu_mul_q8_1(gate_dev, up_dev, qs_dev, ds_dev, n_ff)?;
             } else {
-                self.launch_silu_mul(gate_dev, up_dev, n_ff)?;
+                self.launch_silu_mul_q8_1(gate_dev, up_dev, qs_dev, ds_dev, n_ff)?;
             }
         } else if gelu {
             self.launch_gelu_mul(gate_dev, up_dev, n_ff)?;
@@ -3920,7 +3926,8 @@ impl CudaState {
         }
         self.trace_dense_stage(trace_call, "cuda-dense-expert", "activation", trace_stage)?;
 
-        if gelu {
+        // down 커널 선택은 activation(gelu/silu)과 무관 — q8dot/packed 가용성만 본다.
+        {
             match down_quant {
                 12 => {
                     if let (Some(qs_dev), Some(ds_dev)) = (down_q8_qs_dev, down_q8_ds_dev) {
@@ -3996,31 +4003,6 @@ impl CudaState {
                         )
                     }
                 }
-                other => Err(format!("unsupported Qwen35 CUDA down quant code {other}")),
-            }
-        } else {
-            match down_quant {
-                12 => self.launch_q4k_gemv_to_dev(
-                    down_weights,
-                    n_embd,
-                    n_ff / 256,
-                    gate_dev,
-                    output_dev,
-                ),
-                13 => self.launch_q5k_gemv_to_dev(
-                    down_weights,
-                    n_embd,
-                    n_ff / 256,
-                    gate_dev,
-                    output_dev,
-                ),
-                14 => self.launch_q6k_gemv_to_dev(
-                    down_weights,
-                    n_embd,
-                    n_ff / 256,
-                    gate_dev,
-                    output_dev,
-                ),
                 other => Err(format!("unsupported Qwen35 CUDA down quant code {other}")),
             }
         }?;
@@ -5784,6 +5766,7 @@ impl CudaState {
         hidden: &[f32],
         norm_eps: f32,
         unit_offset_norm: bool,
+        gelu: bool,
     ) -> Result<Vec<f32>, String> {
         if hidden.len() != n_embd {
             return Err(format!(
@@ -5836,7 +5819,7 @@ impl CudaState {
             normed_dev,
             ffn_out_dev,
             None,
-            true,
+            gelu,
         )?;
         if let Some(post_norm_weight) = post_norm_weight {
             let norm_weight_dev = self.resident_f32_ptr(post_norm_weight)?;
