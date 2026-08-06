@@ -593,9 +593,9 @@ fn qwen35_metal_batch_auto_eligible(
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn qwen35_metal_batch_auto_spec_k(architecture: ModelArchitecture) -> usize {
+fn qwen35_metal_batch_auto_spec_k(architecture: ModelArchitecture, sampled: bool) -> usize {
     match architecture {
-        ModelArchitecture::Qwen35MoE => 2,
+        ModelArchitecture::Qwen35MoE if sampled => 2,
         _ => 1,
     }
 }
@@ -909,11 +909,11 @@ impl Engine {
         ) {
             let (spec_k, reason) = match self.architecture {
                 ModelArchitecture::Qwen35MoE => (
-                    qwen35_metal_batch_auto_spec_k(self.architecture),
-                    "qwen35moe-k2-metal-batch-decode-chain-auto",
+                    qwen35_metal_batch_auto_spec_k(self.architecture, true),
+                    "qwen35moe-adaptive-k-metal-batch-decode-chain-auto",
                 ),
                 _ => (
-                    qwen35_metal_batch_auto_spec_k(self.architecture),
+                    qwen35_metal_batch_auto_spec_k(self.architecture, true),
                     "dense-qwen35-metal-batch-decode-chain-auto",
                 ),
             };
@@ -990,11 +990,25 @@ impl Engine {
         })
     }
 
-    pub(crate) fn mtp_effective_spec_k(&self, requested: usize) -> usize {
+    pub fn mtp_auto_spec_k_for_temperature(&self, temperature: f32) -> usize {
+        let policy = self.mtp_auto_policy();
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        if qwen35_metal_batch_auto_eligible(
+            self.architecture,
+            &self.metadata,
+            self.mtp_runtime_ready(),
+            self.batched_decode_chain_ready(),
+        ) {
+            return qwen35_metal_batch_auto_spec_k(self.architecture, temperature > 0.0);
+        }
+        policy.spec_k.max(1)
+    }
+
+    pub(crate) fn mtp_effective_spec_k(&self, requested: usize, temperature: f32) -> usize {
         if self.mtp_explicitly_forced() {
             requested.max(1)
         } else {
-            self.mtp_auto_policy().spec_k.max(1)
+            self.mtp_auto_spec_k_for_temperature(temperature)
         }
     }
 
@@ -2188,9 +2202,20 @@ mod tests {
     #[test]
     fn qwen35_metal_batch_auto_requires_supported_arch_full_chain_and_runtime() {
         let dense = policy_metadata(4096, 40);
-        assert_eq!(qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35), 1);
         assert_eq!(
-            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35MoE),
+            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35, false),
+            1
+        );
+        assert_eq!(
+            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35, true),
+            1
+        );
+        assert_eq!(
+            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35MoE, false),
+            1
+        );
+        assert_eq!(
+            qwen35_metal_batch_auto_spec_k(ModelArchitecture::Qwen35MoE, true),
             2
         );
         assert!(qwen35_metal_batch_auto_eligible(

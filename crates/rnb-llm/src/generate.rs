@@ -272,7 +272,7 @@ pub fn generate_stream(
         GenerateRoute::Mtp => {
             // pm118: 미설정/auto 로 진입한 MTP 는 spec_k 도 모델별 auto policy 값
             // (GLM nextn 1층 k=1 등). 명시 truthy 강제일 때만 caller 값 유지.
-            let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+            let spec_k = engine.mtp_effective_spec_k(params.spec_k, params.temperature);
             if spec_k == params.spec_k {
                 crate::mtp_generate::generate_stream_mtp(engine, prompt, params, callback)
             } else {
@@ -420,7 +420,7 @@ pub(crate) fn generate_stream_resuming(
     };
     let mut result = match route {
         GenerateRoute::Mtp => {
-            let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+            let spec_k = engine.mtp_effective_spec_k(params.spec_k, params.temperature);
             if spec_k == params.spec_k {
                 crate::mtp_generate::generate_stream_mtp_resuming(
                     engine,
@@ -646,7 +646,7 @@ pub fn generate_stream_multimodal_resuming(
         ),
     ) == GenerateRoute::Mtp
     {
-        let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+        let spec_k = engine.mtp_effective_spec_k(params.spec_k, params.temperature);
         let mut mtp_params = params.clone();
         mtp_params.spec_k = spec_k;
         crate::mtp_generate::generate_stream_mtp_from_prefill(
@@ -748,7 +748,7 @@ pub fn generate_stream_multimodal(
         ),
     ) == GenerateRoute::Mtp
     {
-        let spec_k = engine.mtp_effective_spec_k(params.spec_k);
+        let spec_k = engine.mtp_effective_spec_k(params.spec_k, params.temperature);
         let mut mtp_params = params.clone();
         mtp_params.spec_k = spec_k;
         crate::mtp_generate::generate_stream_mtp_from_prefill(

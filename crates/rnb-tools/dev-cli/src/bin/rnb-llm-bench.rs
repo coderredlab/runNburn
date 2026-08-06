@@ -2351,12 +2351,17 @@ fn main() {
     let mtp_draft_n_override: Option<usize> = std::env::var("RNB_MTP_DRAFT_N")
         .ok()
         .and_then(|s| s.parse().ok());
+    let sampling = bench_sampling_params_from_env().unwrap_or_else(|err| panic!("{err}"));
     let mtp_env_request = parse_mtp_env_request(std::env::var("RNB_MTP").ok().as_deref());
     let mtp_policy = if matches!(mtp_env_request, MtpEnvRequest::Off) {
         mtp_env_off_policy()
     } else {
         engine.mtp_auto_policy()
     };
+    let mut mtp_effective_policy = mtp_policy;
+    if matches!(mtp_env_request, MtpEnvRequest::Auto) {
+        mtp_effective_policy.spec_k = engine.mtp_auto_spec_k_for_temperature(sampling.temperature);
+    }
     let mtp_sampling_allowed = mtp_auto_sampling_allowed(mtp_env_request, repetition_penalty);
     let mtp_env_requested =
         mtp_env_requests_generation(mtp_env_request, mtp_policy) && mtp_sampling_allowed;
@@ -2398,7 +2403,7 @@ fn main() {
         eprintln!(
             "[MTP_AUTO] enabled={} k={} device_verify={} min_free_vram={}MiB{} reason={}",
             mtp_env_requested,
-            mtp_policy.spec_k,
+            mtp_effective_policy.spec_k,
             mtp_policy.device_verify && mtp_env_requested,
             mtp_policy.min_free_vram_mib,
             resource,
@@ -2552,14 +2557,16 @@ fn main() {
         let spec_k = if let Some(n) = mtp_draft_n_override {
             n.max(1)
         } else {
-            resolve_mtp_spec_k(std::env::var("RNB_SPEC_K").ok().as_deref(), mtp_policy)
-                .unwrap_or_else(|err| panic!("{err}"))
+            resolve_mtp_spec_k(
+                std::env::var("RNB_SPEC_K").ok().as_deref(),
+                mtp_effective_policy,
+            )
+            .unwrap_or_else(|err| panic!("{err}"))
         };
         let spec_depth: f32 = std::env::var("RNB_SPEC_DEPTH")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.5);
-        let sampling = bench_sampling_params_from_env().unwrap_or_else(|err| panic!("{err}"));
         let params = GenerateParams {
             max_tokens: decode_count,
             temperature: sampling.temperature,
