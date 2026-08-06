@@ -181,7 +181,7 @@ pub(in crate::engine) fn chain_function_active(ctx: &ChainCallerCtx<'_>) -> bool
                 }
                 true
             }
-            ModelArchitecture::LLaMA => true,
+            ModelArchitecture::LLaMA | ModelArchitecture::Qwen35 => true,
             _ => false,
         }
     }
@@ -190,6 +190,21 @@ pub(in crate::engine) fn chain_function_active(ctx: &ChainCallerCtx<'_>) -> bool
         let _ = ctx;
         false
     }
+}
+
+/// cu203: 이 arch 의 decode 층이 **전부** chain function 을 타서 hidden carrier 가
+/// 층 사이에 연속(fresh)인가. W1 rms carrier(`try_rms_norm_into_decode_carrier`)는
+/// layer_idx > 0 에서 "이전 층 chain end 가 carrier 에 남긴 hidden" 을 입력으로
+/// 쓰므로 이 보장이 필수다. Qwen35 는 ATN 층 사이의 GDN 층들이 host hidden 만
+/// 갱신해 carrier 가 stale 이 되므로 false — chain function 진입(위)과 별개로
+/// W1 wire 만 비활성화한다.
+pub(in crate::engine) fn chain_hidden_carrier_continuous(ctx: &ChainCallerCtx<'_>) -> bool {
+    chain_function_active(ctx) && arch_hidden_carrier_continuous(ctx.architecture)
+}
+
+/// arch 단독 게이트 — 모든 decode 층이 chain 을 타는 arch 만 true.
+fn arch_hidden_carrier_continuous(architecture: ModelArchitecture) -> bool {
+    !matches!(architecture, ModelArchitecture::Qwen35)
 }
 
 /// Build the chain function arguments for this `(arch, layer)`, or `None` if
@@ -241,8 +256,12 @@ pub(in crate::engine) fn compute_chain_function_args<'a>(
 
         let result = match ctx.architecture {
             ModelArchitecture::Gemma | ModelArchitecture::Gemma4 => build_gemma_args(ctx),
-            ModelArchitecture::LLaMA => build_llama_args(ctx),
-            // Qwen / Phi dense paths land in a later step.
+            ModelArchitecture::LLaMA => build_silu_dense_args(ctx, true),
+            // Qwen3.6 dense(27B) ATN 층 — Llama 와 같은 silu dense 패턴(plain
+            // residual + post_attention_norm 이 ffn_norm 슬롯에 로드됨). GDN 층이
+            // 사이에 껴 hidden carrier 연속성이 없으므로 skip_h2d/d2h 없이 진입.
+            ModelArchitecture::Qwen35 => build_silu_dense_args(ctx, false),
+            // Phi dense 등은 후속.
             _ => None,
         };
 
@@ -256,16 +275,21 @@ pub(in crate::engine) fn compute_chain_function_args<'a>(
 }
 
 #[cfg(feature = "cuda")]
-fn build_llama_args<'a>(ctx: &ChainCallerCtx<'a>) -> Option<ChainArgs<'a>> {
+fn build_silu_dense_args<'a>(
+    ctx: &ChainCallerCtx<'a>,
+    carrier_continuous: bool,
+) -> Option<ChainArgs<'a>> {
     let w = ctx.w;
     let layer_idx = ctx.layer_idx;
 
     // cu59 axis A — sub-phase timing.
     let diag_active = super::chain_diag::is_active();
 
-    // Llama dense only — MoE 는 위 compute_chain_function_args 의 공통 guard 가
-    // 이미 None 처리. PLE / post_attn_norm / post_ffn_norm / layer_output_scale
-    // 모두 없음 — Gemma 특화 인자 = None / false 의 단순 path.
+    // silu dense only (Llama / Qwen3.6 dense ATN) — MoE 는 위
+    // compute_chain_function_args 의 공통 guard 가 이미 None 처리.
+    // PLE / post_attn_norm / post_ffn_norm / layer_output_scale 모두 없음.
+    // Qwen 은 post_attention_norm 이 로딩 시 ffn_norm 슬롯에 복제돼 있고
+    // residual 은 plain add 라 Llama 와 같은 형태다.
 
     // WeightResolve — w.o_weight / ffn_gate / ffn_up / ffn_down reference (단순 borrow).
     let t_weight = if diag_active {
@@ -298,8 +322,10 @@ fn build_llama_args<'a>(ctx: &ChainCallerCtx<'a>) -> Option<ChainArgs<'a>> {
         );
     }
 
-    let skip_h2d_hidden = layer_idx > 0;
-    let skip_d2h_hidden = layer_idx + 1 < ctx.num_layers;
+    // carrier_continuous=false(Qwen35): ATN 층 사이의 GDN 층들이 host hidden 만
+    // 갱신하므로 이전 chain 이 carrier 에 남긴 값은 stale — 매 층 H2D/D2H.
+    let skip_h2d_hidden = carrier_continuous && layer_idx > 0;
+    let skip_d2h_hidden = carrier_continuous && layer_idx + 1 < ctx.num_layers;
 
     // Acquire
     let t_acquire = if diag_active {
@@ -589,5 +615,14 @@ mod tests {
             GGMLType::Q4_0,
             GGMLType::Q4_0
         ));
+    }
+
+    // cu203: Qwen35 는 GDN 층이 사이에 껴 hidden carrier 가 층간 stale — W1 rms
+    // carrier 게이트가 반드시 꺼져야 한다 (켜지면 stale carrier 로 norm → garbage).
+    #[test]
+    fn qwen35_hidden_carrier_is_not_continuous() {
+        assert!(!arch_hidden_carrier_continuous(ModelArchitecture::Qwen35));
+        assert!(arch_hidden_carrier_continuous(ModelArchitecture::LLaMA));
+        assert!(arch_hidden_carrier_continuous(ModelArchitecture::Gemma4));
     }
 }

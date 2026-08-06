@@ -329,7 +329,10 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         None
     };
     #[cfg(feature = "cuda")]
-    let chain_emits_hidden_carrier: bool = !force_qwen_imrope && {
+    let (chain_emits_hidden_carrier, chain_carrier_continuous): (bool, bool) = if force_qwen_imrope
+    {
+        (false, false)
+    } else {
         let signal_ctx = super::forward::chain_args::ChainCallerCtx {
             architecture,
             layer_idx,
@@ -353,7 +356,10 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             has_sliding_window: active_sliding_window(metadata, architecture, layer_idx).is_some(),
             long_kv_split_preferred: cu71_long_kv_split_preferred(head_dim, cache_pos + 1),
         };
-        super::forward::chain_args::chain_function_active(&signal_ctx)
+        (
+            super::forward::chain_args::chain_function_active(&signal_ctx),
+            super::forward::chain_args::chain_hidden_carrier_continuous(&signal_ctx),
+        )
     };
     #[cfg(feature = "cuda")]
     if let Some(t) = signal_eval_t {
@@ -364,6 +370,10 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     }
     #[cfg(not(feature = "cuda"))]
     let chain_emits_hidden_carrier: bool = false;
+    #[cfg(not(feature = "cuda"))]
+    let chain_carrier_continuous: bool = false;
+    #[cfg(not(feature = "cuda"))]
+    let _ = chain_carrier_continuous;
     #[cfg(feature = "cuda")]
     let qkv_consumes_device_norm = {
         let supports_device_input = |weight: &QuantizedWeight| {
@@ -383,8 +393,11 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // 이전엔 effective_rms_layer=0 로 강제해서 carrier 에 layer 0 norm 만 채우고
     // rms_used_cuda=true 반환했는데, 후속 attention QKV 의 carrier path 가 그
     // stale (layer 0) norm 을 모든 layer 에서 input 으로 사용 → garbage.
-    // Nemotron / Llama / Qwen 처럼 chain function 미호출 arch 는 항상 host RMS.
-    let rms_used_cuda = if chain_emits_hidden_carrier && qkv_consumes_device_norm {
+    // Nemotron 처럼 chain function 미호출 arch 는 항상 host RMS.
+    // cu203: W1 은 carrier 연속성(chain_hidden_carrier_continuous)까지 요구한다 —
+    // Qwen35 는 chain function 은 타지만 GDN 층이 사이에 껴 carrier 가 stale 이라
+    // W1 만 비활성.
+    let rms_used_cuda = if chain_carrier_continuous && qkv_consumes_device_norm {
         backend_runtime::try_rms_norm_into_decode_carrier_if_supported(
             layer_idx,
             &scratch.hidden[..hidden_dim],
