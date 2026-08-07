@@ -106,6 +106,25 @@ type ResidentEntry = (
 );
 
 #[cfg(target_os = "macos")]
+struct ConstantF32Entry {
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    source_lease: Option<HostStorageLease>,
+    fallback_bits: Option<Box<[u32]>>,
+}
+
+#[cfg(target_os = "macos")]
+impl ConstantF32Entry {
+    fn matches(&self, data: &[f32]) -> bool {
+        self.source_lease.is_some()
+            || self.fallback_bits.as_deref().is_some_and(|bits| {
+                bits.iter()
+                    .zip(data)
+                    .all(|(&expected, &value)| expected == value.to_bits())
+            })
+    }
+}
+
+#[cfg(target_os = "macos")]
 /// pm112: GLM MoE decode 의 UD-quant 레이어 조합 선택. 기본값은
 /// IQ2_XXS gate/up + IQ3_XXS down + Q5K/Q5K/Q6K shared.
 #[derive(Clone, Copy, Default)]
@@ -1716,7 +1735,7 @@ pub struct MetalBackend {
     device_name: Option<String>,
     ctx: Option<compute::MetalContext>,
     /// Immutable small constants copied once and reused by the whole-model decode chain.
-    constant_f32: RefCell<HashMap<ResidentKey, Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    constant_f32: RefCell<HashMap<ResidentKey, ConstantF32Entry>>,
     constant_u32: RefCell<HashMap<u32, Retained<ProtocolObject<dyn MTLBuffer>>>>,
     /// One shared hidden buffer per model width; decode calls are serialized on this backend.
     decode_chain_hidden: RefCell<HashMap<usize, Retained<ProtocolObject<dyn MTLBuffer>>>>,
@@ -2129,6 +2148,50 @@ impl MetalBackend {
         {
             Self::default()
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn constant_f32_buffer(
+        &self,
+        ctx: &compute::MetalContext,
+        data: &[f32],
+        cache_enabled: bool,
+    ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        if !cache_enabled {
+            return ffn_chain::shared_f32_buf(ctx, data);
+        }
+
+        let key = (data.as_ptr() as usize, data.len());
+        if let Some(buffer) = self
+            .constant_f32
+            .borrow()
+            .get(&key)
+            .filter(|entry| entry.matches(data))
+            .map(|entry| entry.buffer.clone())
+        {
+            return buffer;
+        }
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data))
+        };
+        let source_lease = rnb_core::tensor::host_storage_lease(bytes);
+        let fallback_bits = source_lease.is_none().then(|| {
+            data.iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
+        let buffer = ffn_chain::shared_f32_buf(ctx, data);
+        self.constant_f32.borrow_mut().insert(
+            key,
+            ConstantF32Entry {
+                buffer: buffer.clone(),
+                source_lease,
+                fallback_bits,
+            },
+        );
+        buffer
     }
 
     /// 열린 Metal device 의 이름 (다음 milestone 의 facade/로깅에서 사용).
@@ -9266,17 +9329,7 @@ impl MetalBackend {
                 .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
                 .clone()
         };
-        let constant_f32 = |data: &[f32]| {
-            if !cache_constants {
-                return ffn_chain::shared_f32_buf(ctx, data);
-            }
-            let key = (data.as_ptr() as usize, data.len());
-            let mut cache = self.constant_f32.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
-                .clone()
-        };
+        let constant_f32 = |data: &[f32]| self.constant_f32_buffer(ctx, data, cache_constants);
         let o_off_buf = constant_u32(o_off);
         let gate_off_buf = constant_u32(gate_off);
         let up_off_buf = constant_u32(up_off);
@@ -9376,17 +9429,7 @@ impl MetalBackend {
                 .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
                 .clone()
         };
-        let constant_f32 = |data: &[f32]| {
-            if !cache_constants {
-                return ffn_chain::shared_f32_buf(ctx, data);
-            }
-            let key = (data.as_ptr() as usize, data.len());
-            let mut cache = self.constant_f32.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
-                .clone()
-        };
+        let constant_f32 = |data: &[f32]| self.constant_f32_buffer(ctx, data, cache_constants);
         let o_off_buf = constant_u32(o_off);
         let gate_off_buf = constant_u32(gate_off);
         let up_off_buf = constant_u32(up_off);
@@ -10490,14 +10533,7 @@ impl MetalBackend {
                 .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
                 .clone()
         };
-        let constant_f32 = |data: &[f32]| {
-            let key = (data.as_ptr() as usize, data.len());
-            let mut cache = self.constant_f32.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
-                .clone()
-        };
+        let constant_f32 = |data: &[f32]| self.constant_f32_buffer(ctx, data, true);
 
         // 양자화 GEMV weight NoCopy resident wrap. self.resident 를 borrow_mut→drop 하므로
         // closure 호출마다 borrow scope 안전(attn/gdn 공통).
@@ -11717,14 +11753,7 @@ impl MetalBackend {
                 .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
                 .clone()
         };
-        let constant_f32 = |data: &[f32]| {
-            let key = (data.as_ptr() as usize, data.len());
-            let mut cache = self.constant_f32.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
-                .clone()
-        };
+        let constant_f32 = |data: &[f32]| self.constant_f32_buffer(ctx, data, true);
         let wrap = |raw: &[u8]| {
             let mut r = self.resident.borrow_mut();
             let e = r
@@ -12324,14 +12353,7 @@ impl MetalBackend {
                 .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
                 .clone()
         };
-        let constant_f32 = |data: &[f32]| {
-            let key = (data.as_ptr() as usize, data.len());
-            let mut cache = self.constant_f32.borrow_mut();
-            cache
-                .entry(key)
-                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
-                .clone()
-        };
+        let constant_f32 = |data: &[f32]| self.constant_f32_buffer(ctx, data, true);
         let wrap = |raw: &[u8]| {
             let mut r = self.resident.borrow_mut();
             let e = r
@@ -12670,6 +12692,43 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn constant_f32_cache_retains_registered_sources_and_refreshes_transient_values() {
+        let backend = MetalBackend::new();
+        let ctx = backend.ctx.as_ref().expect("Metal context");
+
+        let registered = rnb_core::tensor::Tensor::from_vec(vec![1.0f32, 2.0], &[2]);
+        registered.register_host_storage();
+        let registered_bytes = registered.as_bytes().expect("registered tensor bytes");
+        let registered_values = unsafe {
+            std::slice::from_raw_parts(
+                registered_bytes.as_ptr().cast::<f32>(),
+                registered_bytes.len() / std::mem::size_of::<f32>(),
+            )
+        };
+        let registered_key = (registered_values.as_ptr() as usize, registered_values.len());
+        let _registered_buffer = backend.constant_f32_buffer(ctx, registered_values, true);
+        assert!(backend
+            .constant_f32
+            .borrow()
+            .get(&registered_key)
+            .expect("registered constant cache entry")
+            .source_lease
+            .is_some());
+
+        let mut transient = vec![3.0f32, 4.0, 5.0];
+        let first = backend.constant_f32_buffer(ctx, &transient, true);
+        assert_eq!(unsafe { *(first.contents().as_ptr() as *const f32) }, 3.0);
+
+        transient[0] = 7.0;
+        let refreshed = backend.constant_f32_buffer(ctx, &transient, true);
+        assert_eq!(
+            unsafe { *(refreshed.contents().as_ptr() as *const f32) },
+            7.0
+        );
     }
 
     #[test]
