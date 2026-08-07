@@ -126,8 +126,20 @@ pub fn q4k_batch_raw_seq4_enabled(seq_len: usize, rows: usize, blocks_per_row: u
     env_bool("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", default)
 }
 
+/// cu219: MMQ tile32 의 최소 seq 게이트 (Q4_K/Q6_K). 커널은 partial tile 을
+/// token bounds 마스킹으로 완전 지원하므로 32 는 정확성 경계가 아니라
+/// 휴리스틱이었다. RTX 3090 27B 15/100 에서 8 로 낮추면 host-input 위임과
+/// 결합해 generation −14.5%(3/3), 1139-token 도 −37.6%로 f32/구세대 대비
+/// 우세 구간만 있었다. `RNB_CUDA_MMQ_TILE32_MIN_SEQ` 로 조절한다.
+pub fn mmq_tile32_min_seq() -> usize {
+    std::env::var("RNB_CUDA_MMQ_TILE32_MIN_SEQ")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+}
+
 pub fn q4k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
-    let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
+    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
 }
 
@@ -140,8 +152,16 @@ pub fn q3k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q3K_MMQ_TILE32", true)
 }
 pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
-    let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
+    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
+}
+
+/// cu219: host-input prefill 배치(gemv_batch)를 dev-input 경로의 검증된 kernel
+/// 우선순위(MMQ/MMA v3/pair2/q8dot)로 위임한다. 기존 host 분기는 seq4/raw
+/// 세대에 갇혀 15-token prefill 이 층당 weight 를 토큰 수만큼 재읽었다.
+/// `RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH=0` 은 기존 host 분기 opt-out.
+pub fn prefill_batch_dev_dispatch_enabled() -> bool {
+    env_bool("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", true)
 }
 pub fn q8_0_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= 32 && rows >= 128 && blocks_per_row >= 4;
@@ -2345,9 +2365,20 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE32");
         }
         assert!(q4k_mmq_tile32_enabled(1115, 2560, 10));
-        assert!(!q4k_mmq_tile32_enabled(31, 2560, 10));
+        // cu219: 기본 min_seq 는 8 (partial tile 마스킹으로 안전, 27B 15/100
+        // −14.5% 근거). env 로 경계를 되돌릴 수 있다.
+        assert!(q4k_mmq_tile32_enabled(8, 2560, 10));
+        assert!(!q4k_mmq_tile32_enabled(7, 2560, 10));
         assert!(!q4k_mmq_tile32_enabled(1115, 512, 10));
         assert!(!q4k_mmq_tile32_enabled(1115, 2560, 3));
+        unsafe {
+            std::env::set_var("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "32");
+        }
+        assert!(!q4k_mmq_tile32_enabled(31, 2560, 10));
+        assert!(q4k_mmq_tile32_enabled(32, 2560, 10));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MMQ_TILE32_MIN_SEQ");
+        }
 
         unsafe {
             std::env::set_var("RNB_CUDA_Q4K_MMQ_TILE32", "0");
@@ -2365,7 +2396,8 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE32");
         }
         assert!(q6k_mmq_tile32_enabled(1115, 8192, 8));
-        assert!(!q6k_mmq_tile32_enabled(31, 8192, 8));
+        assert!(q6k_mmq_tile32_enabled(8, 8192, 8));
+        assert!(!q6k_mmq_tile32_enabled(7, 8192, 8));
         assert!(!q6k_mmq_tile32_enabled(1115, 512, 8));
         assert!(!q6k_mmq_tile32_enabled(1115, 8192, 3));
 

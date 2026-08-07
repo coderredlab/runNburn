@@ -4568,6 +4568,73 @@ impl CudaState {
                 return Ok(output);
             }
         }
+        // cu219: host-input prefill 배치를 dev-input 경로의 검증된 kernel
+        // 우선순위(MMQ tile32 / MMA v3 / pair2 / q8dot)로 위임한다. 기존 host
+        // 분기는 seq4/raw 세대라 15-token prefill 이 층당 weight 를 토큰
+        // 수만큼 재읽었다 (27B: Q4 seq4 341.6ms + Q6 raw 223.0ms + Q5 raw
+        // 108.0ms / prefill). `RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH=0` opt-out.
+        if tuning::prefill_batch_dev_dispatch_enabled()
+            && matches!(
+                kernel_name,
+                "rnb_q4k_gemv_batch" | "rnb_q5k_gemv_batch" | "rnb_q6k_gemv_batch"
+            )
+        {
+            let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input),
+                    self.stream,
+                )?;
+            }
+            match kernel_name {
+                "rnb_q4k_gemv_batch" => self.q4k_batch_dev_input_to_dev(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    input_dev,
+                    output_dev,
+                )?,
+                "rnb_q5k_gemv_batch" => {
+                    if super::dense::dense_q5_batch_dev_input_q8dot_enabled(
+                        seq_len,
+                        rows,
+                        blocks_per_row,
+                    ) {
+                        self.q5k_batch_dev_input_q8dot_to_dev(
+                            weights,
+                            rows,
+                            blocks_per_row,
+                            seq_len,
+                            input_dev,
+                            output_dev,
+                        )?
+                    } else {
+                        self.q5k_batch_dev_input_to_dev(
+                            weights,
+                            rows,
+                            blocks_per_row,
+                            seq_len,
+                            input_dev,
+                            output_dev,
+                        )?
+                    }
+                }
+                _ => self.q6k_batch_dev_input_to_dev(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    input_dev,
+                    output_dev,
+                )?,
+            }
+            let mut output = vec![0.0f32; output_len];
+            self.dtoh_f32_via_pinned(output_dev, &mut output)?;
+            return Ok(output);
+        }
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let input_dev = self.compute_input_ptr(std::mem::size_of_val(input))?;
 

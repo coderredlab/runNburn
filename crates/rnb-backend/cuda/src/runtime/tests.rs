@@ -12178,23 +12178,88 @@ fn cuda_q4k_mmq_tile32_matches_cpu_reference_with_tails() {
     let input = (0..seq_len * cols)
         .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
         .collect::<Vec<_>>();
-    let mut expected = Vec::with_capacity(seq_len * rows);
-    for token in 0..seq_len {
-        expected.extend(cpu_q4k_gemv_rows(
-            &weights,
-            rows,
-            blocks_per_row,
-            &input[token * cols..(token + 1) * cols],
-        ));
-    }
+    // cu219: host-input 위임으로 이 테스트가 실제 MMQ tile32 를 실행하게 됐다.
+    // 위임 경로는 GPU quantizer(launch_quantize_q8_1_by_32)를 쓰므로, host
+    // 참조 quantizer 와의 LSB 차이가 허용오차를 오염시키지 않도록 GPU
+    // quantizer 의 qs/ds 를 그대로 내려받아 dequantize 한 CPU reference 와
+    // 비교한다 (cu199 관례의 GPU-quantizer 변형).
+    let expected = {
+        let mut state = CudaState::open().expect("open CUDA state");
+        let input_dev = state
+            .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+            .expect("allocate MMQ tails test input");
+        unsafe {
+            state
+                .api
+                .memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input.as_slice()),
+                    state.stream,
+                )
+                .expect("copy MMQ tails test input");
+        }
+        let qs_dev = state
+            .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+            .expect("allocate MMQ tails qs");
+        let ds_dev = state
+            .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+            .expect("allocate MMQ tails ds");
+        state
+            .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+            .expect("quantize MMQ tails input");
+        let mut qs = vec![0i8; seq_len * blocks_per_row * 256];
+        let mut ds = vec![0.0f32; seq_len * blocks_per_row * 8];
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    qs.as_mut_ptr().cast::<libc::c_void>(),
+                    qs_dev,
+                    qs.len(),
+                    state.stream,
+                )
+                .expect("copy MMQ tails qs");
+            state
+                .api
+                .memcpy_dtoh_async(
+                    ds.as_mut_ptr().cast::<libc::c_void>(),
+                    ds_dev,
+                    std::mem::size_of_val(ds.as_slice()),
+                    state.stream,
+                )
+                .expect("copy MMQ tails ds");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize MMQ tails quantize");
+        let mut expected = Vec::with_capacity(seq_len * rows);
+        for token in 0..seq_len {
+            let token_qs = &qs[token * blocks_per_row * 256..(token + 1) * blocks_per_row * 256];
+            let token_ds = &ds[token * blocks_per_row * 8..(token + 1) * blocks_per_row * 8];
+            let quantized_input = dequantize_q8_1_by_32(token_qs, token_ds);
+            expected.extend(cpu_q4k_gemv_rows(
+                &weights,
+                rows,
+                blocks_per_row,
+                &quantized_input,
+            ));
+        }
+        expected
+    };
     let mut first_actual: Option<Vec<f32>> = None;
     for run in 0..16 {
         let actual = q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K tiled MMQ");
-        assert_close_rows(
+        // MMQ 는 int8 mma 결과를 block 별 (d·sc, dmin·mn) 2단 float fold 로
+        // 접어 dp4a 계열보다 누산 순서 오차가 약간 넓다. GPU-quantizer 참조
+        // 기준이라 잔여 오차는 float 누산 순서뿐이며, mis-unpack/scale 결함은
+        // %대 오차라 이 허용오차에서도 즉시 잡힌다.
+        assert_close_rows_abs_rel(
             &format!("Q4_K tiled MMQ run {run}"),
             &actual,
             &expected,
-            0.08,
+            1e-3,
+            1e-3,
         );
         if let Some(first) = first_actual.as_ref() {
             let mismatch = actual
@@ -13305,6 +13370,10 @@ fn cuda_dense_q4k_gelu_ffn_batch_q8dot_matches_separate_batch_path() {
     std::env::set_var("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "1");
     std::env::set_var("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
     std::env::set_var("RNB_CUDA_Q4K_BATCH_Q8DOT", "1");
+    // cu219: 이 계약은 chain 과 수동 조합 stage 가 같은 kernel 세대일 때의
+    // 수치 일치를 방어한다. host-input 위임(dev 양자화 세대)은 끄고 기존
+    // host-quantize 세대로 고정한다.
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "0");
 
     let n_embd = 1024usize;
     let n_ff = 1024usize;
@@ -13364,6 +13433,8 @@ fn cuda_dense_q4k_silu_ffn_batch_q8dot_matches_separate_batch_path() {
     std::env::set_var("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "1");
     std::env::set_var("RNB_CUDA_DENSE_Q8DOT_DOWN", "1");
     std::env::set_var("RNB_CUDA_Q4K_BATCH_Q8DOT", "1");
+    // cu219: chain 대조 계약 — host-input 위임을 끄고 기존 세대로 고정 (gelu 변형과 동일).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "0");
 
     let n_embd = 1024usize;
     let n_ff = 1024usize;
