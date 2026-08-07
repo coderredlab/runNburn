@@ -310,6 +310,18 @@ fn qwen_gdn_moe_output_device_enabled() -> bool {
 }
 
 #[cfg(any(feature = "cuda", test))]
+fn qwen_dense_attention_device_enabled() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        crate::engine::tuning_runtime::qwen_dense_prefill_attention_device_enabled()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        crate::engine::policy::env_string("RNB_CUDA_QWEN_DENSE_PREFILL_ATTENTION_DEVICE").as_deref()
+            != Some("0")
+    }
+}
+#[cfg(any(feature = "cuda", test))]
 fn device_carrier_accepts_layer_kind(
     architecture: ModelArchitecture,
     layer_kind: Option<&'static str>,
@@ -319,11 +331,13 @@ fn device_carrier_accepts_layer_kind(
         || (architecture == ModelArchitecture::Qwen35MoE
             && qwen_gdn_moe_output_device_enabled()
             && matches!(layer_kind, Some("gated_delta_net" | "attention")))
-        // cu220: dense Qwen35 는 GDN 층만 carrier 로 잇는다 — attention 층은
-        // dense FFN device 경로가 없어 host materialize 로 내린다.
+        // cu221: dense Qwen35 는 GDN 층에 더해 attention 층도 device-input
+        // attention + dense FFN carrier 로 잇는다 (attention 게이트 별도).
         || (architecture == ModelArchitecture::Qwen35
             && qwen_gdn_moe_output_device_enabled()
-            && matches!(layer_kind, Some("gated_delta_net")))
+            && (matches!(layer_kind, Some("gated_delta_net"))
+                || (matches!(layer_kind, Some("attention"))
+                    && qwen_dense_attention_device_enabled())))
 }
 
 #[cfg(feature = "cuda")]
@@ -1966,10 +1980,16 @@ fn run_prefill_layers_cpu_range_impl(
     #[cfg(feature = "cuda")]
     let qwen_attention_device_chain = if imrope_positions.is_none()
         && prefix_collector.is_none()
-        && architecture == ModelArchitecture::Qwen35MoE
-        && crate::engine::inference::qwen35_prefill_attention_moe_device_layers_supported(
-            weights, seq_len,
-        ) {
+        && ((architecture == ModelArchitecture::Qwen35MoE
+            && crate::engine::inference::qwen35_prefill_attention_moe_device_layers_supported(
+                weights, seq_len,
+            ))
+            || (architecture == ModelArchitecture::Qwen35
+                && crate::engine::inference::qwen35_prefill_attention_dense_device_layers_supported(
+                    weights,
+                    metadata.hidden_dim,
+                )))
+    {
         let (base_rope_dim, device_rope_theta, proportional_rope) =
             resolve_rope_params(metadata, architecture, 0, head_dim);
         if proportional_rope {
@@ -2135,12 +2155,10 @@ fn run_prefill_layers_cpu_range_impl(
                 } else if let Some(LayerType::Attention(attention_w)) =
                     weights.layers.get(layer_idx)
                 {
-                    let Some(moe_w) = attention_w.shared_expert_moe.as_ref() else {
-                        hidden = hidden
-                            .into_host_for_layer(Some(layer_idx), "feature_disabled")
-                            .map(hidden_carrier::PrefillHidden::Host)?;
-                        continue;
-                    };
+                    // cu221: dense(Qwen35) attention 층은 moe 없이 dense SwiGLU
+                    // FFN carrier 로 잇는다 — admission 은 chain 설정 단계의
+                    // qwen35_prefill_attention_dense_device_layers_supported 가 보장.
+                    let moe_w = attention_w.shared_expert_moe.as_ref();
                     let device_layer =
                         qwen_attention_device_chain
                             .as_ref()
@@ -2192,8 +2210,8 @@ fn run_prefill_layers_cpu_range_impl(
                     let attention_kv = attention_output.attention_kv;
                     let normalized = attention_output.normalized;
                     let residual = attention_output.residual;
-                    let moe_output =
-                        match models::shared_expert_moe::try_forward_ffn_qwen35moe_device_input_carrier(
+                    let ffn_result = if let Some(moe_w) = moe_w {
+                        models::shared_expert_moe::try_forward_ffn_qwen35moe_device_input_carrier(
                             moe_w,
                             seq_len,
                             metadata.hidden_dim,
@@ -2201,29 +2219,42 @@ fn run_prefill_layers_cpu_range_impl(
                             normalized.output_desc,
                             residual.output_id,
                             residual.output_desc,
-                        ) {
-                            Ok(Some(output)) => output,
-                            Ok(None) => {
-                                let intermediates_cleanup =
-                                    release_qwen_attention_device_intermediates(
-                                        normalized, residual, None,
-                                    );
-                                let input_cleanup = device_hidden.output.release();
-                                return Err(crate::error::LlmError::Forward(format!(
+                        )
+                    } else {
+                        backend_runtime::gdn_dense_prefill_ffn_device_carrier(
+                            &attention_w.ffn_gate_weight,
+                            &attention_w.ffn_up_weight,
+                            &attention_w.ffn_down_weight,
+                            seq_len,
+                            metadata.hidden_dim,
+                            normalized.output_id,
+                            normalized.output_desc,
+                            residual.output_id,
+                            residual.output_desc,
+                        )
+                        .map(Some)
+                    };
+                    let moe_output = match ffn_result {
+                        Ok(Some(output)) => output,
+                        Ok(None) => {
+                            let intermediates_cleanup = release_qwen_attention_device_intermediates(
+                                normalized, residual, None,
+                            );
+                            let input_cleanup = device_hidden.output.release();
+                            return Err(crate::error::LlmError::Forward(format!(
                                     "CUDA Qwen attention device-input MoE returned no output after support check; intermediate cleanup={intermediates_cleanup:?}; input cleanup={input_cleanup:?}"
                                 )));
-                            }
-                            Err(err) => {
-                                let intermediates_cleanup =
-                                    release_qwen_attention_device_intermediates(
-                                        normalized, residual, None,
-                                    );
-                                let input_cleanup = device_hidden.output.release();
-                                return Err(crate::error::LlmError::Forward(format!(
+                        }
+                        Err(err) => {
+                            let intermediates_cleanup = release_qwen_attention_device_intermediates(
+                                normalized, residual, None,
+                            );
+                            let input_cleanup = device_hidden.output.release();
+                            return Err(crate::error::LlmError::Forward(format!(
                                     "{err}; CUDA Qwen attention intermediate cleanup={intermediates_cleanup:?}; input cleanup={input_cleanup:?}"
                                 )));
-                            }
-                        };
+                        }
+                    };
                     if let Err(err) = release_qwen_attention_device_intermediates(
                         normalized,
                         residual,
@@ -3378,10 +3409,25 @@ mod tests {
             super::ModelArchitecture::Qwen35,
             Some("gated_delta_net")
         ));
+        // cu221: dense Qwen35 attention 도 carrier 를 받는다 (전용 게이트 on).
+        assert!(super::device_carrier_accepts_layer_kind(
+            super::ModelArchitecture::Qwen35,
+            Some("attention")
+        ));
+        unsafe {
+            std::env::set_var("RNB_CUDA_QWEN_DENSE_PREFILL_ATTENTION_DEVICE", "0");
+        }
         assert!(!super::device_carrier_accepts_layer_kind(
             super::ModelArchitecture::Qwen35,
             Some("attention")
         ));
+        assert!(super::device_carrier_accepts_layer_kind(
+            super::ModelArchitecture::Qwen35,
+            Some("gated_delta_net")
+        ));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_QWEN_DENSE_PREFILL_ATTENTION_DEVICE");
+        }
         unsafe {
             std::env::remove_var("RNB_CUDA_GDN_PREFILL_CHAIN_MOE_OUTPUT_DEVICE");
         }

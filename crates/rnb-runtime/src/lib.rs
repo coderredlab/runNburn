@@ -175,7 +175,8 @@ pub mod compute {
             prefill_output_logits_requested, prefill_q4k_f16_gemm_enabled,
             prefill_q4k_f16_o_proj_enabled, prefill_q4k_f16_qkv_gemm_enabled,
             prefill_q8_0_batch_enabled, q4k_gemv_warp8_enabled, q8_0_output_q8dot_argmax_enabled,
-            qwen35_device_moe_inplace_residual_enabled, qwen_moe_batch_enabled,
+            qwen35_device_moe_inplace_residual_enabled,
+            qwen_dense_prefill_attention_device_enabled, qwen_moe_batch_enabled,
             qwen_moe_device_decode_enabled, qwen_moe_gate_up_enabled, shared_f32_enabled,
         };
     }

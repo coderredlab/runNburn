@@ -3281,6 +3281,64 @@ pub(in crate::engine) fn qwen35_prefill_attention_moe_device_layers_supported(
     saw_attention
 }
 
+/// cu221: dense Qwen(Qwen35) attention 층 전체가 prefill device carrier
+/// chain 에 들어갈 수 있는지 검사한다. MoE 판정(`qwen35_prefill_attention_
+/// moe_device_layers_supported`)의 dense 판 — attention quant/norm 조건은
+/// 동일하고 FFN 은 dense SwiGLU device carrier admission 을 요구한다.
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn qwen35_prefill_attention_dense_device_layers_supported(
+    weights: &super::layer_weights::ModelWeights,
+    hidden_dim: usize,
+) -> bool {
+    if !crate::engine::tuning_runtime::qwen_dense_prefill_attention_device_enabled() {
+        return false;
+    }
+    let mut saw_attention = false;
+    for layer in &weights.layers {
+        let attn = match layer {
+            super::layer_weights::LayerType::Attention(attn) => {
+                saw_attention = true;
+                attn
+            }
+            super::layer_weights::LayerType::GatedDeltaNet(_) => continue,
+            _ => return false,
+        };
+        if attn.shared_expert_moe.is_some() {
+            return false;
+        }
+        let attention_quant_supported = [
+            attn.q_weight.ggml_type,
+            attn.k_weight.ggml_type,
+            attn.v_weight.ggml_type,
+            attn.o_weight.ggml_type,
+        ]
+        .into_iter()
+        .all(|quant| {
+            matches!(
+                quant,
+                rnb_loader::GGMLType::Q4_K
+                    | rnb_loader::GGMLType::Q5_K
+                    | rnb_loader::GGMLType::Q6_K
+                    | rnb_loader::GGMLType::Q8_0
+            )
+        });
+        if !attention_quant_supported
+            || attn.q_norm.is_none()
+            || attn.k_norm.is_none()
+            || attn.post_attn_norm.is_none()
+            || !super::backend_runtime::gdn_dense_prefill_ffn_device_supported(
+                &attn.ffn_gate_weight,
+                &attn.ffn_up_weight,
+                &attn.ffn_down_weight,
+                hidden_dim,
+            )
+        {
+            return false;
+        }
+    }
+    saw_attention
+}
+
 #[cfg(all(feature = "cuda", test))]
 pub(super) fn build_mtp_device_verify_gdn_moe_layers<'a>(
     weights: &'a super::layer_weights::ModelWeights,

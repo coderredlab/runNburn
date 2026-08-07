@@ -165,6 +165,13 @@ pub fn q6k_down_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: 
         && env_bool("RNB_CUDA_Q6K_DOWN_MMQ_TILE32", true)
 }
 
+/// cu221: dense Qwen(Qwen35) attention 층을 prefill device carrier chain 에
+/// 연결하는 게이트 — attention device-input + dense SwiGLU FFN carrier.
+/// `=0` 은 attention 층을 기존 host materialize 경로로 되돌린다.
+pub fn qwen_dense_prefill_attention_device_enabled() -> bool {
+    env_bool("RNB_CUDA_QWEN_DENSE_PREFILL_ATTENTION_DEVICE", true)
+}
+
 /// cu219: 위임된 host-input prefill 배치에서 Q5_K 를 raw F32 대신 q8dot
 /// batch(wide) 세대로 태우는 게이트. Q5 는 MMQ tile32 가 없어 위임 후에도
 /// raw 로 남았었다 (27B 15-token prefill 의 102ms/48calls). verify 의
