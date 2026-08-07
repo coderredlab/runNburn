@@ -154,6 +154,15 @@ pub fn mmq_tile_seq64_enabled(seq_len: usize) -> bool {
     seq_len >= 64 && env_bool("RNB_CUDA_MMQ_TILE_SEQ64", true)
 }
 
+/// cu228: Q4_K 64x64 tile 게이트 — seq64 tile 의 b-side(activation) 로드가
+/// loader ops 의 2/3 이고 grid.x 의 32-row CTA 마다 재발행되므로, row 64
+/// tile 이 b 를 출력당 절반으로 상각한다. 512-thread CTA 가 32x64 와 같은
+/// per-thread accumulator 레이아웃을 유지해 bitwise 계약 불변. rows >= 64
+/// 는 tile 높이의 구조적 최소치다. 진단 대조는 `RNB_CUDA_Q4K_MMQ_TILE64=0`.
+pub fn q4k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
+    mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q4K_MMQ_TILE64", true)
+}
+
 pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q2K_MMQ_TILE32", true)
@@ -2475,6 +2484,27 @@ mod tests {
 
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE32");
+        }
+    }
+
+    #[test]
+    fn q4k_mmq_tile64_requires_seq64_and_row_tile_and_allows_opt_out() {
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE64");
+        }
+        assert!(q4k_mmq_tile64_enabled(64, 64));
+        assert!(q4k_mmq_tile64_enabled(1139, 12288));
+        assert!(!q4k_mmq_tile64_enabled(63, 12288));
+        assert!(!q4k_mmq_tile64_enabled(1139, 63));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q4K_MMQ_TILE64", "0");
+        }
+        assert!(!q4k_mmq_tile64_enabled(1139, 12288));
+
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE64");
         }
     }
 
