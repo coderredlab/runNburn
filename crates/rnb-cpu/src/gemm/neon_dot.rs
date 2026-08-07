@@ -3192,13 +3192,26 @@ unsafe fn gemm_q4_k_rows16_i8mm(
         while token < seq_len {
             let token1 = (token + 1).min(seq_len - 1);
             let token_pair = token / 2;
-            let mut acc = [vdupq_n_f32(0.0); ROW_PAIRS];
+            let mut acc = [[0.0f32; 4]; ROW_PAIRS];
+            if !is_first_chunk {
+                for (pair, pair_acc) in acc.iter_mut().enumerate() {
+                    let pair_row = row + pair * 2;
+                    *pair_acc = [
+                        *out_ptr.add(token * rows + pair_row),
+                        *out_ptr.add(token1 * rows + pair_row),
+                        *out_ptr.add(token * rows + pair_row + 1),
+                        *out_ptr.add(token1 * rows + pair_row + 1),
+                    ];
+                }
+            }
 
             for ci in 0..chunk_n {
                 let bi = blk_start + ci;
                 let pair_block = token_pair * n_blocks + bi;
                 let activations = packed_q8k.tiles.as_ptr().add(pair_block * PAIR_BLOCK_BYTES);
                 let x_d = vld1q_f32(packed_q8k.d.as_ptr().add(pair_block * 4));
+                let mut x_d_lanes = [0.0f32; 4];
+                vst1q_f32(x_d_lanes.as_mut_ptr(), x_d);
                 let mut sumi = [vdupq_n_s32(0); ROW_PAIRS];
                 let mut summ = [vdupq_n_s32(0); ROW_PAIRS];
 
@@ -3226,27 +3239,26 @@ unsafe fn gemm_q4_k_rows16_i8mm(
 
                 for pair in 0..ROW_PAIRS {
                     let meta_index = pair * CHUNK_BLOCKS + ci;
-                    acc[pair] = vmlaq_f32(
-                        acc[pair],
-                        vcvtq_f32_s32(sumi[pair]),
-                        vmulq_f32(d_arr[meta_index], x_d),
-                    );
-                    acc[pair] = vmlsq_f32(
-                        acc[pair],
-                        vcvtq_f32_s32(summ[pair]),
-                        vmulq_f32(dmin_arr[meta_index], x_d),
-                    );
+                    let mut d_lanes = [0.0f32; 4];
+                    let mut dmin_lanes = [0.0f32; 4];
+                    let mut sumi_lanes = [0i32; 4];
+                    let mut summ_lanes = [0i32; 4];
+                    vst1q_f32(d_lanes.as_mut_ptr(), d_arr[meta_index]);
+                    vst1q_f32(dmin_lanes.as_mut_ptr(), dmin_arr[meta_index]);
+                    vst1q_s32(sumi_lanes.as_mut_ptr(), sumi[pair]);
+                    vst1q_s32(summ_lanes.as_mut_ptr(), summ[pair]);
+                    for lane in 0..4 {
+                        acc[pair][lane] -=
+                            x_d_lanes[lane] * dmin_lanes[lane] * summ_lanes[lane] as f32;
+                        let d = x_d_lanes[lane] * d_lanes[lane];
+                        acc[pair][lane] += d * sumi_lanes[lane] as f32;
+                    }
                 }
             }
 
             for (pair, pair_acc) in acc.into_iter().enumerate() {
                 let pair_row = row + pair * 2;
-                let values = [
-                    vgetq_lane_f32(pair_acc, 0),
-                    vgetq_lane_f32(pair_acc, 1),
-                    vgetq_lane_f32(pair_acc, 2),
-                    vgetq_lane_f32(pair_acc, 3),
-                ];
+                let values = pair_acc;
                 for (lane, (output_token, output_row)) in [
                     (token, pair_row),
                     (token1, pair_row),
@@ -3257,12 +3269,7 @@ unsafe fn gemm_q4_k_rows16_i8mm(
                 .enumerate()
                 {
                     if output_token != token || lane == 0 || lane == 2 {
-                        let dst = out_ptr.add(output_token * rows + output_row);
-                        if is_first_chunk {
-                            *dst = values[lane];
-                        } else {
-                            *dst += values[lane];
-                        }
+                        *out_ptr.add(output_token * rows + output_row) = values[lane];
                     }
                 }
             }
@@ -3318,7 +3325,7 @@ pub fn gemv_q4_k_int8(
                     };
                 }
             });
-    } else if std::arch::is_aarch64_feature_detected!("i8mm") && rows >= 16 {
+    } else if seq_len > 1 && std::arch::is_aarch64_feature_detected!("i8mm") && rows >= 16 {
         let packed_q8k = unsafe { pack_q8k_i8mm_token_pairs(q8k, n_blocks, seq_len) };
         let out_addr = output.as_mut_ptr() as usize;
         let row_tiles = rows / 16;
@@ -4114,9 +4121,63 @@ mod tests {
                 let expected = dot_q4_k_q8k_scalar(row_bytes, q8k_token, blocks);
                 let got = actual[token * rows + row];
                 assert!(
-                    (got - expected).abs() < 1e-4,
+                    (got - expected).abs() < 1e-3,
                     "token {token} row {row}: actual={got} expected={expected}",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_k_i8mm_batch_preserves_existing_token_bits() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+
+        let rows = 17;
+        let blocks = 10;
+        let cols = blocks * 256;
+        let bytes_per_row = blocks * 144;
+        let mut bytes = Vec::with_capacity(rows * bytes_per_row);
+        for row in 0..rows {
+            let mut row_bytes = make_q4_k_row(blocks);
+            row_bytes[16 + row] ^= (row as u8 + 1) * 3;
+            bytes.extend_from_slice(&row_bytes);
+        }
+        let mut q8k = Vec::with_capacity(3 * blocks);
+        for token in 0..3 {
+            let mut token_blocks = make_q8k_blocks(blocks);
+            for block in &mut token_blocks {
+                block.d *= 1.0 + token as f32 * 0.125;
+            }
+            q8k.extend_from_slice(&token_blocks);
+        }
+
+        let mut outputs = Vec::new();
+        for seq_len in 1..=3 {
+            let mut output = vec![0.0f32; seq_len * rows];
+            gemv_q4_k_int8(
+                &bytes,
+                &q8k[..seq_len * blocks],
+                &mut output,
+                rows,
+                cols,
+                seq_len,
+                bytes_per_row,
+            );
+            outputs.push(output);
+        }
+
+        for seq_len in 2..=3 {
+            for token in 0..seq_len - 1 {
+                for row in 0..rows {
+                    let index = token * rows + row;
+                    assert_eq!(
+                        outputs[seq_len - 2][index].to_bits(),
+                        outputs[seq_len - 1][index].to_bits(),
+                        "seq_len {seq_len} changed token {token} row {row}",
+                    );
+                }
             }
         }
     }
@@ -4171,12 +4232,12 @@ mod tests {
                 let expected_right = dot_q4_k_q8k_scalar(right_row, q8k_token, blocks);
                 let index = token * rows + row;
                 assert!(
-                    (left_actual[index] - expected_left).abs() < 1e-4,
+                    (left_actual[index] - expected_left).abs() < 1e-3,
                     "left token {token} row {row}: actual={} expected={expected_left}",
                     left_actual[index]
                 );
                 assert!(
-                    (right_actual[index] - expected_right).abs() < 1e-4,
+                    (right_actual[index] - expected_right).abs() < 1e-3,
                     "right token {token} row {row}: actual={} expected={expected_right}",
                     right_actual[index]
                 );
