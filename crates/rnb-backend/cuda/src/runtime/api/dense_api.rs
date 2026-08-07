@@ -333,6 +333,137 @@ pub fn dense_q4k_silu_ffn_batch(
         )
 }
 
+/// cu220: dense SwiGLU FFN consuming GDN prefill chain device carriers.
+/// `input` is the normalized FFN input carrier ([seq_len, n_embd] F32) and is
+/// clobbered by the FFN output; the residual carrier is updated in place and
+/// returned as the layer output.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_q4k_silu_ffn_batch_device_carrier(
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    n_ff: usize,
+    n_embd: usize,
+    seq_len: usize,
+    input_id: rnb_backend_api::DeviceTensorId,
+    input_desc: rnb_backend_api::DeviceTensorDesc,
+    residual_id: rnb_backend_api::DeviceTensorId,
+    residual_desc: rnb_backend_api::DeviceTensorDesc,
+) -> Result<
+    (
+        rnb_backend_api::DeviceTensorId,
+        rnb_backend_api::DeviceTensorDesc,
+    ),
+    String,
+> {
+    if seq_len == 0 {
+        return Err("dense SiLU FFN device carrier requires seq_len > 0".to_string());
+    }
+    if n_embd == 0 || n_embd % 256 != 0 {
+        return Err(format!(
+            "dense SiLU FFN device carrier n_embd must be a non-zero multiple of 256, got {n_embd}"
+        ));
+    }
+    if n_ff == 0 || n_ff % 256 != 0 {
+        return Err(format!(
+            "dense SiLU FFN device carrier n_ff must be a non-zero multiple of 256, got {n_ff}"
+        ));
+    }
+    let q4k_row_bytes = (n_embd / 256) * 144;
+    let expected_gate_up = n_ff
+        .checked_mul(q4k_row_bytes)
+        .ok_or_else(|| "dense SiLU FFN device carrier gate/up byte overflow".to_string())?;
+    if gate_weights.len() != expected_gate_up || up_weights.len() != expected_gate_up {
+        return Err(format!(
+            "dense SiLU FFN device carrier gate/up byte mismatch: gate={} up={} expected={expected_gate_up}",
+            gate_weights.len(),
+            up_weights.len()
+        ));
+    }
+    let down_block_bytes = match down_quant {
+        12 => 144,
+        13 => 176,
+        14 => 210,
+        other => {
+            return Err(format!(
+                "dense SiLU FFN device carrier down quant must be Q4_K/Q5_K/Q6_K, got {other}"
+            ));
+        }
+    };
+    let expected_down = n_embd
+        .checked_mul((n_ff / 256) * down_block_bytes)
+        .ok_or_else(|| "dense SiLU FFN device carrier down byte overflow".to_string())?;
+    if down_weights.len() != expected_down {
+        return Err(format!(
+            "dense SiLU FFN device carrier down byte mismatch: got {}, expected {expected_down}",
+            down_weights.len()
+        ));
+    }
+    for (label, desc, role_ok) in [
+        (
+            "input",
+            input_desc,
+            matches!(
+                input_desc.role(),
+                rnb_backend_api::DeviceTensorRole::Normalized
+                    | rnb_backend_api::DeviceTensorRole::Hidden
+            ),
+        ),
+        (
+            "residual",
+            residual_desc,
+            matches!(
+                residual_desc.role(),
+                rnb_backend_api::DeviceTensorRole::Hidden
+            ),
+        ),
+    ] {
+        if desc.rows() != seq_len || desc.cols() != n_embd {
+            return Err(format!(
+                "dense SiLU FFN device carrier {label} shape mismatch: got {}x{}, expected {seq_len}x{n_embd}",
+                desc.rows(),
+                desc.cols()
+            ));
+        }
+        if desc.dtype() != rnb_backend_api::ScalarType::F32 {
+            return Err(format!(
+                "dense SiLU FFN device carrier {label} expects F32, got {:?}",
+                desc.dtype()
+            ));
+        }
+        if !role_ok {
+            return Err(format!(
+                "dense SiLU FFN device carrier {label} role mismatch: got {:?}",
+                desc.role()
+            ));
+        }
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .dense_prefill_silu_ffn_device_carrier(
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            n_ff,
+            n_embd,
+            seq_len,
+            input_id,
+            input_desc,
+            residual_id,
+            residual_desc,
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dense_q4k_gelu_ffn_norm_residual(
     gate_weights: &[u8],

@@ -987,6 +987,20 @@ impl CudaState {
         input_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        // cu220: Q5 는 MMQ tile32 가 없어 dev-input 배치가 raw 로 남았었다
+        // (27B GDN prefill chain ssm_out 102ms/48calls). seq>4(prefill 대역)는
+        // cu219 host-input 위임과 같은 게이트로 q8dot(wide) 세대를 태운다.
+        // verify 밴드(2..=4)의 정책 소유권은 기존 dispatch 게이트에 남긴다.
+        if seq_len > 4 && tuning::prefill_q5_batch_q8dot_enabled(seq_len, rows, blocks_per_row) {
+            return self.q5k_batch_dev_input_q8dot_to_dev(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_dev,
+                output_dev,
+            );
+        }
         self.k_quant_batch_dev_input_to_dev(
             "rnb_q5k_gemv_batch",
             weights,
@@ -1791,6 +1805,56 @@ impl CudaState {
             trace_stage,
             false,
         )
+    }
+
+    /// cu220: dense SwiGLU FFN over registry device carriers for the GDN
+    /// prefill chain (Qwen dense GDN layers). Runs the MTP-verify dev-input
+    /// FFN with the normalized carrier as both input and output (the input is
+    /// fully consumed by the gate/up stage before the down projection writes),
+    /// then adds the result into the residual carrier in place. Returns the
+    /// residual carrier as the layer output — the caller must not release the
+    /// residual separately from the returned output.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dense_prefill_silu_ffn_device_carrier(
+        &mut self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        n_ff: usize,
+        n_embd: usize,
+        seq_len: usize,
+        input_id: rnb_backend_api::DeviceTensorId,
+        input_desc: rnb_backend_api::DeviceTensorDesc,
+        residual_id: rnb_backend_api::DeviceTensorId,
+        residual_desc: rnb_backend_api::DeviceTensorDesc,
+    ) -> Result<
+        (
+            rnb_backend_api::DeviceTensorId,
+            rnb_backend_api::DeviceTensorDesc,
+        ),
+        String,
+    > {
+        let input_ptr = self.device_tensor_ptr(input_id, input_desc)?;
+        let residual_ptr = self.device_tensor_ptr(residual_id, residual_desc)?;
+        let mut trace_stage = std::time::Instant::now();
+        self.dense_q4k_silu_ffn_batch_dev_input_to_dev(
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            n_ff,
+            n_embd,
+            seq_len,
+            input_ptr,
+            input_ptr,
+            None,
+            None,
+            &mut trace_stage,
+        )?;
+        self.launch_add_f32_inplace(residual_ptr, input_ptr, seq_len * n_embd)
+            .map_err(|err| format!("dense SiLU FFN device carrier residual add failed: {err}"))?;
+        Ok((residual_id, residual_desc))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -934,6 +934,131 @@ fn cuda_dense_ffn_dev_input_path_prefers_packed_or_raw_over_expanded_diag_candid
     assert!(counters.packed_q8dot_bytes > 0);
 }
 
+// cu220: GDN prefill chain 의 dense SwiGLU FFN carrier 소비 경로 계약 —
+// 실제 kernel 실행으로 (1) residual carrier 재사용(output_id == residual_id),
+// (2) residual add 정확성(zero-residual 호출과의 차분 == residual),
+// (3) 배선 sanity(CPU dequant reference 와 norm-level 일치)를 고정한다.
+// element 단위 타이트 대조는 이중 Q8_1 양자화(입력 q8 gate/up + act q8 down)의
+// cancellation 증폭 때문에 부적합하다 (cu219 GPU-quantizer reference 교훈).
+#[test]
+fn dense_silu_ffn_device_carrier_adds_residual_and_reuses_carrier() {
+    let _guard = runtime_test_lock();
+
+    let n_embd = 1024usize;
+    let n_ff = 1024usize;
+    let seq_len = 6usize; // >4: GDN prefill chain dense FFN 소비 대역
+    let gate_blocks = n_embd / 256;
+    let down_blocks = n_ff / 256;
+    let gate = make_test_q4k_weights(1, n_ff, gate_blocks, 811)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, gate_blocks, 821)
+        .pop()
+        .unwrap();
+    let down = make_test_q6k_weights(1, n_embd, down_blocks, 823)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * n_embd)
+        .map(|i| ((i as f32 % 61.0) - 30.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let residual = (0..seq_len * n_embd)
+        .map(|i| ((i as f32 % 43.0) - 21.0) * 0.0078125)
+        .collect::<Vec<_>>();
+
+    let input_desc = rnb_backend_api::DeviceTensorDesc::new(
+        seq_len,
+        n_embd,
+        rnb_backend_api::ScalarType::F32,
+        rnb_backend_api::DeviceTensorRole::Normalized,
+    );
+    let residual_desc = rnb_backend_api::DeviceTensorDesc::new(
+        seq_len,
+        n_embd,
+        rnb_backend_api::ScalarType::F32,
+        rnb_backend_api::DeviceTensorRole::Hidden,
+    );
+    let run_carrier = |residual_values: &[f32]| -> Result<Vec<f32>, String> {
+        // 입력 carrier 는 FFN output 으로 클로버되므로 호출마다 새로 올린다.
+        let input_id = upload_device_tensor_f32(input_desc, &input)?;
+        let residual_id = upload_device_tensor_f32(residual_desc, residual_values)?;
+        let (output_id, output_desc) = crate::dense_q4k_silu_ffn_batch_device_carrier(
+            &gate,
+            &up,
+            &down,
+            14,
+            n_ff,
+            n_embd,
+            seq_len,
+            input_id,
+            input_desc,
+            residual_id,
+            residual_desc,
+        )?;
+        assert_eq!(
+            output_id, residual_id,
+            "output must reuse the residual carrier"
+        );
+        assert_eq!(output_desc, residual_desc);
+        let output = download_device_tensor_f32(output_id)?;
+        assert!(release_device_tensor(output_id)?);
+        assert!(release_device_tensor(input_id)?);
+        Ok(output)
+    };
+
+    let ffn_only = match run_carrier(&vec![0.0f32; seq_len * n_embd]) {
+        Ok(output) => output,
+        Err(err) if err.contains("CUDA") || err.contains("cuda") => {
+            eprintln!("skipping dense carrier FFN test: {err}");
+            return;
+        }
+        Err(err) => panic!("dense carrier FFN zero-residual run failed: {err}"),
+    };
+    let with_residual = run_carrier(&residual).expect("dense carrier FFN residual run");
+
+    // (2) residual add: 같은 입력/가중치의 FFN 은 결정적이므로 두 호출의
+    // 차분은 residual 과 부동소수 add 오차(ulp of |ffn|) 안에서 일치한다.
+    for (idx, ((with_r, ffn), r)) in with_residual
+        .iter()
+        .zip(ffn_only.iter())
+        .zip(residual.iter())
+        .enumerate()
+    {
+        let diff = (with_r - ffn - r).abs();
+        let tolerance = 1.0e-3f32.max(ffn.abs() * 1.0e-6);
+        assert!(
+            diff <= tolerance,
+            "dense carrier FFN residual add mismatch at {idx}: with_r={with_r} ffn={ffn} residual={r} diff={diff}"
+        );
+    }
+
+    // (3) 배선 sanity: CPU dequant reference 와 norm-level 로 일치해야 한다.
+    // (gate/up 교체, down 가중치 오배선 같은 결함은 수십 % 로 발산한다.)
+    let mut cpu_ffn = Vec::with_capacity(seq_len * n_embd);
+    for token in input.chunks_exact(n_embd) {
+        let gate_row = cpu_q4k_gemv_rows(&gate, n_ff, gate_blocks, token);
+        let up_row = cpu_q4k_gemv_rows(&up, n_ff, gate_blocks, token);
+        let act = gate_row
+            .iter()
+            .zip(up_row.iter())
+            .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+            .collect::<Vec<_>>();
+        cpu_ffn.extend(cpu_q6k_gemv_rows(&down, n_embd, down_blocks, &act));
+    }
+    let err_norm = ffn_only
+        .iter()
+        .zip(cpu_ffn.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f32>()
+        .sqrt();
+    let ref_norm = cpu_ffn.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!(ref_norm > 0.0, "CPU reference must be non-trivial");
+    let rel = err_norm / ref_norm;
+    assert!(
+        rel < 2.0e-2,
+        "dense carrier FFN deviates from CPU reference: rel_norm_err={rel}"
+    );
+}
+
 #[test]
 #[ignore]
 fn cuda_weight_residency_q4_f16_transient_admission_records_expanded_counter() {

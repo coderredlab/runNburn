@@ -136,15 +136,17 @@ fn emit_gdn_stage_trace(tag: &str, layer_idx: usize, data: &[f32], seq_len: usiz
 
 #[cfg(feature = "cuda")]
 fn gdn_device_chain_weights_supported(w: &GdnLayerWeights) -> bool {
+    // cu220: Q5_K 는 chain 이 공유하는 MTP verify projection dispatch 의
+    // q8dot 세대(cu209)로 이미 지원된다 — 27B dense ssm_out 이 Q5_K.
     matches!(
         w.qkv_weight.ggml_type,
-        GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::Q8_0
+        GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
     ) && matches!(w.gate_weight.ggml_type, GGMLType::Q4_K | GGMLType::Q8_0)
         && matches!(w.ssm_alpha.ggml_type, GGMLType::Q4_K | GGMLType::F32)
         && matches!(w.ssm_beta.ggml_type, GGMLType::Q4_K | GGMLType::F32)
         && matches!(
             w.ssm_out.ggml_type,
-            GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::Q8_0
+            GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
         )
 }
 
@@ -202,10 +204,19 @@ fn try_forward_gdn_layer_to_device_output(
     if !gdn_device_chain_weights_supported(w) {
         return Ok(None);
     }
-    let Some(moe_w) = w.shared_expert_moe.as_ref() else {
-        return Ok(None);
-    };
-    if !qwen35moe_device_input_supported(moe_w, seq_len) {
+    let moe_w = w.shared_expert_moe.as_ref();
+    if let Some(moe_w) = moe_w {
+        if !qwen35moe_device_input_supported(moe_w, seq_len) {
+            return Ok(None);
+        }
+    } else if !backend_runtime::gdn_dense_prefill_ffn_device_supported(
+        &w.ffn_gate_weight,
+        &w.ffn_up_weight,
+        &w.ffn_down_weight,
+        metadata.hidden_dim,
+    ) {
+        // cu220: dense GDN 층은 FFN admission 을 chain 실행 전에 확정해야 한다
+        // — chain 이 SSM state 를 전진시킨 뒤에는 staged 후퇴가 불가능하다.
         return Ok(None);
     }
 
@@ -274,6 +285,53 @@ fn try_forward_gdn_layer_to_device_output(
             Err(cleanup_err) => Err(crate::error::LlmError::Forward(format!(
                 "CUDA Qwen GDN device-input chain did not return MoE carriers; cleanup failed: {cleanup_err}"
             ))),
+        };
+    };
+
+    // cu220: dense GDN 층 — chain carrier 를 device-input dense SwiGLU FFN 으로
+    // 소비한다. output 은 residual carrier 재사용이므로 이중 해제를 막는다.
+    let Some(moe_w) = moe_w else {
+        let output = match backend_runtime::gdn_dense_prefill_ffn_device_carrier(
+            &w.ffn_gate_weight,
+            &w.ffn_up_weight,
+            &w.ffn_down_weight,
+            seq_len,
+            metadata.hidden_dim,
+            moe_input_id,
+            moe_input_desc,
+            residual_id,
+            residual_desc,
+        ) {
+            Ok(output) => output,
+            Err(err) => {
+                let cleanup = chain_output.release_device_carriers_if_present();
+                return Err(match cleanup {
+                    Ok(()) => err,
+                    Err(cleanup_err) => crate::error::LlmError::Forward(format!(
+                        "{err}; CUDA Qwen GDN device carriers cleanup failed: {cleanup_err}"
+                    )),
+                });
+            }
+        };
+        if output.output_id == residual_id {
+            chain_output.device_residual = None;
+        }
+        return match chain_output.release_device_carriers_if_present() {
+            Ok(()) => Ok(Some(output)),
+            Err(cleanup_err) => {
+                let output_cleanup = output.release();
+                Err(match output_cleanup {
+                    Ok(true) => crate::error::LlmError::Forward(format!(
+                        "CUDA Qwen GDN dense device carrier cleanup failed: {cleanup_err}"
+                    )),
+                    Ok(false) => crate::error::LlmError::Forward(format!(
+                        "CUDA Qwen GDN dense device carrier cleanup failed: {cleanup_err}; output cleanup failed: tensor was already missing"
+                    )),
+                    Err(output_cleanup_err) => crate::error::LlmError::Forward(format!(
+                        "CUDA Qwen GDN dense device carrier cleanup failed: {cleanup_err}; output cleanup failed: {output_cleanup_err}"
+                    )),
+                })
+            }
         };
     };
 

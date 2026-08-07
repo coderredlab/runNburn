@@ -144,6 +144,10 @@ pub(super) use gpu_gdn::{
     gdn_prefill_gated_norm_silu_project, ssm_prefill_conv1d_silu, ssm_prefill_delta_net,
     try_gdn_prefill_chain_if_supported, GdnPrefillChainShape,
 };
+#[cfg(feature = "cuda")]
+pub(super) use gpu_gdn::{
+    gdn_dense_prefill_ffn_device_carrier, gdn_dense_prefill_ffn_device_supported,
+};
 #[cfg(any(not(feature = "cuda"), test))]
 pub(super) use gpu_gdn::{nemotron_mamba2_decode_scan, nemotron_mamba2_prefill_scan};
 #[cfg(feature = "vulkan")]

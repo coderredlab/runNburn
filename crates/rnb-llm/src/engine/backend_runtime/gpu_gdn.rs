@@ -147,7 +147,7 @@ pub(in crate::engine) fn try_gdn_prefill_chain_if_supported(
 fn chain_k_quant_weight_supported(weight: &QuantizedWeight) -> bool {
     matches!(
         weight.ggml_type,
-        GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::Q8_0
+        GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
     )
 }
 
@@ -163,10 +163,10 @@ fn chain_k_quant_weight_raw<'a>(
 ) -> crate::error::Result<(&'a [u8], GGMLType)> {
     if !matches!(
         weight.ggml_type,
-        GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::Q8_0
+        GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K | GGMLType::Q8_0
     ) {
         return Err(crate::error::LlmError::Forward(format!(
-            "CUDA GDN prefill chain {label} must be Q4_K, Q6_K or Q8_0, got {:?}",
+            "CUDA GDN prefill chain {label} must be Q4_K, Q5_K, Q6_K or Q8_0, got {:?}",
             weight.ggml_type
         )));
     }
@@ -312,6 +312,86 @@ pub(in crate::engine) fn gdn_prefill_chain_q4k(
     }
     #[cfg(not(feature = "cuda"))]
     Ok(None)
+}
+
+/// cu220: dense GDN 층(shared_expert_moe 없음)의 prefill chain carrier 를
+/// device-input dense SwiGLU FFN 으로 소비할 수 있는지 admission 검사.
+/// chain 이 SSM state 를 전진시키기 전에 호출해야 한다 — FFN admission 이
+/// 나중에 실패하면 staged 후퇴가 불가능하다(state 이미 변경).
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn gdn_dense_prefill_ffn_device_supported(
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    down: &QuantizedWeight,
+    hidden_dim: usize,
+) -> bool {
+    crate::engine::tuning_runtime::gdn_prefill_chain_dense_ffn_device_enabled()
+        && gate.ggml_type == GGMLType::Q4_K
+        && up.ggml_type == GGMLType::Q4_K
+        && matches!(
+            down.ggml_type,
+            GGMLType::Q4_K | GGMLType::Q5_K | GGMLType::Q6_K
+        )
+        && hidden_dim > 0
+        && hidden_dim % 256 == 0
+        && gate.rows > 0
+        && gate.rows % 256 == 0
+        && gate.cols == hidden_dim
+        && up.rows == gate.rows
+        && up.cols == hidden_dim
+        && down.rows == hidden_dim
+        && down.cols == gate.rows
+        && gate.data.as_bytes().is_some()
+        && up.data.as_bytes().is_some()
+        && down.data.as_bytes().is_some()
+}
+
+/// cu220: chain carrier(normalized FFN 입력 + residual)를 dense SwiGLU FFN 으로
+/// 소비한다. 반환 output 은 residual carrier 를 재사용하므로 호출자는
+/// `output.output_id == residual_id` 일 때 residual 의 이중 해제를 피해야 한다.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn gdn_dense_prefill_ffn_device_carrier(
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    down: &QuantizedWeight,
+    seq_len: usize,
+    hidden_dim: usize,
+    input_id: cuda_runtime::DeviceTensorId,
+    input_desc: cuda_runtime::DeviceTensorDesc,
+    residual_id: cuda_runtime::DeviceTensorId,
+    residual_desc: cuda_runtime::DeviceTensorDesc,
+) -> crate::error::Result<super::NemotronDeviceLayerOutput> {
+    let gate_bytes = gate
+        .data
+        .as_bytes()
+        .ok_or_else(|| cuda_error("dense GDN prefill FFN gate raw bytes missing".to_string()))?;
+    let up_bytes = up
+        .data
+        .as_bytes()
+        .ok_or_else(|| cuda_error("dense GDN prefill FFN up raw bytes missing".to_string()))?;
+    let down_bytes = down
+        .data
+        .as_bytes()
+        .ok_or_else(|| cuda_error("dense GDN prefill FFN down raw bytes missing".to_string()))?;
+    let (output_id, output_desc) = cuda_runtime::dense_q4k_silu_ffn_batch_device_carrier(
+        gate_bytes,
+        up_bytes,
+        down_bytes,
+        down.ggml_type,
+        gate.rows,
+        hidden_dim,
+        seq_len,
+        input_id,
+        input_desc,
+        residual_id,
+        residual_desc,
+    )
+    .map_err(cuda_error)?;
+    Ok(super::NemotronDeviceLayerOutput {
+        output_id,
+        output_desc,
+    })
 }
 
 #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(unused_variables))]
@@ -901,9 +981,10 @@ mod tests {
             1,
             1,
         );
-        let q5k_weight = QuantizedWeight::new(
+        // cu220: Q5_K 는 chain 지원 quant 로 승격됐다 — 미지원 소재는 Q3_K.
+        let q3k_weight = QuantizedWeight::new(
             rnb_core::tensor::Tensor::zeros(&[1], rnb_core::tensor::DType::U8),
-            GGMLType::Q5_K,
+            GGMLType::Q3_K,
             1,
             1,
         );
@@ -928,7 +1009,7 @@ mod tests {
             &[],
             &mut delta_state,
             &[],
-            &q5k_weight,
+            &q3k_weight,
             &[],
             true,
             1e-6,

@@ -1140,6 +1140,41 @@ pub fn dense_q4k_silu_ffn_batch(
     .map_err(|err| format!("CUDA dense Q4_K SiLU FFN batch failed: {err}"))
 }
 
+// cu220: GDN prefill chain dense FFN — carrier 입력을 그대로 소비하고
+// residual carrier 를 layer output 으로 반환한다 (host 왕복 0).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_q4k_silu_ffn_batch_device_carrier(
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    n_ff: usize,
+    n_embd: usize,
+    seq_len: usize,
+    input_id: rnb_backend_api::DeviceTensorId,
+    input_desc: rnb_backend_api::DeviceTensorDesc,
+    residual_id: rnb_backend_api::DeviceTensorId,
+    residual_desc: rnb_backend_api::DeviceTensorDesc,
+) -> Result<(
+    rnb_backend_api::DeviceTensorId,
+    rnb_backend_api::DeviceTensorDesc,
+)> {
+    backend::dense_q4k_silu_ffn_batch_device_carrier(
+        gate,
+        up,
+        down,
+        down_quant as u32,
+        n_ff,
+        n_embd,
+        seq_len,
+        input_id,
+        input_desc,
+        residual_id,
+        residual_desc,
+    )
+    .map_err(|err| format!("CUDA dense Q4_K SiLU FFN device carrier failed: {err}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn dense_q4k_gelu_ffn_norm_residual(
     gate: &[u8],

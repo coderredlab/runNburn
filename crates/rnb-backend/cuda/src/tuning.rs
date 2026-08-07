@@ -825,6 +825,10 @@ pub fn gdn_prefill_chain_moe_output_device_enabled() -> bool {
     env_bool("RNB_CUDA_GDN_PREFILL_CHAIN_MOE_OUTPUT_DEVICE", true)
 }
 
+pub fn gdn_prefill_chain_dense_ffn_device_enabled() -> bool {
+    env_bool("RNB_CUDA_GDN_PREFILL_CHAIN_DENSE_FFN_DEVICE", true)
+}
+
 pub fn gdn_prefill_chain_skip_host_projection_enabled() -> bool {
     env_bool("RNB_CUDA_GDN_PREFILL_CHAIN_SKIP_HOST_PROJECTION", true)
 }

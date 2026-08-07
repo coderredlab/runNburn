@@ -319,6 +319,11 @@ fn device_carrier_accepts_layer_kind(
         || (architecture == ModelArchitecture::Qwen35MoE
             && qwen_gdn_moe_output_device_enabled()
             && matches!(layer_kind, Some("gated_delta_net" | "attention")))
+        // cu220: dense Qwen35 는 GDN 층만 carrier 로 잇는다 — attention 층은
+        // dense FFN device 경로가 없어 host materialize 로 내린다.
+        || (architecture == ModelArchitecture::Qwen35
+            && qwen_gdn_moe_output_device_enabled()
+            && matches!(layer_kind, Some("gated_delta_net")))
 }
 
 #[cfg(feature = "cuda")]
@@ -2064,7 +2069,10 @@ fn run_prefill_layers_cpu_range_impl(
         #[cfg(feature = "cuda")]
         if matches!(hidden, hidden_carrier::PrefillHidden::Device(_)) {
             let current_layer_kind = weights.layers.get(layer_idx).map(prefill_layer_kind_name);
-            if architecture == ModelArchitecture::Qwen35MoE && qwen_gdn_moe_output_device_enabled()
+            if matches!(
+                architecture,
+                ModelArchitecture::Qwen35MoE | ModelArchitecture::Qwen35
+            ) && qwen_gdn_moe_output_device_enabled()
             {
                 if !device_carrier_accepts_layer_kind(architecture, current_layer_kind) {
                     let reason = device_hidden_materialize_reason(current_layer_kind);
@@ -2886,7 +2894,10 @@ fn run_prefill_layers_cpu_range_impl(
             LayerType::GatedDeltaNet(w) => {
                 #[cfg(feature = "cuda")]
                 if prefix_collector.is_none()
-                    && architecture == ModelArchitecture::Qwen35MoE
+                    && matches!(
+                        architecture,
+                        ModelArchitecture::Qwen35MoE | ModelArchitecture::Qwen35
+                    )
                     && qwen_gdn_moe_output_device_enabled()
                 {
                     if let Some(output) =
@@ -3361,6 +3372,14 @@ mod tests {
         ));
         assert!(super::device_carrier_accepts_layer_kind(
             super::ModelArchitecture::Qwen35MoE,
+            Some("attention")
+        ));
+        assert!(super::device_carrier_accepts_layer_kind(
+            super::ModelArchitecture::Qwen35,
+            Some("gated_delta_net")
+        ));
+        assert!(!super::device_carrier_accepts_layer_kind(
+            super::ModelArchitecture::Qwen35,
             Some("attention")
         ));
         unsafe {
