@@ -1062,13 +1062,35 @@ fn metal_qwen_route_sort_enabled() -> bool {
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn metal_qwen_prefill_moe_trace_requirement(active: bool) -> Option<&'static str> {
+fn metal_prefill_diagnostic_requirement(layer_range: &Range<usize>) -> Option<&'static str> {
+    if dump_bin_dir().is_some() {
+        return Some("binary_dump");
+    }
+    if layer_trace_enabled() {
+        return Some("layer_trace");
+    }
+    if attn_trace_enabled() {
+        return Some("attention_trace");
+    }
+    if crate::engine::policy::env_os_string("RNB_DEBUG_HIDDEN_HASH_TRACE").is_some() {
+        return Some("hidden_hash_trace");
+    }
+    if crate::engine::policy::env_os_string("RNB_PREFILL_NAN_TRACE").is_some() {
+        return Some("nan_trace");
+    }
+    if layer_range.clone().any(targeted_attn_trace_enabled) {
+        return Some("targeted_attention_trace");
+    }
+    None
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_prefill_moe_trace_requirement(active: bool) -> Option<&'static str> {
     active.then_some("moe_trace_active")
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
-fn metal_qwen_prefill_host_requirement(
-    weights: &ModelWeights,
+fn metal_prefill_host_requirement(
     layer_range: &Range<usize>,
     profiler_enabled: bool,
 ) -> Option<&'static str> {
@@ -1081,17 +1103,7 @@ fn metal_qwen_prefill_host_requirement(
     if crate::engine::moe_profile::is_enabled() {
         return Some("moe_profile");
     }
-    if dump_bin_dir().is_some() {
-        return Some("binary_dump");
-    }
-    if layer_trace_enabled() {
-        return Some("layer_trace");
-    }
-    if attn_trace_enabled() {
-        return Some("attention_trace");
-    }
-    if let Some(reason) =
-        metal_qwen_prefill_moe_trace_requirement(crate::engine::moe_trace::is_active())
+    if let Some(reason) = metal_prefill_moe_trace_requirement(crate::engine::moe_trace::is_active())
     {
         return Some(reason);
     }
@@ -1101,14 +1113,20 @@ fn metal_qwen_prefill_host_requirement(
     if crate::engine::moe_trace::predictor_trace_is_active() {
         return Some("moe_predictor_trace");
     }
+    metal_prefill_diagnostic_requirement(layer_range)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn metal_qwen_prefill_host_requirement(
+    weights: &ModelWeights,
+    layer_range: &Range<usize>,
+    profiler_enabled: bool,
+) -> Option<&'static str> {
+    if let Some(reason) = metal_prefill_host_requirement(layer_range, profiler_enabled) {
+        return Some(reason);
+    }
     if crate::engine::models::shared_expert_moe::jit_request::qwen35_moe_jit_load_requested() {
         return Some("moe_jit_load");
-    }
-    if crate::engine::policy::env_os_string("RNB_DEBUG_HIDDEN_HASH_TRACE").is_some() {
-        return Some("hidden_hash_trace");
-    }
-    if crate::engine::policy::env_os_string("RNB_PREFILL_NAN_TRACE").is_some() {
-        return Some("nan_trace");
     }
     if crate::engine::policy::env_os_string("RNB_DEBUG_GDN_STAGE_DUMP_DIR").is_some() {
         return Some("gdn_stage_dump");
@@ -1118,9 +1136,6 @@ fn metal_qwen_prefill_host_requirement(
         return Some("vulkan_layer_trace");
     }
     for layer_idx in layer_range.clone() {
-        if targeted_attn_trace_enabled(layer_idx) {
-            return Some("targeted_attention_trace");
-        }
         if weights.layers.get(layer_idx).is_some_and(|layer| {
             matches!(layer, LayerType::GatedDeltaNet(_))
                 && models::qwen::debug_gdn_stage_trace_enabled(layer_idx)
@@ -1498,8 +1513,8 @@ fn try_run_metal_gemma_prefill_layer_range(
             None,
         );
     }
-    if profiler_enabled || crate::engine::policy::profiling_enabled() {
-        return metal_gemma_prefill_layer_range_fallback("profiler", seq_len, layer_range, None);
+    if let Some(reason) = metal_prefill_host_requirement(layer_range, profiler_enabled) {
+        return metal_gemma_prefill_layer_range_fallback(reason, seq_len, layer_range, None);
     }
     if layer_range.start >= layer_range.end || layer_range.end > weights.layers.len() {
         return metal_gemma_prefill_layer_range_fallback(
@@ -3250,6 +3265,54 @@ mod tests {
             }
         }
     }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[test]
+    fn metal_prefill_diagnostics_require_host_execution() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cases = [
+            ("RNB_DUMP_BIN_DIR", "test-dump", "binary_dump"),
+            ("RNB_DEBUG_LAYER_TRACE", "1", "layer_trace"),
+            ("RNB_DEBUG_ATTN_TRACE", "1", "attention_trace"),
+            ("RNB_DEBUG_HIDDEN_HASH_TRACE", "1", "hidden_hash_trace"),
+            ("RNB_PREFILL_NAN_TRACE", "1", "nan_trace"),
+            ("RNB_DEBUG_ATTN_LAYER", "2", "targeted_attention_trace"),
+        ];
+        let previous = cases
+            .iter()
+            .map(|(key, _, _)| (*key, crate::engine::policy::env_os_string(key)))
+            .collect::<Vec<_>>();
+
+        for (key, _, _) in cases {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        for (key, value, expected) in cases {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            assert_eq!(
+                super::metal_prefill_diagnostic_requirement(&(2..3)),
+                Some(expected)
+            );
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+
+        for (key, value) in previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
     #[test]
     fn device_hidden_materialize_reason_tracks_next_layer_kind() {
         assert_eq!(super::device_hidden_materialize_reason(None), "range_end");
@@ -3378,12 +3441,12 @@ mod tests {
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     #[test]
-    fn qwen_prefill_layer_chain_requires_host_for_active_moe_histogram_trace() {
+    fn prefill_layer_chain_requires_host_for_active_moe_histogram_trace() {
         assert_eq!(
-            super::metal_qwen_prefill_moe_trace_requirement(true),
+            super::metal_prefill_moe_trace_requirement(true),
             Some("moe_trace_active")
         );
-        assert_eq!(super::metal_qwen_prefill_moe_trace_requirement(false), None);
+        assert_eq!(super::metal_prefill_moe_trace_requirement(false), None);
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
