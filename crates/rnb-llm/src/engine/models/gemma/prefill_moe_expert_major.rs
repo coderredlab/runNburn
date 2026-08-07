@@ -189,6 +189,7 @@ fn compute_shared_output(
 ) -> crate::error::Result<Vec<f32>> {
     let shared_start = profile_enabled.then(Instant::now);
     let mut shared_down = vec![0.0f32; seq_len * hidden_dim];
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let used_metal = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
         &w.ffn_gate_weight,
         &w.ffn_up_weight,
@@ -199,6 +200,8 @@ fn compute_shared_output(
         hidden_dim,
         true,
     )?;
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    let used_metal = false;
     if !used_metal {
         let (mut shared_gate, shared_up) = prefill_gate_up_vectors(
             &w.ffn_gate_weight,
