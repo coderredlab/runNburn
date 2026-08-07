@@ -31,6 +31,7 @@ pub(super) fn compute_prefill_attention(
     cached_k_tensor: Option<&Tensor>,
     cached_v_tensor: Option<&Tensor>,
     cached_kv_f16: Option<(&[u16], &[u16])>,
+    metal_f16_kv_resident: Option<(u64, usize, bool)>,
     attn_gate: Option<&Tensor>,
     layer_idx: usize,
     seq_len: usize,
@@ -64,19 +65,45 @@ pub(super) fn compute_prefill_attention(
     let f16_attention_out = if !non_causal && !force_tokenwise {
         if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
             let gemma_flash = if matches!(architecture, ModelArchitecture::Gemma4) {
-                backend_runtime::prefill_attention_f16kv_gemma_if_supported(
-                    kernels::tensor_as_f32_slice(q),
-                    cached_k_f16,
-                    cached_v_f16,
-                    seq_len,
-                    kv_len,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    resolve_attention_scale(metadata, architecture),
-                    sliding_window,
-                    resolve_attention_softcap(architecture),
-                )?
+                let resident =
+                    if let Some((sequence_epoch, cache_layer, owns_kv)) = metal_f16_kv_resident {
+                        backend_runtime::prefill_attention_f16kv_gemma_resident_if_supported(
+                            kernels::tensor_as_f32_slice(q),
+                            cached_k_f16,
+                            cached_v_f16,
+                            sequence_epoch,
+                            cache_layer,
+                            owns_kv,
+                            seq_len,
+                            pos_start,
+                            kv_len,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            resolve_attention_scale(metadata, architecture),
+                            sliding_window,
+                            resolve_attention_softcap(architecture),
+                        )?
+                    } else {
+                        None
+                    };
+                if resident.is_some() {
+                    resident
+                } else {
+                    backend_runtime::prefill_attention_f16kv_gemma_if_supported(
+                        kernels::tensor_as_f32_slice(q),
+                        cached_k_f16,
+                        cached_v_f16,
+                        seq_len,
+                        kv_len,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        resolve_attention_scale(metadata, architecture),
+                        sliding_window,
+                        resolve_attention_softcap(architecture),
+                    )?
+                }
             } else {
                 None
             };

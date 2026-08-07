@@ -46,6 +46,10 @@ impl LayerCacheRead<'_> {
             Self::Materialized { key, value } => (key, value),
         }
     }
+
+    pub(crate) fn is_borrowed(&self) -> bool {
+        matches!(self, Self::Borrowed { .. })
+    }
 }
 
 #[inline]
@@ -801,7 +805,7 @@ impl KVCache {
         self.current_len = len;
     }
 
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(any(feature = "cuda", feature = "metal", test))]
     pub(crate) fn sequence_epoch(&self) -> u64 {
         self.sequence_epoch
     }

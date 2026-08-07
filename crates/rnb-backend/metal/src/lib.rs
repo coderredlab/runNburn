@@ -1723,6 +1723,12 @@ mod tests_fixture;
 // MetalBackend
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
+struct GemmaPrefillF16KvResident {
+    sequence_epoch: u64,
+    kv: compute::KvResident,
+}
+
 /// Metal 추론 백엔드.
 ///
 /// `new()` 에서 device / command queue / Q4_K pipeline 을 한 번만 빌드한다.
@@ -1904,6 +1910,9 @@ pub struct MetalBackend {
     /// layer → KvResident. KV cache device residency — decode 매 토큰 전체 KV
     /// 업로드 대신 1 token append. attn_decode 가 device buffer 를 직접 읽음.
     kv_residents: RefCell<HashMap<usize, compute::KvResident>>,
+    /// External MTP target의 canonical host F16 cache를 cache-layer별로 mirror한다.
+    /// Layer key 하나당 active sequence epoch 한 세트만 유지한다.
+    gemma_prefill_f16kv_residents: RefCell<HashMap<usize, GemmaPrefillF16KvResident>>,
     /// layer → compressed KVarN KV device residency.
     kvarn_residents: RefCell<HashMap<usize, compute::KvarnResident>>,
     /// layer → AttnCarrier. attention layer 전체 단일 command buffer carrier.
@@ -2131,6 +2140,7 @@ impl MetalBackend {
                 gdn_inproj_carriers: RefCell::new(HashMap::new()),
                 o_chain_carriers: RefCell::new(HashMap::new()),
                 kv_residents: RefCell::new(HashMap::new()),
+                gemma_prefill_f16kv_residents: RefCell::new(HashMap::new()),
                 kvarn_residents: RefCell::new(HashMap::new()),
                 attn_carriers: RefCell::new(HashMap::new()),
                 attn_moe_carriers: RefCell::new(HashMap::new()),
@@ -2214,11 +2224,17 @@ impl MetalBackend {
         self.gdn_core_carriers.borrow_mut().clear();
         self.qwen_moe_decode_chain_carriers.borrow_mut().clear();
         self.kv_residents.borrow_mut().clear();
+        self.gemma_prefill_f16kv_residents.borrow_mut().clear();
         self.kvarn_residents.borrow_mut().clear();
         self.attn_batch_carriers.borrow_mut().clear();
         self.gdn_batch_carriers.borrow_mut().clear();
         self.batched_gdn_state_handle.borrow_mut().take();
         self.active_batched_gdn_carriers.borrow_mut().clear();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clear_gemma_prefill_f16kv_residents(&self) {
+        self.gemma_prefill_f16kv_residents.borrow_mut().clear();
     }
 
     /// pm112: weight residency 활성 여부. 기본 ON — MLA dense GEMV Metal 경로가
@@ -2359,6 +2375,7 @@ impl MetalBackend {
             gdn_inproj_carriers: RefCell::new(HashMap::new()),
             o_chain_carriers: RefCell::new(HashMap::new()),
             kv_residents: RefCell::new(HashMap::new()),
+            gemma_prefill_f16kv_residents: RefCell::new(HashMap::new()),
             kvarn_residents: RefCell::new(HashMap::new()),
             attn_carriers: RefCell::new(HashMap::new()),
             attn_moe_carriers: RefCell::new(HashMap::new()),
@@ -2782,6 +2799,90 @@ impl MetalBackend {
             q,
             k_f16,
             v_f16,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            softcap,
+        );
+        Some(out)
+    }
+
+    /// External MTP target continuation의 F16 K/V를 cache-layer별 shared buffer에 유지한다.
+    /// Epoch mismatch나 64-row capacity 증가에서는 prefix 전체를 다시 동기화한다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_attention_gemma_resident(
+        &self,
+        sequence_epoch: u64,
+        cache_layer: usize,
+        owns_kv: bool,
+        pos_start: usize,
+        q: &[f32],
+        k_f16: &[u16],
+        v_f16: &[u16],
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+        softcap: Option<f32>,
+    ) -> Option<Vec<f32>> {
+        let ctx = self.ctx.as_ref()?;
+        let supported = match head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !supported {
+            return None;
+        }
+        let capacity = kv_len.next_multiple_of(64);
+        {
+            let mut cache = self.gemma_prefill_f16kv_residents.borrow_mut();
+            let recreate = cache
+                .get(&cache_layer)
+                .map(|entry| {
+                    entry.sequence_epoch != sequence_epoch
+                        || entry.kv.kv_int8
+                        || entry.kv.num_kv_heads != num_kv_heads
+                        || entry.kv.head_dim != head_dim
+                        || entry.kv.capacity < capacity
+                })
+                .unwrap_or(true);
+            if recreate {
+                cache.insert(
+                    cache_layer,
+                    GemmaPrefillF16KvResident {
+                        sequence_epoch,
+                        kv: compute::KvResident::new_f16_zeroed(
+                            ctx,
+                            num_kv_heads,
+                            head_dim,
+                            capacity,
+                        ),
+                    },
+                );
+            }
+            let entry = cache
+                .get_mut(&cache_layer)
+                .expect("Metal Gemma F16 KV resident was not initialized");
+            let dirty_start = if owns_kv { pos_start } else { kv_len };
+            entry.kv.sync_f16_range(k_f16, v_f16, dirty_start, kv_len);
+        }
+        let cache = self.gemma_prefill_f16kv_residents.borrow();
+        let resident = &cache
+            .get(&cache_layer)
+            .expect("Metal Gemma F16 KV resident was not initialized")
+            .kv;
+        let (out, _gpu_ms) = compute::prefill_flash_attention_gemma_resident_with_ctx(
+            ctx,
+            q,
+            resident,
             seq_len,
             kv_len,
             num_heads,
@@ -16568,6 +16669,198 @@ kernel void coop_right_direct_fill_probe(
             assert!(max_abs < 5e-3, "Gemma HD{hd} flash max_abs={max_abs}");
             assert!(cosine > 0.99999, "Gemma HD{hd} flash cosine={cosine}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires M5 Metal device"]
+    fn gemma_prefill_f16kv_resident_matches_fresh_state_transitions() {
+        let backend = MetalBackend::new();
+        let ctx = backend.ctx.as_ref().expect("metal ctx");
+        if !ctx.tensorops_capable {
+            return;
+        }
+        let (nh, nkv, scale, cache_layer) = (4usize, 2usize, 1.0f32, 7usize);
+        let r = |i: usize, salt: usize| -> f32 {
+            ((((i + salt) as u64).wrapping_mul(2654435761) % 1000) as f32 / 500.0 - 1.0) * 0.25
+        };
+        for (hd, window, softcap) in [
+            (256usize, Some(32usize), None),
+            (512usize, None, Some(50.0f32)),
+        ] {
+            let kv_dim = nkv * hd;
+
+            let (seq, pos_start, kv_len) = (2usize, 61usize, 63usize);
+            let q: Vec<f32> = (0..seq * nh * hd).map(|i| r(i, 3)).collect();
+            let k: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 7)).to_bits())
+                .collect();
+            let v: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 13)).to_bits())
+                .collect();
+            let fresh = backend
+                .prefill_flash_attention_gemma(
+                    &q, &k, &v, seq, kv_len, nh, nkv, hd, scale, window, softcap,
+                )
+                .expect("fresh Gemma flash");
+            let resident = backend
+                .prefill_flash_attention_gemma_resident(
+                    11,
+                    cache_layer,
+                    true,
+                    pos_start,
+                    &q,
+                    &k,
+                    &v,
+                    seq,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    window,
+                    softcap,
+                )
+                .expect("resident Gemma flash");
+            assert_eq!(resident, fresh, "HD{hd} initial resident upload");
+
+            let (seq, pos_start, kv_len) = (3usize, 63usize, 66usize);
+            let q: Vec<f32> = (0..seq * nh * hd).map(|i| r(i, 17)).collect();
+            let k: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 7)).to_bits())
+                .collect();
+            let v: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 13)).to_bits())
+                .collect();
+            let fresh = backend
+                .prefill_flash_attention_gemma(
+                    &q, &k, &v, seq, kv_len, nh, nkv, hd, scale, window, softcap,
+                )
+                .expect("fresh Gemma flash after append");
+            let resident = backend
+                .prefill_flash_attention_gemma_resident(
+                    11,
+                    cache_layer,
+                    true,
+                    pos_start,
+                    &q,
+                    &k,
+                    &v,
+                    seq,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    window,
+                    softcap,
+                )
+                .expect("resident Gemma flash after append");
+            assert_eq!(resident, fresh, "HD{hd} capacity-crossing append");
+
+            let (seq, pos_start, kv_len) = (3usize, 62usize, 65usize);
+            let q: Vec<f32> = (0..seq * nh * hd).map(|i| r(i, 23)).collect();
+            let mut k: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 7)).to_bits())
+                .collect();
+            let mut v: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 13)).to_bits())
+                .collect();
+            for i in pos_start * kv_dim..kv_len * kv_dim {
+                k[i] = half::f16::from_f32(r(i, 29)).to_bits();
+                v[i] = half::f16::from_f32(r(i, 31)).to_bits();
+            }
+            let fresh = backend
+                .prefill_flash_attention_gemma(
+                    &q, &k, &v, seq, kv_len, nh, nkv, hd, scale, window, softcap,
+                )
+                .expect("fresh Gemma flash after truncate");
+            let resident = backend
+                .prefill_flash_attention_gemma_resident(
+                    11,
+                    cache_layer,
+                    true,
+                    pos_start,
+                    &q,
+                    &k,
+                    &v,
+                    seq,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    window,
+                    softcap,
+                )
+                .expect("resident Gemma flash after truncate");
+            assert_eq!(resident, fresh, "HD{hd} truncate/regrow overwrite");
+            {
+                let cache = backend.gemma_prefill_f16kv_residents.borrow();
+                let kv = &cache.get(&cache_layer).expect("resident entry").kv;
+                let padding_start = kv_len * kv_dim;
+                let padding_len = (kv.capacity - kv_len) * kv_dim;
+                let k_tail = unsafe {
+                    std::slice::from_raw_parts(
+                        (kv.k_buf.contents().as_ptr() as *const u16).add(padding_start),
+                        padding_len,
+                    )
+                };
+                let v_tail = unsafe {
+                    std::slice::from_raw_parts(
+                        (kv.v_buf.contents().as_ptr() as *const u16).add(padding_start),
+                        padding_len,
+                    )
+                };
+                assert!(k_tail.iter().all(|&bits| bits == 0));
+                assert!(v_tail.iter().all(|&bits| bits == 0));
+            }
+
+            let (seq, pos_start, kv_len) = (2usize, 61usize, 63usize);
+            let q: Vec<f32> = (0..seq * nh * hd).map(|i| r(i, 37)).collect();
+            let k: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 41)).to_bits())
+                .collect();
+            let v: Vec<u16> = (0..kv_len * kv_dim)
+                .map(|i| half::f16::from_f32(r(i, 43)).to_bits())
+                .collect();
+            let fresh = backend
+                .prefill_flash_attention_gemma(
+                    &q, &k, &v, seq, kv_len, nh, nkv, hd, scale, window, softcap,
+                )
+                .expect("fresh Gemma flash after epoch change");
+            let resident = backend
+                .prefill_flash_attention_gemma_resident(
+                    12,
+                    cache_layer,
+                    true,
+                    pos_start,
+                    &q,
+                    &k,
+                    &v,
+                    seq,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    window,
+                    softcap,
+                )
+                .expect("resident Gemma flash after epoch change");
+            assert_eq!(resident, fresh, "HD{hd} epoch replacement");
+            assert_eq!(
+                backend
+                    .gemma_prefill_f16kv_residents
+                    .borrow()
+                    .get(&cache_layer)
+                    .expect("resident entry")
+                    .sequence_epoch,
+                12
+            );
+        }
+        backend.clear_sequence_state();
+        assert!(backend.gemma_prefill_f16kv_residents.borrow().is_empty());
     }
 
     /// pm47 ② STEP4+STEP5 GEMM 통합 커널이 CPU f32 oracle 과 의미동등 drift 내인지.

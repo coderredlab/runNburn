@@ -4806,13 +4806,12 @@ pub(crate) fn encode_flash_attn_prefill_gemma(
     }
 }
 
-/// Gemma 4 HD=256/512 flash attention의 host 입출력 seam. 반환값은 `(output, GPU-time ms)`다.
 #[allow(clippy::too_many_arguments)]
-pub fn prefill_flash_attention_gemma_with_ctx(
+fn prefill_flash_attention_gemma_buffers_with_ctx(
     ctx: &MetalContext,
     q: &[f32],
-    k_f16: &[u16],
-    v_f16: &[u16],
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
     seq_len: usize,
     kv_len: usize,
     num_heads: usize,
@@ -4823,8 +4822,6 @@ pub fn prefill_flash_attention_gemma_with_ctx(
     softcap: Option<f32>,
 ) -> (Vec<f32>, f64) {
     assert_eq!(q.len(), seq_len * num_heads * head_dim, "q len");
-    assert_eq!(k_f16.len(), kv_len * num_kv_heads * head_dim, "k len");
-    assert_eq!(v_f16.len(), kv_len * num_kv_heads * head_dim, "v len");
     assert!(
         matches!(head_dim, 256 | 512),
         "Gemma flash kernel requires HD=256 or HD=512"
@@ -4843,29 +4840,7 @@ pub fn prefill_flash_attention_gemma_with_ctx(
                     .expect("Metal: buffer")
             }
         };
-    let padded_kv_elems = kv_len.next_multiple_of(64) * num_kv_heads * head_dim;
-    let mk_padded_f16 = |data: &[u16]| -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        let buffer = ctx
-            .device
-            .newBufferWithLength_options(padded_kv_elems * std::mem::size_of::<u16>(), shared)
-            .expect("Metal: padded f16 buffer");
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buffer.contents().as_ptr() as *mut u16,
-                data.len(),
-            );
-            std::ptr::write_bytes(
-                (buffer.contents().as_ptr() as *mut u16).add(data.len()),
-                0,
-                padded_kv_elems - data.len(),
-            );
-        }
-        buffer
-    };
     let q_buf = mk(q.as_ptr() as *const _, std::mem::size_of_val(q));
-    let k_buf = mk_padded_f16(k_f16);
-    let v_buf = mk_padded_f16(v_f16);
     let o_buf = ctx
         .device
         .newBufferWithLength_options(
@@ -4893,8 +4868,8 @@ pub fn prefill_flash_attention_gemma_with_ctx(
         ctx,
         &enc,
         &q_buf,
-        &k_buf,
-        &v_buf,
+        k_buf,
+        v_buf,
         &o_buf,
         &nh_buf,
         &nkv_buf,
@@ -4927,6 +4902,101 @@ pub fn prefill_flash_attention_gemma_with_ctx(
     }
     .to_vec();
     (out, gpu_ms)
+}
+
+/// Gemma 4 HD=256/512 flash attention의 host 입출력 seam. 반환값은 `(output, GPU-time ms)`다.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_flash_attention_gemma_with_ctx(
+    ctx: &MetalContext,
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> (Vec<f32>, f64) {
+    assert_eq!(k_f16.len(), kv_len * num_kv_heads * head_dim, "k len");
+    assert_eq!(v_f16.len(), kv_len * num_kv_heads * head_dim, "v len");
+    let padded_kv_elems = kv_len.next_multiple_of(64) * num_kv_heads * head_dim;
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mk_padded_f16 = |data: &[u16]| -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        let buffer = ctx
+            .device
+            .newBufferWithLength_options(padded_kv_elems * std::mem::size_of::<u16>(), shared)
+            .expect("Metal: padded f16 buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buffer.contents().as_ptr() as *mut u16,
+                data.len(),
+            );
+            std::ptr::write_bytes(
+                (buffer.contents().as_ptr() as *mut u16).add(data.len()),
+                0,
+                padded_kv_elems - data.len(),
+            );
+        }
+        buffer
+    };
+    let k_buf = mk_padded_f16(k_f16);
+    let v_buf = mk_padded_f16(v_f16);
+    prefill_flash_attention_gemma_buffers_with_ctx(
+        ctx,
+        q,
+        &k_buf,
+        &v_buf,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        sliding_window,
+        softcap,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_flash_attention_gemma_resident_with_ctx(
+    ctx: &MetalContext,
+    q: &[f32],
+    resident: &KvResident,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> (Vec<f32>, f64) {
+    assert!(!resident.kv_int8, "Gemma flash requires F16 KV resident");
+    assert_eq!(resident.num_kv_heads, num_kv_heads, "resident kv heads");
+    assert_eq!(resident.head_dim, head_dim, "resident head dim");
+    assert!(
+        resident.filled >= kv_len,
+        "resident KV prefix is incomplete"
+    );
+    assert!(resident.capacity >= kv_len.next_multiple_of(64));
+    prefill_flash_attention_gemma_buffers_with_ctx(
+        ctx,
+        q,
+        &resident.k_buf,
+        &resident.v_buf,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        sliding_window,
+        softcap,
+    )
 }
 
 /// pm48 prefill flash microbench dispatch. q[seq*nh*hd] f32, k/v[kv_len*nkv*hd] f16 bits.
@@ -12261,6 +12331,21 @@ impl KvResident {
         Self::new_with_format(ctx, num_kv_heads, head_dim, capacity, false)
     }
 
+    pub fn new_f16_zeroed(
+        ctx: &MetalContext,
+        num_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Self {
+        let resident = Self::new_f16(ctx, num_kv_heads, head_dim, capacity);
+        let elements = resident.capacity * resident.kv_dim;
+        unsafe {
+            std::ptr::write_bytes(resident.k_buf.contents().as_ptr() as *mut u16, 0, elements);
+            std::ptr::write_bytes(resident.v_buf.contents().as_ptr() as *mut u16, 0, elements);
+        }
+        resident
+    }
+
     fn new_with_format(
         ctx: &MetalContext,
         num_kv_heads: usize,
@@ -12331,6 +12416,43 @@ impl KvResident {
                 kv_int8: false,
             }
         }
+    }
+
+    /// Canonical host F16 cache의 변경 suffix를 resident buffer에 반영한다.
+    /// `dirty_start`가 기존 filled보다 뒤면 아직 없는 구간부터, speculative rollback이면
+    /// dirty suffix 시작부터 덮어쓴다. Gemma flash가 마지막 64-row tile의 V를 모두
+    /// 읽으므로 현재 logical tail 뒤 padding은 매번 다시 0으로 지운다.
+    pub fn sync_f16_range(
+        &mut self,
+        k_all: &[u16],
+        v_all: &[u16],
+        dirty_start: usize,
+        target_len: usize,
+    ) {
+        assert!(!self.kv_int8, "sync_f16_range on int8 KvResident");
+        assert!(
+            target_len <= self.capacity,
+            "kv target_len={target_len} exceeds capacity={}",
+            self.capacity
+        );
+        assert!(
+            k_all.len() >= target_len * self.kv_dim && v_all.len() >= target_len * self.kv_dim,
+            "k_all/v_all shorter than target_len*kv_dim"
+        );
+        let copy_start = dirty_start.min(self.filled).min(target_len);
+        let start = copy_start * self.kv_dim;
+        let count = (target_len - copy_start) * self.kv_dim;
+        let padding_start = target_len * self.kv_dim;
+        let padding_count = (self.capacity - target_len) * self.kv_dim;
+        unsafe {
+            let kp = self.k_buf.contents().as_ptr() as *mut u16;
+            let vp = self.v_buf.contents().as_ptr() as *mut u16;
+            std::ptr::copy_nonoverlapping(k_all.as_ptr().add(start), kp.add(start), count);
+            std::ptr::copy_nonoverlapping(v_all.as_ptr().add(start), vp.add(start), count);
+            std::ptr::write_bytes(kp.add(padding_start), 0, padding_count);
+            std::ptr::write_bytes(vp.add(padding_start), 0, padding_count);
+        }
+        self.filled = target_len;
     }
 
     /// host KV(전체 kv_len, f16 bits)에서 device 에 아직 없는 [filled, target_len)

@@ -319,7 +319,11 @@ pub struct MetalQwenPrefillChainOut {
 // resident/carrier 캐시 재사용.
 thread_local! {
     static METAL: rnb_backend_metal::MetalBackend = rnb_backend_metal::MetalBackend::new();
+    static GEMMA_PREFILL_F16KV_RESIDENT_USED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
+static GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn metal_qwen36_vision_linear_bf16(
     weight: &[u16],
@@ -1934,6 +1938,25 @@ pub fn metal_decode_parity_counters_report(label: &str) {
 pub fn metal_clear_sequence_state() -> Result<()> {
     METAL.with(|b| b.clear_sequence_state());
     Ok(())
+}
+
+fn metal_clear_gemma_prefill_f16kv_residents_local() {
+    GEMMA_PREFILL_F16KV_RESIDENT_USED.with(|used| {
+        if used.replace(false) {
+            METAL.with(|b| b.clear_gemma_prefill_f16kv_residents());
+            GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+}
+
+/// Layer parallelism 때문에 resident는 여러 Rayon TLS backend에 흩어진다. 실제로 이
+/// 경로를 쓴 worker만 동기 broadcast로 비워 teardown에서 Metal buffer를 남기지 않는다.
+pub fn metal_clear_gemma_prefill_f16kv_residents() {
+    metal_clear_gemma_prefill_f16kv_residents_local();
+    if GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    rayon::broadcast(|_| metal_clear_gemma_prefill_f16kv_residents_local());
 }
 
 /// pm31: device 잔류 delta_state(residency 경로)를 host `out` 으로 sync 한다. speculative
@@ -6196,6 +6219,63 @@ pub fn metal_gemma_prefill_attention_flash_if_supported(
     }
     METAL.with(|b| {
         b.prefill_flash_attention_gemma(
+            q,
+            k_f16,
+            v_f16,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            softcap,
+        )
+    })
+}
+
+/// External MTP target의 tiny continuation batch 전용 Gemma F16 KV residency.
+/// Host F16 cache가 canonical이며 cache-layer resident에는 변경 suffix만 반영한다.
+#[allow(clippy::too_many_arguments)]
+pub fn metal_gemma_prefill_attention_flash_resident_if_supported(
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    owns_kv: bool,
+    seq_len: usize,
+    pos_start: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> Option<Vec<f32>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_FLASH_ATTN")
+        || env_falsey("RNB_METAL_GEMMA_PREFILL_F16KV_RESIDENT")
+        || !(2..=3).contains(&seq_len)
+        || pos_start == 0
+        || kv_len != pos_start.saturating_add(seq_len)
+        || !matches!(head_dim, 256 | 512)
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+    {
+        return None;
+    }
+    GEMMA_PREFILL_F16KV_RESIDENT_USED.with(|used| {
+        if !used.replace(true) {
+            GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    METAL.with(|b| {
+        b.prefill_flash_attention_gemma_resident(
+            sequence_epoch,
+            cache_layer,
+            owns_kv,
+            pos_start,
             q,
             k_f16,
             v_f16,

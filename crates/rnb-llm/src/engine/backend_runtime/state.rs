@@ -69,6 +69,7 @@ impl EngineBackendRuntime {
         #[cfg(feature = "metal")]
         {
             metal_runtime::metal_clear_sequence_state().map_err(crate::error::LlmError::Forward)?;
+            metal_runtime::metal_clear_gemma_prefill_f16kv_residents();
         }
         #[cfg(feature = "vulkan")]
         {
@@ -84,6 +85,8 @@ impl EngineBackendRuntime {
 
 impl Drop for EngineBackendRuntime {
     fn drop(&mut self) {
+        #[cfg(feature = "metal")]
+        crate::engine::metal_runtime::metal_clear_gemma_prefill_f16kv_residents();
         #[cfg(feature = "mediatek")]
         {
             crate::engine::mediatek_runtime::clear_gated_gelu_ffn_f32_cache();

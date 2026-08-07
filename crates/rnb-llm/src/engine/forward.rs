@@ -104,6 +104,7 @@ pub(super) fn forward_attention_layer(
         None,
         None,
         false,
+        false,
     )?
     .hidden)
 }
@@ -146,6 +147,7 @@ pub(super) fn forward_attention_layer_with_rope_pos(
         norm_eps,
         None,
         None,
+        false,
         false,
     )?
     .hidden)
@@ -191,6 +193,7 @@ pub(super) fn forward_attention_layer_with_positions(
         Some((positions, rope_sections)),
         None,
         false,
+        false,
     )
 }
 
@@ -212,6 +215,7 @@ pub(super) fn forward_attention_layer_with_gemma4_ple_fusion(
     rope_theta: f32,
     norm_eps: f32,
     ple_fusion: Option<&Gemma4PrefillPleFusion<'_>>,
+    external_target_batch: bool,
     non_causal: bool,
 ) -> crate::error::Result<PrefillAttentionLayerOutput> {
     forward_attention_layer_impl(
@@ -233,6 +237,7 @@ pub(super) fn forward_attention_layer_with_gemma4_ple_fusion(
         norm_eps,
         None,
         ple_fusion,
+        external_target_batch,
         non_causal,
     )
 }
@@ -257,6 +262,7 @@ fn forward_attention_layer_impl(
     norm_eps: f32,
     imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
     ple_fusion: Option<&Gemma4PrefillPleFusion<'_>>,
+    external_target_batch: bool,
     non_causal: bool,
 ) -> crate::error::Result<PrefillAttentionLayerOutput> {
     if !non_causal
@@ -709,6 +715,7 @@ fn forward_attention_layer_impl(
                 kv_dim,
                 norm_eps,
                 imrope_positions,
+                external_target_batch,
                 non_causal,
                 projection,
                 &prof,
@@ -750,6 +757,7 @@ fn forward_attention_layer_impl(
             kv_dim,
             norm_eps,
             imrope_positions,
+            external_target_batch,
             non_causal,
             projection,
             &prof,
@@ -932,6 +940,7 @@ fn compute_prefill_attention_from_projection<F>(
     kv_dim: usize,
     norm_eps: f32,
     imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
+    external_target_batch: bool,
     non_causal: bool,
     projection: projection::PrefillAttentionProjection,
     prof: &F,
@@ -1234,6 +1243,13 @@ where
                 .expect("cached K tensor materialized")
         });
     }
+    #[cfg(feature = "metal")]
+    let metal_f16_kv_resident = cached_kv_f16_storage
+        .as_ref()
+        .filter(|storage| external_target_batch && storage.is_borrowed())
+        .map(|_| (kv_cache.sequence_epoch(), kv_cache_layer, owns_kv));
+    #[cfg(not(feature = "metal"))]
+    let metal_f16_kv_resident: Option<(u64, usize, bool)> = None;
     let cached_kv_f16 = if cached_k_tensor.is_none() && cached_v_tensor.is_none() {
         cached_kv_f16_storage
             .as_ref()
@@ -1286,6 +1302,7 @@ where
         cached_k_tensor.as_ref(),
         cached_v_tensor.as_ref(),
         cached_kv_f16,
+        metal_f16_kv_resident,
         attn_gate.as_ref(),
         layer_idx,
         seq_len,

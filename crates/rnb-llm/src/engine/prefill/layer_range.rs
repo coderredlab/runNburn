@@ -42,6 +42,50 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range(
         rope_theta,
         norm_eps,
         true,
+        false,
+        None,
+    )
+    .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn run_prefill_layers_cpu_range_external_target_batch(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    gemma_per_layer_base: Option<&GemmaPerLayerBase>,
+    hidden: Tensor,
+    layer_range: Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+) -> crate::error::Result<Tensor> {
+    run_prefill_layers_cpu_range_impl(
+        kv_cache,
+        metadata,
+        architecture,
+        weights,
+        gemma_per_layer_base,
+        hidden,
+        layer_range,
+        seq_len,
+        pos_start,
+        None,
+        false,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rope_theta,
+        norm_eps,
+        true,
+        true,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -84,6 +128,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_non_causal(
         rope_theta,
         norm_eps,
         true,
+        false,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -133,6 +178,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_with_positions(
         rope_theta,
         norm_eps,
         true,
+        false,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -175,6 +221,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_mtp_resident_kv(
         kv_dim,
         rope_theta,
         norm_eps,
+        false,
         false,
         None,
     )
@@ -219,6 +266,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_carrier(
         rope_theta,
         norm_eps,
         true,
+        false,
         None,
     )
 }
@@ -260,6 +308,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_prefix_state(
         rope_theta,
         norm_eps,
         true,
+        false,
         prefix_collector,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -1937,6 +1986,7 @@ fn run_prefill_layers_cpu_range_impl(
     rope_theta: f32,
     norm_eps: f32,
     _mirror_attention_kv_to_host: bool,
+    external_target_batch: bool,
     mut prefix_collector: Option<&mut verify_window::GdnPrefixStateCollector>,
 ) -> crate::error::Result<hidden_carrier::PrefillHidden> {
     #[cfg(feature = "cuda")]
@@ -2866,6 +2916,7 @@ fn run_prefill_layers_cpu_range_impl(
                             rope_theta,
                             norm_eps,
                             ple_fusion.as_ref(),
+                            external_target_batch,
                             non_causal,
                         )?
                     };

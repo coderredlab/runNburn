@@ -22,6 +22,7 @@ use super::policy;
 use super::prefill::{
     new_empty_kv_cache, run_prefill_layers_cpu_range,
     run_prefill_layers_cpu_range_collect_prefix_state,
+    run_prefill_layers_cpu_range_external_target_batch,
 };
 #[cfg(feature = "cuda")]
 use super::prefill::{
@@ -536,7 +537,7 @@ impl Engine {
         &mut self,
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true, false)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true, false, false)
             .map(|(result, _)| result)
     }
 
@@ -550,6 +551,7 @@ impl Engine {
             Some(vec![prefix_tokens]),
             true,
             false,
+            false,
         )
         .map(|(result, _)| result)
     }
@@ -558,7 +560,7 @@ impl Engine {
         &mut self,
         tokens: &[u32],
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
-        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, false, false)
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, false, false, false)
             .map(|(result, _)| result)
     }
 
@@ -570,6 +572,7 @@ impl Engine {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(
             tokens,
             Some(vec![prefix_tokens]),
+            false,
             false,
             false,
         )
@@ -587,6 +590,7 @@ impl Engine {
             Some(prefix_tokens.to_vec()),
             false,
             collect_output_logits,
+            false,
         )
         .map(|(result, _)| result)
     }
@@ -600,6 +604,7 @@ impl Engine {
             None,
             true,
             collect_output_logits,
+            true,
         )
     }
 
@@ -865,6 +870,7 @@ impl Engine {
         prefix_tokens: Option<Vec<usize>>,
         observe_mtp: bool,
         collect_output_logits: bool,
+        external_target_batch: bool,
     ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
         let weights = match &self.weights {
             Some(w) => w,
@@ -943,6 +949,24 @@ impl Engine {
                 rope_theta,
                 norm_eps,
                 prefix_collector.as_mut(),
+            )?
+        } else if external_target_batch {
+            run_prefill_layers_cpu_range_external_target_batch(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
             )?
         } else {
             run_prefill_layers_cpu_range(

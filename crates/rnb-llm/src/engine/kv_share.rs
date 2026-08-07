@@ -19,6 +19,31 @@ use super::dequant::dequantize_bytes_to_f32;
 use super::state::Engine;
 use crate::{KvBorrow, SharedKvLayer, SharedKvStates};
 
+#[cfg(feature = "metal")]
+struct GemmaF16KvResidentErrorGuard {
+    armed: bool,
+}
+
+#[cfg(feature = "metal")]
+impl GemmaF16KvResidentErrorGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for GemmaF16KvResidentErrorGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::engine::metal_runtime::metal_clear_gemma_prefill_f16kv_residents();
+        }
+    }
+}
+
 impl Engine {
     /// Read-only borrow of target's KV cache for drafter cross-attention.
     ///
@@ -274,7 +299,15 @@ impl Engine {
         _position_offset: u32,
         collect_output_logits: bool,
     ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
-        self.forward_prefill_argmax_tokens_collect_output_hidden(tokens, collect_output_logits)
+        #[cfg(feature = "metal")]
+        let mut resident_guard = GemmaF16KvResidentErrorGuard::new();
+        let result =
+            self.forward_prefill_argmax_tokens_collect_output_hidden(tokens, collect_output_logits);
+        #[cfg(feature = "metal")]
+        if result.is_ok() {
+            resident_guard.disarm();
+        }
+        result
     }
 
     /// Target Engine 의 KV cache 를 `new_position` 으로 truncate 한다.

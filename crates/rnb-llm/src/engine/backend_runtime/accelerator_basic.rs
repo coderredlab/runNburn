@@ -156,6 +156,69 @@ pub(in crate::engine) fn prefill_attention_f16kv_gemma_if_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn prefill_attention_f16kv_gemma_resident_if_supported(
+    q: &[f32],
+    k: &[u16],
+    v: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    owns_kv: bool,
+    seq_len: usize,
+    pos_start: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    #[cfg(feature = "metal")]
+    {
+        return Ok(
+            metal_runtime::metal_gemma_prefill_attention_flash_resident_if_supported(
+                q,
+                k,
+                v,
+                sequence_epoch,
+                cache_layer,
+                owns_kv,
+                seq_len,
+                pos_start,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                sliding_window,
+                softcap,
+            ),
+        );
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (
+            q,
+            k,
+            v,
+            sequence_epoch,
+            cache_layer,
+            owns_kv,
+            seq_len,
+            pos_start,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            softcap,
+        );
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn prefill_attention_f16kv_dense_chain_if_supported(
     q: &[f32],
