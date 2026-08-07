@@ -726,6 +726,9 @@ pub struct MetalContext {
     /// Q8_0 tensorops GEMM(unsloth UD attn/GDN/shared projection). NK=32(block), Q4_K v1 구조.
     pub(crate) gemm_q8_0_tensorops_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Q8_0 tensorops GEMM for tiny M. 8×32 tile keeps the v1 F32-input arithmetic.
+    pub(crate) gemm_q8_0_tensorops_small_m_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Q8_0 v2 tensorops GEMM(llama 패턴 64×128, NK=32). GDN in_proj/ATN proj/ssm_out(Q8_0).
     pub(crate) gemm_q8_0_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -1708,6 +1711,17 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let gemm_q8_0_tensorops_small_m_pipeline: Option<
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    > = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q8_0_tensorops_small_m",
+        ))
+    } else {
+        None
+    };
     // pm42 M3: production v2 GEMM(64×128 winner 타일) + cast. 같은 src, fn명만 다름. capability 시만.
     let gemm_q4k_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2548,6 +2562,7 @@ pub fn build_metal_context_with_opts(
         gemm_q3k_tensorops_v2_pipeline,
         gemm_q2k_tensorops_v2_pipeline,
         gemm_q8_0_tensorops_pipeline,
+        gemm_q8_0_tensorops_small_m_pipeline,
         gemm_q8_0_tensorops_v2_pipeline,
         gemm_q4k_tensorops_v2_scatter_accum_pipeline,
         gemm_q6k_tensorops_v2_scatter_accum_pipeline,
@@ -5941,6 +5956,43 @@ pub(crate) fn encode_gemm_q8_0_tensorops(
         n,
         m,
         64,
+        32,
+        4,
+    );
+}
+
+/// Q8_0 tensorops GEMM encode for M<=3. 8×32 tile, KC=32, same F32-input arithmetic as v1.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q8_0_tensorops_small_m(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q8_0_tensorops_small_m_pipeline
+        .as_ref()
+        .expect("gemm_q8_0_tensorops_small_m_pipeline missing (capability=false?)");
+    encode_tensorops_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        8,
         32,
         4,
     );

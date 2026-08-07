@@ -14882,6 +14882,49 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires TensorOps-capable Metal device; sets env, run single-threaded"]
+    fn prefill_q8_0_small_m_chain_matches_default_chain_exactly() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend = MetalBackend::new();
+        let ctx = backend.ctx.as_ref().expect("metal ctx");
+        if !ctx.tensorops_capable {
+            eprintln!("[q8-small-m] not tensorops-capable; skipping runtime oracle");
+            return;
+        }
+
+        let (hid, ffn) = (256usize, 512usize);
+        let gate_w = build_q8_0_rows(ffn, hid);
+        let up_w = build_q8_0_rows(ffn, hid);
+        let down_w = build_q8_0_rows(hid, ffn);
+        let gate_mapped = mapped_test_tensor(&gate_w);
+        let up_mapped = mapped_test_tensor(&up_w);
+        let down_mapped = mapped_test_tensor(&down_w);
+        let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
+        let up_raw = up_mapped.as_bytes().expect("up bytes");
+        let down_raw = down_mapped.as_bytes().expect("down bytes");
+
+        for m in [2usize, 3] {
+            let normed = det_vals(m * hid, 0.1);
+            let default = {
+                let _off = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "0");
+                backend.prefill_ffn_chain(
+                    &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
+                )
+            };
+            let small_m = {
+                let _on = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "1");
+                backend.prefill_ffn_chain(
+                    &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
+                )
+            };
+            assert_eq!(small_m, default, "Q8_0 tiny-M chain mismatch for M={m}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires TensorOps-capable Metal device; sets env, run single-threaded"]
     fn qwen_moe_id_primitive_runtime_matches_cpu_sparse_accum() {
         let _env_lock = ENV_LOCK
             .lock()

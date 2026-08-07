@@ -1455,3 +1455,79 @@ kernel void gemm_q8_0_tensorops(
         }
     }
 }
+
+// Tiny-M Q8_0 FFN tile. The projection arithmetic matches the v1 F32-input
+// TensorOps path while avoiding a 64-row activation/output tile for M<=3.
+kernel void gemm_q8_0_tensorops_small_m(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const float *input        [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N            [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M            [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    const uint BM = 8u, BN = 32u, KC = 32u;
+    uint row0 = tgid.x * BN;
+    uint tok0 = tgid.y * BM;
+    uint num_blk = K / 32u;
+
+    threadgroup half  A_stage[8 * 32];
+    threadgroup half  B_stage[32 * 32];
+    threadgroup float C_stage[8 * 32];
+
+    for (uint i = tid; i < BM * BN; i += 128u) {
+        C_stage[i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = 0; c < num_blk; c++) {
+        for (uint i = tid; i < BM * KC; i += 128u) {
+            uint t = i / KC;
+            uint kk = i % KC;
+            uint tok = tok0 + t;
+            A_stage[i] = (tok < M) ? (half)input[tok * K + c * KC + kk] : (half)0;
+        }
+        if (tid < BN) {
+            uint row = row0 + tid;
+            if (row < N) {
+                device const uchar *blk = weight_bytes + (row * num_blk + c) * 34u;
+                ushort d_bits = (ushort)blk[0] | ((ushort)blk[1] << 8);
+                float d = (float)as_type<half>(d_bits);
+                device const char *qs = (device const char *)(blk + 2);
+                for (uint l = 0; l < KC; l++) {
+                    B_stage[l * BN + tid] = (half)(d * (float)qs[l]);
+                }
+            } else {
+                for (uint k = 0; k < KC; k++) {
+                    B_stage[k * BN + tid] = (half)0;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto A = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
+            A_stage, dextents<int32_t, 2>(32, 8));
+        auto B = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
+            B_stage, dextents<int32_t, 2>(32, 32));
+        auto C = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(
+            C_stage, dextents<int32_t, 2>(32, 8));
+        constexpr auto desc = matmul2d_descriptor(
+            8, 32, 32, false, false, false,
+            matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<desc, execution_simdgroups<4>> op;
+        op.run(A, B, C);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = tid; i < BM * BN; i += 128u) {
+        uint t = i / BN;
+        uint r = i % BN;
+        uint tok = tok0 + t;
+        uint row = row0 + r;
+        if (tok < M && row < N) {
+            out[tok * N + row] = C_stage[t * BN + r];
+        }
+    }
+}

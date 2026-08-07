@@ -11644,6 +11644,52 @@ pub(crate) fn prefill_ffn_chain_v2_scatter_accum_encode_gather(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn prefill_ffn_q8_0_gemm_encode(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+    small_m: bool,
+) {
+    if small_m {
+        crate::compute::encode_gemm_q8_0_tensorops_small_m(
+            ctx,
+            enc,
+            w_buf,
+            weight_byte_offset,
+            in_buf,
+            out_buf,
+            n_buf,
+            k_buf,
+            m_buf,
+            n,
+            m,
+        );
+    } else {
+        crate::compute::encode_gemm_q8_0_tensorops(
+            ctx,
+            enc,
+            w_buf,
+            weight_byte_offset,
+            in_buf,
+            out_buf,
+            n_buf,
+            k_buf,
+            m_buf,
+            n,
+            m,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
     ctx: &MetalContext,
     carrier: &PrefillFfnCarrier,
@@ -11660,10 +11706,14 @@ pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
     let ffn_dim = carrier.ffn_dim;
     let seq_len = carrier.seq_len;
     carrier.upload_normed(normed);
+    let small_m = seq_len <= 3;
+    #[cfg(test)]
+    let small_m =
+        small_m && std::env::var("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M").as_deref() != Ok("0");
 
     let cmd = ctx.queue.commandBuffer().expect("command buffer");
     let enc = cmd.computeCommandEncoder().expect("compute encoder");
-    crate::compute::encode_gemm_q8_0_tensorops(
+    prefill_ffn_q8_0_gemm_encode(
         ctx,
         &enc,
         gate_w_buf,
@@ -11675,8 +11725,9 @@ pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
         &carrier.m_buf,
         ffn_dim,
         seq_len,
+        small_m,
     );
-    crate::compute::encode_gemm_q8_0_tensorops(
+    prefill_ffn_q8_0_gemm_encode(
         ctx,
         &enc,
         up_w_buf,
@@ -11688,6 +11739,7 @@ pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
         &carrier.m_buf,
         ffn_dim,
         seq_len,
+        small_m,
     );
     crate::compute::chain_barrier(ctx, &enc);
     if use_gelu {
@@ -11710,7 +11762,7 @@ pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
         );
     }
     crate::compute::chain_barrier(ctx, &enc);
-    crate::compute::encode_gemm_q8_0_tensorops(
+    prefill_ffn_q8_0_gemm_encode(
         ctx,
         &enc,
         down_w_buf,
@@ -11722,6 +11774,7 @@ pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
         &carrier.m_buf,
         hidden_dim,
         seq_len,
+        small_m,
     );
 
     enc.endEncoding();
