@@ -137,26 +137,48 @@ pub(in crate::runtime) fn pack_q4k_for_q8dot(
         rows * blocks_per_row
             * super::weight_residency::Q4K_PACKED_Q8DOT_BYTES_PER_BLOCK
     ];
-    for row in 0..rows {
-        for block_idx in 0..blocks_per_row {
-            let src_base = (row * blocks_per_row + block_idx) * 144;
-            let block = &weights[src_base..src_base + 144];
-            let dst_base = (row * blocks_per_row + block_idx) * 148;
-            let dst = &mut packed[dst_base..dst_base + 148];
-            dst[0..4].copy_from_slice(&block[0..4]);
-            for j in 0..8usize {
-                let (sc, mn) = if j < 4 {
-                    (block[4 + j] & 63, block[4 + j + 4] & 63)
-                } else {
-                    let sc = (block[4 + j + 4] & 0x0f) | ((block[4 + j - 4] >> 6) << 4);
-                    let mn = (block[4 + j + 4] >> 4) | ((block[4 + j] >> 6) << 4);
-                    (sc, mn)
-                };
-                let scmn = (sc as u16) | ((mn as u16) << 8);
-                dst[4 + j * 2..6 + j * 2].copy_from_slice(&scmn.to_le_bytes());
-            }
-            dst[20..148].copy_from_slice(&block[16..144]);
+    // cu230: GB 급 텐서의 직렬 pack 을 row 단위 scoped thread 로 분할한다
+    // (출력 disjoint — 바이트 결과는 분할과 무관하게 동일).
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows.max(1));
+    let rows_per = rows.div_ceil(threads.max(1)).max(1);
+    let dst_row = blocks_per_row * super::weight_residency::Q4K_PACKED_Q8DOT_BYTES_PER_BLOCK;
+    std::thread::scope(|scope| {
+        let mut rest = packed.as_mut_slice();
+        let mut row_start = 0usize;
+        while row_start < rows {
+            let chunk_rows = rows_per.min(rows - row_start);
+            let (chunk, next) = rest.split_at_mut(chunk_rows * dst_row);
+            rest = next;
+            let base_row = row_start;
+            scope.spawn(move || {
+                for local_row in 0..chunk_rows {
+                    let row = base_row + local_row;
+                    for block_idx in 0..blocks_per_row {
+                        let src_base = (row * blocks_per_row + block_idx) * 144;
+                        let block = &weights[src_base..src_base + 144];
+                        let dst_base = (local_row * blocks_per_row + block_idx) * 148;
+                        let dst = &mut chunk[dst_base..dst_base + 148];
+                        dst[0..4].copy_from_slice(&block[0..4]);
+                        for j in 0..8usize {
+                            let (sc, mn) = if j < 4 {
+                                (block[4 + j] & 63, block[4 + j + 4] & 63)
+                            } else {
+                                let sc = (block[4 + j + 4] & 0x0f) | ((block[4 + j - 4] >> 6) << 4);
+                                let mn = (block[4 + j + 4] >> 4) | ((block[4 + j] >> 6) << 4);
+                                (sc, mn)
+                            };
+                            let scmn = (sc as u16) | ((mn as u16) << 8);
+                            dst[4 + j * 2..6 + j * 2].copy_from_slice(&scmn.to_le_bytes());
+                        }
+                        dst[20..148].copy_from_slice(&block[16..144]);
+                    }
+                }
+            });
+            row_start += chunk_rows;
         }
-    }
+    });
     Ok(packed)
 }

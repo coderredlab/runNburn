@@ -41,11 +41,21 @@ impl CudaState {
                 + d_super.len() * std::mem::size_of::<u16>()
                 + sub_scale.len() * std::mem::size_of::<i8>(),
         );
-        packed_payload.extend(qs.iter().map(|value| *value as u8));
-        for value in d_super {
-            packed_payload.extend_from_slice(&value.to_le_bytes());
-        }
-        packed_payload.extend(sub_scale.iter().map(|value| *value as u8));
+        // cu230: byte-map extend 는 GB 급 payload 에서 직렬 byte 루프가 된다 —
+        // i8→u8 은 layout 동일 reinterpret, u16 은 지원 타깃(x86_64/aarch64)
+        // 전부 little-endian 이라 native byte order == LE 로 한 번에 복사한다.
+        packed_payload.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(qs.as_ptr().cast::<u8>(), qs.len())
+        });
+        packed_payload.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(
+                d_super.as_ptr().cast::<u8>(),
+                d_super.len() * std::mem::size_of::<u16>(),
+            )
+        });
+        packed_payload.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(sub_scale.as_ptr().cast::<u8>(), sub_scale.len())
+        });
         self.resident_q6k_packed_payload_ptrs(weights, &packed_payload, rows, blocks_per_row)
     }
 
@@ -198,38 +208,69 @@ pub(in crate::runtime) fn pack_q6k_for_q8dot(
     let mut qs = vec![0i8; rows * blocks_per_row * 256];
     let mut d_super = vec![0u16; rows * blocks_per_row];
     let mut sub_scale = vec![0i8; rows * blocks_per_row * 16];
-    for row in 0..rows {
-        for block_idx in 0..blocks_per_row {
-            let src_base = (row * blocks_per_row + block_idx) * 210;
-            let block = &weights[src_base..src_base + 210];
-            let raw_d = u16::from_le_bytes([block[208], block[209]]);
-            d_super[row * blocks_per_row + block_idx] = raw_d;
+    // cu230: per-element 분기 루프라 GB 급 텐서에서 직렬로 수 초를 먹는다 —
+    // row 단위로 출력이 disjoint 하므로 scoped thread 로 분할한다 (출력 바이트
+    // 는 분할과 무관하게 동일 — 결정적).
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows.max(1));
+    let rows_per = rows.div_ceil(threads.max(1)).max(1);
+    let qs_row = blocks_per_row * 256;
+    let ds_row = blocks_per_row;
+    let ss_row = blocks_per_row * 16;
+    std::thread::scope(|scope| {
+        let mut qs_rest = qs.as_mut_slice();
+        let mut d_rest = d_super.as_mut_slice();
+        let mut ss_rest = sub_scale.as_mut_slice();
+        let mut row_start = 0usize;
+        while row_start < rows {
+            let chunk_rows = rows_per.min(rows - row_start);
+            let (qs_chunk, qs_next) = qs_rest.split_at_mut(chunk_rows * qs_row);
+            let (d_chunk, d_next) = d_rest.split_at_mut(chunk_rows * ds_row);
+            let (ss_chunk, ss_next) = ss_rest.split_at_mut(chunk_rows * ss_row);
+            qs_rest = qs_next;
+            d_rest = d_next;
+            ss_rest = ss_next;
+            let base_row = row_start;
+            scope.spawn(move || {
+                for local_row in 0..chunk_rows {
+                    let row = base_row + local_row;
+                    for block_idx in 0..blocks_per_row {
+                        let src_base = (row * blocks_per_row + block_idx) * 210;
+                        let block = &weights[src_base..src_base + 210];
+                        let raw_d = u16::from_le_bytes([block[208], block[209]]);
+                        d_chunk[local_row * ds_row + block_idx] = raw_d;
 
-            let sub_scale_base = (row * blocks_per_row + block_idx) * 16;
-            for i in 0..16 {
-                sub_scale[sub_scale_base + i] = block[192 + i] as i8;
-            }
+                        let sub_scale_base = (local_row * blocks_per_row + block_idx) * 16;
+                        for i in 0..16 {
+                            ss_chunk[sub_scale_base + i] = block[192 + i] as i8;
+                        }
 
-            let q_base = (row * blocks_per_row + block_idx) * 256;
-            for tid in 0..256usize {
-                let n = tid >> 7;
-                let rem = tid & 127;
-                let l = rem & 31;
-                let ql_base = n * 64;
-                let qh_base = 128 + n * 32;
-                let qh = block[qh_base + l];
-                let q = if rem < 32 {
-                    (block[ql_base + l] & 0x0f) | (((qh >> 0) & 3) << 4)
-                } else if rem < 64 {
-                    (block[ql_base + l + 32] & 0x0f) | (((qh >> 2) & 3) << 4)
-                } else if rem < 96 {
-                    (block[ql_base + l] >> 4) | (((qh >> 4) & 3) << 4)
-                } else {
-                    (block[ql_base + l + 32] >> 4) | (((qh >> 6) & 3) << 4)
-                };
-                qs[q_base + tid] = (q as i16 - 32) as i8;
-            }
+                        let q_base = (local_row * blocks_per_row + block_idx) * 256;
+                        for tid in 0..256usize {
+                            let n = tid >> 7;
+                            let rem = tid & 127;
+                            let l = rem & 31;
+                            let ql_base = n * 64;
+                            let qh_base = 128 + n * 32;
+                            let qh = block[qh_base + l];
+                            let q = if rem < 32 {
+                                (block[ql_base + l] & 0x0f) | (((qh >> 0) & 3) << 4)
+                            } else if rem < 64 {
+                                (block[ql_base + l + 32] & 0x0f) | (((qh >> 2) & 3) << 4)
+                            } else if rem < 96 {
+                                (block[ql_base + l] >> 4) | (((qh >> 4) & 3) << 4)
+                            } else {
+                                (block[ql_base + l + 32] >> 4) | (((qh >> 6) & 3) << 4)
+                            };
+                            qs_chunk[q_base + tid] = (q as i16 - 32) as i8;
+                        }
+                    }
+                }
+            });
+            row_start += chunk_rows;
         }
-    }
+    });
     Ok((qs, d_super, sub_scale))
 }
