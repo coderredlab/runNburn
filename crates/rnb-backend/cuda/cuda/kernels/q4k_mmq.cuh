@@ -30,13 +30,14 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mmq_tile32(
     const unsigned warp_row_off = (warp & 1u) * 16u;
     const unsigned warp_seq_off = (warp >> 1) * 8u;
 
-    __shared__ signed char a_tile[32 * 32];
-    __shared__ signed char b_tile[32 * 32];
+    __shared__ signed char a_tile[32 * 36];
+    __shared__ signed char b_tile[32 * 36];
     __shared__ float x_d[32];
     __shared__ float x_dmin[32];
     __shared__ unsigned char x_sc[32];
     __shared__ unsigned char x_mn[32];
     __shared__ float y_d[32];
+    __shared__ float y_s[32];
 
     const unsigned t_row_a = lane >> 2;
     const unsigned t_row_b = t_row_a + 8u;
@@ -66,7 +67,7 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mmq_tile32(
             const unsigned load_row = tid >> 3;
             const unsigned load_off = (tid & 7u) * 4u;
             const unsigned global_row = row_base + load_row;
-            signed char* a_dst = a_tile + load_row * 32u + load_off;
+            signed char* a_dst = a_tile + load_row * 36u + load_off;
 
             if (global_row < rows) {
                 const unsigned char* packed = weights + global_row * row_bytes + block * 144u;
@@ -111,42 +112,55 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mmq_tile32(
                 }
             }
 
+            // cu223: b-tile 로더가 자신이 나른 4B word 를 그 자리에서 dp4a 로
+            // 접고 8-lane shuffle 로 chunk 합을 만들어 y_s 에 기록한다.
+            // (기존에는 모든 warp 가 min-term 합을 dp4a 루프로 재계산 — LSU
+            // 파이프의 최대 소비자였다. int 덧셈이라 결과는 bitwise 동일.)
             const unsigned load_seq = tid >> 3;
             const unsigned seq_off = (tid & 7u) * 4u;
             const unsigned global_seq = seq_base + load_seq;
-            signed char* b_dst = b_tile + load_seq * 32u + seq_off;
+            signed char* b_dst = b_tile + load_seq * 36u + seq_off;
+            int b_word = 0;
             if (global_seq < seq_len) {
                 const unsigned chunk = block * 8u + sub;
                 const signed char* b_src = input_qs +
                     (global_seq * blocks_per_row * 256u) + chunk * 32u + seq_off;
-                *reinterpret_cast<unsigned*>(b_dst) = *reinterpret_cast<const unsigned*>(b_src);
+                b_word = *reinterpret_cast<const int*>(b_src);
+                *reinterpret_cast<int*>(b_dst) = b_word;
                 if (seq_off == 0u) {
                     y_d[load_seq] = input_ds[global_seq * blocks_per_row * 8u + chunk];
                 }
             } else {
-                *reinterpret_cast<unsigned*>(b_dst) = 0u;
+                *reinterpret_cast<int*>(b_dst) = 0;
                 if (seq_off == 0u) {
                     y_d[load_seq] = 0.0f;
                 }
+            }
+            int chunk_sum = __dp4a(0x01010101, b_word, 0);
+            chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 4u, 8);
+            chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 2u, 8);
+            chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 1u, 8);
+            if ((tid & 7u) == 0u) {
+                y_s[load_seq] = static_cast<float>(chunk_sum);
             }
             __syncthreads();
 
             const unsigned a_col_lo = (lane & 3u) * 4u;
             const unsigned a_col_hi = a_col_lo + 16u;
             const int a0 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 32u + a_col_lo]);
+                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_lo]);
             const int a1 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 32u + a_col_lo]);
+                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_lo]);
             const int a2 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 32u + a_col_hi]);
+                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_hi]);
             const int a3 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 32u + a_col_hi]);
+                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_hi]);
 
             const unsigned b_seq = warp_seq_off + (lane >> 2);
             const unsigned b_col_lo = (lane & 3u) * 4u;
             const unsigned b_col_hi = b_col_lo + 16u;
-            const int b0 = *reinterpret_cast<const int*>(&b_tile[b_seq * 32u + b_col_lo]);
-            const int b1 = *reinterpret_cast<const int*>(&b_tile[b_seq * 32u + b_col_hi]);
+            const int b0 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_lo]);
+            const int b1 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_hi]);
 
             int d0 = 0;
             int d1 = 0;
@@ -154,21 +168,10 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mmq_tile32(
             int d3 = 0;
             rnb_mma_m16n8k32_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, 0, 0, 0, 0);
 
-            int sum_qy_a = 0;
-            int sum_qy_b = 0;
             const bool seq_a_valid = seq_a < seq_len;
             const bool seq_b_valid = seq_b < seq_len;
-#pragma unroll
-            for (int k = 0; k < 32; k += 4) {
-                if (seq_a_valid) {
-                    const int y_a = *reinterpret_cast<const int*>(&b_tile[t_col_a * 32u + k]);
-                    sum_qy_a = __dp4a(0x01010101, y_a, sum_qy_a);
-                }
-                if (seq_b_valid) {
-                    const int y_b = *reinterpret_cast<const int*>(&b_tile[t_col_b * 32u + k]);
-                    sum_qy_b = __dp4a(0x01010101, y_b, sum_qy_b);
-                }
-            }
+            const float sum_qy_a = y_s[t_col_a];
+            const float sum_qy_b = y_s[t_col_b];
             const float dy_a = seq_a_valid ? y_d[t_col_a] : 0.0f;
             const float dy_b = seq_b_valid ? y_d[t_col_b] : 0.0f;
             const float scale_a = static_cast<float>(x_sc[warp_row_off + t_row_a]);
@@ -180,10 +183,10 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mmq_tile32(
             block_d_a1 += dy_b * scale_a * static_cast<float>(d1);
             block_d_b0 += dy_a * scale_b * static_cast<float>(d2);
             block_d_b1 += dy_b * scale_b * static_cast<float>(d3);
-            block_m_a0 += dy_a * min_a * static_cast<float>(sum_qy_a);
-            block_m_a1 += dy_b * min_a * static_cast<float>(sum_qy_b);
-            block_m_b0 += dy_a * min_b * static_cast<float>(sum_qy_a);
-            block_m_b1 += dy_b * min_b * static_cast<float>(sum_qy_b);
+            block_m_a0 += dy_a * min_a * sum_qy_a;
+            block_m_a1 += dy_b * min_a * sum_qy_b;
+            block_m_b0 += dy_a * min_b * sum_qy_a;
+            block_m_b1 += dy_b * min_b * sum_qy_b;
             __syncthreads();
         }
 

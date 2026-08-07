@@ -30,8 +30,8 @@ extern "C" __global__ void rnb_q6k_q8_1_matmul_mmq_tile32(
     const unsigned warp_row_off = (warp & 1u) * 16u;
     const unsigned warp_seq_off = (warp >> 1) * 8u;
 
-    __shared__ signed char a_tile[32 * 32];
-    __shared__ signed char b_tile[32 * 32];
+    __shared__ signed char a_tile[32 * 36];
+    __shared__ signed char b_tile[32 * 36];
     __shared__ float weight_d[32];
     __shared__ signed char weight_scale_lo[32];
     __shared__ signed char weight_scale_hi[32];
@@ -58,7 +58,7 @@ extern "C" __global__ void rnb_q6k_q8_1_matmul_mmq_tile32(
             const unsigned load_row = tid >> 3;
             const unsigned load_off = (tid & 7u) * 4u;
             const unsigned global_row = row_base + load_row;
-            signed char* a_dst = a_tile + load_row * 32u + load_off;
+            signed char* a_dst = a_tile + load_row * 36u + load_off;
 
             if (global_row < rows) {
                 const unsigned char* packed =
@@ -112,7 +112,7 @@ extern "C" __global__ void rnb_q6k_q8_1_matmul_mmq_tile32(
             const unsigned load_seq = tid >> 3;
             const unsigned seq_off = (tid & 7u) * 4u;
             const unsigned global_seq = seq_base + load_seq;
-            signed char* b_dst = b_tile + load_seq * 32u + seq_off;
+            signed char* b_dst = b_tile + load_seq * 36u + seq_off;
             if (global_seq < seq_len) {
                 const unsigned chunk = block_index * 8u + sub;
                 const signed char* b_src = input_qs
@@ -132,19 +132,19 @@ extern "C" __global__ void rnb_q6k_q8_1_matmul_mmq_tile32(
             const unsigned a_col_lo = (lane & 3u) * 4u;
             const unsigned a_col_hi = a_col_lo + 16u;
             const int a0 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 32u + a_col_lo]);
+                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_lo]);
             const int a1 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 32u + a_col_lo]);
+                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_lo]);
             const int a2 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 32u + a_col_hi]);
+                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_hi]);
             const int a3 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 32u + a_col_hi]);
+                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_hi]);
 
             const unsigned b_seq = warp_seq_off + (lane >> 2);
             const unsigned b_col_lo = (lane & 3u) * 4u;
             const unsigned b_col_hi = b_col_lo + 16u;
-            const int b0 = *reinterpret_cast<const int*>(&b_tile[b_seq * 32u + b_col_lo]);
-            const int b1 = *reinterpret_cast<const int*>(&b_tile[b_seq * 32u + b_col_hi]);
+            const int b0 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_lo]);
+            const int b1 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_hi]);
 
             int lo0 = 0;
             int lo1 = 0;
