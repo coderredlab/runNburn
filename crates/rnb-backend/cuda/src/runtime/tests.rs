@@ -12404,6 +12404,127 @@ fn cuda_q4k_mmq_tile32_matches_cpu_reference_with_tails() {
     }
 }
 
+// cu226: seq64 tile — tile32 와 per-element 누산 순서가 같아 bitwise 동일이
+// 계약이다. GPU-quantizer dequantized reference(1e-3/1e-3, cu219 관례)와
+// partial row/seq tail(1057 x 77 = 64 + 13) 마스킹, 결정성, tile32 와의
+// bitwise 교차를 함께 고정한다. 제품 host-input 위임 경로를 그대로 태운다.
+#[test]
+fn cuda_q4k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 77usize;
+    let weights = make_test_q4k_weights(1, rows, blocks_per_row, 98)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let expected = {
+        let mut state = CudaState::open().expect("open CUDA state");
+        let input_dev = state
+            .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+            .expect("allocate seq64 tails test input");
+        unsafe {
+            state
+                .api
+                .memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input.as_slice()),
+                    state.stream,
+                )
+                .expect("copy seq64 tails test input");
+        }
+        let qs_dev = state
+            .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+            .expect("allocate seq64 tails qs");
+        let ds_dev = state
+            .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+            .expect("allocate seq64 tails ds");
+        state
+            .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+            .expect("quantize seq64 tails input");
+        let mut qs = vec![0i8; seq_len * blocks_per_row * 256];
+        let mut ds = vec![0.0f32; seq_len * blocks_per_row * 8];
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    qs.as_mut_ptr().cast::<libc::c_void>(),
+                    qs_dev,
+                    qs.len(),
+                    state.stream,
+                )
+                .expect("copy seq64 tails qs");
+            state
+                .api
+                .memcpy_dtoh_async(
+                    ds.as_mut_ptr().cast::<libc::c_void>(),
+                    ds_dev,
+                    std::mem::size_of_val(ds.as_slice()),
+                    state.stream,
+                )
+                .expect("copy seq64 tails ds");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize seq64 tails quantize");
+        let mut expected = Vec::with_capacity(seq_len * rows);
+        for token in 0..seq_len {
+            let token_qs = &qs[token * blocks_per_row * 256..(token + 1) * blocks_per_row * 256];
+            let token_ds = &ds[token * blocks_per_row * 8..(token + 1) * blocks_per_row * 8];
+            let quantized_input = dequantize_q8_1_by_32(token_qs, token_ds);
+            expected.extend(cpu_q4k_gemv_rows(
+                &weights,
+                rows,
+                blocks_per_row,
+                &quantized_input,
+            ));
+        }
+        expected
+    };
+    let tile32 = {
+        let _seq64_off = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "0");
+        q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K tile32 baseline")
+    };
+    let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..8 {
+        let actual =
+            q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K tiled MMQ seq64");
+        assert_close_rows_abs_rel(
+            &format!("Q4_K tiled MMQ seq64 run {run}"),
+            &actual,
+            &expected,
+            1e-3,
+            1e-3,
+        );
+        let tile32_mismatch = actual
+            .iter()
+            .zip(&tile32)
+            .position(|(actual, base)| actual.to_bits() != base.to_bits());
+        assert!(
+            tile32_mismatch.is_none(),
+            "Q4_K tiled MMQ seq64 run {run} diverges bitwise from tile32 at {tile32_mismatch:?}"
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q4_K tiled MMQ seq64 run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
 // cu222: Q5_K MMQ tile32 — Q4 tails 테스트의 Q5 판. GPU quantizer 의 qs/ds
 // 를 내려받아 dequantize 한 CPU reference 와 비교하고(호스트 참조 quantizer
 // LSB 오염 방지, cu219 관례), partial row/seq tile 마스킹과 bitwise 결정성을

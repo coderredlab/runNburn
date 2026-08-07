@@ -143,6 +143,17 @@ pub fn q4k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
 }
 
+/// cu226: MMQ tile 의 CTA 당 seq 폭 64 확대 게이트. ncu 재귀속에서 tile32 가
+/// cu223 융합 후에도 LSU-bound 였고, grid.y 의 32-seq slab 들이 같은 weight
+/// tile 을 반복 로드/unpack 하는 것이 a-side 명령·섹터의 지배 항이었다.
+/// 64 폭은 a-tile 비용을 출력당 절반으로 상각한다 (per-element 누산 순서는
+/// tile32 와 동일 — bitwise 계약 유지). partial tile 은 커널이 token bounds
+/// 마스킹으로 지원하지만 seq < 64 는 b-slab 절반이 항상 유휴라 tile32 가
+/// 남는다. 진단 대조는 `RNB_CUDA_MMQ_TILE_SEQ64=0`.
+pub fn mmq_tile_seq64_enabled(seq_len: usize) -> bool {
+    seq_len >= 64 && env_bool("RNB_CUDA_MMQ_TILE_SEQ64", true)
+}
+
 pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q2K_MMQ_TILE32", true)
@@ -2424,6 +2435,25 @@ mod tests {
 
         unsafe {
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE32");
+        }
+    }
+
+    #[test]
+    fn mmq_tile_seq64_defaults_on_at_64_and_allows_opt_out() {
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
+        }
+        assert!(mmq_tile_seq64_enabled(64));
+        assert!(mmq_tile_seq64_enabled(1139));
+        assert!(!mmq_tile_seq64_enabled(63));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_MMQ_TILE_SEQ64", "0");
+        }
+        assert!(!mmq_tile_seq64_enabled(1139));
+
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
         }
     }
 

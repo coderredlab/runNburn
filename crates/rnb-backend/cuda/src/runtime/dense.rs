@@ -877,6 +877,19 @@ impl CudaState {
         output_dev: u64,
     ) -> Result<(), String> {
         if tuning::q4k_mmq_tile32_enabled(seq_len, rows, blocks_per_row) {
+            // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 — a-tile 재로드/unpack
+            // 이 절반이 된다 (bitwise 동일 산술, RNB_CUDA_MMQ_TILE_SEQ64=0 대조).
+            if tuning::mmq_tile_seq64_enabled(seq_len) {
+                return self.launch_q4k_q8_1_matmul_mmq_tile32_seq64(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    input_qs_dev,
+                    input_ds_dev,
+                    output_dev,
+                );
+            }
             return self.launch_q4k_q8_1_matmul_mmq_tile32(
                 weights,
                 rows,
