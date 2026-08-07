@@ -1028,6 +1028,19 @@ impl CudaState {
         let ds_dev =
             self.compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())?;
         self.launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)?;
+        // cu222: prefill 대역(min_seq 이상)은 Q5 MMQ tile32 로 — Q5 는 그동안
+        // MMQ 세대가 없어 q8dot wide 에 갇혀 있었다 (27B ssm_out 1.37s/1139tok).
+        if tuning::q5k_mmq_tile32_enabled(seq_len, rows, blocks_per_row) {
+            return self.launch_q5k_q8_1_matmul_mmq_tile32(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                qs_dev,
+                ds_dev,
+                output_dev,
+            );
+        }
         self.launch_q5k_gemv_batch_q8dot_to_dev(
             weights,
             rows,

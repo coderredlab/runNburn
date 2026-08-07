@@ -6118,6 +6118,7 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mma_4warp_v3(
 #include "q2k_mmq.cuh"
 #include "q3k_mmq.cuh"
 #include "q4k_mmq.cuh"
+#include "q5k_mmq.cuh"
 #include "q6k_mmq.cuh"
 #include "q8_0_mmq.cuh"
 

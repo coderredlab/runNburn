@@ -12403,6 +12403,111 @@ fn cuda_q4k_mmq_tile32_matches_cpu_reference_with_tails() {
     }
 }
 
+// cu222: Q5_K MMQ tile32 — Q4 tails 테스트의 Q5 판. GPU quantizer 의 qs/ds
+// 를 내려받아 dequantize 한 CPU reference 와 비교하고(호스트 참조 quantizer
+// LSB 오염 방지, cu219 관례), partial row/seq tile 마스킹과 bitwise 결정성을
+// 함께 고정한다. 제품 host-input 위임 경로(q5k_gemv_batch)를 그대로 태운다.
+#[test]
+fn cuda_q5k_mmq_tile32_matches_gpu_quantizer_reference_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 37usize;
+    let weights = make_test_q5k_weights(rows, blocks_per_row, 229);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 53.0) - 26.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let expected = {
+        let mut state = CudaState::open().expect("open CUDA state");
+        let input_dev = state
+            .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+            .expect("allocate Q5 MMQ tails test input");
+        unsafe {
+            state
+                .api
+                .memcpy_htod_async(
+                    input_dev,
+                    input.as_ptr().cast::<libc::c_void>(),
+                    std::mem::size_of_val(input.as_slice()),
+                    state.stream,
+                )
+                .expect("copy Q5 MMQ tails test input");
+        }
+        let qs_dev = state
+            .compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)
+            .expect("allocate Q5 MMQ tails qs");
+        let ds_dev = state
+            .compute_up_ptrs_ptr(seq_len * blocks_per_row * 8 * std::mem::size_of::<f32>())
+            .expect("allocate Q5 MMQ tails ds");
+        state
+            .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, seq_len * blocks_per_row * 256)
+            .expect("quantize Q5 MMQ tails input");
+        let mut qs = vec![0i8; seq_len * blocks_per_row * 256];
+        let mut ds = vec![0.0f32; seq_len * blocks_per_row * 8];
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    qs.as_mut_ptr().cast::<libc::c_void>(),
+                    qs_dev,
+                    qs.len(),
+                    state.stream,
+                )
+                .expect("copy Q5 MMQ tails qs");
+            state
+                .api
+                .memcpy_dtoh_async(
+                    ds.as_mut_ptr().cast::<libc::c_void>(),
+                    ds_dev,
+                    std::mem::size_of_val(ds.as_slice()),
+                    state.stream,
+                )
+                .expect("copy Q5 MMQ tails ds");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize Q5 MMQ tails quantize");
+        let mut expected = Vec::with_capacity(seq_len * rows);
+        for token in 0..seq_len {
+            let token_qs = &qs[token * blocks_per_row * 256..(token + 1) * blocks_per_row * 256];
+            let token_ds = &ds[token * blocks_per_row * 8..(token + 1) * blocks_per_row * 8];
+            let quantized_input = dequantize_q8_1_by_32(token_qs, token_ds);
+            expected.extend(cpu_q5k_gemv_rows(
+                &weights,
+                rows,
+                blocks_per_row,
+                &quantized_input,
+            ));
+        }
+        expected
+    };
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..16 {
+        let actual = q5k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q5_K tiled MMQ");
+        assert_close_rows_abs_rel(
+            &format!("Q5_K tiled MMQ run {run}"),
+            &actual,
+            &expected,
+            1e-3,
+            1e-3,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q5_K tiled MMQ run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
 #[test]
 fn cuda_q4k_batch_dev_input_q8dot_matches_cpu_reference() {
     let _guard = runtime_test_lock();

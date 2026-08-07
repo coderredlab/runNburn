@@ -155,6 +155,11 @@ pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
 }
+/// cu222: Q5_K MMQ tile32 게이트 — Q4/Q6 과 같은 min_seq/shape 조건.
+pub fn q5k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
+    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
+    eligible && env_bool("RNB_CUDA_Q5K_MMQ_TILE32", true)
+}
 
 /// cu221: dev-input dense FFN 의 Q6_K down q8dot 분기를 MMQ tile32 로
 /// 라우팅하는 게이트 (Q4 down 은 q4k_batch_q8dot_to_dev 내부 MMQ 라우팅이
