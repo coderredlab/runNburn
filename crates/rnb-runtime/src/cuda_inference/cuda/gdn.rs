@@ -97,6 +97,15 @@ fn gdn_prefill_effective_gemv_mode(
     seq_len: usize,
     requested_mode: &str,
 ) -> String {
+    // cu219: `auto`는 quant batch GEMV 지원 시 원본 quant를 그대로 쓴다
+    // (dequant F32 업로드 0). 미지원 quant는 f32 dequant 경로로 후퇴한다.
+    if requested_mode == "auto" {
+        return if gdn_prefill_batch_quant_supported(ggml_type) {
+            "q".to_string()
+        } else {
+            "f32".to_string()
+        };
+    }
     if gdn_prefill_batch_quant_supported(ggml_type) && seq_len <= 2 && requested_mode == "f32" {
         "q".to_string()
     } else {
@@ -209,23 +218,27 @@ pub fn gdn_prefill_chain_q4k(
     {
         backend::GdnPrefillChainPlan::Disabled => Ok(None),
         backend::GdnPrefillChainPlan::Q4KDeviceChain => {
+            // cu219: 명시 f32 모드이거나 chain이 소화 못 하는 quant(F32/Q4_K
+            // 외)일 때만 alpha/beta를 host dequant한다. auto 기본에서는 원본
+            // quant가 chain의 k-quant projection으로 직접 들어간다.
             let f32_projection_mode =
                 backend::tuning::gdn_prefill_gemv_mode_for_seq(request.shape.seq_len).as_deref()
                     == Some("f32");
-            let alpha_dequant =
-                (f32_projection_mode && request.alpha_quant != GGMLType::F32).then(|| {
-                    dequant::dequantize_bytes_to_f32(
-                        request.alpha_q4k,
-                        dequant_type(request.alpha_quant),
-                    )
-                });
-            let beta_dequant =
-                (f32_projection_mode && request.beta_quant != GGMLType::F32).then(|| {
-                    dequant::dequantize_bytes_to_f32(
-                        request.beta_q4k,
-                        dequant_type(request.beta_quant),
-                    )
-                });
+            let chain_alpha_beta_supported =
+                |quant: GGMLType| matches!(quant, GGMLType::F32 | GGMLType::Q4_K);
+            let alpha_needs_dequant = request.alpha_quant != GGMLType::F32
+                && (f32_projection_mode || !chain_alpha_beta_supported(request.alpha_quant));
+            let beta_needs_dequant = request.beta_quant != GGMLType::F32
+                && (f32_projection_mode || !chain_alpha_beta_supported(request.beta_quant));
+            let alpha_dequant = alpha_needs_dequant.then(|| {
+                dequant::dequantize_bytes_to_f32(
+                    request.alpha_q4k,
+                    dequant_type(request.alpha_quant),
+                )
+            });
+            let beta_dequant = beta_needs_dequant.then(|| {
+                dequant::dequantize_bytes_to_f32(request.beta_q4k, dequant_type(request.beta_quant))
+            });
             backend::gdn_prefill_chain_q4k(backend::GdnPrefillChainQ4KRequest {
                 shape: request.shape,
                 hidden: request.hidden,
@@ -728,6 +741,15 @@ pub fn gdn_prefill_gated_norm_silu_project(
     {
         return Ok(None);
     }
+    // cu219: auto 모드에서 batch quant 지원 ssm_out은 dequant F32 fused GEMM
+    // 대신 gated_norm_silu + quant GEMV 폴백을 쓴다 — 층당 dequant F32
+    // (27B: 120MiB) 미등록 업로드가 매 요청 반복되는 것을 제거한다. 명시
+    // `f32` 모드는 기존 fused 경로를 유지한다.
+    if backend::tuning::gdn_prefill_gemv_mode().as_deref() == Some("auto")
+        && gdn_prefill_batch_quant_supported(weight_ggml_type)
+    {
+        return Ok(None);
+    }
     let Some(weight_bytes) = weight_bytes else {
         return Err("GDN ssm_out has no quantized bytes".to_string());
     };
@@ -783,6 +805,23 @@ mod tests {
         assert_eq!(
             gdn_prefill_effective_gemv_mode(GGMLType::IQ4_XS, 2, "f32"),
             "q"
+        );
+    }
+
+    #[test]
+    fn auto_mode_resolves_supported_quants_to_q() {
+        assert_eq!(
+            gdn_prefill_effective_gemv_mode(GGMLType::Q4_K, 15, "auto"),
+            "q"
+        );
+        assert_eq!(
+            gdn_prefill_effective_gemv_mode(GGMLType::Q5_K, 1139, "auto"),
+            "q"
+        );
+        // batch 미지원 quant는 dequant f32 로 후퇴한다.
+        assert_eq!(
+            gdn_prefill_effective_gemv_mode(GGMLType::Q2_K, 15, "auto"),
+            "f32"
         );
     }
 

@@ -1001,13 +1001,19 @@ pub fn gdn_gated_norm_gemm_enabled_for_seq(seq_len: usize) -> bool {
     gdn_gated_norm_gemm_enabled() && !qwen35_short_window_prefill(seq_len)
 }
 
+/// cu219: GDN prefill projection 모드. 기본 `auto`는 quant가 batch GEMV를
+/// 지원하면 원본 quant weight를 그대로 쓰고(업로드 0 — resident 재사용),
+/// 미지원 quant만 host dequant F32 GEMM으로 후퇴한다. 이전 기본 `f32`는
+/// seq>2에서 층당 dequant F32 전량을 미등록 직접 업로드해(27B: 층당
+/// 440MiB, 요청당 ~20GiB, prefill의 ~2.2s) cu194 클래스의 매 요청 재업로드를
+/// 만들었다. 명시 `f32`/`q`는 그대로 존중한다.
 pub fn gdn_prefill_gemv_mode() -> Option<String> {
-    let raw = std::env::var("RNB_CUDA_GDN_PREFILL_GEMV").unwrap_or_else(|_| "f32".to_string());
+    let raw = std::env::var("RNB_CUDA_GDN_PREFILL_GEMV").unwrap_or_else(|_| "auto".to_string());
     let mode = raw.to_ascii_lowercase();
     if matches!(mode.as_str(), "0" | "false" | "off" | "no") {
         None
     } else if matches!(mode.as_str(), "" | "1" | "true" | "on" | "yes") {
-        Some("f32".to_string())
+        Some("auto".to_string())
     } else {
         Some(mode)
     }
@@ -1424,7 +1430,7 @@ mod tests {
         unsafe {
             std::env::remove_var("RNB_CUDA_GDN_PREFILL_GEMV");
         }
-        assert_eq!(gdn_prefill_gemv_mode().as_deref(), Some("f32"));
+        assert_eq!(gdn_prefill_gemv_mode().as_deref(), Some("auto"));
 
         unsafe {
             std::env::set_var("RNB_CUDA_GDN_PREFILL_GEMV", "0");
@@ -1455,12 +1461,12 @@ mod tests {
             std::env::remove_var("RNB_CUDA_ALLOW_EXPANDED_WEIGHT_CACHE");
         }
 
-        assert_eq!(gdn_prefill_gemv_mode_for_seq(1).as_deref(), Some("f32"));
+        assert_eq!(gdn_prefill_gemv_mode_for_seq(1).as_deref(), Some("auto"));
         assert!(gdn_gated_norm_gemm_enabled_for_seq(1));
         assert!(prefill_moe_enabled_for_seq(1));
         assert!(!qwen35_shared_q4_f32_cache_enabled_for_seq(1));
 
-        assert_eq!(gdn_prefill_gemv_mode_for_seq(2).as_deref(), Some("f32"));
+        assert_eq!(gdn_prefill_gemv_mode_for_seq(2).as_deref(), Some("auto"));
         assert!(gdn_gated_norm_gemm_enabled_for_seq(2));
         assert!(prefill_moe_enabled_for_seq(2));
         assert!(!qwen35_shared_q4_f32_cache_enabled_for_seq(2));
@@ -1476,7 +1482,7 @@ mod tests {
         assert!(!prefill_moe_enabled_for_seq(16));
         assert!(qwen35_shared_q4_f32_cache_enabled_for_seq(16));
 
-        assert_eq!(gdn_prefill_gemv_mode_for_seq(17).as_deref(), Some("f32"));
+        assert_eq!(gdn_prefill_gemv_mode_for_seq(17).as_deref(), Some("auto"));
         assert!(gdn_gated_norm_gemm_enabled_for_seq(17));
         assert!(prefill_moe_enabled_for_seq(17));
         assert!(!qwen35_shared_q4_f32_cache_enabled_for_seq(17));
