@@ -1009,7 +1009,8 @@ fn dense_silu_ffn_device_carrier_adds_residual_and_reuses_carrier() {
 
     let ffn_only = match run_carrier(&vec![0.0f32; seq_len * n_embd]) {
         Ok(output) => output,
-        Err(err) if err.contains("CUDA") || err.contains("cuda") => {
+        // cu224 리뷰 수정(P2): driver 부재만 skip — launch/runtime 실패는 잡는다.
+        Err(err) if cuda_driver_unavailable_for_test(&err) => {
             eprintln!("skipping dense carrier FFN test: {err}");
             return;
         }

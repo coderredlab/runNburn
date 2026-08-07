@@ -400,6 +400,14 @@ pub fn dense_q4k_silu_ffn_batch_device_carrier(
             down_weights.len()
         ));
     }
+    // cu224 리뷰 수정(P2): input 은 normalized FFN 입력 계약이므로 Normalized
+    // 만 허용한다. 또한 input 버퍼는 FFN 출력으로 클로버된 뒤 residual 에
+    // 가산되므로 두 carrier 가 같은 tensor 면 self-alias 오출력이다.
+    if input_id == residual_id {
+        return Err(
+            "dense SiLU FFN device carrier input and residual must be distinct tensors".to_string(),
+        );
+    }
     for (label, desc, role_ok) in [
         (
             "input",
@@ -407,7 +415,6 @@ pub fn dense_q4k_silu_ffn_batch_device_carrier(
             matches!(
                 input_desc.role(),
                 rnb_backend_api::DeviceTensorRole::Normalized
-                    | rnb_backend_api::DeviceTensorRole::Hidden
             ),
         ),
         (

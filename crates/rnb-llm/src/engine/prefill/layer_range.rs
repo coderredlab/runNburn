@@ -2180,6 +2180,14 @@ fn run_prefill_layers_cpu_range_impl(
                             "expected CUDA device hidden carrier".to_string(),
                         )
                     })?;
+                    // cu224 리뷰 수정(P1): resident-KV MTP prefill(mirror=false)은
+                    // kvarn 층에서만 host 캐시가 kvarn_prior 로 채워진다. F16
+                    // 진단 포맷(`RNB_KV_CACHE_FORMAT=f16`) 층은 mirror 를 강제해
+                    // host KV 가 0 으로 남는 것(후속 chunk prior 오염, device
+                    // verify opt-out decode 오답)을 막는다. 기본 kvarn 경로는
+                    // 불변.
+                    let mirror_attention_kv =
+                        _mirror_attention_kv_to_host || !kv_cache.layer_uses_kvarn(layer_idx);
                     let attention_output =
                         match backend_runtime::qwen35_prefill_attention_device_input(
                             &device_hidden.output,
@@ -2191,7 +2199,7 @@ fn run_prefill_layers_cpu_range_impl(
                             *device_rope_theta,
                             pos_start,
                             norm_eps,
-                            _mirror_attention_kv_to_host,
+                            mirror_attention_kv,
                         ) {
                             Ok(output) => output,
                             Err(err) => {
