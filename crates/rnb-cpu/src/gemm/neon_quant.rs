@@ -106,6 +106,25 @@ pub unsafe fn dot_q4_1_q8_neon(row_bytes: &[u8], q8: &[Q8Block], n_blocks: usize
     sum
 }
 
+/// Unpacks one Q5_1 block into unsigned 5-bit values stored in signed byte lanes.
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn unpack_q5_1_block(
+    block: *const u8,
+    bit_masks: uint8x16_t,
+    mask_low: uint8x16_t,
+    high_bit: uint8x16_t,
+) -> (int8x16_t, int8x16_t) {
+    let qh_low_source = vcombine_u8(vdup_n_u8(*block.add(4)), vdup_n_u8(*block.add(5)));
+    let qh_high_source = vcombine_u8(vdup_n_u8(*block.add(6)), vdup_n_u8(*block.add(7)));
+    let qh_low = vandq_u8(vtstq_u8(qh_low_source, bit_masks), high_bit);
+    let qh_high = vandq_u8(vtstq_u8(qh_high_source, bit_masks), high_bit);
+    let packed = vld1q_u8(block.add(8));
+    (
+        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed, mask_low), qh_low)),
+        vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed, 4), qh_high)),
+    )
+}
+
 /// Q5_1 × Q8_0 direct integer dot product.
 #[target_feature(enable = "neon,dotprod")]
 pub unsafe fn dot_q5_1_q8_neon(row_bytes: &[u8], q8: &[Q8Block], n_blocks: usize) -> f32 {
@@ -116,18 +135,13 @@ pub unsafe fn dot_q5_1_q8_neon(row_bytes: &[u8], q8: &[Q8Block], n_blocks: usize
 
     let bits = vld1_u8(BIT_MASKS.as_ptr());
     let bit_masks = vcombine_u8(bits, bits);
+    let mask_low = vdupq_n_u8(0x0f);
     let high_bit = vdupq_n_u8(0x10);
     let mut sum = 0.0f32;
 
     for bi in 0..n_blocks {
         let block = row_bytes.as_ptr().add(bi * 24);
-        let qh_low_source = vcombine_u8(vdup_n_u8(*block.add(4)), vdup_n_u8(*block.add(5)));
-        let qh_high_source = vcombine_u8(vdup_n_u8(*block.add(6)), vdup_n_u8(*block.add(7)));
-        let qh_low = vandq_u8(vtstq_u8(qh_low_source, bit_masks), high_bit);
-        let qh_high = vandq_u8(vtstq_u8(qh_high_source, bit_masks), high_bit);
-        let packed = vld1q_u8(block.add(8));
-        let low = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed, vdupq_n_u8(0x0f)), qh_low));
-        let high = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed, 4), qh_high));
+        let (low, high) = unpack_q5_1_block(block, bit_masks, mask_low, high_bit);
         let input_low = vld1q_s8(q8[bi].qs.as_ptr());
         let input_high = vld1q_s8(q8[bi].qs.as_ptr().add(16));
         let quant_dot = dot_i8x16(low, input_low) + dot_i8x16(high, input_high);
@@ -137,6 +151,86 @@ pub unsafe fn dot_q5_1_q8_neon(row_bytes: &[u8], q8: &[Q8Block], n_blocks: usize
         sum += q8[bi].d * (d * quant_dot as f32 + min * input_sum as f32);
     }
     sum
+}
+
+/// Computes two Q5_1 rows against two Q8_0 inputs with one I8MM tile.
+///
+/// Lanes are `[row0×x0, row0×x1, row1×x0, row1×x1]`. The per-block
+/// floating-point expression and accumulation order match `dot_q5_1_q8_neon`.
+#[target_feature(enable = "neon,dotprod,i8mm")]
+pub unsafe fn dot_q5_1_q8_i8mm_2x2(
+    row0: &[u8],
+    row1: &[u8],
+    x0: &[Q8Block],
+    x1: &[Q8Block],
+    n_blocks: usize,
+) -> [f32; 4] {
+    const BIT_MASKS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+    debug_assert_eq!(row0.len(), n_blocks * 24);
+    debug_assert_eq!(row1.len(), n_blocks * 24);
+    debug_assert_eq!(x0.len(), n_blocks);
+    debug_assert_eq!(x1.len(), n_blocks);
+
+    let bits = vld1_u8(BIT_MASKS.as_ptr());
+    let bit_masks = vcombine_u8(bits, bits);
+    let mask_low = vdupq_n_u8(0x0f);
+    let high_bit = vdupq_n_u8(0x10);
+    let mut sum = vdupq_n_f32(0.0);
+
+    for bi in 0..n_blocks {
+        let block0 = row0.as_ptr().add(bi * 24);
+        let block1 = row1.as_ptr().add(bi * 24);
+        let (w0_low, w0_high) = unpack_q5_1_block(block0, bit_masks, mask_low, high_bit);
+        let (w1_low, w1_high) = unpack_q5_1_block(block1, bit_masks, mask_low, high_bit);
+        let x0_low = vld1q_s8(x0[bi].qs.as_ptr());
+        let x0_high = vld1q_s8(x0[bi].qs.as_ptr().add(16));
+        let x1_low = vld1q_s8(x1[bi].qs.as_ptr());
+        let x1_high = vld1q_s8(x1[bi].qs.as_ptr().add(16));
+
+        let mut dot = vdupq_n_s32(0);
+        dot = vmmlaq_s32(
+            dot,
+            vcombine_s8(vget_low_s8(w0_low), vget_low_s8(w1_low)),
+            vcombine_s8(vget_low_s8(x0_low), vget_low_s8(x1_low)),
+        );
+        dot = vmmlaq_s32(
+            dot,
+            vcombine_s8(vget_high_s8(w0_low), vget_high_s8(w1_low)),
+            vcombine_s8(vget_high_s8(x0_low), vget_high_s8(x1_low)),
+        );
+        dot = vmmlaq_s32(
+            dot,
+            vcombine_s8(vget_low_s8(w0_high), vget_low_s8(w1_high)),
+            vcombine_s8(vget_low_s8(x0_high), vget_low_s8(x1_high)),
+        );
+        dot = vmmlaq_s32(
+            dot,
+            vcombine_s8(vget_high_s8(w0_high), vget_high_s8(w1_high)),
+            vcombine_s8(vget_high_s8(x0_high), vget_high_s8(x1_high)),
+        );
+
+        let input_sum0 = sum_i8x16(x0_low) + sum_i8x16(x0_high);
+        let input_sum1 = sum_i8x16(x1_low) + sum_i8x16(x1_high);
+        let d0 = f16_le(std::slice::from_raw_parts(block0, 2));
+        let min0 = f16_le(std::slice::from_raw_parts(block0.add(2), 2));
+        let d1 = f16_le(std::slice::from_raw_parts(block1, 2));
+        let min1 = f16_le(std::slice::from_raw_parts(block1.add(2), 2));
+        let terms = [
+            x0[bi].d * (d0 * vgetq_lane_s32::<0>(dot) as f32 + min0 * input_sum0 as f32),
+            x1[bi].d * (d0 * vgetq_lane_s32::<1>(dot) as f32 + min0 * input_sum1 as f32),
+            x0[bi].d * (d1 * vgetq_lane_s32::<2>(dot) as f32 + min1 * input_sum0 as f32),
+            x1[bi].d * (d1 * vgetq_lane_s32::<3>(dot) as f32 + min1 * input_sum1 as f32),
+        ];
+        sum = vaddq_f32(sum, vld1q_f32(terms.as_ptr()));
+    }
+
+    [
+        vgetq_lane_f32::<0>(sum),
+        vgetq_lane_f32::<1>(sum),
+        vgetq_lane_f32::<2>(sum),
+        vgetq_lane_f32::<3>(sum),
+    ]
 }
 
 /// Q8_1 × Q8_0 direct integer dot product. The stored Q8_1 sum is not needed

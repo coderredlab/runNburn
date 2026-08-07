@@ -588,6 +588,61 @@ fn gemv_quantized_aarch64_q8(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn gemv_q5_1_i8mm_2x2(
+    bytes: &[u8],
+    input_q8: &[crate::gemm::activation_q8::Q8Block],
+    output: &mut [f32],
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    bytes_per_row: usize,
+) {
+    use crate::gemm::neon_quant::{dot_q5_1_q8_i8mm_2x2, dot_q5_1_q8_neon};
+
+    let n_blocks = cols / 32;
+    let output_address = output.as_mut_ptr() as usize;
+    let row_pairs = rows / 2;
+    (0..row_pairs).into_par_iter().for_each(move |pair| {
+        let row = pair * 2;
+        let output_ptr = output_address as *mut f32;
+        let row0 = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+        let row1 = &bytes[(row + 1) * bytes_per_row..(row + 2) * bytes_per_row];
+        let mut sequence = 0usize;
+        while sequence + 1 < batch {
+            let input0 = &input_q8[sequence * n_blocks..(sequence + 1) * n_blocks];
+            let input1 = &input_q8[(sequence + 1) * n_blocks..(sequence + 2) * n_blocks];
+            let values = unsafe { dot_q5_1_q8_i8mm_2x2(row0, row1, input0, input1, n_blocks) };
+            unsafe {
+                *output_ptr.add(sequence * rows + row) = values[0];
+                *output_ptr.add((sequence + 1) * rows + row) = values[1];
+                *output_ptr.add(sequence * rows + row + 1) = values[2];
+                *output_ptr.add((sequence + 1) * rows + row + 1) = values[3];
+            }
+            sequence += 2;
+        }
+        if sequence < batch {
+            let input = &input_q8[sequence * n_blocks..(sequence + 1) * n_blocks];
+            unsafe {
+                *output_ptr.add(sequence * rows + row) = dot_q5_1_q8_neon(row0, input, n_blocks);
+                *output_ptr.add(sequence * rows + row + 1) =
+                    dot_q5_1_q8_neon(row1, input, n_blocks);
+            }
+        }
+    });
+    if rows & 1 != 0 {
+        let row = rows - 1;
+        let row_bytes = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+        for sequence in 0..batch {
+            let input = &input_q8[sequence * n_blocks..(sequence + 1) * n_blocks];
+            unsafe {
+                *(output_address as *mut f32).add(sequence * rows + row) =
+                    dot_q5_1_q8_neon(row_bytes, input, n_blocks);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 pub fn gemv_aarch64_q8_prequantized(
     bytes: &[u8],
     input_q8: &[crate::gemm::activation_q8::Q8Block],
@@ -601,6 +656,12 @@ pub fn gemv_aarch64_q8_prequantized(
     use crate::gemm::activation_q8::Q8Block;
     use crate::gemm::neon_dot::{dot_q4_0_q8_neon, dot_q5_0_q8_neon, dot_q8_0_q8_neon};
     use crate::gemm::neon_quant::{dot_q4_1_q8_neon, dot_q5_1_q8_neon, dot_q8_1_q8_neon};
+
+    if quant == QuantGemvType::Q5_1 && batch > 1 && std::arch::is_aarch64_feature_detected!("i8mm")
+    {
+        gemv_q5_1_i8mm_2x2(bytes, input_q8, output, rows, cols, batch, bytes_per_row);
+        return;
+    }
 
     let n_blocks = cols / 32;
     let dot_fn: unsafe fn(&[u8], &[Q8Block], usize) -> f32 = match quant {
@@ -1650,6 +1711,61 @@ mod tests {
                     );
                     assert_near(actual[s * rows + row], expected, quant);
                 }
+            }
+        }
+    }
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn q5_1_i8mm_2x2_matches_single_dot_bits() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+
+        use crate::gemm::activation_q8::quantize_input_q8;
+        use crate::gemm::neon_quant::dot_q5_1_q8_neon;
+
+        let rows = 3;
+        let batch = 3;
+        let n_blocks = 7;
+        let cols = n_blocks * 32;
+        let bytes_per_row = QuantGemvType::Q5_1.block_bytes() * n_blocks;
+        let mut bytes = Vec::with_capacity(rows * bytes_per_row);
+        for row in 0..rows {
+            bytes.extend(seeded_quant_row(
+                QuantGemvType::Q5_1,
+                n_blocks,
+                0x6a09_e667 + row as u32,
+            ));
+        }
+        let input = (0..batch * cols)
+            .map(|index| {
+                ((index as f32 * 0.037).sin() * 3.25) + ((index % 19) as f32 - 9.0) * 0.015625
+            })
+            .collect::<Vec<_>>();
+        let input_q8 = quantize_input_q8(&input);
+        let mut actual = vec![0.0f32; rows * batch];
+
+        super::gemv_aarch64_q8_prequantized(
+            &bytes,
+            &input_q8,
+            &mut actual,
+            rows,
+            cols,
+            batch,
+            bytes_per_row,
+            QuantGemvType::Q5_1,
+        );
+
+        for sequence in 0..batch {
+            let input = &input_q8[sequence * n_blocks..(sequence + 1) * n_blocks];
+            for row in 0..rows {
+                let row_bytes = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+                let expected = unsafe { dot_q5_1_q8_neon(row_bytes, input, n_blocks) };
+                assert_eq!(
+                    actual[sequence * rows + row].to_bits(),
+                    expected.to_bits(),
+                    "sequence={sequence} row={row}"
+                );
             }
         }
     }
