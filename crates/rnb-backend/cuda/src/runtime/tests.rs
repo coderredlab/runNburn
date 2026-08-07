@@ -12689,6 +12689,8 @@ fn cuda_q5k_mmq_tile32_matches_gpu_quantizer_reference_with_tails() {
 fn cuda_q5k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE32", "1");
+    // cu228: 기본값은 64x64 로 라우팅되므로 32x64 커널을 명시적으로 pin.
+    let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE64", "0");
     let rows = 1057usize;
     let cols = 1024usize;
     let seq_len = 77usize;
@@ -12722,6 +12724,52 @@ fn cuda_q5k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
             assert!(
                 mismatch.is_none(),
                 "Q5_K tiled MMQ seq64 run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
+// cu228: Q5_K 64x64 tile — tile32 와 bitwise 동일 계약 + row/seq tail 마스킹.
+#[test]
+fn cuda_q5k_mmq_tile64_matches_tile32_bitwise_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let seq_len = 77usize;
+    let blocks_per_row = cols / 256;
+    let weights = make_test_q5k_weights(rows, blocks_per_row, 229);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 53.0) - 26.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let tile32 = {
+        let _seq64_off = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "0");
+        q5k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q5_K tile32 baseline")
+    };
+    let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE64", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..8 {
+        let actual =
+            q5k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q5_K tiled MMQ tile64");
+        let tile32_mismatch = actual
+            .iter()
+            .zip(&tile32)
+            .position(|(actual, base)| actual.to_bits() != base.to_bits());
+        assert!(
+            tile32_mismatch.is_none(),
+            "Q5_K tiled MMQ tile64 run {run} diverges bitwise from tile32 at {tile32_mismatch:?}"
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q5_K tiled MMQ tile64 run {run} is not bitwise deterministic at {mismatch:?}"
             );
         } else {
             first_actual = Some(actual.clone());
@@ -13424,6 +13472,8 @@ fn cuda_q6k_mmq_tile32_matches_cpu_reference_with_tails() {
 fn cuda_q6k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");
+    // cu228: 기본값은 64x64 로 라우팅되므로 32x64 커널을 명시적으로 pin.
+    let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "0");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
@@ -13459,6 +13509,54 @@ fn cuda_q6k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
             assert!(
                 mismatch.is_none(),
                 "Q6_K tiled MMQ seq64 run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual.clone());
+        }
+    }
+}
+
+// cu228: Q6_K 64x64 tile — tile32 와 bitwise 동일 계약 + row/seq tail 마스킹.
+#[test]
+fn cuda_q6k_mmq_tile64_matches_tile32_bitwise_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 77usize;
+    let weights = make_test_q6k_weights(1, rows, blocks_per_row, 99)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let tile32 = {
+        let _seq64_off = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "0");
+        q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K tile32 baseline")
+    };
+    let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..8 {
+        let actual =
+            q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K tiled MMQ tile64");
+        let tile32_mismatch = actual
+            .iter()
+            .zip(&tile32)
+            .position(|(actual, base)| actual.to_bits() != base.to_bits());
+        assert!(
+            tile32_mismatch.is_none(),
+            "Q6_K tiled MMQ tile64 run {run} diverges bitwise from tile32 at {tile32_mismatch:?}"
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q6_K tiled MMQ tile64 run {run} is not bitwise deterministic at {mismatch:?}"
             );
         } else {
             first_actual = Some(actual.clone());

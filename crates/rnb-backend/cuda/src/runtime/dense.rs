@@ -1058,6 +1058,18 @@ impl CudaState {
         if tuning::q5k_mmq_tile32_enabled(seq_len, rows, blocks_per_row) {
             // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
+                // cu228: rows >= 64 는 64x64 tile — b-side 상각 (bitwise 동일).
+                if tuning::q5k_mmq_tile64_enabled(seq_len, rows) {
+                    return self.launch_q5k_q8_1_matmul_mmq_tile64_seq64(
+                        weights,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        qs_dev,
+                        ds_dev,
+                        output_dev,
+                    );
+                }
                 return self.launch_q5k_q8_1_matmul_mmq_tile32_seq64(
                     weights,
                     rows,
@@ -1138,6 +1150,18 @@ impl CudaState {
             )?;
             // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
+                // cu228: rows >= 64 는 64x64 tile — b-side 상각 (bitwise 동일).
+                if tuning::q6k_mmq_tile64_enabled(seq_len, rows) {
+                    return self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
+                        weights,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        qs_dev,
+                        ds_dev,
+                        output_dev,
+                    );
+                }
                 return self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
                     weights,
                     rows,
@@ -2222,15 +2246,28 @@ impl CudaState {
                         // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise
                         // 동일 산술).
                         if tuning::mmq_tile_seq64_enabled(seq_len) {
-                            self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
-                                down_weights,
-                                n_embd,
-                                down_blocks,
-                                seq_len,
-                                qs_dev,
-                                ds_dev,
-                                output_dev,
-                            )
+                            // cu228: n_embd >= 64 는 64x64 tile (bitwise 동일).
+                            if tuning::q6k_mmq_tile64_enabled(seq_len, n_embd) {
+                                self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
+                                    down_weights,
+                                    n_embd,
+                                    down_blocks,
+                                    seq_len,
+                                    qs_dev,
+                                    ds_dev,
+                                    output_dev,
+                                )
+                            } else {
+                                self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
+                                    down_weights,
+                                    n_embd,
+                                    down_blocks,
+                                    seq_len,
+                                    qs_dev,
+                                    ds_dev,
+                                    output_dev,
+                                )
+                            }
                         } else {
                             self.launch_q6k_q8_1_matmul_mmq_tile32(
                                 down_weights,

@@ -163,6 +163,15 @@ pub fn q4k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
     mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q4K_MMQ_TILE64", true)
 }
 
+/// cu228: Q5_K/Q6_K 64x64 tile 게이트 — Q4 와 같은 b-side 상각 (rows >= 64
+/// 는 tile 높이의 구조적 최소치). 진단 대조는 각 env `=0`.
+pub fn q5k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
+    mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q5K_MMQ_TILE64", true)
+}
+pub fn q6k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
+    mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q6K_MMQ_TILE64", true)
+}
+
 pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= 32 && rows >= 1024 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q2K_MMQ_TILE32", true)
