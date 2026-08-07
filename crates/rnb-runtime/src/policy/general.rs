@@ -95,6 +95,12 @@ pub fn tied_output_q8_disabled() -> bool {
     env_flag("RNB_DISABLE_TIED_OUTPUT_Q8")
 }
 
+/// Diagnostic opt-out for the macOS Metal Gemma path that preserves a tied
+/// token embedding in its original GGUF quantization.
+pub fn metal_gemma_tied_output_q8_forced() -> bool {
+    env_truthy_override("RNB_METAL_GEMMA_TIED_OUTPUT_Q8").unwrap_or(false)
+}
+
 pub fn q80_prepack_load_enabled() -> bool {
     env_flag("RNB_Q80_PREPACK_LOAD")
 }

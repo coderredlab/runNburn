@@ -1,19 +1,25 @@
 use super::super::dequant::dequantize_bytes_to_f32;
-use super::super::policy;
 use super::super::quantized_weight_types::QuantizedWeight;
 use rnb_core::tensor::Tensor;
 
-pub(super) fn build_tied_output_weight(token_embd: &QuantizedWeight) -> QuantizedWeight {
-    // weight tying: quantized token_embd -> Q8_0 conversion (chunk streaming)
+pub(super) fn build_tied_output_weight(
+    token_embd: &QuantizedWeight,
+    reuse_original: bool,
+) -> QuantizedWeight {
     let rows = token_embd.rows;
     let cols = token_embd.cols;
 
-    if policy::tied_output_q8_disabled() {
+    if reuse_original {
         eprintln!(
             "[INFO] output: reusing token_embd {:?} without Q8_0 conversion",
             token_embd.ggml_type
         );
-        return QuantizedWeight::new(token_embd.data.clone(), token_embd.ggml_type, rows, cols);
+        return QuantizedWeight::new(
+            token_embd.data.clone(),
+            token_embd.ggml_type,
+            token_embd.rows,
+            token_embd.cols,
+        );
     }
 
     let blocks_per_row = cols / 32;

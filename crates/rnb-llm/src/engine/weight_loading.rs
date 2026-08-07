@@ -55,7 +55,17 @@ pub(super) fn load_model_weights(
         );
         w
     } else {
-        build_tied_output_weight(&token_embd)
+        let preserve_gemma_metal_tied_output =
+            cfg!(all(
+                feature = "metal",
+                target_os = "macos",
+                target_arch = "aarch64"
+            )) && matches!(model.metadata.architecture, ModelArchitecture::Gemma4)
+                && !super::policy::metal_gemma_tied_output_q8_forced();
+        build_tied_output_weight(
+            &token_embd,
+            super::policy::tied_output_q8_disabled() || preserve_gemma_metal_tied_output,
+        )
     };
 
     let deepseek4 = deepseek4::load_deepseek4_weights(
