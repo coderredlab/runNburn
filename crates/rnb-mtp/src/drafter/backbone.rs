@@ -62,6 +62,8 @@ const RMS_EPS: f32 = 1e-6;
 pub struct DrafterForwardOutput {
     /// `[vocab_size]` full vector. non-selected token = `NEG_INFINITY`.
     pub logits: Vec<f32>,
+    /// Direct tied-lm-head `(top1 - top2) / max(abs(top1), 1)` confidence.
+    pub direct_vocab_margin_ratio: Option<f32>,
     /// `[backbone_hidden]` = drafter post_projection 결과.
     pub projected_hidden: Vec<f32>,
 }
@@ -269,18 +271,21 @@ pub fn drafter_forward(
     }
 
     // ----- Step 5: tied LM head -------------------------------------------------
-    let logits = if drafter.centroids.is_some() {
+    let (logits, direct_vocab_margin_ratio) = if drafter.centroids.is_some() {
         let vq = vq_head_forward(drafter, &last_hidden);
         let cluster_table = ClusterTokenTable::permutation(
             drafter.token_ordering.clone(),
             drafter.n_centroids as usize,
         );
-        vocab_logits_in_top_k_clusters(
-            drafter,
-            &vq.cluster_logits,
-            &last_hidden,
-            drafter.centroid_top_k as usize,
-            &cluster_table,
+        (
+            vocab_logits_in_top_k_clusters(
+                drafter,
+                &vq.cluster_logits,
+                &last_hidden,
+                drafter.centroid_top_k as usize,
+                &cluster_table,
+            ),
+            None,
         )
     } else {
         direct_vocab_argmax_logits(drafter, &last_hidden)
@@ -288,6 +293,7 @@ pub fn drafter_forward(
 
     DrafterForwardOutput {
         logits,
+        direct_vocab_margin_ratio,
         projected_hidden,
     }
 }

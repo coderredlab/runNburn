@@ -302,7 +302,7 @@ pub fn vocab_logits_in_top_k_clusters(
 /// External Gemma4 MTP는 greedy verify만 허용하므로 전체 262k logits를
 /// materialize하지 않는다. CUDA에서는 Q8_0 argmax kernel을 쓰고, CPU
 /// fallback은 한 행씩 dequant해 같은 argmax 계약을 보존한다.
-pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> Vec<f32> {
+pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> (Vec<f32>, Option<f32>) {
     assert_eq!(x_norm.len(), drafter.hidden);
     assert_eq!(drafter.token_embd.shape.len(), 2);
     let vocab_size = drafter.token_embd.shape[0];
@@ -333,17 +333,21 @@ pub fn direct_vocab_argmax_logits(drafter: &Drafter, x_norm: &[f32]) -> Vec<f32>
     } else {
         None
     };
-    let (token, value) = cuda_argmax
-        .map(|(token, value)| (token as usize, value))
-        .or(metal_argmax)
-        .unwrap_or_else(|| q8_0_argmax_cpu(&drafter.token_embd, x_norm));
+    let (token, value, confidence_ratio) = if let Some((token, value)) = cuda_argmax {
+        (token as usize, value, None)
+    } else if let Some((token, value, second)) = metal_argmax {
+        (token, value, Some((value - second) / value.abs().max(1.0)))
+    } else {
+        let (token, value, second) = q8_0_argmax_cpu(&drafter.token_embd, x_norm);
+        (token, value, Some((value - second) / value.abs().max(1.0)))
+    };
 
     let mut logits = vec![f32::NEG_INFINITY; vocab_size];
     logits[token] = value;
-    logits
+    (logits, confidence_ratio)
 }
 
-fn q8_0_argmax_cpu(weight: &super::types::TensorView, input: &[f32]) -> (usize, f32) {
+fn q8_0_argmax_cpu(weight: &super::types::TensorView, input: &[f32]) -> (usize, f32, f32) {
     let rows = weight.shape[0];
     let cols = weight.shape[1];
     assert_eq!(cols % 32, 0);
@@ -353,6 +357,7 @@ fn q8_0_argmax_cpu(weight: &super::types::TensorView, input: &[f32]) -> (usize, 
     assert_eq!(bytes.len(), rows * bytes_per_row);
 
     let mut best = (0usize, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
     let mut block_values = [0.0f32; 32];
     for row in 0..rows {
         let row_bytes = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
@@ -369,8 +374,11 @@ fn q8_0_argmax_cpu(weight: &super::types::TensorView, input: &[f32]) -> (usize, 
             }
         }
         if acc > best.1 {
+            second = best.1;
             best = (row, acc);
+        } else if acc > second {
+            second = acc;
         }
     }
-    best
+    (best.0, best.1, second)
 }

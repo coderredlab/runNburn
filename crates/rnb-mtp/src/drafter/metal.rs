@@ -89,26 +89,34 @@ pub(crate) fn drafter_q8_0_dual_gemv(
     Ok(true)
 }
 
+fn argmax_top_two(logits: &[f32]) -> (usize, f32, f32) {
+    let mut best = (0usize, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
+    for (token, &value) in logits.iter().enumerate() {
+        if value > best.1 {
+            second = best.1;
+            best = (token, value);
+        } else if value > second {
+            second = value;
+        }
+    }
+    (best.0, best.1, second)
+}
+
 pub(crate) fn drafter_q8_0_argmax(
     weight: &TensorView,
     input: &[f32],
-) -> Result<Option<(usize, f32)>, String> {
+) -> Result<Option<(usize, f32, f32)>, String> {
     let mut logits = vec![0.0f32; weight.shape.first().copied().unwrap_or(0)];
     if !drafter_q8_0_gemv(weight, input, &mut logits)? {
         return Ok(None);
     }
-    let mut best = (0usize, f32::NEG_INFINITY);
-    for (token, &value) in logits.iter().enumerate() {
-        if value > best.1 {
-            best = (token, value);
-        }
-    }
-    Ok(Some(best))
+    Ok(Some(argmax_top_two(&logits)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::or_cpu_fallback;
+    use super::{argmax_top_two, or_cpu_fallback};
 
     #[test]
     fn metal_error_selects_cpu_fallback() {
@@ -118,11 +126,17 @@ mod tests {
         ));
         assert!(or_cpu_fallback("test projection", Ok(true)));
         assert_eq!(
-            or_cpu_fallback::<Option<(usize, f32)>>(
+            or_cpu_fallback::<Option<(usize, f32, f32)>>(
                 "test argmax",
                 Err("backend failure".to_string())
             ),
             None
         );
+    }
+
+    #[test]
+    fn argmax_top_two_preserves_first_max_and_runner_up() {
+        assert_eq!(argmax_top_two(&[0.5, 1.5, 1.5, -2.0]), (1, 1.5, 1.5));
+        assert_eq!(argmax_top_two(&[-3.0, -1.0, -2.0]), (1, -1.0, -2.0));
     }
 }

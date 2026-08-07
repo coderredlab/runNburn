@@ -2266,6 +2266,26 @@ fn external_draft_position(position_before_verify: u32, step: usize) -> u32 {
         .expect("external MTP draft position exceeds u32")
 }
 
+const GEMMA4_METAL_EXTERNAL_DRAFT_MIN_MARGIN_RATIO: f32 = 1.0 / 8.0;
+
+#[inline]
+fn gemma4_metal_adaptive_second_draft(
+    architecture: rnb_loader::Architecture,
+    draft_n: usize,
+) -> bool {
+    cfg!(all(feature = "metal", not(feature = "cuda")))
+        && architecture == rnb_loader::Architecture::Gemma4
+        && draft_n == 2
+}
+
+#[inline]
+fn external_draft_should_continue(adaptive_second_draft: bool, confidence: Option<f32>) -> bool {
+    !adaptive_second_draft
+        || confidence.is_none_or(|value| {
+            !value.is_finite() || value >= GEMMA4_METAL_EXTERNAL_DRAFT_MIN_MARGIN_RATIO
+        })
+}
+
 fn generate_with_external_drafter(
     engine: &mut Engine,
     prompt_tokens: &[u32],
@@ -2380,6 +2400,7 @@ fn generate_with_external_drafter(
     let mut t_verify = 0.0f64;
     let t_commit_emit = 0.0f64;
     let timing_enabled = crate::engine::policy::env_string("RNB_MC78_TIMING").is_some();
+    let adaptive_second_draft = gemma4_metal_adaptive_second_draft(engine.architecture(), draft_n);
     let external_device_verify = engine.mtp_device_verify_requested();
     let sampled_verify = mtp_sampled_verify_allowed(params);
     if external_device_verify {
@@ -2489,6 +2510,14 @@ fn generate_with_external_drafter(
                 result.push(tok);
                 prev_tok = tok;
                 current_last_hidden = out.projected_hidden; // Eagle: 다음 step input
+                if step == 0
+                    && !external_draft_should_continue(
+                        adaptive_second_draft,
+                        out.direct_vocab_margin_ratio,
+                    )
+                {
+                    break;
+                }
             }
             result
         };
@@ -3388,6 +3417,15 @@ mod tests {
         assert_eq!(external_batch_committed_verify_tokens(3, 1, true), 2);
         assert_eq!(external_batch_committed_verify_tokens(3, 3, true), 4);
         assert_eq!(external_batch_committed_verify_tokens(3, 1, false), 4);
+    }
+
+    #[test]
+    fn gemma4_metal_adaptive_draft_uses_normalized_top_two_margin() {
+        assert!(!external_draft_should_continue(true, Some(0.124)));
+        assert!(external_draft_should_continue(true, Some(0.125)));
+        assert!(external_draft_should_continue(true, None));
+        assert!(external_draft_should_continue(true, Some(f32::NAN)));
+        assert!(external_draft_should_continue(false, Some(0.0)));
     }
 
     #[test]
