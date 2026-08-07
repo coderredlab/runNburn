@@ -215,6 +215,21 @@ fn resident_key(raw: &[u8]) -> ResidentKey {
 }
 
 #[cfg(target_os = "macos")]
+fn gemma_decode_constant_cache_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("RNB_METAL_GEMMA_DECODE_CONSTANT_CACHE")
+            .map(|value| {
+                !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+#[cfg(target_os = "macos")]
 fn resident_source(raw: &[u8]) -> HostStorageLease {
     rnb_core::tensor::host_storage_lease(raw)
         .unwrap_or_else(|| panic!("Metal NoCopy weights must belong to registered host storage"))
@@ -9234,14 +9249,35 @@ impl MetalBackend {
         let (up_w, up_off) = resident_weight(up_raw);
         let (down_w, down_off) = resident_weight(down_raw);
 
-        let o_off_buf = ffn_chain::u32_buf(ctx, o_off);
-        let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
-        let up_off_buf = ffn_chain::u32_buf(ctx, up_off);
-        let down_off_buf = ffn_chain::u32_buf(ctx, down_off);
-        let post_attn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, post_attn_norm_weight);
-        let ffn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, ffn_norm_weight);
-        let post_ffn_norm_w_buf =
-            post_ffn_norm_weight.map(|weight| ffn_chain::shared_f32_buf(ctx, weight));
+        let cache_constants = gemma_decode_constant_cache_enabled();
+        let constant_u32 = |value| {
+            if !cache_constants {
+                return ffn_chain::u32_buf(ctx, value);
+            }
+            let mut cache = self.constant_u32.borrow_mut();
+            cache
+                .entry(value)
+                .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
+                .clone()
+        };
+        let constant_f32 = |data: &[f32]| {
+            if !cache_constants {
+                return ffn_chain::shared_f32_buf(ctx, data);
+            }
+            let key = (data.as_ptr() as usize, data.len());
+            let mut cache = self.constant_f32.borrow_mut();
+            cache
+                .entry(key)
+                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
+                .clone()
+        };
+        let o_off_buf = constant_u32(o_off);
+        let gate_off_buf = constant_u32(gate_off);
+        let up_off_buf = constant_u32(up_off);
+        let down_off_buf = constant_u32(down_off);
+        let post_attn_norm_w_buf = constant_f32(post_attn_norm_weight);
+        let ffn_norm_w_buf = constant_f32(ffn_norm_weight);
+        let post_ffn_norm_w_buf = post_ffn_norm_weight.map(constant_f32);
 
         let mut o_carriers = self.o_chain_carriers.borrow_mut();
         let o_carrier = o_carriers
@@ -9323,20 +9359,40 @@ impl MetalBackend {
             resident_weight(next_v_raw)
         };
 
-        let o_off_buf = ffn_chain::u32_buf(ctx, o_off);
-        let gate_off_buf = ffn_chain::u32_buf(ctx, gate_off);
-        let up_off_buf = ffn_chain::u32_buf(ctx, up_off);
-        let down_off_buf = ffn_chain::u32_buf(ctx, down_off);
-        let next_q_off_buf = ffn_chain::u32_buf(ctx, next_q_off);
-        let next_k_off_buf = ffn_chain::u32_buf(ctx, next_k_off);
-        let next_v_off_buf = ffn_chain::u32_buf(ctx, next_v_off);
-        let post_attn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, post_attn_norm_weight);
-        let ffn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, ffn_norm_weight);
-        let post_ffn_norm_w_buf =
-            post_ffn_norm_weight.map(|weight| ffn_chain::shared_f32_buf(ctx, weight));
-        let layer_output_scale_buf =
-            layer_output_scale.map(|scale| ffn_chain::shared_f32_buf(ctx, &[scale]));
-        let next_attn_norm_w_buf = ffn_chain::shared_f32_buf(ctx, next_attn_norm_weight);
+        let cache_constants = gemma_decode_constant_cache_enabled();
+        let constant_u32 = |value| {
+            if !cache_constants {
+                return ffn_chain::u32_buf(ctx, value);
+            }
+            let mut cache = self.constant_u32.borrow_mut();
+            cache
+                .entry(value)
+                .or_insert_with(|| ffn_chain::u32_buf(ctx, value))
+                .clone()
+        };
+        let constant_f32 = |data: &[f32]| {
+            if !cache_constants {
+                return ffn_chain::shared_f32_buf(ctx, data);
+            }
+            let key = (data.as_ptr() as usize, data.len());
+            let mut cache = self.constant_f32.borrow_mut();
+            cache
+                .entry(key)
+                .or_insert_with(|| ffn_chain::shared_f32_buf(ctx, data))
+                .clone()
+        };
+        let o_off_buf = constant_u32(o_off);
+        let gate_off_buf = constant_u32(gate_off);
+        let up_off_buf = constant_u32(up_off);
+        let down_off_buf = constant_u32(down_off);
+        let next_q_off_buf = constant_u32(next_q_off);
+        let next_k_off_buf = constant_u32(next_k_off);
+        let next_v_off_buf = constant_u32(next_v_off);
+        let post_attn_norm_w_buf = constant_f32(post_attn_norm_weight);
+        let ffn_norm_w_buf = constant_f32(ffn_norm_weight);
+        let post_ffn_norm_w_buf = post_ffn_norm_weight.map(constant_f32);
+        let layer_output_scale_buf = layer_output_scale.map(|scale| constant_u32(scale.to_bits()));
+        let next_attn_norm_w_buf = constant_f32(next_attn_norm_weight);
 
         let mut o_carriers = self.o_chain_carriers.borrow_mut();
         let o_carrier = o_carriers
