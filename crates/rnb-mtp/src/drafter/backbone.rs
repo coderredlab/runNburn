@@ -31,9 +31,9 @@
 //! `t * kv_dim + kv_h * head_dim` 식과는 axis 다름 — 본 모듈의 attention 은
 //! head-major index 만 사용한다.
 //!
-//! Q 만 RoPE 적용 (`position_id` = last validated token position, constant
-//! across drafting loop). K 는 target prefill 시 이미 RoPE 적용된 상태로
-//! `shared_kv_states` 에 저장됨 — 추가 RoPE 적용 금지.
+//! Q 만 RoPE 적용 (`position_id` = 현재 draft step의 candidate token position).
+//! K 는 target prefill 시 이미 RoPE 적용된 상태로 `shared_kv_states` 에 저장됨 —
+//! 추가 RoPE 적용 금지.
 
 use super::dequant::dequant_to_f32;
 use super::types::{Drafter, DrafterLayer};
@@ -74,8 +74,8 @@ pub struct DrafterForwardOutput {
 ///   target_last_hidden])` (concatenation order verbatim spec §7).
 /// - `shared_kv_states` — Stage β 의 `Engine::shared_kv_states_for_drafter()`
 ///   결과. sliding / full 두 layer_type 의 K/V dict.
-/// - `position_id` — drafting loop 의 constant position
-///   (= `input_ids.shape[1] - 1`, last validated token's position).
+/// - `position_id` — 현재 draft step의 candidate token position
+///   (= 해당 step의 `input_ids.shape[1] - 1`).
 ///
 /// 출력: `DrafterForwardOutput { logits, projected_hidden }`.
 pub fn drafter_forward(
@@ -356,7 +356,7 @@ fn decoder_layer_forward(
     }
 
     // RoPE on Q only — K 는 shared_kv 에 이미 RoPE 적용된 상태 (spec §4 Critical).
-    // position_id 는 drafting loop 의 constant (last validated token's position).
+    // position_id 는 현재 draft step의 candidate token position.
     apply_rope_q(
         &mut q,
         layer.n_heads,
@@ -619,9 +619,9 @@ fn matvec(weight: &[f32], rows: usize, cols: usize, x: &[f32], out: &mut [f32]) 
 /// Standard RoPE on Q only. Pairs `(i, i + head_dim/2)` rotated by
 /// `theta_i = pos * base^(-2i / head_dim)`.
 ///
-/// Spec §4 Critical: drafter 의 모든 layer 가 같은 `position_id`
-/// (= last validated token position) 로 단일 회전. K 는 dict 에 이미 적용된
-/// 상태라 추가 회전 금지.
+/// Spec §4 Critical: 한 `drafter_forward` 안의 모든 layer가 현재 draft step의
+/// 동일한 `position_id`로 회전한다. K 는 dict 에 이미 적용된 상태라 추가 회전
+/// 금지.
 fn apply_rope_q(q: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, base: f32) {
     assert!(
         head_dim % 2 == 0,
@@ -656,10 +656,10 @@ fn apply_rope_q(q: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, base
 /// Q layout: `[n_heads, head_dim]` row-major.
 /// out layout: `[n_heads, head_dim]` row-major (overwritten).
 ///
-/// SWA mask: drafter 의 `q_len = 1` 이라 SWA mask 가 trivial — `position_id`
-/// 가 last validated token 이고 모든 K position 이 그 이전이므로 모든 K 에
-/// attend 함 (causal mask trivial, SWA mask 도 sliding window 안에 들어옴).
-/// 따라서 본 구현은 mask 없이 전체 seq_len attend.
+/// SWA mask: drafter 의 `q_len = 1` 이라 SWA mask 가 trivial — 모든 shared K
+/// position은 현재 draft candidate position보다 앞선 validated prefix다. 따라서
+/// causal mask와 SWA mask 모두 현재 입력에서 추가 제외 항목이 없고, 본 구현은
+/// mask 없이 전체 seq_len에 attend한다.
 fn cross_attention_gqa(
     q: &[f32],
     k: &[f32],

@@ -2258,6 +2258,14 @@ fn generate_with_dspark(
     ))
 }
 
+#[inline]
+fn external_draft_position(position_before_verify: u32, step: usize) -> u32 {
+    let step = u32::try_from(step).expect("external MTP draft step exceeds u32");
+    position_before_verify
+        .checked_add(step)
+        .expect("external MTP draft position exceeds u32")
+}
+
 fn generate_with_external_drafter(
     engine: &mut Engine,
     prompt_tokens: &[u32],
@@ -2461,7 +2469,7 @@ fn generate_with_external_drafter(
             let mut result = Vec::with_capacity(draft_n);
             let mut prev_tok = current_token;
 
-            for _step in 0..draft_n {
+            for step in 0..draft_n {
                 let mut prev_embd = engine.token_embd_row(prev_tok);
                 debug_assert_eq!(prev_embd.len(), backbone);
                 for v in prev_embd.iter_mut() {
@@ -2469,12 +2477,13 @@ fn generate_with_external_drafter(
                 }
                 inputs[..backbone].copy_from_slice(&prev_embd);
                 inputs[backbone..].copy_from_slice(&current_last_hidden);
+                let draft_position = external_draft_position(current_token_position, step);
 
                 let out = rnb_mtp::drafter::drafter_forward(
                     &drafter_arc,
                     &inputs,
                     &shared_kv,
-                    current_token_position,
+                    draft_position,
                 );
                 let tok = crate::external_drafter::argmax(&out.logits);
                 result.push(tok);
@@ -2837,6 +2846,13 @@ mod tests {
     fn mtp_zero_token_budget_skips_initial_sample() {
         assert_eq!(mtp_initial_generation_budget(0).unwrap(), None);
         assert_eq!(mtp_initial_generation_budget(1).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn external_draft_position_advances_with_each_candidate() {
+        assert_eq!(external_draft_position(1_114, 0), 1_114);
+        assert_eq!(external_draft_position(1_114, 1), 1_115);
+        assert_eq!(external_draft_position(1_114, 2), 1_116);
     }
 
     #[test]
