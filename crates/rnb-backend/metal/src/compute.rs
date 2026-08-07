@@ -723,12 +723,14 @@ pub struct MetalContext {
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q2k_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Q8_0 tensorops v1은 하나의 컴파일된 library를 공유한다.
+    pub(crate) gemm_q8_0_tensorops_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     /// Q8_0 tensorops GEMM(unsloth UD attn/GDN/shared projection). NK=32(block), Q4_K v1 구조.
     pub(crate) gemm_q8_0_tensorops_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    /// Q8_0 tensorops GEMM for tiny M. 8×32 tile keeps the v1 F32-input arithmetic.
+    /// Q8_0 tensorops GEMM for tiny M. 첫 사용 때 공유 library에서 pipeline만 생성한다.
     pub(crate) gemm_q8_0_tensorops_small_m_pipeline:
-        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+        OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Q8_0 v2 tensorops GEMM(llama 패턴 64×128, NK=32). GDN in_proj/ATN proj/ssm_out(Q8_0).
     pub(crate) gemm_q8_0_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -977,6 +979,15 @@ fn lazy_qwen_moe_llama_pipeline<'a>(
         )
     });
     cell.get_or_init(|| build_pipeline_from_library(&ctx.device, library, fn_name))
+}
+
+fn lazy_gemm_q8_0_tensorops_small_m_pipeline(
+    ctx: &MetalContext,
+) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+    let library = ctx.gemm_q8_0_tensorops_library.as_ref()?;
+    Some(ctx.gemm_q8_0_tensorops_small_m_pipeline.get_or_init(|| {
+        build_pipeline_from_library(&ctx.device, library, "gemm_q8_0_tensorops_small_m")
+    }))
 }
 
 impl MetalContext {
@@ -1700,28 +1711,20 @@ pub fn build_metal_context_with_opts(
         } else {
             None
         };
-    let gemm_q8_0_tensorops_pipeline: Option<
-        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    > = if tensorops_capable {
-        Some(build_pipeline_v4(
-            &device,
-            GEMM_TENSOROPS_POC_SRC,
-            "gemm_q8_0_tensorops",
-        ))
-    } else {
-        None
-    };
-    let gemm_q8_0_tensorops_small_m_pipeline: Option<
-        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    > = if tensorops_capable {
-        Some(build_pipeline_v4(
-            &device,
-            GEMM_TENSOROPS_POC_SRC,
-            "gemm_q8_0_tensorops_small_m",
-        ))
-    } else {
-        None
-    };
+    let gemm_q8_0_tensorops_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>> =
+        if tensorops_capable {
+            Some(build_library_v4(
+                &device,
+                GEMM_TENSOROPS_POC_SRC,
+                "gemm_q8_0_tensorops",
+            ))
+        } else {
+            None
+        };
+    let gemm_q8_0_tensorops_pipeline = gemm_q8_0_tensorops_library
+        .as_ref()
+        .map(|library| build_pipeline_from_library(&device, library, "gemm_q8_0_tensorops"));
+    let gemm_q8_0_tensorops_small_m_pipeline = OnceLock::new();
     // pm42 M3: production v2 GEMM(64×128 winner 타일) + cast. 같은 src, fn명만 다름. capability 시만.
     let gemm_q4k_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2561,6 +2564,7 @@ pub fn build_metal_context_with_opts(
         gemm_q6k_tensorops_v2_pipeline,
         gemm_q3k_tensorops_v2_pipeline,
         gemm_q2k_tensorops_v2_pipeline,
+        gemm_q8_0_tensorops_library,
         gemm_q8_0_tensorops_pipeline,
         gemm_q8_0_tensorops_small_m_pipeline,
         gemm_q8_0_tensorops_v2_pipeline,
@@ -5976,9 +5980,7 @@ pub(crate) fn encode_gemm_q8_0_tensorops_small_m(
     n: usize,
     m: usize,
 ) {
-    let pipeline = ctx
-        .gemm_q8_0_tensorops_small_m_pipeline
-        .as_ref()
+    let pipeline = lazy_gemm_q8_0_tensorops_small_m_pipeline(ctx)
         .expect("gemm_q8_0_tensorops_small_m_pipeline missing (capability=false?)");
     encode_tensorops_dispatch(
         pipeline,

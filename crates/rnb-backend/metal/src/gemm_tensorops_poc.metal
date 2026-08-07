@@ -1378,104 +1378,27 @@ kernel void gemm_q8_0_tensorops_v2_64x128(
     gemm_q8_0_v2_tmpl<64u, 128u, 4u>(weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
 }
 
-// v1 (A+B+C threadgroup staging, input f32). gemm_q6k_tensorops 구조 1:1, dequant 만 Q8_0.
-// KC=32(Q8_0 block). grid=(ceil(N/32), ceil(M/64)), tg=128. 비-tensorops-capable/OFF fallback.
-kernel void gemm_q8_0_tensorops(
-    device const uchar *weight_bytes [[buffer(0)]],  // N rows * (K/32)*34
-    device const float *input        [[buffer(1)]],  // M * K f32
-    device float       *out          [[buffer(2)]],  // M * N f32 (row-major)
-    constant uint      &N            [[buffer(3)]],
-    constant uint      &K            [[buffer(4)]],
-    constant uint      &M            [[buffer(5)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]])  // 0..128
+// v1 (A+B+C threadgroup staging, input f32). KC=32(Q8_0 block), BN=32,
+// tg=128. BM=64 is the default path; BM=8 avoids oversized staging for tiny M.
+template<uint BM>
+static void gemm_q8_0_v1_tmpl(
+    device const uchar *weight_bytes,
+    device const float *input,
+    device float       *out,
+    constant uint      &N,
+    constant uint      &K,
+    constant uint      &M,
+    threadgroup half  *A_stage,
+    threadgroup half  *B_stage,
+    threadgroup float *C_stage,
+    uint2 tgid,
+    uint  tid)
 {
-    const uint BM = 64u, BN = 32u, KC = 32u;  // KC = Q8_0 block
+    constexpr uint BN = 32u;
+    constexpr uint KC = 32u;
     uint row0 = tgid.x * BN;
     uint tok0 = tgid.y * BM;
-    uint num_blk = K / 32u;
-    uint nchunk = num_blk;  // K / KC
-
-    threadgroup half  A_stage[64 * 32];  // [BM][KC]
-    threadgroup half  B_stage[32 * 32];  // [KC][BN] transposed
-    threadgroup float C_stage[64 * 32];  // [BM][BN]
-
-    for (uint i = tid; i < BM * BN; i += 128u) {
-        C_stage[i] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint c = 0; c < nchunk; c++) {
-        for (uint i = tid; i < BM * KC; i += 128u) {
-            uint t = i / KC;
-            uint kk = i % KC;
-            uint tok = tok0 + t;
-            A_stage[i] = (tok < M) ? (half)input[tok * K + c * KC + kk] : (half)0;
-        }
-        if (tid < BN) {
-            uint r = tid;
-            uint row = row0 + r;
-            if (row < N) {
-                device const uchar *blk = weight_bytes + (row * num_blk + c) * 34u;
-                ushort d_bits = (ushort)blk[0] | ((ushort)blk[1] << 8);
-                float d = (float)as_type<half>(d_bits);
-                device const char *qs = (device const char *)(blk + 2);
-                for (uint l = 0; l < 32u; l++) {
-                    B_stage[l * BN + r] = (half)(d * (float)qs[l]);
-                }
-            } else {
-                for (uint k = 0; k < KC; k++) {
-                    B_stage[k * BN + r] = (half)0;
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto A = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
-            A_stage, dextents<int32_t, 2>(32, 64));
-        auto B = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
-            B_stage, dextents<int32_t, 2>(32, 32));
-        auto C = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(
-            C_stage, dextents<int32_t, 2>(32, 64));
-        constexpr auto desc = matmul2d_descriptor(
-            64, 32, 32, false, false, false,
-            matmul2d_descriptor::mode::multiply_accumulate);
-        matmul2d<desc, execution_simdgroups<4>> op;
-        op.run(A, B, C);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    for (uint i = tid; i < BM * BN; i += 128u) {
-        uint t = i / BN;
-        uint r = i % BN;
-        uint tok = tok0 + t;
-        uint row = row0 + r;
-        if (tok < M && row < N) {
-            out[tok * N + row] = C_stage[t * BN + r];
-        }
-    }
-}
-
-// Tiny-M Q8_0 FFN tile. The projection arithmetic matches the v1 F32-input
-// TensorOps path while avoiding a 64-row activation/output tile for M<=3.
-kernel void gemm_q8_0_tensorops_small_m(
-    device const uchar *weight_bytes [[buffer(0)]],
-    device const float *input        [[buffer(1)]],
-    device float       *out          [[buffer(2)]],
-    constant uint      &N            [[buffer(3)]],
-    constant uint      &K            [[buffer(4)]],
-    constant uint      &M            [[buffer(5)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]])
-{
-    const uint BM = 8u, BN = 32u, KC = 32u;
-    uint row0 = tgid.x * BN;
-    uint tok0 = tgid.y * BM;
-    uint num_blk = K / 32u;
-
-    threadgroup half  A_stage[8 * 32];
-    threadgroup half  B_stage[32 * 32];
-    threadgroup float C_stage[8 * 32];
+    uint num_blk = K / KC;
 
     for (uint i = tid; i < BM * BN; i += 128u) {
         C_stage[i] = 0.0f;
@@ -1508,13 +1431,13 @@ kernel void gemm_q8_0_tensorops_small_m(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         auto A = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
-            A_stage, dextents<int32_t, 2>(32, 8));
+            A_stage, dextents<int32_t, 2>(KC, BM));
         auto B = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
-            B_stage, dextents<int32_t, 2>(32, 32));
+            B_stage, dextents<int32_t, 2>(KC, BN));
         auto C = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(
-            C_stage, dextents<int32_t, 2>(32, 8));
+            C_stage, dextents<int32_t, 2>(BN, BM));
         constexpr auto desc = matmul2d_descriptor(
-            8, 32, 32, false, false, false,
+            BM, BN, KC, false, false, false,
             matmul2d_descriptor::mode::multiply_accumulate);
         matmul2d<desc, execution_simdgroups<4>> op;
         op.run(A, B, C);
@@ -1530,4 +1453,38 @@ kernel void gemm_q8_0_tensorops_small_m(
             out[tok * N + row] = C_stage[t * BN + r];
         }
     }
+}
+
+kernel void gemm_q8_0_tensorops(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const float *input        [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N            [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M            [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup half A_stage[64 * 32];
+    threadgroup half B_stage[32 * 32];
+    threadgroup float C_stage[64 * 32];
+    gemm_q8_0_v1_tmpl<64u>(
+        weight_bytes, input, out, N, K, M, A_stage, B_stage, C_stage, tgid, tid);
+}
+
+kernel void gemm_q8_0_tensorops_small_m(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const float *input        [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N            [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M            [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup half A_stage[8 * 32];
+    threadgroup half B_stage[32 * 32];
+    threadgroup float C_stage[8 * 32];
+    gemm_q8_0_v1_tmpl<8u>(
+        weight_bytes, input, out, N, K, M, A_stage, B_stage, C_stage, tgid, tid);
 }

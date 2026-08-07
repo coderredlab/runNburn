@@ -14904,21 +14904,46 @@ mod tests {
         let up_raw = up_mapped.as_bytes().expect("up bytes");
         let down_raw = down_mapped.as_bytes().expect("down bytes");
 
-        for m in [2usize, 3] {
-            let normed = det_vals(m * hid, 0.1);
-            let default = {
-                let _off = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "0");
-                backend.prefill_ffn_chain(
-                    &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
-                )
-            };
-            let small_m = {
-                let _on = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "1");
-                backend.prefill_ffn_chain(
-                    &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
-                )
-            };
-            assert_eq!(small_m, default, "Q8_0 tiny-M chain mismatch for M={m}");
+        assert!(
+            ctx.gemm_q8_0_tensorops_small_m_pipeline.get().is_none(),
+            "tiny-M pipeline must start uninitialized"
+        );
+        let mut initialized_pipeline = None;
+        for use_gelu in [false, true] {
+            for m in [1usize, 2, 3] {
+                let normed = det_vals(m * hid, 0.1);
+                let default = {
+                    let _off = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "0");
+                    backend.prefill_ffn_chain(
+                        &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, use_gelu,
+                    )
+                };
+                assert!(
+                    initialized_pipeline.is_some()
+                        || ctx.gemm_q8_0_tensorops_small_m_pipeline.get().is_none(),
+                    "default path must not initialize the tiny-M pipeline"
+                );
+                let small_m = {
+                    let _on = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "1");
+                    backend.prefill_ffn_chain(
+                        &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, use_gelu,
+                    )
+                };
+                let pipeline = ctx
+                    .gemm_q8_0_tensorops_small_m_pipeline
+                    .get()
+                    .expect("tiny-M pipeline must initialize on first use");
+                let pipeline_address = std::ptr::from_ref(pipeline).addr();
+                assert_eq!(
+                    initialized_pipeline.get_or_insert(pipeline_address),
+                    &pipeline_address,
+                    "tiny-M pipeline must initialize exactly once"
+                );
+                assert_eq!(
+                    small_m, default,
+                    "Q8_0 tiny-M chain mismatch for M={m}, use_gelu={use_gelu}"
+                );
+            }
         }
     }
 
