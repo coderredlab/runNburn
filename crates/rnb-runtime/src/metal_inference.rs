@@ -3728,6 +3728,27 @@ pub fn metal_ffn_chain_into_if_supported(
 /// Prefill FFN batch GEMM chain. `metal_ffn_chain_into_if_supported`의 M>1 아날로그.
 /// norm은 caller가 적용하고 residual도 caller가 처리한다. `use_gelu`는 Gemma GeGLU,
 /// false는 기존 SwiGLU 산술을 선택한다.
+fn metal_prefill_ffn_quant_mode(
+    gate_ggml: GGMLType,
+    up_ggml: GGMLType,
+    down_ggml: GGMLType,
+    q8_tensorops_supported: bool,
+) -> Option<(bool, bool)> {
+    let q8_0 =
+        gate_ggml == GGMLType::Q8_0 && up_ggml == GGMLType::Q8_0 && down_ggml == GGMLType::Q8_0;
+    if q8_0 {
+        return q8_tensorops_supported.then_some((false, true));
+    }
+    if gate_ggml != GGMLType::Q4_K || up_ggml != GGMLType::Q4_K {
+        return None;
+    }
+    match down_ggml {
+        GGMLType::Q4_K => Some((false, false)),
+        GGMLType::Q6_K => Some((true, false)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn metal_prefill_ffn_chain_into_if_supported(
     gate_ggml: GGMLType,
@@ -3747,19 +3768,14 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     if std::env::var("RNB_METAL_PREFILL_FFN").as_deref() == Ok("0") {
         return Ok(false);
     }
-    let q8_0 =
+    let q8_0_candidate =
         gate_ggml == GGMLType::Q8_0 && up_ggml == GGMLType::Q8_0 && down_ggml == GGMLType::Q8_0;
-    let down_is_q6k = if q8_0 {
-        false
-    } else {
-        if gate_ggml != GGMLType::Q4_K || up_ggml != GGMLType::Q4_K {
-            return Ok(false);
-        }
-        match down_ggml {
-            GGMLType::Q4_K => false,
-            GGMLType::Q6_K => true,
-            _ => return Ok(false),
-        }
+    let q8_tensorops_supported =
+        !q8_0_candidate || METAL.with(|backend| backend.prefill_ffn_q8_0_supported());
+    let Some((down_is_q6k, q8_0)) =
+        metal_prefill_ffn_quant_mode(gate_ggml, up_ggml, down_ggml, q8_tensorops_supported)
+    else {
+        return Ok(false);
     };
     let r = METAL.with(|b| {
         b.prefill_ffn_chain(
@@ -3777,6 +3793,39 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     });
     out.copy_from_slice(&r);
     Ok(true)
+}
+
+#[cfg(test)]
+mod metal_prefill_ffn_quant_mode_tests {
+    use super::*;
+
+    #[test]
+    fn q8_prefill_requires_tensorops_capability() {
+        assert_eq!(
+            metal_prefill_ffn_quant_mode(GGMLType::Q8_0, GGMLType::Q8_0, GGMLType::Q8_0, false,),
+            None
+        );
+        assert_eq!(
+            metal_prefill_ffn_quant_mode(GGMLType::Q8_0, GGMLType::Q8_0, GGMLType::Q8_0, true,),
+            Some((false, true))
+        );
+    }
+
+    #[test]
+    fn q4_prefill_keeps_q4_and_q6_down_modes() {
+        assert_eq!(
+            metal_prefill_ffn_quant_mode(GGMLType::Q4_K, GGMLType::Q4_K, GGMLType::Q4_K, false,),
+            Some((false, false))
+        );
+        assert_eq!(
+            metal_prefill_ffn_quant_mode(GGMLType::Q4_K, GGMLType::Q4_K, GGMLType::Q6_K, false,),
+            Some((true, false))
+        );
+        assert_eq!(
+            metal_prefill_ffn_quant_mode(GGMLType::Q8_0, GGMLType::Q4_K, GGMLType::Q8_0, true,),
+            None
+        );
+    }
 }
 
 fn metal_qwen_moe_expert_batch_enabled(group_len: usize) -> bool {

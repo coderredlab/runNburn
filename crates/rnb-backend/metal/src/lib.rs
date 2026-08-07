@@ -5815,6 +5815,12 @@ impl MetalBackend {
         );
     }
 
+    pub fn prefill_ffn_q8_0_supported(&self) -> bool {
+        self.ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.tensorops_capable && ctx.gemm_q8_0_tensorops_pipeline.is_some())
+    }
+
     /// Prefill FFN chain(M>1). normed[seq_len*hidden] + gate/up/down(Q8_0), or
     /// gate/up(Q4_K) + down(Q4_K|Q6_K), → down result[seq_len*hidden](before residual).
     /// `use_gelu` selects Gemma GeGLU; false selects SwiGLU. Weights retain source
