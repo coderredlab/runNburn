@@ -1044,6 +1044,18 @@ impl CudaState {
         // cu222: prefill 대역(min_seq 이상)은 Q5 MMQ tile32 로 — Q5 는 그동안
         // MMQ 세대가 없어 q8dot wide 에 갇혀 있었다 (27B ssm_out 1.37s/1139tok).
         if tuning::q5k_mmq_tile32_enabled(seq_len, rows, blocks_per_row) {
+            // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
+            if tuning::mmq_tile_seq64_enabled(seq_len) {
+                return self.launch_q5k_q8_1_matmul_mmq_tile32_seq64(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    output_dev,
+                );
+            }
             return self.launch_q5k_q8_1_matmul_mmq_tile32(
                 weights,
                 rows,
@@ -1112,6 +1124,18 @@ impl CudaState {
                 ds_dev,
                 seq_len * blocks_per_row * 256,
             )?;
+            // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
+            if tuning::mmq_tile_seq64_enabled(seq_len) {
+                return self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    output_dev,
+                );
+            }
             return self.launch_q6k_q8_1_matmul_mmq_tile32(
                 weights,
                 rows,
@@ -2183,15 +2207,29 @@ impl CudaState {
                     // silu_mul_q8_1 의 qs/ds 를 그대로 소비한다. min_seq 게이트
                     // (기본 8)가 verify(2..4)와 decode 를 배제한다.
                     if tuning::q6k_down_mmq_tile32_enabled(seq_len, n_embd, down_blocks) {
-                        self.launch_q6k_q8_1_matmul_mmq_tile32(
-                            down_weights,
-                            n_embd,
-                            down_blocks,
-                            seq_len,
-                            qs_dev,
-                            ds_dev,
-                            output_dev,
-                        )
+                        // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise
+                        // 동일 산술).
+                        if tuning::mmq_tile_seq64_enabled(seq_len) {
+                            self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
+                                down_weights,
+                                n_embd,
+                                down_blocks,
+                                seq_len,
+                                qs_dev,
+                                ds_dev,
+                                output_dev,
+                            )
+                        } else {
+                            self.launch_q6k_q8_1_matmul_mmq_tile32(
+                                down_weights,
+                                n_embd,
+                                down_blocks,
+                                seq_len,
+                                qs_dev,
+                                ds_dev,
+                                output_dev,
+                            )
+                        }
                     } else if let Some((packed_qs_dev, packed_d_super_dev, packed_sub_scale_dev)) =
                         packed_q6_down
                     {

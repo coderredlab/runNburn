@@ -6162,6 +6162,42 @@ impl CudaState {
         )
     }
 
+    // cu226: Q6_K 32x64 tile — Q4 seq64 와 같은 a-side 상각 (grid.y 반감,
+    // per-element bitwise 동일).
+    pub(in crate::runtime) fn launch_q6k_q8_1_matmul_mmq_tile32_seq64(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        self.launch_cached_gemv(
+            "rnb_q6k_q8_1_matmul_mmq_tile32_seq64",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(32) as u32, seq_len.div_ceil(64) as u32, 1),
+            (256, 1, 1),
+        )
+    }
+
     // cu222: Q5_K MMQ tile32 — Q4_K MMQ 와 같은 affine(min) 처리에 qh 5th-bit
     // 주입만 추가된 커널. prefill 대역(seq>=min_seq)의 Q5 배치가 q8dot wide
     // GEMV 대신 tile 재사용 matmul 을 탄다.
@@ -6195,6 +6231,41 @@ impl CudaState {
                 (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
             ],
             (rows.div_ceil(32) as u32, seq_len.div_ceil(32) as u32, 1),
+            (256, 1, 1),
+        )
+    }
+
+    // cu226: Q5_K 32x64 tile — qh 5th-bit 주입 유지, a-side 상각 동일.
+    pub(in crate::runtime) fn launch_q5k_q8_1_matmul_mmq_tile32_seq64(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        self.launch_cached_gemv(
+            "rnb_q5k_q8_1_matmul_mmq_tile32_seq64",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(32) as u32, seq_len.div_ceil(64) as u32, 1),
             (256, 1, 1),
         )
     }
