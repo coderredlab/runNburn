@@ -408,6 +408,19 @@ pub fn mtp_verify_router_stable_key_enabled() -> bool {
     env_bool("RNB_CUDA_MTP_VERIFY_ROUTER_STABLE_KEY", true)
 }
 
+/// cu219: dense verify GDN 경로의 model F32 weight lookup(alpha/beta, conv
+/// kernel, dt_bias/ssm_a, ssm_norm)을 content FNV hash 대신 allocation-identity
+/// 키로 조회한다. 이 slice 들은 target decode chain 이 이미 stable 키로 쓰는
+/// 것과 같은 model tensor 라 engine 수명 동안 주소·내용이 안정적이고, engine
+/// reset 은 `clear_stable_resident_f32_sources` 로 stable 항목을 함께 비운다.
+/// 27B verify 는 layer 당 alpha/beta 해싱에만 host ~163µs 를 쓰고 있었다
+/// (nsys idle 421.8ms/run — Q4 pair2 → f32 multi2 경계).
+/// `RNB_CUDA_MTP_VERIFY_GDN_STABLE_KEYS=0` 은 content-hash 조회로 되돌리는
+/// 진단 opt-out 이다.
+pub fn mtp_verify_gdn_stable_keys_enabled() -> bool {
+    env_bool("RNB_CUDA_MTP_VERIFY_GDN_STABLE_KEYS", true)
+}
+
 pub fn mtp_verify_snapshot_pool_enabled() -> bool {
     env_bool("RNB_CUDA_MTP_VERIFY_SNAPSHOT_POOL", true)
 }
@@ -1705,6 +1718,21 @@ mod tests {
         assert!(!mtp_verify_router_stable_key_enabled());
         unsafe {
             std::env::remove_var("RNB_CUDA_MTP_VERIFY_ROUTER_STABLE_KEY");
+        }
+    }
+
+    #[test]
+    fn mtp_verify_gdn_stable_keys_defaults_on_and_allows_opt_out() {
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MTP_VERIFY_GDN_STABLE_KEYS");
+        }
+        assert!(mtp_verify_gdn_stable_keys_enabled());
+        unsafe {
+            std::env::set_var("RNB_CUDA_MTP_VERIFY_GDN_STABLE_KEYS", "0");
+        }
+        assert!(!mtp_verify_gdn_stable_keys_enabled());
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MTP_VERIFY_GDN_STABLE_KEYS");
         }
     }
 

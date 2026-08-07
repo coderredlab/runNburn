@@ -2929,9 +2929,11 @@ impl CudaState {
         )
     }
 
+    // cu219: weight resident 조회는 호출자(verify GDN)가 stable-key 정책과 함께
+    // 수행하고, 여기는 device 포인터만 받는다.
     pub(in crate::runtime) fn launch_f32_gemv_batch_token2_multi2_to_dev(
         &mut self,
-        weights: [&[f32]; 2],
+        weights_dev: [u64; 2],
         rows: [usize; 2],
         cols: usize,
         input_dev: u64,
@@ -2958,8 +2960,8 @@ impl CudaState {
         let mut cols = u32::try_from(cols).map_err(|_| {
             format!("F32 token2 multi-projection columns exceeds CUDA u32 limit: {cols}")
         })?;
-        let mut weights0 = self.resident_f32_ptr(weights[0])?;
-        let mut weights1 = self.resident_f32_ptr(weights[1])?;
+        let mut weights0 = weights_dev[0];
+        let mut weights1 = weights_dev[1];
         let mut output0 = outputs[0];
         let mut output1 = outputs[1];
         let mut input = input_dev;

@@ -1770,6 +1770,19 @@ impl super::CudaState {
         Ok(logits)
     }
 
+    // cu219: dense verify GDN 이 참조하는 model F32 weight 는 target decode
+    // chain 이 stable 키로 쓰는 것과 같은 engine 수명 tensor slice 다. content
+    // FNV hash 조회는 layer 당 host ~163µs 를 태워 GPU idle 을 만들었다
+    // (Q4 pair2 → f32 multi2 경계 421.8ms/run). engine reset 은
+    // `clear_stable_resident_f32_sources` 로 stable 항목을 함께 비운다.
+    fn mtp_verify_gdn_weight_f32_ptr(&mut self, data: &[f32]) -> Result<u64, String> {
+        if crate::tuning::mtp_verify_gdn_stable_keys_enabled() {
+            self.resident_f32_ptr_stable_source(data)
+        } else {
+            self.resident_f32_ptr(data)
+        }
+    }
+
     pub(in crate::runtime) fn stage_mtp_verify_hidden_rows_rms_norm(
         &mut self,
         buffers: &MtpVerifyDeviceBuffers,
@@ -1934,8 +1947,10 @@ impl super::CudaState {
             && request.alpha_cols == request.beta_cols
             && crate::tuning::mtp_verify_f32_multi_projection_enabled()
         {
+            let alpha_w_dev = self.mtp_verify_gdn_weight_f32_ptr(request.alpha_f32)?;
+            let beta_w_dev = self.mtp_verify_gdn_weight_f32_ptr(request.beta_f32)?;
             self.launch_f32_gemv_batch_token2_multi2_to_dev(
-                [request.alpha_f32, request.beta_f32],
+                [alpha_w_dev, beta_w_dev],
                 [request.alpha_rows, request.beta_rows],
                 request.alpha_cols,
                 buffers.scratch_hidden_dev,
@@ -1954,7 +1969,7 @@ impl super::CudaState {
                     projection_buffers.alpha_dev,
                 )?,
                 None => {
-                    let alpha_dev = self.resident_f32_ptr(request.alpha_f32)?;
+                    let alpha_dev = self.mtp_verify_gdn_weight_f32_ptr(request.alpha_f32)?;
                     self.sgemm_device(
                         alpha_dev,
                         request.alpha_rows,
@@ -1977,7 +1992,7 @@ impl super::CudaState {
                     projection_buffers.beta_dev,
                 )?,
                 None => {
-                    let beta_dev = self.resident_f32_ptr(request.beta_f32)?;
+                    let beta_dev = self.mtp_verify_gdn_weight_f32_ptr(request.beta_f32)?;
                     self.sgemm_device(
                         beta_dev,
                         request.beta_rows,
@@ -3441,7 +3456,7 @@ impl super::CudaState {
                 )?;
             }
         }
-        let conv_kernel_dev = self.resident_f32_ptr(conv_kernel)?;
+        let conv_kernel_dev = self.mtp_verify_gdn_weight_f32_ptr(conv_kernel)?;
         self.launch_gdn_build_conv_input_f32(
             conv_buffers.conv_input_dev,
             conv_buffers.conv_state_dev,
@@ -3731,8 +3746,8 @@ impl super::CudaState {
             head_k_dim,
             head_v_dim,
         )?;
-        let dt_bias_dev = self.resident_f32_ptr(dt_bias)?;
-        let ssm_a_dev = self.resident_f32_ptr(ssm_a)?;
+        let dt_bias_dev = self.mtp_verify_gdn_weight_f32_ptr(dt_bias)?;
+        let ssm_a_dev = self.mtp_verify_gdn_weight_f32_ptr(ssm_a)?;
         let q_scale = 1.0 / (head_k_dim as f32).sqrt();
         self.launch_gdn_prepare_delta_qkv_f32(
             delta_buffers.q_dev,
@@ -4396,7 +4411,7 @@ impl super::CudaState {
             d_inner,
             ssm_out_rows,
         )?;
-        let norm_dev = self.resident_f32_ptr(ssm_norm)?;
+        let norm_dev = self.mtp_verify_gdn_weight_f32_ptr(ssm_norm)?;
         self.launch_gdn_gated_norm_silu_dev(
             ssm_buffers.gated_dev,
             scan_buffers.output_dev,
