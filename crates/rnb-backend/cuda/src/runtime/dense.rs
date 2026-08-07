@@ -2151,7 +2151,22 @@ impl CudaState {
                         output_dev,
                     )
                 } else if let Some((qs_dev, ds_dev)) = down_q8 {
-                    if let Some((packed_qs_dev, packed_d_super_dev, packed_sub_scale_dev)) =
+                    // cu221: Q4 down 은 q8dot 분기 내부에서 MMQ tile32 로
+                    // 라우팅되는데 Q6 만 packed/paired 에 갇혀 있었다 — 27B
+                    // 1139-token prefill 에서 down 이 q8dot wide 2.8s. MMQ 는
+                    // silu_mul_q8_1 의 qs/ds 를 그대로 소비한다. min_seq 게이트
+                    // (기본 8)가 verify(2..4)와 decode 를 배제한다.
+                    if tuning::q6k_down_mmq_tile32_enabled(seq_len, n_embd, down_blocks) {
+                        self.launch_q6k_q8_1_matmul_mmq_tile32(
+                            down_weights,
+                            n_embd,
+                            down_blocks,
+                            seq_len,
+                            qs_dev,
+                            ds_dev,
+                            output_dev,
+                        )
+                    } else if let Some((packed_qs_dev, packed_d_super_dev, packed_sub_scale_dev)) =
                         packed_q6_down
                     {
                         self.launch_q6k_packed_batch_q8dot_to_dev(

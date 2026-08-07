@@ -946,7 +946,9 @@ fn dense_silu_ffn_device_carrier_adds_residual_and_reuses_carrier() {
 
     let n_embd = 1024usize;
     let n_ff = 1024usize;
-    let seq_len = 6usize; // >4: GDN prefill chain dense FFN 소비 대역
+    // >4: GDN prefill chain dense FFN 소비 대역, ≥8: Q4 gate/up MMQ +
+    // cu221 Q6 down MMQ tile32 라우팅까지 실제 kernel 로 실행된다.
+    let seq_len = 12usize;
     let gate_blocks = n_embd / 256;
     let down_blocks = n_ff / 256;
     let gate = make_test_q4k_weights(1, n_ff, gate_blocks, 811)

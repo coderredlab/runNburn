@@ -156,6 +156,15 @@ pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
 }
 
+/// cu221: dev-input dense FFN 의 Q6_K down q8dot 분기를 MMQ tile32 로
+/// 라우팅하는 게이트 (Q4 down 은 q4k_batch_q8dot_to_dev 내부 MMQ 라우팅이
+/// 이미 있었다). min_seq(기본 8) 미달인 verify/decode 는 이 게이트와
+/// 무관하게 기존 packed/paired 경로를 유지한다. `=0` 은 진단 opt-out.
+pub fn q6k_down_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
+    q6k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
+        && env_bool("RNB_CUDA_Q6K_DOWN_MMQ_TILE32", true)
+}
+
 /// cu219: 위임된 host-input prefill 배치에서 Q5_K 를 raw F32 대신 q8dot
 /// batch(wide) 세대로 태우는 게이트. Q5 는 MMQ tile32 가 없어 위임 후에도
 /// raw 로 남았었다 (27B 15-token prefill 의 102ms/48calls). verify 의
