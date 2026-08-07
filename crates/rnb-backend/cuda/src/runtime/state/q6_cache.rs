@@ -35,27 +35,9 @@ impl CudaState {
             return Ok(Some((entry.qs_ptr, entry.d_super_ptr, entry.sub_scale_ptr)));
         }
 
-        let (qs, d_super, sub_scale) = pack_q6k_for_q8dot(weights, rows, blocks_per_row)?;
-        let mut packed_payload = Vec::with_capacity(
-            qs.len()
-                + d_super.len() * std::mem::size_of::<u16>()
-                + sub_scale.len() * std::mem::size_of::<i8>(),
-        );
-        // cu230: byte-map extend 는 GB 급 payload 에서 직렬 byte 루프가 된다 —
-        // i8→u8 은 layout 동일 reinterpret, u16 은 지원 타깃(x86_64/aarch64)
-        // 전부 little-endian 이라 native byte order == LE 로 한 번에 복사한다.
-        packed_payload.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(qs.as_ptr().cast::<u8>(), qs.len())
-        });
-        packed_payload.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(
-                d_super.as_ptr().cast::<u8>(),
-                d_super.len() * std::mem::size_of::<u16>(),
-            )
-        });
-        packed_payload.extend_from_slice(unsafe {
-            std::slice::from_raw_parts(sub_scale.as_ptr().cast::<u8>(), sub_scale.len())
-        });
+        // cu231: payload 레이아웃으로 직접 pack — triple Vec + GB 급 concat
+        // 복사를 제거한다.
+        let packed_payload = pack_q6k_payload_for_q8dot(weights, rows, blocks_per_row)?;
         self.resident_q6k_packed_payload_ptrs(weights, &packed_payload, rows, blocks_per_row)
     }
 
@@ -189,11 +171,15 @@ impl CudaState {
     }
 }
 
-pub(in crate::runtime) fn pack_q6k_for_q8dot(
+/// cu230/cu231: packs the canonical 210B Q6_K blocks into the resident
+/// payload layout `[qs | d_super(le16) | sub_scale]` in one pass — per-row
+/// scoped threads over disjoint output slices (identical bytes regardless of
+/// the split — deterministic), no intermediate triple-Vec or concat copy.
+pub(in crate::runtime) fn pack_q6k_payload_for_q8dot(
     weights: &[u8],
     rows: usize,
     blocks_per_row: usize,
-) -> Result<(Vec<i8>, Vec<u16>, Vec<i8>), String> {
+) -> Result<Vec<u8>, String> {
     let expected = rows
         .checked_mul(blocks_per_row)
         .and_then(|v| v.checked_mul(210))
@@ -205,29 +191,31 @@ pub(in crate::runtime) fn pack_q6k_for_q8dot(
         ));
     }
 
-    let mut qs = vec![0i8; rows * blocks_per_row * 256];
-    let mut d_super = vec![0u16; rows * blocks_per_row];
-    let mut sub_scale = vec![0i8; rows * blocks_per_row * 16];
-    // cu230: per-element 분기 루프라 GB 급 텐서에서 직렬로 수 초를 먹는다 —
-    // row 단위로 출력이 disjoint 하므로 scoped thread 로 분할한다 (출력 바이트
-    // 는 분할과 무관하게 동일 — 결정적).
+    let block_count = rows * blocks_per_row;
+    let q_bytes = block_count * 256;
+    let d_bytes = block_count * 2;
+    let ss_bytes = block_count * 16;
+    let mut payload = vec![0u8; q_bytes + d_bytes + ss_bytes];
+    let (qs_all, tail) = payload.split_at_mut(q_bytes);
+    let (d_all, ss_all) = tail.split_at_mut(d_bytes);
+
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .min(rows.max(1));
     let rows_per = rows.div_ceil(threads.max(1)).max(1);
     let qs_row = blocks_per_row * 256;
-    let ds_row = blocks_per_row;
+    let d_row = blocks_per_row * 2;
     let ss_row = blocks_per_row * 16;
     std::thread::scope(|scope| {
-        let mut qs_rest = qs.as_mut_slice();
-        let mut d_rest = d_super.as_mut_slice();
-        let mut ss_rest = sub_scale.as_mut_slice();
+        let mut qs_rest = qs_all;
+        let mut d_rest = d_all;
+        let mut ss_rest = ss_all;
         let mut row_start = 0usize;
         while row_start < rows {
             let chunk_rows = rows_per.min(rows - row_start);
             let (qs_chunk, qs_next) = qs_rest.split_at_mut(chunk_rows * qs_row);
-            let (d_chunk, d_next) = d_rest.split_at_mut(chunk_rows * ds_row);
+            let (d_chunk, d_next) = d_rest.split_at_mut(chunk_rows * d_row);
             let (ss_chunk, ss_next) = ss_rest.split_at_mut(chunk_rows * ss_row);
             qs_rest = qs_next;
             d_rest = d_next;
@@ -239,13 +227,13 @@ pub(in crate::runtime) fn pack_q6k_for_q8dot(
                     for block_idx in 0..blocks_per_row {
                         let src_base = (row * blocks_per_row + block_idx) * 210;
                         let block = &weights[src_base..src_base + 210];
-                        let raw_d = u16::from_le_bytes([block[208], block[209]]);
-                        d_chunk[local_row * ds_row + block_idx] = raw_d;
+                        let d_base = (local_row * blocks_per_row + block_idx) * 2;
+                        d_chunk[d_base] = block[208];
+                        d_chunk[d_base + 1] = block[209];
 
                         let sub_scale_base = (local_row * blocks_per_row + block_idx) * 16;
-                        for i in 0..16 {
-                            ss_chunk[sub_scale_base + i] = block[192 + i] as i8;
-                        }
+                        ss_chunk[sub_scale_base..sub_scale_base + 16]
+                            .copy_from_slice(&block[192..208]);
 
                         let q_base = (local_row * blocks_per_row + block_idx) * 256;
                         for tid in 0..256usize {
@@ -264,7 +252,7 @@ pub(in crate::runtime) fn pack_q6k_for_q8dot(
                             } else {
                                 (block[ql_base + l + 32] >> 4) | (((qh >> 6) & 3) << 4)
                             };
-                            qs_chunk[q_base + tid] = (q as i16 - 32) as i8;
+                            qs_chunk[q_base + tid] = ((q as i16 - 32) as i8) as u8;
                         }
                     }
                 }
@@ -272,5 +260,32 @@ pub(in crate::runtime) fn pack_q6k_for_q8dot(
             row_start += chunk_rows;
         }
     });
+    Ok(payload)
+}
+
+/// Test-only tuple view of the payload pack (the payload layout is the
+/// production contract; tests that want the split buffers slice it apart).
+#[cfg(test)]
+pub(in crate::runtime) fn pack_q6k_for_q8dot(
+    weights: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+) -> Result<(Vec<i8>, Vec<u16>, Vec<i8>), String> {
+    let payload = pack_q6k_payload_for_q8dot(weights, rows, blocks_per_row)?;
+    let block_count = rows * blocks_per_row;
+    let q_bytes = block_count * 256;
+    let d_bytes = block_count * 2;
+    let qs = payload[..q_bytes]
+        .iter()
+        .map(|value| *value as i8)
+        .collect::<Vec<_>>();
+    let d_super = payload[q_bytes..q_bytes + d_bytes]
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    let sub_scale = payload[q_bytes + d_bytes..]
+        .iter()
+        .map(|value| *value as i8)
+        .collect::<Vec<_>>();
     Ok((qs, d_super, sub_scale))
 }
