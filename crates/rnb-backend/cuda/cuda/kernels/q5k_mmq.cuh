@@ -1,3 +1,5 @@
+#include <cuda_pipeline.h>
+
 // Q5_K x Q8_1 tiled matrix multiply for Ampere-class integer tensor cores.
 //
 // cu222: Q5_K was the last prefill-band quant without an MMQ generation —
@@ -246,6 +248,10 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q5k_q8_1_matmul_mmq_til
 
     __shared__ signed char a_tile[32 * 36];
     __shared__ signed char b_tile[64 * 36];
+    // cu227: raw Q5_K block staging — 176B rows padded to 224B (16B-aligned
+    // cp.async rows; the 56-word stride shifts rows by 24 banks, keeping the
+    // 8-thread qs/qh reads conflict-free across the 4 rows of a warp).
+    __shared__ unsigned char raw_stage[32 * 224];
     __shared__ float x_d[32];
     __shared__ float x_dmin[32];
     __shared__ unsigned char x_sc[32];
@@ -275,6 +281,24 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q5k_q8_1_matmul_mmq_til
         float block_d[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float block_m[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
+        // cu227: stage the 32 raw 176B blocks once per block iteration with
+        // 16B async copies (11 chunks/row, 352 total); every sub-iteration
+        // unpacks qs/qh/scales from shared. Arithmetic unchanged — bitwise.
+        for (unsigned c = tid; c < 352u; c += 256u) {
+            const unsigned s_row = c / 11u;
+            const unsigned s_off = (c % 11u) * 16u;
+            const unsigned g_row = row_base + s_row;
+            if (g_row < rows) {
+                __pipeline_memcpy_async(
+                    raw_stage + s_row * 224u + s_off,
+                    weights + g_row * row_bytes + block * 176u + s_off,
+                    16);
+            }
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
         for (unsigned sub = 0; sub < 8u; ++sub) {
             const unsigned load_row = tid >> 3;
             const unsigned load_off = (tid & 7u) * 4u;
@@ -282,7 +306,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q5k_q8_1_matmul_mmq_til
             signed char* a_dst = a_tile + load_row * 36u + load_off;
 
             if (global_row < rows) {
-                const unsigned char* packed = weights + global_row * row_bytes + block * 176u;
+                const unsigned char* packed = raw_stage + load_row * 224u;
                 if (sub == 0u && load_off == 0u) {
                     const unsigned raw_d = static_cast<unsigned>(packed[0])
                         | (static_cast<unsigned>(packed[1]) << 8);

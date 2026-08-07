@@ -1,3 +1,5 @@
+#include <cuda_pipeline.h>
+
 // Q4_K x Q8_1 tiled matrix multiply for Ampere-class integer tensor cores.
 //
 // One 8-warp CTA computes a 32-row x 32-sequence output tile. Compared with
@@ -247,6 +249,9 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q4k_q8_1_matmul_mmq_til
 
     __shared__ signed char a_tile[32 * 36];
     __shared__ signed char b_tile[64 * 36];
+    // cu227: raw Q4_K block staging — 144B rows padded to 160B (16B-aligned
+    // cp.async rows, 40-word stride keeps the 8-thread qs reads bank-clean).
+    __shared__ unsigned char raw_stage[32 * 160];
     __shared__ float x_d[32];
     __shared__ float x_dmin[32];
     __shared__ unsigned char x_sc[32];
@@ -276,6 +281,28 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q4k_q8_1_matmul_mmq_til
         float block_d[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float block_m[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
+        // cu227: stage the 32 raw 144B blocks once per block iteration with
+        // 16B async copies (9 chunks/row, 288 total). The former per-sub
+        // loader re-read the same qs window and scale bytes from global on
+        // every sub — misaligned 32B windows (block*144+16 straddles sectors)
+        // and scattered byte loads were 54% excessive sectors in ncu. All
+        // sub-iterations now unpack from shared; arithmetic is unchanged, so
+        // outputs stay bitwise equal.
+        for (unsigned c = tid; c < 288u; c += 256u) {
+            const unsigned s_row = c / 9u;
+            const unsigned s_off = (c % 9u) * 16u;
+            const unsigned g_row = row_base + s_row;
+            if (g_row < rows) {
+                __pipeline_memcpy_async(
+                    raw_stage + s_row * 160u + s_off,
+                    weights + g_row * row_bytes + block * 144u + s_off,
+                    16);
+            }
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
         for (unsigned sub = 0; sub < 8u; ++sub) {
             const unsigned load_row = tid >> 3;
             const unsigned load_off = (tid & 7u) * 4u;
@@ -283,7 +310,7 @@ extern "C" __global__ void __launch_bounds__(256, 4) rnb_q4k_q8_1_matmul_mmq_til
             signed char* a_dst = a_tile + load_row * 36u + load_off;
 
             if (global_row < rows) {
-                const unsigned char* packed = weights + global_row * row_bytes + block * 144u;
+                const unsigned char* packed = raw_stage + load_row * 160u;
                 if (sub == 0u && load_off == 0u) {
                     const unsigned raw_d = static_cast<unsigned>(packed[0])
                         | (static_cast<unsigned>(packed[1]) << 8);
