@@ -4598,11 +4598,13 @@ impl CudaState {
                     output_dev,
                 )?,
                 "rnb_q5k_gemv_batch" => {
-                    if super::dense::dense_q5_batch_dev_input_q8dot_enabled(
-                        seq_len,
-                        rows,
-                        blocks_per_row,
-                    ) {
+                    if tuning::prefill_q5_batch_q8dot_enabled(seq_len, rows, blocks_per_row)
+                        || super::dense::dense_q5_batch_dev_input_q8dot_enabled(
+                            seq_len,
+                            rows,
+                            blocks_per_row,
+                        )
+                    {
                         self.q5k_batch_dev_input_q8dot_to_dev(
                             weights,
                             rows,

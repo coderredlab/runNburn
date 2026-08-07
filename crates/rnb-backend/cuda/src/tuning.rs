@@ -156,6 +156,18 @@ pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
 }
 
+/// cu219: 위임된 host-input prefill 배치에서 Q5_K 를 raw F32 대신 q8dot
+/// batch(wide) 세대로 태우는 게이트. Q5 는 MMQ tile32 가 없어 위임 후에도
+/// raw 로 남았었다 (27B 15-token prefill 의 102ms/48calls). verify 의
+/// `RNB_CUDA_Q5K_BATCH_Q8DOT`(2..=4 밴드) 정책 소유권은 건드리지 않는다.
+/// `RNB_CUDA_PREFILL_Q5_BATCH_Q8DOT=0` 은 raw 로 되돌리는 진단 opt-out.
+pub fn prefill_q5_batch_q8dot_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
+    seq_len >= 2
+        && rows >= 1024
+        && blocks_per_row >= 4
+        && env_bool("RNB_CUDA_PREFILL_Q5_BATCH_Q8DOT", true)
+}
+
 /// cu219: host-input prefill 배치(gemv_batch)를 dev-input 경로의 검증된 kernel
 /// 우선순위(MMQ/MMA v3/pair2/q8dot)로 위임한다. 기존 host 분기는 seq4/raw
 /// 세대에 갇혀 15-token prefill 이 층당 weight 를 토큰 수만큼 재읽었다.
