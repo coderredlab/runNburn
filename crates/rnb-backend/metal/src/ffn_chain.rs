@@ -12471,6 +12471,155 @@ pub(crate) fn o_chain_dispatch(
 /// The attention residual stays in `o_carrier.hidden_dev`; only the final
 /// post-FFN hidden state is read back.
 #[allow(clippy::too_many_arguments)]
+fn encode_gemma_o_ffn_chain(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    o_carrier: &OChainCarrier,
+    ffn_carrier: &FfnCarrier,
+    o_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_attn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_ffn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    output_scale_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_is_q6k: bool,
+) {
+    crate::compute::encode_gemv_q4k_auto(
+        ctx,
+        enc,
+        o_w_buf,
+        &o_carrier.attn_dev,
+        &o_carrier.proj_dev,
+        &o_carrier.hidden_n_buf,
+        &o_carrier.k_q_buf,
+        o_off_buf,
+        o_carrier.hidden_dim,
+    );
+    encode_rms_norm(
+        ctx,
+        enc,
+        &o_carrier.proj_dev,
+        post_attn_norm_w_buf,
+        &ffn_carrier.normed_dev,
+        &ffn_carrier.hdim_buf,
+        &ffn_carrier.eps_buf,
+    );
+    encode_residual_add(
+        ctx,
+        enc,
+        &o_carrier.hidden_dev,
+        &ffn_carrier.normed_dev,
+        &ffn_carrier.hdim_buf,
+        ffn_carrier.hidden_dim,
+    );
+
+    encode_rms_norm(
+        ctx,
+        enc,
+        &o_carrier.hidden_dev,
+        ffn_norm_w_buf,
+        &ffn_carrier.normed_dev,
+        &ffn_carrier.hdim_buf,
+        &ffn_carrier.eps_buf,
+    );
+    crate::compute::encode_gemv_q4k_auto(
+        ctx,
+        enc,
+        gate_w_buf,
+        &ffn_carrier.normed_dev,
+        &ffn_carrier.gate_dev,
+        &ffn_carrier.fdim_buf,
+        &ffn_carrier.k_hidden_buf,
+        gate_off_buf,
+        ffn_carrier.ffn_dim,
+    );
+    crate::compute::encode_gemv_q4k_auto(
+        ctx,
+        enc,
+        up_w_buf,
+        &ffn_carrier.normed_dev,
+        &ffn_carrier.up_dev,
+        &ffn_carrier.fdim_buf,
+        &ffn_carrier.k_hidden_buf,
+        up_off_buf,
+        ffn_carrier.ffn_dim,
+    );
+    encode_gelu_mul(
+        ctx,
+        enc,
+        &ffn_carrier.gate_dev,
+        &ffn_carrier.up_dev,
+        &ffn_carrier.fdim_buf,
+        ffn_carrier.ffn_dim,
+    );
+    if down_is_q6k {
+        crate::compute::encode_gemv_q6k_auto(
+            ctx,
+            enc,
+            down_w_buf,
+            &ffn_carrier.gate_dev,
+            &ffn_carrier.down_dev,
+            &ffn_carrier.hdim_buf,
+            &ffn_carrier.k_ffn_buf,
+            down_off_buf,
+            ffn_carrier.hidden_dim,
+        );
+    } else {
+        crate::compute::encode_gemv_q4k_auto(
+            ctx,
+            enc,
+            down_w_buf,
+            &ffn_carrier.gate_dev,
+            &ffn_carrier.down_dev,
+            &ffn_carrier.hdim_buf,
+            &ffn_carrier.k_ffn_buf,
+            down_off_buf,
+            ffn_carrier.hidden_dim,
+        );
+    }
+    let ffn_residual = if let Some(post_ffn_norm_w_buf) = post_ffn_norm_w_buf {
+        encode_rms_norm(
+            ctx,
+            enc,
+            &ffn_carrier.down_dev,
+            post_ffn_norm_w_buf,
+            &ffn_carrier.normed_dev,
+            &ffn_carrier.hdim_buf,
+            &ffn_carrier.eps_buf,
+        );
+        &ffn_carrier.normed_dev
+    } else {
+        &ffn_carrier.down_dev
+    };
+    if let Some(output_scale_buf) = output_scale_buf {
+        encode_residual_add_scaled(
+            ctx,
+            enc,
+            &o_carrier.hidden_dev,
+            ffn_residual,
+            &ffn_carrier.hdim_buf,
+            output_scale_buf,
+            ffn_carrier.hidden_dim,
+        );
+    } else {
+        encode_residual_add(
+            ctx,
+            enc,
+            &o_carrier.hidden_dev,
+            ffn_residual,
+            &ffn_carrier.hdim_buf,
+            ffn_carrier.hidden_dim,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gemma_o_ffn_chain_dispatch(
     ctx: &MetalContext,
     o_carrier: &OChainCarrier,
@@ -12494,127 +12643,159 @@ pub(crate) fn gemma_o_ffn_chain_dispatch(
 
     let cmd = ctx.queue.commandBuffer().expect("command buffer");
     let enc = cmd.computeCommandEncoder().expect("compute encoder");
-
-    crate::compute::encode_gemv_q4k_auto(
+    encode_gemma_o_ffn_chain(
         ctx,
         &enc,
+        o_carrier,
+        ffn_carrier,
         o_w_buf,
-        &o_carrier.attn_dev,
-        &o_carrier.proj_dev,
-        &o_carrier.hidden_n_buf,
-        &o_carrier.k_q_buf,
         o_off_buf,
-        o_carrier.hidden_dim,
-    );
-    encode_rms_norm(
-        ctx,
-        &enc,
-        &o_carrier.proj_dev,
         post_attn_norm_w_buf,
-        &ffn_carrier.normed_dev,
-        &ffn_carrier.hdim_buf,
-        &ffn_carrier.eps_buf,
-    );
-    encode_residual_add(
-        ctx,
-        &enc,
-        &o_carrier.hidden_dev,
-        &ffn_carrier.normed_dev,
-        &ffn_carrier.hdim_buf,
-        ffn_carrier.hidden_dim,
-    );
-
-    encode_rms_norm(
-        ctx,
-        &enc,
-        &o_carrier.hidden_dev,
         ffn_norm_w_buf,
-        &ffn_carrier.normed_dev,
-        &ffn_carrier.hdim_buf,
-        &ffn_carrier.eps_buf,
-    );
-    crate::compute::encode_gemv_q4k_auto(
-        ctx,
-        &enc,
+        post_ffn_norm_w_buf,
+        None,
         gate_w_buf,
-        &ffn_carrier.normed_dev,
-        &ffn_carrier.gate_dev,
-        &ffn_carrier.fdim_buf,
-        &ffn_carrier.k_hidden_buf,
         gate_off_buf,
-        ffn_carrier.ffn_dim,
-    );
-    crate::compute::encode_gemv_q4k_auto(
-        ctx,
-        &enc,
         up_w_buf,
-        &ffn_carrier.normed_dev,
-        &ffn_carrier.up_dev,
-        &ffn_carrier.fdim_buf,
-        &ffn_carrier.k_hidden_buf,
         up_off_buf,
-        ffn_carrier.ffn_dim,
+        down_w_buf,
+        down_off_buf,
+        down_is_q6k,
     );
-    encode_gelu_mul(
-        ctx,
-        &enc,
-        &ffn_carrier.gate_dev,
-        &ffn_carrier.up_dev,
-        &ffn_carrier.fdim_buf,
-        ffn_carrier.ffn_dim,
-    );
-    if down_is_q6k {
-        crate::compute::encode_gemv_q6k_auto(
-            ctx,
-            &enc,
-            down_w_buf,
-            &ffn_carrier.gate_dev,
-            &ffn_carrier.down_dev,
-            &ffn_carrier.hdim_buf,
-            &ffn_carrier.k_ffn_buf,
-            down_off_buf,
-            ffn_carrier.hidden_dim,
-        );
-    } else {
-        crate::compute::encode_gemv_q4k_auto(
-            ctx,
-            &enc,
-            down_w_buf,
-            &ffn_carrier.gate_dev,
-            &ffn_carrier.down_dev,
-            &ffn_carrier.hdim_buf,
-            &ffn_carrier.k_ffn_buf,
-            down_off_buf,
-            ffn_carrier.hidden_dim,
-        );
-    }
-    let ffn_residual = if let Some(post_ffn_norm_w_buf) = post_ffn_norm_w_buf {
-        encode_rms_norm(
-            ctx,
-            &enc,
-            &ffn_carrier.down_dev,
-            post_ffn_norm_w_buf,
-            &ffn_carrier.normed_dev,
-            &ffn_carrier.hdim_buf,
-            &ffn_carrier.eps_buf,
-        );
-        &ffn_carrier.normed_dev
-    } else {
-        &ffn_carrier.down_dev
-    };
-    encode_residual_add(
-        ctx,
-        &enc,
-        &o_carrier.hidden_dev,
-        ffn_residual,
-        &ffn_carrier.hdim_buf,
-        ffn_carrier.hidden_dim,
-    );
-
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
     readback_into(&o_carrier.hidden_dev, hidden);
+}
+
+/// Gemma layer tail followed by the next layer's attention RMSNorm and raw QKV
+/// projections. Host KVarN attention stays between these carriers; this only
+/// removes the tail/front command-buffer boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemma_o_ffn_qkv_chain_dispatch(
+    ctx: &MetalContext,
+    o_carrier: &OChainCarrier,
+    ffn_carrier: &FfnCarrier,
+    qkv_carrier: &QkvCarrier,
+    attn_out: &[f32],
+    hidden: &mut [f32],
+    o_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_attn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_ffn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_is_q6k: bool,
+    output_scale_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    next_attn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_q_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_q_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_k_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_k_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_v_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_v_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_v_from_k: bool,
+    next_v_is_q6k: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    o_carrier.upload(attn_out, hidden);
+
+    let cmd = ctx.queue.commandBuffer().expect("command buffer");
+    let enc = cmd.computeCommandEncoder().expect("compute encoder");
+    encode_gemma_o_ffn_chain(
+        ctx,
+        &enc,
+        o_carrier,
+        ffn_carrier,
+        o_w_buf,
+        o_off_buf,
+        post_attn_norm_w_buf,
+        ffn_norm_w_buf,
+        post_ffn_norm_w_buf,
+        output_scale_buf,
+        gate_w_buf,
+        gate_off_buf,
+        up_w_buf,
+        up_off_buf,
+        down_w_buf,
+        down_off_buf,
+        down_is_q6k,
+    );
+    encode_rms_norm(
+        ctx,
+        &enc,
+        &o_carrier.hidden_dev,
+        next_attn_norm_w_buf,
+        &qkv_carrier.norm_dev,
+        &ffn_carrier.hdim_buf,
+        &ffn_carrier.eps_buf,
+    );
+    crate::compute::encode_gemv_q4k_auto(
+        ctx,
+        &enc,
+        next_q_w_buf,
+        &qkv_carrier.norm_dev,
+        &qkv_carrier.q_dev,
+        &qkv_carrier.q_n_buf,
+        &qkv_carrier.k_hidden_buf,
+        next_q_off_buf,
+        qkv_carrier.q_out_dim,
+    );
+    crate::compute::encode_gemv_q4k_auto(
+        ctx,
+        &enc,
+        next_k_w_buf,
+        &qkv_carrier.norm_dev,
+        &qkv_carrier.k_dev,
+        &qkv_carrier.kv_n_buf,
+        &qkv_carrier.k_hidden_buf,
+        next_k_off_buf,
+        qkv_carrier.kv_dim,
+    );
+    if !next_v_from_k {
+        if next_v_is_q6k {
+            crate::compute::encode_gemv_q6k_auto(
+                ctx,
+                &enc,
+                next_v_w_buf,
+                &qkv_carrier.norm_dev,
+                &qkv_carrier.v_dev,
+                &qkv_carrier.kv_n_buf,
+                &qkv_carrier.k_hidden_buf,
+                next_v_off_buf,
+                qkv_carrier.kv_dim,
+            );
+        } else {
+            crate::compute::encode_gemv_q4k_auto(
+                ctx,
+                &enc,
+                next_v_w_buf,
+                &qkv_carrier.norm_dev,
+                &qkv_carrier.v_dev,
+                &qkv_carrier.kv_n_buf,
+                &qkv_carrier.k_hidden_buf,
+                next_v_off_buf,
+                qkv_carrier.kv_dim,
+            );
+        }
+    }
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+
+    readback_into(&o_carrier.hidden_dev, hidden);
+    let q = readback(&qkv_carrier.q_dev, qkv_carrier.q_out_dim);
+    let k = readback(&qkv_carrier.k_dev, qkv_carrier.kv_dim);
+    let v = if next_v_from_k {
+        k.clone()
+    } else {
+        readback(&qkv_carrier.v_dev, qkv_carrier.kv_dim)
+    };
+    (q, k, v)
 }
 
 #[cfg(test)]
@@ -16725,6 +16906,125 @@ mod tests {
             .map(|(got, want)| (got - want).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 1e-5, "fused/serial max_abs={max_abs}");
+        let boundary_scale = 0.75f32;
+        let scaled_fused = fused
+            .iter()
+            .map(|value| value * boundary_scale)
+            .collect::<Vec<_>>();
+        let boundary_scale_buf = f32_buf(&ctx, boundary_scale);
+
+        let next_attn_norm: Vec<f32> = (0..hidden_dim)
+            .map(|i| 0.85 + ((i % 11) as f32) * 0.005)
+            .collect();
+        let next_attn_norm_w_buf = shared_f32_buf(&ctx, &next_attn_norm);
+        let next_norm = {
+            let input = shared_f32_buf(&ctx, &scaled_fused);
+            let output = empty_f32_buf(&ctx, hidden_dim);
+            let dim_buf = u32_buf(&ctx, hidden_dim as u32);
+            let eps_buf = f32_buf(&ctx, eps);
+            let cmd = ctx.queue.commandBuffer().expect("command buffer");
+            let enc = cmd.computeCommandEncoder().expect("compute encoder");
+            encode_rms_norm(
+                &ctx,
+                &enc,
+                &input,
+                &next_attn_norm_w_buf,
+                &output,
+                &dim_buf,
+                &eps_buf,
+            );
+            enc.endEncoding();
+            cmd.commit();
+            cmd.waitUntilCompleted();
+            readback(&output, hidden_dim)
+        };
+        let next_q_out_dim = 512usize;
+        let next_kv_dim = 256usize;
+        let next_q_w: Vec<u8> = block
+            .iter()
+            .cycle()
+            .take(next_q_out_dim * (hidden_dim / 256) * 144)
+            .copied()
+            .collect();
+        let next_k_w: Vec<u8> = block
+            .iter()
+            .cycle()
+            .take(next_kv_dim * (hidden_dim / 256) * 144)
+            .copied()
+            .collect();
+        let next_v_w = next_k_w.clone();
+        let next_q_w_buf = shared_u8_buf(&ctx, &next_q_w);
+        let next_k_w_buf = shared_u8_buf(&ctx, &next_k_w);
+        let next_v_w_buf = shared_u8_buf(&ctx, &next_v_w);
+        let serial_qkv_carrier = QkvCarrier::new(&ctx, hidden_dim, next_q_out_dim, next_kv_dim);
+        let serial_qkv = qkv_chain_dispatch(
+            &ctx,
+            &serial_qkv_carrier,
+            &next_norm,
+            &next_q_w_buf,
+            &zero_off,
+            &next_k_w_buf,
+            &zero_off,
+            &next_v_w_buf,
+            &zero_off,
+            false,
+        );
+
+        let boundary_o = OChainCarrier::new(&ctx, hidden_dim, q_dim);
+        let boundary_ffn = FfnCarrier::new(&ctx, hidden_dim, ffn_dim, eps);
+        let boundary_qkv = QkvCarrier::new(&ctx, hidden_dim, next_q_out_dim, next_kv_dim);
+        let mut boundary_hidden = hidden.clone();
+        let boundary_qkv_out = gemma_o_ffn_qkv_chain_dispatch(
+            &ctx,
+            &boundary_o,
+            &boundary_ffn,
+            &boundary_qkv,
+            &attn,
+            &mut boundary_hidden,
+            &o_w_buf,
+            &zero_off,
+            &post_attn_norm_w_buf,
+            &ffn_norm_w_buf,
+            Some(&post_ffn_norm_w_buf),
+            &gate_w_buf,
+            &zero_off,
+            &up_w_buf,
+            &zero_off,
+            &down_w_buf,
+            &zero_off,
+            false,
+            Some(&boundary_scale_buf),
+            &next_attn_norm_w_buf,
+            &next_q_w_buf,
+            &zero_off,
+            &next_k_w_buf,
+            &zero_off,
+            &next_v_w_buf,
+            &zero_off,
+            false,
+            false,
+        );
+        let boundary_hidden_max_abs = boundary_hidden
+            .iter()
+            .zip(&scaled_fused)
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            boundary_hidden_max_abs <= 1e-5,
+            "boundary hidden max_abs={boundary_hidden_max_abs}"
+        );
+        for (name, got, want) in [
+            ("q", &boundary_qkv_out.0, &serial_qkv.0),
+            ("k", &boundary_qkv_out.1, &serial_qkv.1),
+            ("v", &boundary_qkv_out.2, &serial_qkv.2),
+        ] {
+            let max_abs = got
+                .iter()
+                .zip(want)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_abs <= 1e-5, "boundary {name} max_abs={max_abs}");
+        }
     }
 
     /// gate/up = Q4_K, down = Q6_K 인 chain 이 CPU reference FFN 과 일치하는지.

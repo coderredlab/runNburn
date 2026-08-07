@@ -73,7 +73,9 @@ pub use debug::{PrefillDriftRecord, PrefillDriftTrace};
 use decode::attn_carrier_eligible;
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 use decode::qwen_attn_moe_chain_eligible;
-use decode::{decode_attention_layer, decode_attention_layer_with_rope_pos};
+use decode::{
+    decode_attention_layer, decode_attention_layer_with_rope_pos, GemmaMetalDecodeLookahead,
+};
 use decode_attention_compute::decode_attention_compute;
 use decode_attention_output::decode_attention_output_projection;
 use decode_attention_post_qkv::apply_decode_attention_qkv_postprocess;

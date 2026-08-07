@@ -1373,6 +1373,8 @@ impl Engine {
                 // chain 이 이미 처리한 GDN layer 들을 skip(run 의 마지막 layer index).
                 #[cfg(all(feature = "metal", not(feature = "cuda")))]
                 let mut skip_until: Option<usize> = None;
+                #[cfg(all(feature = "metal", not(feature = "cuda")))]
+                let mut metal_qkv_precomputed = false;
                 for layer_idx in 0..metadata.num_layers {
                     #[cfg(all(feature = "metal", not(feature = "cuda")))]
                     if let Some(last) = skip_until {
@@ -1381,6 +1383,10 @@ impl Engine {
                         }
                         skip_until = None;
                     }
+                    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+                    let qkv_precomputed = std::mem::take(&mut metal_qkv_precomputed);
+                    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+                    let qkv_precomputed = false;
                     if let Some(cap) = eager_layer_cap {
                         if layer_idx >= cap {
                             break;
@@ -1581,7 +1587,7 @@ impl Engine {
                                 }
                             );
                         }
-                        if handled {
+                        if handled && !qkv_precomputed {
                             let chain_report = try_run_decode_chain(
                                 kv_cache,
                                 metadata,
@@ -1616,6 +1622,7 @@ impl Engine {
                         }
                     }
                     let mut ple_fused_in_attention = false;
+                    let mut layer_output_scale_handled_in_attention = false;
                     match &weights.layers[layer_idx] {
                         LayerType::Attention(w) => {
                             if architecture == ModelArchitecture::GlmDsa {
@@ -1681,7 +1688,45 @@ impl Engine {
                                 } else {
                                     None
                                 };
-                                ple_fused_in_attention = decode_attention_layer_with_rope_pos(
+                                let metal_lookahead = {
+                                    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+                                    {
+                                        let next_layer_idx = layer_idx + 1;
+                                        let next_layer_enabled = next_layer_idx
+                                            < metadata.num_layers
+                                            && eager_layer_cap
+                                                .map(|cap| next_layer_idx < cap)
+                                                .unwrap_or(true)
+                                            && !gemma_disable_layer_decode_enabled(next_layer_idx)
+                                            && !gemma_ple_disable_attention_layer(next_layer_idx)
+                                            && !gemma_disable_attn_decode_enabled(next_layer_idx)
+                                            && !(keep_layer_hidden_snapshots
+                                                && gemma_reuse_source_hidden_decode_enabled(
+                                                    next_layer_idx,
+                                                ));
+                                        if architecture == ModelArchitecture::Gemma4
+                                            && !force_qwen_imrope
+                                            && !gemma_ple_active
+                                            && next_layer_enabled
+                                        {
+                                            match &weights.layers[next_layer_idx] {
+                                                LayerType::Attention(next_weights) => {
+                                                    Some(GemmaMetalDecodeLookahead {
+                                                        weights: next_weights,
+                                                    })
+                                                }
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+                                    {
+                                        None
+                                    }
+                                };
+                                let attention_report = decode_attention_layer_with_rope_pos(
                                     kv_cache,
                                     metadata,
                                     architecture,
@@ -1697,6 +1742,8 @@ impl Engine {
                                     ple_fusion_for_attention,
                                     ple_input_device_offset,
                                     cu72_hidden_persistence_trace.as_mut(),
+                                    qkv_precomputed,
+                                    metal_lookahead,
                                     #[cfg(feature = "vulkan")]
                                     if backend_layers && layer_idx < backend_max_layer {
                                         gpu_runtime.as_mut()
@@ -1704,6 +1751,13 @@ impl Engine {
                                         None
                                     },
                                 )?;
+                                ple_fused_in_attention = attention_report.ple_fused;
+                                layer_output_scale_handled_in_attention =
+                                    attention_report.layer_output_scale_handled;
+                                #[cfg(all(feature = "metal", not(feature = "cuda")))]
+                                {
+                                    metal_qkv_precomputed = attention_report.next_qkv_precomputed;
+                                }
                             }
                         }
                         LayerType::GatedDeltaNet(w) => {
@@ -1744,11 +1798,13 @@ impl Engine {
                     }
                     if gemma_ple_before_layer() {
                         if let LayerType::Attention(w) = &weights.layers[layer_idx] {
-                            apply_layer_output_scale_inplace(
-                                &mut scratch.hidden[..hidden_dim],
-                                w.out_scale.as_ref(),
-                                layer_idx,
-                            );
+                            if !layer_output_scale_handled_in_attention {
+                                apply_layer_output_scale_inplace(
+                                    &mut scratch.hidden[..hidden_dim],
+                                    w.out_scale.as_ref(),
+                                    layer_idx,
+                                );
+                            }
                         }
                         emit_layer_trace("decode", layer_idx, &scratch.hidden[..hidden_dim]);
                         if verbose {
@@ -1791,8 +1847,9 @@ impl Engine {
                         // cu44 step 20: chain path (ple_fused_in_attention=true) +
                         // env opt-in 시 chain function 내부에서 device-side out_scale
                         // 이미 apply 됨 — host apply skip (double 방지).
-                        let device_out_scale_applied = ple_fused_in_attention
-                            && cuda_decode_device_out_scale_in_chain_active();
+                        let device_out_scale_applied = layer_output_scale_handled_in_attention
+                            || (ple_fused_in_attention
+                                && cuda_decode_device_out_scale_in_chain_active());
                         if !device_out_scale_applied {
                             apply_layer_output_scale_inplace(
                                 &mut scratch.hidden[..hidden_dim],

@@ -1925,6 +1925,8 @@ fn run_mtp_block_decode(
         None,
         None,
         None,
+        false,
+        None,
         #[cfg(feature = "vulkan")]
         None,
     )?;

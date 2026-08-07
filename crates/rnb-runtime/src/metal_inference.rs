@@ -3579,6 +3579,96 @@ pub fn metal_gemma_attention_o_ffn_chain_into_if_supported(
     Ok(true)
 }
 
+/// Gemma dense layer tail and the next attention layer's raw QKV front in one
+/// command buffer. Host KVarN attention remains the consumer of those QKV
+/// vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn metal_gemma_attention_o_ffn_qkv_chain_into_if_supported(
+    o_ggml: GGMLType,
+    gate_ggml: GGMLType,
+    up_ggml: GGMLType,
+    down_ggml: GGMLType,
+    next_q_ggml: GGMLType,
+    next_k_ggml: GGMLType,
+    next_v_ggml: GGMLType,
+    o_raw: &[u8],
+    gate_raw: &[u8],
+    up_raw: &[u8],
+    down_raw: &[u8],
+    next_q_raw: &[u8],
+    next_k_raw: &[u8],
+    next_v_raw: &[u8],
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: Option<&[f32]>,
+    layer_output_scale: Option<f32>,
+    next_attn_norm_weight: &[f32],
+    attn_out: &[f32],
+    hidden: &mut [f32],
+    next_q_out: &mut [f32],
+    next_k_out: &mut [f32],
+    next_v_out: &mut [f32],
+    hidden_dim: usize,
+    q_dim: usize,
+    ffn_dim: usize,
+    next_q_out_dim: usize,
+    next_kv_dim: usize,
+    norm_eps: f32,
+    next_v_from_k: bool,
+) -> Result<bool> {
+    if std::env::var("RNB_METAL_GEMMA_DECODE_LAYER_BOUNDARY")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    if o_ggml != GGMLType::Q4_K
+        || gate_ggml != GGMLType::Q4_K
+        || up_ggml != GGMLType::Q4_K
+        || next_q_ggml != GGMLType::Q4_K
+        || next_k_ggml != GGMLType::Q4_K
+        || !matches!(next_v_ggml, GGMLType::Q4_K | GGMLType::Q6_K)
+    {
+        return Ok(false);
+    }
+    let down_is_q6k = match down_ggml {
+        GGMLType::Q4_K => false,
+        GGMLType::Q6_K => true,
+        _ => return Ok(false),
+    };
+    let (q, k, v) = METAL.with(|backend| {
+        backend.gemma_attention_o_ffn_qkv_chain_resident(
+            attn_out,
+            hidden,
+            o_raw,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            gate_raw,
+            up_raw,
+            down_raw,
+            hidden_dim,
+            q_dim,
+            ffn_dim,
+            norm_eps,
+            down_is_q6k,
+            layer_output_scale,
+            next_attn_norm_weight,
+            next_q_raw,
+            next_k_raw,
+            next_v_raw,
+            next_q_out_dim,
+            next_kv_dim,
+            next_v_from_k,
+            next_v_ggml == GGMLType::Q6_K,
+        )
+    });
+    next_q_out.copy_from_slice(&q);
+    next_k_out.copy_from_slice(&k);
+    next_v_out.copy_from_slice(&v);
+    Ok(true)
+}
+
 /// FFN device-resident chain. `RNB_METAL_FFN_CHAIN=1` 일 때만 활성.
 /// gate/up은 Q4_K, down은 Q4_K 또는 Q6_K raw mmap bytes다. Gemma는 GeGLU와
 /// 선택적 post-FFW norm을 같은 command buffer에 넣고 기본 활성화한다. 비-Gemma

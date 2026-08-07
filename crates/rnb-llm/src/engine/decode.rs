@@ -33,6 +33,17 @@ fn cu71_long_kv_split_preferred(head_dim: usize, kv_len: usize) -> bool {
         && crate::engine::tuning_runtime::decode_attention_hd512_split_enabled()
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct DecodeAttentionLayerReport {
+    pub ple_fused: bool,
+    pub next_qkv_precomputed: bool,
+    pub layer_output_scale_handled: bool,
+}
+
+pub(super) struct GemmaMetalDecodeLookahead<'a> {
+    pub weights: &'a AttentionLayerWeights,
+}
+
 /// Attention layer decode (seq_len=1). Operates in-place on scratch buffers.
 pub(super) fn decode_attention_layer(
     kv_cache: &mut KVCache,
@@ -50,7 +61,7 @@ pub(super) fn decode_attention_layer(
     cu72_trace: Option<&mut super::decode_layer_graph::Cu72HiddenPersistenceTrace>,
     #[cfg(feature = "vulkan")] mut vulkan_backend: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<bool> {
-    decode_attention_layer_with_rope_pos(
+    Ok(decode_attention_layer_with_rope_pos(
         kv_cache,
         metadata,
         architecture,
@@ -66,9 +77,12 @@ pub(super) fn decode_attention_layer(
         ple_fusion,
         ple_input_device_offset,
         cu72_trace,
+        false,
+        None,
         #[cfg(feature = "vulkan")]
         vulkan_backend.as_deref_mut(),
-    )
+    )?
+    .ple_fused)
 }
 
 fn attn_chain_core_eligible(
@@ -162,8 +176,10 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     ple_fusion: Option<(&GemmaPerLayerBase, &GemmaPerLayerWeights)>,
     ple_input_device_offset: Option<usize>,
     cu72_trace: Option<&mut super::decode_layer_graph::Cu72HiddenPersistenceTrace>,
+    qkv_precomputed: bool,
+    metal_lookahead: Option<GemmaMetalDecodeLookahead<'_>>,
     #[cfg(feature = "vulkan")] mut vulkan_backend: Option<&mut backend_runtime::GpuRuntime>,
-) -> crate::error::Result<bool> {
+) -> crate::error::Result<DecodeAttentionLayerReport> {
     let prof_level = super::policy::profiling_level();
     let profiling = prof_level >= 1;
     let verbose = prof_level >= 2;
@@ -290,7 +306,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             "after_ffn",
             &scratch.hidden[..hidden_dim],
         );
-        return Ok(false);
+        return Ok(DecodeAttentionLayerReport::default());
     }
 
     // 1. Attention norm
@@ -397,7 +413,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // cu203: W1 은 carrier 연속성(chain_hidden_carrier_continuous)까지 요구한다 —
     // Qwen35 는 chain function 은 타지만 GDN 층이 사이에 껴 carrier 가 stale 이라
     // W1 만 비활성.
-    let rms_used_cuda = if chain_carrier_continuous && qkv_consumes_device_norm {
+    let rms_used_cuda = if !qkv_precomputed && chain_carrier_continuous && qkv_consumes_device_norm
+    {
         backend_runtime::try_rms_norm_into_decode_carrier_if_supported(
             layer_idx,
             &scratch.hidden[..hidden_dim],
@@ -409,7 +426,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     } else {
         false
     };
-    if !rms_used_cuda {
+    if !qkv_precomputed && !rms_used_cuda {
         apply_model_norm_into(
             &scratch.hidden[..hidden_dim],
             attn_norm_data,
@@ -418,16 +435,19 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             architecture,
         );
     }
-    emit_mtp_finite_trace(
-        "decode-attn",
-        layer_idx,
-        "attn_norm",
-        &scratch.norm_buf[..hidden_dim],
-    );
+    if !qkv_precomputed {
+        emit_mtp_finite_trace(
+            "decode-attn",
+            layer_idx,
+            "attn_norm",
+            &scratch.norm_buf[..hidden_dim],
+        );
+    }
     // cu76: eager attn_norm output probe for layer-0 divergence diff.
     // Even if rms_used_cuda=true (device computed it), reconstruct host RMSNorm
     // here for diagnostic comparison vs persistent kernel.
-    if layer_idx == 0
+    if !qkv_precomputed
+        && layer_idx == 0
         && crate::engine::policy::env_string("RNB_CUDA_EAGER_ATTN_NORM_PROBE").as_deref()
             == Some("1")
     {
@@ -466,7 +486,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     let used_fused_hd128 = {
         let (rope_dim, rope_theta, proportional_rope) =
             resolve_rope_params(metadata, architecture, layer_idx, head_dim);
-        if !rms_used_cuda
+        if !qkv_precomputed
+            && !rms_used_cuda
             && !force_qwen_imrope
             && head_dim == 128
             && !has_gated_attn
@@ -531,7 +552,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     let cu68_attention_device_len = false;
 
     #[cfg(feature = "cuda")]
-    let (used_device_qkv, cu66_q_dev): (bool, Option<u64>) = if !used_fused_hd128
+    let (used_device_qkv, cu66_q_dev): (bool, Option<u64>) = if !qkv_precomputed
+        && !used_fused_hd128
         && chain_emits_hidden_carrier
         && rms_used_cuda
         && !has_gated_attn
@@ -618,7 +640,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     #[cfg(not(feature = "cuda"))]
     let (used_device_qkv, cu66_q_dev): (bool, Option<u64>) = (false, None);
 
-    if !used_fused_hd128 && !used_device_qkv {
+    if !qkv_precomputed && !used_fused_hd128 && !used_device_qkv {
         decode_attention_qkv_projection(
             scratch,
             w,
@@ -1021,7 +1043,11 @@ pub(super) fn decode_attention_layer_with_rope_pos(
                 prof!("o_proj+ffn_chain", t_chain);
                 // cu59 axis A — chain call 완료 후 sub-phase timing flush.
                 super::forward::chain_diag::flush_call();
-                return Ok(args.ple_fused);
+                return Ok(DecodeAttentionLayerReport {
+                    ple_fused: args.ple_fused,
+                    next_qkv_precomputed: false,
+                    layer_output_scale_handled: false,
+                });
             }
         }
     }
@@ -1054,6 +1080,63 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         if let Some(post_attn_norm) = &w.post_attn_norm {
             let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
             let ffn_dim = w.ffn_gate_weight.rows;
+            if let Some(lookahead) = metal_lookahead.as_ref() {
+                let next_layer_idx = layer_idx + 1;
+                let next_kv_source = shared_kv_source_layer(metadata, architecture, next_layer_idx);
+                if next_kv_source.is_none() {
+                    let next_layer_kv_override = metadata
+                        .head_count_kv_per_layer
+                        .as_ref()
+                        .and_then(|values| values.get(next_layer_idx).copied());
+                    let next_layout = resolve_attention_layout(
+                        metadata,
+                        lookahead.weights,
+                        next_layer_kv_override,
+                    )?;
+                    let next_q_out_dim = lookahead.weights.q_weight.rows;
+                    let next_kv_dim = next_layout.kv_dim;
+                    if backend_runtime::metal_gemma_attention_o_ffn_qkv_chain_into_if_supported(
+                        &scratch.attn_out[..q_dim],
+                        &mut scratch.hidden[..hidden_dim],
+                        &w.o_weight,
+                        kernels::tensor_as_f32_slice(post_attn_norm),
+                        kernels::tensor_as_f32_slice(ffn_norm),
+                        w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice),
+                        active_layer_output_scale(w.out_scale.as_ref(), layer_idx)
+                            .map(|scale| scale[0]),
+                        &w.ffn_gate_weight,
+                        &w.ffn_up_weight,
+                        &w.ffn_down_weight,
+                        kernels::tensor_as_f32_slice(&lookahead.weights.attn_norm),
+                        &lookahead.weights.q_weight,
+                        &lookahead.weights.k_weight,
+                        &lookahead.weights.v_weight,
+                        &mut scratch.q_buf[..next_q_out_dim],
+                        &mut scratch.k_buf[..next_kv_dim],
+                        &mut scratch.v_buf[..next_kv_dim],
+                        hidden_dim,
+                        q_dim,
+                        ffn_dim,
+                        next_q_out_dim,
+                        next_kv_dim,
+                        norm_eps,
+                        lookahead.weights.v_proj_missing,
+                    )? {
+                        prof!("o_proj+ffn+next_qkv", t0);
+                        emit_mtp_finite_trace(
+                            "decode-attn",
+                            layer_idx,
+                            "after_ffn",
+                            &scratch.hidden[..hidden_dim],
+                        );
+                        return Ok(DecodeAttentionLayerReport {
+                            ple_fused: false,
+                            next_qkv_precomputed: true,
+                            layer_output_scale_handled: true,
+                        });
+                    }
+                }
+            }
             if backend_runtime::metal_gemma_attention_o_ffn_chain_into_if_supported(
                 &scratch.attn_out[..q_dim],
                 &mut scratch.hidden[..hidden_dim],
@@ -1076,7 +1159,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
                     "after_ffn",
                     &scratch.hidden[..hidden_dim],
                 );
-                return Ok(false);
+                return Ok(DecodeAttentionLayerReport::default());
             }
         }
     }
@@ -1139,7 +1222,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     if matches!(architecture, ModelArchitecture::NemotronHMoE)
         || gemma_effective_skip_ffn_decode_enabled(architecture, gemma_runtime_flavor, layer_idx)
     {
-        return Ok(false);
+        return Ok(DecodeAttentionLayerReport::default());
     }
 
     // 8. FFN.
@@ -1162,5 +1245,5 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     );
     prof!("ffn_total", t0);
 
-    Ok(false)
+    Ok(DecodeAttentionLayerReport::default())
 }

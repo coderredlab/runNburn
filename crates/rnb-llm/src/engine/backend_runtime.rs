@@ -216,7 +216,9 @@ pub(super) use metal_prefill::{
 #[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
 pub(super) use metal_projection::{
     metal_attention_o_chain_into_if_supported, metal_ffn_chain_into_if_supported,
-    metal_gemma_attention_o_ffn_chain_into_if_supported, metal_prefill_ffn_chain_into_if_supported,
+    metal_gemma_attention_o_ffn_chain_into_if_supported,
+    metal_gemma_attention_o_ffn_qkv_chain_into_if_supported,
+    metal_prefill_ffn_chain_into_if_supported,
 };
 pub(super) use metal_projection::{
     metal_deepseek4_attention_prefill_batch_requested,
