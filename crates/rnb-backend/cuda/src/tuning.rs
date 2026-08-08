@@ -2427,6 +2427,8 @@ mod tests {
 
     #[test]
     fn q4k_mmq_tile32_defaults_on_for_long_prefill_and_allows_opt_out() {
+        // 공용 잠금 — 이 env 들은 런타임 Q4 계약 테스트와 공유한다.
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE32");
         }
@@ -2458,6 +2460,8 @@ mod tests {
 
     #[test]
     fn mmq_tile_seq64_defaults_on_at_64_and_allows_opt_out() {
+        // 공용 잠금 — 이 env(RNB_CUDA_MMQ_TILE_SEQ64)는 계약 테스트도 쓴다.
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
         }
@@ -2477,6 +2481,8 @@ mod tests {
 
     #[test]
     fn q6k_mmq_tile32_defaults_on_for_long_prefill_and_allows_opt_out() {
+        // 공용 잠금 — 이 env 들은 런타임 Q6 계약 테스트와 공유한다.
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE32");
         }
@@ -2498,6 +2504,8 @@ mod tests {
 
     #[test]
     fn q4k_mmq_tile64_requires_seq64_and_row_tile_and_allows_opt_out() {
+        // 공용 잠금 — 이 env(RNB_CUDA_Q4K_MMQ_TILE64)는 계약 테스트도 쓴다.
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE64");
@@ -2514,6 +2522,41 @@ mod tests {
 
         unsafe {
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE64");
+        }
+    }
+
+    #[test]
+    fn q5k_q6k_mmq_tile64_share_seq64_requirement_and_own_opt_out() {
+        // 공용 잠금 — 이 env 들은 계약 테스트도 쓴다.
+        let _guard = crate::runtime::cuda_test_env_lock();
+        unsafe {
+            std::env::remove_var("RNB_CUDA_MMQ_TILE_SEQ64");
+            std::env::remove_var("RNB_CUDA_Q5K_MMQ_TILE64");
+            std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE64");
+        }
+        assert!(q5k_mmq_tile64_enabled(64, 64));
+        assert!(q5k_mmq_tile64_enabled(1139, 12288));
+        assert!(q6k_mmq_tile64_enabled(64, 64));
+        assert!(q6k_mmq_tile64_enabled(1139, 12288));
+        assert!(!q5k_mmq_tile64_enabled(63, 12288));
+        assert!(!q6k_mmq_tile64_enabled(1139, 63));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q5K_MMQ_TILE64", "0");
+        }
+        assert!(!q5k_mmq_tile64_enabled(1139, 12288));
+        assert!(q6k_mmq_tile64_enabled(1139, 12288));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q5K_MMQ_TILE64");
+        }
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q6K_MMQ_TILE64", "0");
+        }
+        assert!(!q6k_mmq_tile64_enabled(1139, 12288));
+        assert!(q5k_mmq_tile64_enabled(1139, 12288));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE64");
         }
     }
 

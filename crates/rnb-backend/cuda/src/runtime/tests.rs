@@ -12412,6 +12412,11 @@ fn cuda_q4k_mmq_tile32_matches_cpu_reference_with_tails() {
 fn cuda_q4k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트를 고정해 후보 커널(MMQ seq64)이
+    // 실제로 실행되게 한다 — off 면 구 host 경로로 조용히 빠져 bitwise 비교가
+    // trivially 통과한다 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     // cu228: rows 1057 은 기본값에서 64x64 tile 로 라우팅되므로 이 테스트는
     // 32x64 커널을 명시적으로 pin 한다 (64x64 는 아래 tile64 테스트가 pin).
     let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE64", "0");
@@ -12535,6 +12540,10 @@ fn cuda_q4k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
 fn cuda_q4k_mmq_tile64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트 고정 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE64", "1");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
@@ -12550,7 +12559,6 @@ fn cuda_q4k_mmq_tile64_matches_tile32_bitwise_with_tails() {
         q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K tile32 baseline")
     };
     let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
-    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE64", "1");
     let mut first_actual: Option<Vec<f32>> = None;
     for run in 0..8 {
         let actual =
@@ -12689,6 +12697,10 @@ fn cuda_q5k_mmq_tile32_matches_gpu_quantizer_reference_with_tails() {
 fn cuda_q5k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트 고정 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _q5 = EnvVarGuard::set("RNB_CUDA_PREFILL_Q5_BATCH_Q8DOT", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     // cu228: 기본값은 64x64 로 라우팅되므로 32x64 커널을 명시적으로 pin.
     let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE64", "0");
     let rows = 1057usize;
@@ -12736,6 +12748,11 @@ fn cuda_q5k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
 fn cuda_q5k_mmq_tile64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트 고정 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _q5 = EnvVarGuard::set("RNB_CUDA_PREFILL_Q5_BATCH_Q8DOT", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE64", "1");
     let rows = 1057usize;
     let cols = 1024usize;
     let seq_len = 77usize;
@@ -12749,7 +12766,6 @@ fn cuda_q5k_mmq_tile64_matches_tile32_bitwise_with_tails() {
         q5k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q5_K tile32 baseline")
     };
     let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
-    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q5K_MMQ_TILE64", "1");
     let mut first_actual: Option<Vec<f32>> = None;
     for run in 0..8 {
         let actual =
@@ -13472,6 +13488,9 @@ fn cuda_q6k_mmq_tile32_matches_cpu_reference_with_tails() {
 fn cuda_q6k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트 고정 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     // cu228: 기본값은 64x64 로 라우팅되므로 32x64 커널을 명시적으로 pin.
     let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "0");
     let rows = 1057usize;
@@ -13521,6 +13540,10 @@ fn cuda_q6k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
 fn cuda_q6k_mmq_tile64_matches_tile32_bitwise_with_tails() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");
+    // cu230-review: 상위 디스패치 게이트 고정 (ContractReviewer BLOCKING).
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
@@ -13536,7 +13559,6 @@ fn cuda_q6k_mmq_tile64_matches_tile32_bitwise_with_tails() {
         q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K tile32 baseline")
     };
     let _seq64_on = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
-    let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
     let mut first_actual: Option<Vec<f32>> = None;
     for run in 0..8 {
         let actual =
