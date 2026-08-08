@@ -214,6 +214,11 @@ pub fn drafter_forward(
             shared_kv,
             kv_f16,
             native_kv_f16,
+            if layer.is_sliding_window {
+                Some(drafter.sliding_window)
+            } else {
+                None
+            },
             position_id,
             rope_base,
         );
@@ -313,6 +318,7 @@ fn decoder_layer_forward(
     shared_kv: &SharedKvLayer,
     kv_f16: Option<(&[u16], &[u16])>,
     native_kv_f16: Option<(&[u16], &[u16], usize)>,
+    sliding_window: Option<usize>,
     position_id: u32,
     rope_base: f32,
 ) {
@@ -378,6 +384,8 @@ fn decoder_layer_forward(
          (sliding={}: target dict head_dim mismatch)",
         shared_kv.head_dim, layer.head_dim, layer.is_sliding_window
     );
+    let window_start =
+        drafter_attention_window_start(shared_kv.seq_len, position_id as usize, sliding_window);
     let mut attn_out = vec![0.0f32; q_dim];
     // cu66 Phase 4 step 2: cross_attention cuda 의 K/V f16 cache 활용.
     // forward-scoped cache 가 있으면 변환 안 함 (cu63 의 saturation 해소).
@@ -392,6 +400,7 @@ fn decoder_layer_forward(
                 layer.n_heads,
                 shared_kv.n_kv_heads,
                 layer.head_dim,
+                window_start,
                 &mut attn_out,
             )
             .unwrap_or_else(|err| panic!("CUDA drafter resident cross-attention failed: {err}"))
@@ -399,7 +408,8 @@ fn decoder_layer_forward(
             false
         }
     } else if let Some((k_f16, v_f16)) = kv_f16 {
-        rnb_runtime::policy::drafter_cuda_enabled()
+        window_start == 0
+            && rnb_runtime::policy::drafter_cuda_enabled()
             && super::cuda::drafter_cross_attention_cuda_cached(
                 &q,
                 k_f16,
@@ -412,7 +422,8 @@ fn decoder_layer_forward(
             )
             .unwrap_or(false)
     } else {
-        rnb_runtime::policy::drafter_cuda_enabled()
+        window_start == 0
+            && rnb_runtime::policy::drafter_cuda_enabled()
             && super::cuda::drafter_cross_attention_cuda(
                 &q,
                 &shared_kv.k,
@@ -431,6 +442,7 @@ fn decoder_layer_forward(
             &shared_kv.k,
             &shared_kv.v,
             shared_kv.seq_len,
+            window_start,
             layer.n_heads,
             shared_kv.n_kv_heads,
             layer.head_dim,
@@ -649,6 +661,21 @@ fn apply_rope_q(q: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, base
     }
 }
 
+fn drafter_attention_window_start(
+    seq_len: usize,
+    position_id: usize,
+    sliding_window: Option<usize>,
+) -> usize {
+    let Some(window) = sliding_window else {
+        return 0;
+    };
+    assert!(window > 0, "drafter sliding window must be positive");
+    position_id
+        .saturating_add(1)
+        .saturating_sub(window)
+        .min(seq_len)
+}
+
 /// Cross-attention with GQA.
 ///
 /// **K/V layout (spec §4 Critical)**: row-major
@@ -662,15 +689,14 @@ fn apply_rope_q(q: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, base
 /// Q layout: `[n_heads, head_dim]` row-major.
 /// out layout: `[n_heads, head_dim]` row-major (overwritten).
 ///
-/// SWA mask: drafter 의 `q_len = 1` 이라 SWA mask 가 trivial — 모든 shared K
-/// position은 현재 draft candidate position보다 앞선 validated prefix다. 따라서
-/// causal mask와 SWA mask 모두 현재 입력에서 추가 제외 항목이 없고, 본 구현은
-/// mask 없이 전체 seq_len에 attend한다.
+/// `window_start`보다 앞선 K/V는 SWA mask에서 제외한다. Candidate K/V는 shared
+/// target cache에 아직 없으므로 draft step이 전진할수록 유효한 shared prefix가 줄어든다.
 fn cross_attention_gqa(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     seq_len: usize,
+    window_start: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -700,6 +726,10 @@ fn cross_attention_gqa(
         n_heads % n_kv_heads == 0,
         "GQA: n_heads {n_heads} must be multiple of n_kv_heads {n_kv_heads}"
     );
+    assert!(
+        window_start <= seq_len,
+        "GQA window start {window_start} exceeds seq_len {seq_len}"
+    );
 
     if seq_len == 0 {
         out.fill(0.0);
@@ -712,7 +742,7 @@ fn cross_attention_gqa(
     // mt84 spec §4 의 "Cross-attention (GQA)" 의사코드 line 133 의 `scaling=1.0` 명시.
     let scale: f32 = 1.0;
     let queries_per_kv = n_heads / n_kv_heads;
-    let mut scores = vec![0.0f32; seq_len];
+    let mut scores = vec![0.0f32; seq_len - window_start];
 
     for h in 0..n_heads {
         let kv_h = h / queries_per_kv;
@@ -721,7 +751,7 @@ fn cross_attention_gqa(
 
         // Score = Q · K_t scaled. K layout = [n_kv_heads, seq_len, head_dim].
         let mut max_s = f32::NEG_INFINITY;
-        for t in 0..seq_len {
+        for t in window_start..seq_len {
             let k_off = kv_head_base + t * head_dim;
             let k_t = &k[k_off..k_off + head_dim];
             let mut s = 0.0f32;
@@ -729,7 +759,7 @@ fn cross_attention_gqa(
                 s += q_h[j] * k_t[j];
             }
             let s = s * scale;
-            scores[t] = s;
+            scores[t - window_start] = s;
             if s > max_s {
                 max_s = s;
             }
@@ -752,10 +782,10 @@ fn cross_attention_gqa(
         // Attention output: sum_t softmax_t * V_t[kv_h]
         let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
         out_h.fill(0.0);
-        for t in 0..seq_len {
+        for t in window_start..seq_len {
             let v_off = kv_head_base + t * head_dim;
             let v_t = &v[v_off..v_off + head_dim];
-            let w = scores[t];
+            let w = scores[t - window_start];
             for j in 0..head_dim {
                 out_h[j] += w * v_t[j];
             }
@@ -795,7 +825,7 @@ mod tests {
         let k = vec![0.0f32; 0];
         let v = vec![0.0f32; 0];
         let mut out = vec![1.0f32; 4 * 8];
-        cross_attention_gqa(&q, &k, &v, 0, 4, 2, 8, &mut out);
+        cross_attention_gqa(&q, &k, &v, 0, 0, 4, 2, 8, &mut out);
         for &x in out.iter() {
             assert_eq!(x, 0.0);
         }
@@ -822,7 +852,9 @@ mod tests {
             }
         }
         let mut out = vec![0.0f32; n_heads * head_dim];
-        cross_attention_gqa(&q, &k, &v, seq_len, n_heads, n_kv_heads, head_dim, &mut out);
+        cross_attention_gqa(
+            &q, &k, &v, seq_len, 0, n_heads, n_kv_heads, head_dim, &mut out,
+        );
         // Uniform softmax: each weight = 1/3. Output per head =
         //   sum_t (1/3) * v[kv_h, t, d] = (kv_h+1) * (1+2+3)/3 = (kv_h+1) * 2.
         let queries_per_kv = n_heads / n_kv_heads;
@@ -837,5 +869,20 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn cross_attention_gqa_sliding_window_excludes_old_prefix() {
+        let (seq_len, head_dim) = (4usize, 2usize);
+        let q = vec![0.0f32; head_dim];
+        let k = vec![0.0f32; seq_len * head_dim];
+        let v = vec![100.0, 100.0, 200.0, 200.0, 3.0, 3.0, 5.0, 5.0];
+        let mut out = vec![0.0f32; head_dim];
+
+        cross_attention_gqa(&q, &k, &v, seq_len, 2, 1, 1, head_dim, &mut out);
+
+        assert_eq!(out, vec![4.0, 4.0]);
+        assert_eq!(drafter_attention_window_start(1_114, 1_114, Some(512)), 603);
+        assert_eq!(drafter_attention_window_start(1_114, 1_115, Some(512)), 604);
+        assert_eq!(drafter_attention_window_start(1_114, 1_114, None), 0);
     }
 }

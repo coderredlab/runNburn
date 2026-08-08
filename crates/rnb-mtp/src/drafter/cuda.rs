@@ -563,7 +563,7 @@ pub(crate) fn drafter_cross_attention_cuda_cached(
 }
 
 /// Native token-major target K/V를 CUDA incremental cache로 사용한다.
-/// 첫 호출만 전체 K/V를 올리고 이후 round는 새 token suffix만 전송한다.
+/// Sliding layer는 같은 resident cache에서 현재 candidate 위치의 window만 계산한다.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drafter_cross_attention_cuda_resident(
@@ -575,25 +575,51 @@ pub(crate) fn drafter_cross_attention_cuda_resident(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    window_start: usize,
     out: &mut [f32],
 ) -> Result<bool, String> {
     if seq_len == 0 {
         out.fill(0.0);
         return Ok(true);
     }
+    if window_start > seq_len {
+        return Err(format!(
+            "drafter resident window start {window_start} exceeds seq_len {seq_len}"
+        ));
+    }
+    if window_start == seq_len {
+        out.fill(0.0);
+        return Ok(true);
+    }
     let namespace = 1usize << (usize::BITS - 1);
     let cache_layer_idx = namespace | source_layer_idx;
-    let result = rnb_runtime::compute::attention_decode_cached(
-        cache_layer_idx,
-        q,
-        k_f16,
-        v_f16,
-        seq_len,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        1.0,
-    )?;
+    let result = if window_start == 0 {
+        rnb_runtime::compute::attention_decode_cached(
+            cache_layer_idx,
+            q,
+            k_f16,
+            v_f16,
+            seq_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1.0,
+        )?
+    } else {
+        rnb_runtime::compute::attention_decode_cached_window(
+            cache_layer_idx,
+            q,
+            k_f16,
+            v_f16,
+            seq_len,
+            window_start,
+            seq_len - window_start,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            1.0,
+        )?
+    };
     if result.len() < n_heads * head_dim {
         return Err(format!(
             "drafter resident cross-attention result len {} < {}",
@@ -616,6 +642,7 @@ pub(crate) fn drafter_cross_attention_cuda_resident(
     _n_heads: usize,
     _n_kv_heads: usize,
     _head_dim: usize,
+    _window_start: usize,
     _out: &mut [f32],
 ) -> Result<bool, String> {
     Ok(false)

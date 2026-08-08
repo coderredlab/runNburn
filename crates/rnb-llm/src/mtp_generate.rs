@@ -2266,14 +2266,41 @@ fn external_draft_position(position_before_verify: u32, step: usize) -> u32 {
         .expect("external MTP draft position exceeds u32")
 }
 
+#[cfg(feature = "metal")]
+struct GemmaF16KvResidentErrorGuard {
+    armed: bool,
+}
+
+#[cfg(feature = "metal")]
+impl GemmaF16KvResidentErrorGuard {
+    fn new(armed: bool) -> Self {
+        Self { armed }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for GemmaF16KvResidentErrorGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::engine::metal_runtime::metal_clear_gemma_prefill_f16kv_residents();
+        }
+    }
+}
+
 const GEMMA4_METAL_EXTERNAL_DRAFT_MIN_MARGIN_RATIO: f32 = 1.0 / 8.0;
 
 #[inline]
 fn gemma4_metal_adaptive_second_draft(
     architecture: rnb_loader::Architecture,
     draft_n: usize,
+    explicitly_forced: bool,
 ) -> bool {
-    cfg!(all(feature = "metal", not(feature = "cuda")))
+    !explicitly_forced
+        && cfg!(all(feature = "metal", not(feature = "cuda")))
         && architecture == rnb_loader::Architecture::Gemma4
         && draft_n == 2
 }
@@ -2281,7 +2308,7 @@ fn gemma4_metal_adaptive_second_draft(
 #[inline]
 fn external_draft_should_continue(adaptive_second_draft: bool, confidence: Option<f32>) -> bool {
     !adaptive_second_draft
-        || confidence.is_none_or(|value| {
+        || confidence.is_some_and(|value| {
             !value.is_finite() || value >= GEMMA4_METAL_EXTERNAL_DRAFT_MIN_MARGIN_RATIO
         })
 }
@@ -2400,7 +2427,11 @@ fn generate_with_external_drafter(
     let mut t_verify = 0.0f64;
     let t_commit_emit = 0.0f64;
     let timing_enabled = crate::engine::policy::env_string("RNB_MC78_TIMING").is_some();
-    let adaptive_second_draft = gemma4_metal_adaptive_second_draft(engine.architecture(), draft_n);
+    let adaptive_second_draft = gemma4_metal_adaptive_second_draft(
+        engine.architecture(),
+        draft_n,
+        engine.mtp_explicitly_forced(),
+    );
     let external_device_verify = engine.mtp_device_verify_requested();
     let sampled_verify = mtp_sampled_verify_allowed(params);
     if external_device_verify {
@@ -2412,6 +2443,10 @@ fn generate_with_external_drafter(
         crate::runtime::mtp_batch_verify_enabled(),
         crate::runtime::mtp_batch_verify_disabled(),
         mtp_external_batch_verify_default_enabled(engine.architecture()),
+    );
+    #[cfg(feature = "metal")]
+    let mut resident_error_guard = GemmaF16KvResidentErrorGuard::new(
+        external_batch_verify && engine.architecture() == rnb_loader::Architecture::Gemma4,
     );
     if crate::runtime::mtp_batch_verify_enabled()
         && target_needs_sequential
@@ -2840,14 +2875,16 @@ fn generate_with_external_drafter(
         );
     }
 
-    let elapsed = start.elapsed().as_secs_f32();
-    Ok(GenerateResult::new(
+    let result = GenerateResult::new(
         generated_text.finish(&mut callback),
         generated_tokens.len(),
         prompt_len,
-        elapsed,
+        start.elapsed().as_secs_f32(),
         generated_tokens,
-    ))
+    );
+    #[cfg(feature = "metal")]
+    resident_error_guard.disarm();
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -3423,9 +3460,18 @@ mod tests {
     fn gemma4_metal_adaptive_draft_uses_normalized_top_two_margin() {
         assert!(!external_draft_should_continue(true, Some(0.124)));
         assert!(external_draft_should_continue(true, Some(0.125)));
-        assert!(external_draft_should_continue(true, None));
+        assert!(!external_draft_should_continue(true, None));
         assert!(external_draft_should_continue(true, Some(f32::NAN)));
         assert!(external_draft_should_continue(false, Some(0.0)));
+        assert_eq!(
+            gemma4_metal_adaptive_second_draft(rnb_loader::Architecture::Gemma4, 2, false,),
+            cfg!(all(feature = "metal", not(feature = "cuda")))
+        );
+        assert!(!gemma4_metal_adaptive_second_draft(
+            rnb_loader::Architecture::Gemma4,
+            2,
+            true,
+        ));
     }
 
     #[test]
