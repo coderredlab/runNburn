@@ -537,20 +537,44 @@ fn forward_attention_layer_impl(
             }
             prof("qkv+rope+qknorm+attn_o_ffn_full_metal", fused_t0);
             PrefillAttentionStep::FinalHidden(fused.hidden)
-        } else if let Some(fused) = try_prefill_gemma_qkv_o_tail_metal(
-            metadata,
-            architecture,
-            gemma_runtime_flavor,
-            &hidden,
-            w,
-            rope_freqs,
-            layout,
-            gemma4_reuse_q_only,
-            layer_idx,
-            seq_len,
-            pos_start,
-            norm_eps,
-        )? {
+        } else if let Some(fused) = {
+            let resident_kv = if external_target_batch && pos_start != 0 {
+                let cached_len = if owns_kv {
+                    pos_start
+                } else {
+                    pos_start + seq_len
+                };
+                Some(kv_cache.read_up_to(kv_cache_layer, cached_len))
+            } else {
+                None
+            };
+            let resident = resident_kv.as_ref().map(|storage| {
+                let (cached_k_f16, cached_v_f16) = storage.as_slices();
+                projection::GemmaPrefillResidentContext {
+                    sequence_epoch: kv_cache.sequence_epoch(),
+                    cache_layer: kv_cache_layer,
+                    owns_kv,
+                    kv_len: pos_start + seq_len,
+                    cached_k_f16,
+                    cached_v_f16,
+                }
+            });
+            try_prefill_gemma_qkv_o_tail_metal(
+                metadata,
+                architecture,
+                gemma_runtime_flavor,
+                &hidden,
+                w,
+                rope_freqs,
+                layout,
+                gemma4_reuse_q_only,
+                layer_idx,
+                seq_len,
+                pos_start,
+                resident,
+                norm_eps,
+            )?
+        } {
             if owns_kv {
                 kv_cache
                     .replace_layer_f16_range_compacted(

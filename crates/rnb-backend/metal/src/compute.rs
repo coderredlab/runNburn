@@ -831,6 +831,9 @@ pub struct MetalContext {
     pub(crate) prefill_rope_qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Gemma full NeoX RoPE: per-head RMSNorm followed by split-half rotation.
     pub(crate) prefill_neox_qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Gemma continuation exact-baseline Q/K norm plus host-table NeoX RoPE.
+    pub(crate) prefill_neox_qk_norm_table_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(crate) prefill_rope_only_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(crate) prefill_imrope_only_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(crate) vision_linear_bf16_pipeline:
@@ -2376,6 +2379,11 @@ pub fn build_metal_context_with_opts(
         build_pipeline(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_rope_qk_norm");
     let prefill_neox_qk_norm_pipeline =
         build_pipeline(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_neox_qk_norm");
+    let prefill_neox_qk_norm_table_pipeline = build_pipeline_safe_math(
+        &device,
+        PREFILL_ROPE_QK_NORM_SRC,
+        "prefill_neox_qk_norm_table",
+    );
     let prefill_rope_only_pipeline =
         build_pipeline_safe_math(&device, PREFILL_ROPE_QK_NORM_SRC, "prefill_rope_only");
     let prefill_imrope_only_pipeline =
@@ -2615,6 +2623,7 @@ pub fn build_metal_context_with_opts(
         flash_attn_prefill_hd512_gemma_pipeline,
         prefill_rope_qk_norm_pipeline,
         prefill_neox_qk_norm_pipeline,
+        prefill_neox_qk_norm_table_pipeline,
         prefill_rope_only_pipeline,
         prefill_imrope_only_pipeline,
         vision_linear_bf16_pipeline,
@@ -14083,6 +14092,44 @@ pub(crate) fn encode_prefill_neox_qk_norm(
         enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 7);
         enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 8);
         enc.setBuffer_offset_atIndex(Some(freq_factors_buf), 0, 9);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: seq_len * num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_prefill_neox_qk_norm_table(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    rope_cos_sin_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    eps_buf: &ProtocolObject<dyn MTLBuffer>,
+    seq_len: usize,
+    num_heads: usize,
+) {
+    enc.setComputePipelineState(&ctx.prefill_neox_qk_norm_table_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(in_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(rope_cos_sin_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 6);
     }
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {

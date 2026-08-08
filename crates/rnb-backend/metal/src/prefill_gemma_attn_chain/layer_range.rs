@@ -100,7 +100,17 @@ pub(crate) fn prefill_gemma_layer_range_submit(
         attention.seq_len,
     );
     compute::chain_barrier(ctx, &encoder);
-    encode_gemma_qkv_o(ctx, &encoder, attention, buffers.attention, &req.attention);
+    encode_gemma_qkv_o(
+        ctx,
+        &encoder,
+        attention,
+        buffers.attention,
+        &req.attention,
+        None,
+        true,
+        0,
+        &attention.seq_buf,
+    );
     encode_gemma_full_layer_tail(
         ctx,
         &encoder,

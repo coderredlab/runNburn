@@ -114,6 +114,99 @@ pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_gemma_prefill_qkv_o_resident_if_supported(
+    normed: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    rope_freq_factors: Option<&[f32]>,
+    v_from_k: bool,
+    q_weight: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    o_weight: &QuantizedWeight,
+    sequence_epoch: u64,
+    cache_layer: usize,
+    owns_kv: bool,
+    seq_len: usize,
+    pos_start: usize,
+    kv_len: usize,
+    cached_k_f16: &[u16],
+    cached_v_f16: &[u16],
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    scale: f32,
+    norm_eps: f32,
+    sliding_window: Option<usize>,
+    softcap: Option<f32>,
+) -> crate::error::Result<Option<metal_runtime::MetalPrefillAtnOTailOut>> {
+    let (Some(q_view), Some(o_view)) = (q_weight.backend_view(), o_weight.backend_view()) else {
+        return Ok(None);
+    };
+    let (k_view, v_view) = if owns_kv {
+        let (Some(k_view), Some(v_view)) = (k_weight.backend_view(), v_weight.backend_view())
+        else {
+            return Ok(None);
+        };
+        (k_view, v_view)
+    } else {
+        (q_view, q_view)
+    };
+    metal_runtime::metal_gemma_prefill_qkv_o_resident_if_supported(
+        metal_runtime::MetalGemmaPrefillQkvOResidentRequest {
+            attention: metal_runtime::MetalGemmaPrefillQkvOTailRequest {
+                normed,
+                q_norm_w,
+                k_norm_w,
+                rope_freq_factors,
+                v_from_k,
+                q_weight_ggml: backend_ggml_type(q_view.quant()),
+                q_weight_raw: q_view.raw(),
+                q_weight_rows: q_view.rows(),
+                q_weight_cols: q_view.cols(),
+                k_weight_ggml: backend_ggml_type(k_view.quant()),
+                k_weight_raw: k_view.raw(),
+                k_weight_rows: k_view.rows(),
+                k_weight_cols: k_view.cols(),
+                v_weight_ggml: backend_ggml_type(v_view.quant()),
+                v_weight_raw: v_view.raw(),
+                v_weight_rows: v_view.rows(),
+                v_weight_cols: v_view.cols(),
+                o_weight_ggml: backend_ggml_type(o_view.quant()),
+                o_weight_raw: o_view.raw(),
+                o_weight_rows: o_view.rows(),
+                o_weight_cols: o_view.cols(),
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                kv_dim,
+                rope_theta,
+                scale,
+                norm_eps,
+                sliding_window,
+                softcap,
+            },
+            sequence_epoch,
+            cache_layer,
+            owns_kv,
+            pos_start,
+            kv_len,
+            cached_k_f16,
+            cached_v_f16,
+        },
+    )
+    .map_err(crate::error::LlmError::Forward)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn metal_gemma_prefill_full_layer_if_supported(
     hidden: &[f32],
     normed: &[f32],

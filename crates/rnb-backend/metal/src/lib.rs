@@ -1443,6 +1443,19 @@ pub struct GemmaPrefillQkvOTailBackendRequest<'a> {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
+pub struct GemmaPrefillQkvOResidentBackendRequest<'a> {
+    pub attention: GemmaPrefillQkvOTailBackendRequest<'a>,
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub owns_kv: bool,
+    pub pos_start: usize,
+    pub kv_len: usize,
+    pub cached_k_f16: &'a [u16],
+    pub cached_v_f16: &'a [u16],
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
 pub struct GemmaPrefillFullLayerBackendRequest<'a> {
     pub attention: GemmaPrefillQkvOTailBackendRequest<'a>,
     pub hidden: &'a [f32],
@@ -1890,6 +1903,13 @@ pub struct MetalBackend {
             prefill_gemma_attn_chain::GemmaPrefillQkvOTailCarrier,
         >,
     >,
+    /// External target continuation QKV→resident flash→O projection carrier.
+    gemma_prefill_qkv_o_resident_carriers: RefCell<
+        HashMap<
+            GemmaPrefillQkvOTailCarrierKey,
+            prefill_gemma_attn_chain::GemmaPrefillQkvOResidentCarrier,
+        >,
+    >,
     /// Gemma prefill attention→post norms/residual→GeGLU FFN full-layer carrier.
     gemma_prefill_full_layer_carriers: RefCell<
         HashMap<
@@ -2133,6 +2153,7 @@ impl MetalBackend {
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
+                gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -2368,6 +2389,7 @@ impl MetalBackend {
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
             prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
+            gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -4187,6 +4209,263 @@ impl MetalBackend {
                     sliding_window: req.sliding_window,
                     softcap: req.softcap,
                 },
+            },
+        )?;
+        Ok(Some(output))
+    }
+
+    /// External target continuation: QKV projections, exact-baseline normalized RoPE,
+    /// persistent F16 KV append, resident flash attention, and O projection in one command
+    /// buffer. The host F16 cache remains canonical and only the new suffix is returned.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_gemma_qkv_o_resident_if_supported(
+        &self,
+        req: GemmaPrefillQkvOResidentBackendRequest<'_>,
+    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        let attention = req.attention;
+        let flash_supported = match attention.head_dim {
+            256 => ctx.flash_attn_prefill_tg_pipeline.is_some(),
+            512 => ctx.flash_attn_prefill_hd512_gemma_pipeline.is_some(),
+            _ => false,
+        };
+        if !flash_supported
+            || ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.q_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, attention.o_weight.quant)
+            || (req.owns_kv
+                && (!Self::atn_core_tensorops_v2_ready(ctx, attention.k_weight.quant)
+                    || !Self::atn_core_tensorops_v2_ready(ctx, attention.v_weight.quant)))
+        {
+            return Ok(None);
+        }
+        if !(2..=3).contains(&attention.seq_len)
+            || req.pos_start == 0
+            || req.kv_len != req.pos_start.saturating_add(attention.seq_len)
+        {
+            return Ok(None);
+        }
+        if attention.num_heads == 0
+            || attention.num_kv_heads == 0
+            || attention.num_heads % attention.num_kv_heads != 0
+        {
+            return Err("Metal Gemma resident carrier: invalid GQA head counts".to_string());
+        }
+        if attention.sliding_window.is_some_and(|window| window == 0) {
+            return Err("Metal Gemma resident carrier: sliding window must be > 0".to_string());
+        }
+        if !attention.rope_theta.is_finite()
+            || attention.rope_theta <= 0.0
+            || !attention.scale.is_finite()
+            || !attention.norm_eps.is_finite()
+            || attention.norm_eps <= 0.0
+            || attention
+                .softcap
+                .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+        {
+            return Err("Metal Gemma resident carrier: invalid numeric parameter".to_string());
+        }
+
+        let expected_q_dim =
+            Self::atn_core_checked_mul(attention.num_heads, attention.head_dim, "q_dim")?;
+        let expected_kv_dim =
+            Self::atn_core_checked_mul(attention.num_kv_heads, attention.head_dim, "kv_dim")?;
+        let expected_hidden =
+            Self::atn_core_checked_mul(attention.seq_len, attention.hidden_dim, "hidden len")?;
+        Self::atn_core_require_eq("q_dim", attention.q_dim, expected_q_dim)?;
+        Self::atn_core_require_eq("kv_dim", attention.kv_dim, expected_kv_dim)?;
+        Self::atn_core_require_eq("normed len", attention.normed.len(), expected_hidden)?;
+        Self::atn_core_require_eq("q_norm_w len", attention.q_norm_w.len(), attention.head_dim)?;
+        if req.owns_kv {
+            Self::atn_core_require_eq(
+                "k_norm_w len",
+                attention.k_norm_w.len(),
+                attention.head_dim,
+            )?;
+        }
+        if let Some(factors) = attention.rope_freq_factors {
+            Self::atn_core_require_eq(
+                "rope_freq_factors len",
+                factors.len(),
+                attention.head_dim / 2,
+            )?;
+            if factors
+                .iter()
+                .any(|factor| !factor.is_finite() || *factor <= 0.0)
+            {
+                return Err(
+                    "Metal Gemma resident carrier: invalid RoPE frequency factor".to_string(),
+                );
+            }
+        }
+        for (role, weight, rows, cols) in [
+            (
+                "q",
+                attention.q_weight,
+                attention.q_dim,
+                attention.hidden_dim,
+            ),
+            (
+                "o",
+                attention.o_weight,
+                attention.hidden_dim,
+                attention.q_dim,
+            ),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} weight rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} weight cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+        if req.owns_kv {
+            for (role, weight) in [("k", attention.k_weight), ("v", attention.v_weight)] {
+                Self::atn_core_require_eq(
+                    &format!("{role} weight rows"),
+                    weight.rows,
+                    attention.kv_dim,
+                )?;
+                Self::atn_core_require_eq(
+                    &format!("{role} weight cols"),
+                    weight.cols,
+                    attention.hidden_dim,
+                )?;
+                Self::atn_core_validate_weight(role, weight)?;
+            }
+        }
+        let cached_rows = if req.owns_kv {
+            req.pos_start
+        } else {
+            req.kv_len
+        };
+        let expected_cached =
+            Self::atn_core_checked_mul(cached_rows, attention.kv_dim, "cached KV len")?;
+        Self::atn_core_require_eq("cached K len", req.cached_k_f16.len(), expected_cached)?;
+        Self::atn_core_require_eq("cached V len", req.cached_v_f16.len(), expected_cached)?;
+
+        let (q_w_buf, q_w_off, k_w_buf, k_w_off, v_w_buf, v_w_off, o_w_buf, o_w_off) = {
+            let mut weights = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = weights
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (q_w_buf, q_w_off) = wrap(attention.q_weight.raw);
+            let (o_w_buf, o_w_off) = wrap(attention.o_weight.raw);
+            let (k_w_buf, k_w_off) = if req.owns_kv {
+                wrap(attention.k_weight.raw)
+            } else {
+                (q_w_buf.clone(), q_w_off)
+            };
+            let (v_w_buf, v_w_off) = if req.owns_kv {
+                wrap(attention.v_weight.raw)
+            } else {
+                (q_w_buf.clone(), q_w_off)
+            };
+            (
+                q_w_buf, q_w_off, k_w_buf, k_w_off, v_w_buf, v_w_off, o_w_buf, o_w_off,
+            )
+        };
+        let key = GemmaPrefillQkvOTailCarrierKey {
+            seq_len: attention.seq_len,
+            num_heads: attention.num_heads,
+            num_kv_heads: attention.num_kv_heads,
+            head_dim: attention.head_dim,
+            hidden_dim: attention.hidden_dim,
+            q_dim: attention.q_dim,
+            rope_theta_bits: attention.rope_theta.to_bits(),
+            scale_bits: attention.scale.to_bits(),
+            norm_eps_bits: attention.norm_eps.to_bits(),
+            sliding_window: attention.sliding_window,
+            softcap_bits: attention.softcap.map(f32::to_bits),
+            q_quant: attention.q_weight.quant,
+            k_quant: attention.k_weight.quant,
+            v_quant: attention.v_weight.quant,
+            o_quant: attention.o_weight.quant,
+        };
+        let mut carriers = self.gemma_prefill_qkv_o_resident_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_gemma_attn_chain::GemmaPrefillQkvOResidentCarrier::new(
+                ctx,
+                attention.seq_len,
+                attention.num_heads,
+                attention.num_kv_heads,
+                attention.head_dim,
+                attention.hidden_dim,
+                attention.q_dim,
+                attention.rope_theta,
+                attention.scale,
+                attention.norm_eps,
+            )
+        });
+
+        let capacity = req.kv_len.next_multiple_of(64);
+        let mut cache = self.gemma_prefill_f16kv_residents.borrow_mut();
+        let recreate = cache
+            .get(&req.cache_layer)
+            .map(|entry| {
+                entry.sequence_epoch != req.sequence_epoch
+                    || entry.kv.kv_int8
+                    || entry.kv.num_kv_heads != attention.num_kv_heads
+                    || entry.kv.head_dim != attention.head_dim
+                    || entry.kv.capacity < capacity
+            })
+            .unwrap_or(true);
+        if recreate {
+            cache.insert(
+                req.cache_layer,
+                GemmaPrefillF16KvResident {
+                    sequence_epoch: req.sequence_epoch,
+                    kv: compute::KvResident::new_f16_zeroed(
+                        ctx,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                        capacity,
+                    ),
+                },
+            );
+        }
+        let resident = &mut cache
+            .get_mut(&req.cache_layer)
+            .expect("Metal Gemma F16 KV resident was not initialized")
+            .kv;
+        let target_len = if req.owns_kv {
+            req.pos_start
+        } else {
+            req.kv_len
+        };
+        let dirty_start = if recreate { 0 } else { target_len };
+        resident.sync_f16_range(req.cached_k_f16, req.cached_v_f16, dirty_start, target_len);
+        let output = prefill_gemma_attn_chain::prefill_gemma_qkv_o_resident_dispatch(
+            ctx,
+            carrier,
+            resident,
+            prefill_gemma_attn_chain::GemmaPrefillQkvOResidentDispatchRequest {
+                normed: attention.normed,
+                spec: prefill_gemma_attn_chain::GemmaPrefillQkvODispatchSpec {
+                    q_norm_w: attention.q_norm_w,
+                    k_norm_w: attention.k_norm_w,
+                    rope_freq_factors: attention.rope_freq_factors,
+                    v_from_k: attention.v_from_k,
+                    q_w_buf: &q_w_buf,
+                    q_w_off,
+                    q_quant: attention.q_weight.quant,
+                    k_w_buf: &k_w_buf,
+                    k_w_off,
+                    k_quant: attention.k_weight.quant,
+                    v_w_buf: &v_w_buf,
+                    v_w_off,
+                    v_quant: attention.v_weight.quant,
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: attention.o_weight.quant,
+                    sliding_window: attention.sliding_window,
+                    softcap: attention.softcap,
+                },
+                owns_kv: req.owns_kv,
+                pos_start: req.pos_start,
+                kv_len: req.kv_len,
             },
         )?;
         Ok(Some(output))
@@ -16861,6 +17140,216 @@ kernel void coop_right_direct_fill_probe(
         }
         backend.clear_sequence_state();
         assert!(backend.gemma_prefill_f16kv_residents.borrow().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires M5 Metal device"]
+    fn gemma_prefill_qkv_o_resident_matches_fresh_state_transitions() {
+        let backend = MetalBackend::new();
+        let ctx = backend.ctx.as_ref().expect("metal ctx");
+        if !ctx.tensorops_capable {
+            return;
+        }
+        for (hd, sliding_window, softcap) in [
+            (256usize, Some(32usize), None),
+            (512usize, None, Some(50.0f32)),
+        ] {
+            run_gemma_prefill_qkv_o_resident_state_oracle(&backend, hd, sliding_window, softcap);
+        }
+        backend.clear_sequence_state();
+        assert!(backend.gemma_prefill_f16kv_residents.borrow().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_gemma_prefill_qkv_o_resident_state_oracle(
+        backend: &MetalBackend,
+        hd: usize,
+        sliding_window: Option<usize>,
+        softcap: Option<f32>,
+    ) {
+        let (hidden_dim, num_heads, num_kv_heads) = (256usize, 1usize, 1usize);
+        let q_dim = num_heads * hd;
+        let kv_dim = num_kv_heads * hd;
+        let norm_eps = 1.0e-5f32;
+        let rope_theta = 1_000_000.0f32;
+        let v_from_k = hd == 512;
+        let q_norm = det_vals(hd, 0.013)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let k_norm = det_vals(hd, 0.011)
+            .into_iter()
+            .map(|value| 1.0 + value)
+            .collect::<Vec<_>>();
+        let rope_freq_factors = (hd == 512).then(|| {
+            (0..hd / 2)
+                .map(|index| 1.0 + (index % 7) as f32 * 0.125)
+                .collect::<Vec<_>>()
+        });
+        let q_w = quantize_rows_q4k(&det_vals(q_dim * hidden_dim, 0.007), q_dim, hidden_dim);
+        let k_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.009), kv_dim, hidden_dim);
+        let v_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.005), kv_dim, hidden_dim);
+        let o_w = quantize_rows_q4k(&det_vals(hidden_dim * q_dim, 0.006), hidden_dim, q_dim);
+        let q_storage = mapped_test_tensor(&q_w);
+        let k_storage = mapped_test_tensor(&k_w);
+        let v_storage = mapped_test_tensor(&v_w);
+        let o_storage = mapped_test_tensor(&o_w);
+        let q_raw = q_storage.as_bytes().expect("q mapped bytes");
+        let k_raw = k_storage.as_bytes().expect("k mapped bytes");
+        let v_raw = v_storage.as_bytes().expect("v mapped bytes");
+        let o_raw = o_storage.as_bytes().expect("o mapped bytes");
+        let view = |raw, rows, cols| PrefillAtnCoreWeightView {
+            raw,
+            quant: TensoropsQuant::Q4K,
+            rows,
+            cols,
+        };
+        let q_view = view(q_raw, q_dim, hidden_dim);
+        let k_view = view(k_raw, kv_dim, hidden_dim);
+        let v_view = view(if v_from_k { k_raw } else { v_raw }, kv_dim, hidden_dim);
+        let o_view = view(o_raw, hidden_dim, q_dim);
+        let dispatch = |cache_layer: usize,
+                        sequence_epoch: u64,
+                        owns_kv: bool,
+                        seq_len: usize,
+                        pos_start: usize,
+                        cached_k_f16: &[u16],
+                        cached_v_f16: &[u16],
+                        salt: usize| {
+            let normed = det_vals(seq_len * hidden_dim, 0.021 + salt as f32 * 0.001);
+            backend
+                .prefill_gemma_qkv_o_resident_if_supported(GemmaPrefillQkvOResidentBackendRequest {
+                    attention: GemmaPrefillQkvOTailBackendRequest {
+                        normed: &normed,
+                        q_norm_w: &q_norm,
+                        k_norm_w: &k_norm,
+                        rope_freq_factors: rope_freq_factors.as_deref(),
+                        v_from_k,
+                        q_weight: q_view,
+                        k_weight: k_view,
+                        v_weight: v_view,
+                        o_weight: o_view,
+                        seq_len,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim: hd,
+                        hidden_dim,
+                        q_dim,
+                        kv_dim,
+                        rope_theta,
+                        scale: 1.0,
+                        norm_eps,
+                        sliding_window,
+                        softcap,
+                    },
+                    sequence_epoch,
+                    cache_layer,
+                    owns_kv,
+                    pos_start,
+                    kv_len: pos_start + seq_len,
+                    cached_k_f16,
+                    cached_v_f16,
+                })
+                .expect("Gemma resident carrier dispatch")
+                .expect("Gemma resident carrier supported")
+        };
+        let initial_bits = |rows: usize, salt: usize| {
+            det_vals(rows * kv_dim, 0.031 + salt as f32 * 0.001)
+                .into_iter()
+                .map(|value| half::f16::from_f32(value).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let cache_layer = 1_000 + hd;
+        let mut canonical_k = initial_bits(61, 3);
+        let mut canonical_v = initial_bits(61, 7);
+        for (step, (epoch, seq_len, pos_start, salt, replace_epoch)) in [
+            (11u64, 2usize, 61usize, 1usize, false),
+            (11, 3, 63, 2, false),
+            (11, 3, 62, 3, false),
+            (12, 2, 61, 4, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if replace_epoch {
+                canonical_k = initial_bits(pos_start, 41);
+                canonical_v = initial_bits(pos_start, 43);
+            } else {
+                canonical_k.truncate(pos_start * kv_dim);
+                canonical_v.truncate(pos_start * kv_dim);
+            }
+            let persistent = dispatch(
+                cache_layer,
+                epoch,
+                true,
+                seq_len,
+                pos_start,
+                &canonical_k,
+                &canonical_v,
+                salt,
+            );
+            let fresh = dispatch(
+                cache_layer + 100 + step,
+                epoch,
+                true,
+                seq_len,
+                pos_start,
+                &canonical_k,
+                &canonical_v,
+                salt,
+            );
+            assert_eq!(persistent, fresh, "HD{hd} resident step {step}");
+            canonical_k.extend_from_slice(&persistent.1);
+            canonical_v.extend_from_slice(&persistent.2);
+
+            {
+                let cache = backend.gemma_prefill_f16kv_residents.borrow();
+                let kv = &cache.get(&cache_layer).expect("resident entry").kv;
+                assert_eq!(kv.filled, pos_start + seq_len);
+                let padding_start = kv.filled * kv_dim;
+                let padding_len = (kv.capacity - kv.filled) * kv_dim;
+                let k_tail = unsafe {
+                    std::slice::from_raw_parts(
+                        (kv.k_buf.contents().as_ptr() as *const u16).add(padding_start),
+                        padding_len,
+                    )
+                };
+                let v_tail = unsafe {
+                    std::slice::from_raw_parts(
+                        (kv.v_buf.contents().as_ptr() as *const u16).add(padding_start),
+                        padding_len,
+                    )
+                };
+                assert!(k_tail.iter().all(|&bits| bits == 0));
+                assert!(v_tail.iter().all(|&bits| bits == 0));
+            }
+
+            if step == 1 {
+                let shared = dispatch(
+                    cache_layer,
+                    epoch,
+                    false,
+                    seq_len,
+                    pos_start,
+                    &canonical_k,
+                    &canonical_v,
+                    19,
+                );
+                let shared_fresh = dispatch(
+                    cache_layer + 200,
+                    epoch,
+                    false,
+                    seq_len,
+                    pos_start,
+                    &canonical_k,
+                    &canonical_v,
+                    19,
+                );
+                assert_eq!(shared, shared_fresh, "HD{hd} shared-KV resident");
+                assert!(shared.1.is_empty() && shared.2.is_empty());
+            }
+        }
     }
 
     /// pm47 ② STEP4+STEP5 GEMM 통합 커널이 CPU f32 oracle 과 의미동등 drift 내인지.

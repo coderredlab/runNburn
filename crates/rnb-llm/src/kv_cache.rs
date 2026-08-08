@@ -805,7 +805,6 @@ impl KVCache {
         self.current_len = len;
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal", test))]
     pub(crate) fn sequence_epoch(&self) -> u64 {
         self.sequence_epoch
     }

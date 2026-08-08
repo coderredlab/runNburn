@@ -129,6 +129,17 @@ pub struct MetalGemmaPrefillQkvOTailRequest<'a> {
     pub softcap: Option<f32>,
 }
 
+pub struct MetalGemmaPrefillQkvOResidentRequest<'a> {
+    pub attention: MetalGemmaPrefillQkvOTailRequest<'a>,
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub owns_kv: bool,
+    pub pos_start: usize,
+    pub kv_len: usize,
+    pub cached_k_f16: &'a [u16],
+    pub cached_v_f16: &'a [u16],
+}
+
 pub struct MetalGemmaPrefillFullLayerRequest<'a> {
     pub attention: MetalGemmaPrefillQkvOTailRequest<'a>,
     pub hidden: &'a [f32],
@@ -5604,6 +5615,112 @@ pub fn metal_gemma_prefill_qkv_o_tail_if_supported(
                     norm_eps: req.norm_eps,
                     sliding_window: req.sliding_window,
                     softcap: req.softcap,
+                },
+            )
+            .map(|result| {
+                result.map(|(hidden, k_bits, v_bits)| MetalPrefillAtnOTailOut {
+                    hidden,
+                    k_bits,
+                    v_bits,
+                })
+            })
+    })
+}
+
+pub fn metal_gemma_prefill_qkv_o_resident_if_supported(
+    req: MetalGemmaPrefillQkvOResidentRequest<'_>,
+) -> Result<Option<MetalPrefillAtnOTailOut>> {
+    if env_falsey("RNB_METAL_GEMMA_PREFILL_QKV_O_CHAIN")
+        || env_falsey("RNB_METAL_GEMMA_PREFILL_F16KV_RESIDENT")
+        || env_falsey("RNB_METAL_GEMMA_CONTINUATION_QKV_O_CHAIN")
+    {
+        return Ok(None);
+    }
+    let attention = req.attention;
+    if attention.head_dim == 512 && env_falsey("RNB_METAL_GEMMA_PREFILL_GLOBAL_QKV_O_CHAIN") {
+        return Ok(None);
+    }
+    let Some(q_quant) = tensorops_quant_from_ggml(attention.q_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(o_quant) = tensorops_quant_from_ggml(attention.o_weight_ggml) else {
+        return Ok(None);
+    };
+    let k_quant = if req.owns_kv {
+        let Some(quant) = tensorops_quant_from_ggml(attention.k_weight_ggml) else {
+            return Ok(None);
+        };
+        quant
+    } else {
+        q_quant
+    };
+    let v_quant = if req.owns_kv {
+        let Some(quant) = tensorops_quant_from_ggml(attention.v_weight_ggml) else {
+            return Ok(None);
+        };
+        quant
+    } else {
+        q_quant
+    };
+    GEMMA_PREFILL_F16KV_RESIDENT_USED.with(|used| {
+        if !used.replace(true) {
+            GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    METAL.with(|backend| {
+        backend
+            .prefill_gemma_qkv_o_resident_if_supported(
+                rnb_backend_metal::GemmaPrefillQkvOResidentBackendRequest {
+                    attention: rnb_backend_metal::GemmaPrefillQkvOTailBackendRequest {
+                        normed: attention.normed,
+                        q_norm_w: attention.q_norm_w,
+                        k_norm_w: attention.k_norm_w,
+                        rope_freq_factors: attention.rope_freq_factors,
+                        v_from_k: attention.v_from_k,
+                        q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                            raw: attention.q_weight_raw,
+                            quant: q_quant,
+                            rows: attention.q_weight_rows,
+                            cols: attention.q_weight_cols,
+                        },
+                        k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                            raw: attention.k_weight_raw,
+                            quant: k_quant,
+                            rows: attention.k_weight_rows,
+                            cols: attention.k_weight_cols,
+                        },
+                        v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                            raw: attention.v_weight_raw,
+                            quant: v_quant,
+                            rows: attention.v_weight_rows,
+                            cols: attention.v_weight_cols,
+                        },
+                        o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                            raw: attention.o_weight_raw,
+                            quant: o_quant,
+                            rows: attention.o_weight_rows,
+                            cols: attention.o_weight_cols,
+                        },
+                        seq_len: attention.seq_len,
+                        num_heads: attention.num_heads,
+                        num_kv_heads: attention.num_kv_heads,
+                        head_dim: attention.head_dim,
+                        hidden_dim: attention.hidden_dim,
+                        q_dim: attention.q_dim,
+                        kv_dim: attention.kv_dim,
+                        rope_theta: attention.rope_theta,
+                        scale: attention.scale,
+                        norm_eps: attention.norm_eps,
+                        sliding_window: attention.sliding_window,
+                        softcap: attention.softcap,
+                    },
+                    sequence_epoch: req.sequence_epoch,
+                    cache_layer: req.cache_layer,
+                    owns_kv: req.owns_kv,
+                    pos_start: req.pos_start,
+                    kv_len: req.kv_len,
+                    cached_k_f16: req.cached_k_f16,
+                    cached_v_f16: req.cached_v_f16,
                 },
             )
             .map(|result| {

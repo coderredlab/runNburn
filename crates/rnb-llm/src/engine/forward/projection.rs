@@ -131,6 +131,15 @@ pub(super) struct GemmaPrefillMetalLayer {
     pub final_hidden: bool,
 }
 
+pub(super) struct GemmaPrefillResidentContext<'a> {
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub owns_kv: bool,
+    pub kv_len: usize,
+    pub cached_k_f16: &'a [u16],
+    pub cached_v_f16: &'a [u16],
+}
+
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn build_prefill_gemma_layer_range_spec<'a>(
@@ -280,6 +289,7 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
     layer_idx: usize,
     seq_len: usize,
     pos_start: usize,
+    resident: Option<GemmaPrefillResidentContext<'_>>,
     norm_eps: f32,
 ) -> crate::error::Result<Option<GemmaPrefillMetalLayer>> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -287,10 +297,10 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
         let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
         if !matches!(architecture, ModelArchitecture::Gemma4)
             || !use_gemma_block_semantics(architecture)
-            || gemma4_reuse_q_only
+            || (gemma4_reuse_q_only && resident.is_none())
             || layout.has_gated_attn
             || !matches!(layout.head_dim, 256 | 512)
-            || pos_start != 0
+            || (pos_start == 0) != resident.is_none()
             || w.q_bias.is_some()
             || w.k_bias.is_some()
             || w.v_bias.is_some()
@@ -303,8 +313,17 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
         {
             return Ok(None);
         }
-        let (Some(q_norm), Some(k_norm)) = (&w.q_norm, &w.k_norm) else {
+        let Some(q_norm) = &w.q_norm else {
             return Ok(None);
+        };
+        let owns_kv = resident.as_ref().map_or(true, |resident| resident.owns_kv);
+        let k_norm = if owns_kv {
+            let Some(k_norm) = &w.k_norm else {
+                return Ok(None);
+            };
+            k_norm
+        } else {
+            w.k_norm.as_ref().unwrap_or(q_norm)
         };
         let (rope_dim, rope_theta, proportional_rope) =
             resolve_rope_params(metadata, architecture, layer_idx, layout.head_dim);
@@ -317,8 +336,16 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
         );
         if proportional_rope
             || rope_dim != layout.head_dim
-            || gemma4_should_apply_k_rotation(architecture, w.k_weight.ggml_type, layout.head_dim)
-            || gemma4_should_apply_v_rotation(architecture, w.v_weight.ggml_type, layout.head_dim)
+            || (owns_kv
+                && (gemma4_should_apply_k_rotation(
+                    architecture,
+                    w.k_weight.ggml_type,
+                    layout.head_dim,
+                ) || gemma4_should_apply_v_rotation(
+                    architecture,
+                    w.v_weight.ggml_type,
+                    layout.head_dim,
+                )))
         {
             return Ok(None);
         }
@@ -371,6 +398,59 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
                 Some(weight)
             }
         });
+        if let Some(resident) = resident {
+            let out = backend_runtime::metal_gemma_prefill_qkv_o_resident_if_supported(
+                kernels::tensor_as_f32_slice(&normed),
+                q_norm_effective.as_ref(),
+                k_norm_effective.as_ref(),
+                freq_factors,
+                w.v_proj_missing,
+                &w.q_weight,
+                &w.k_weight,
+                &w.v_weight,
+                &w.o_weight,
+                resident.sequence_epoch,
+                resident.cache_layer,
+                resident.owns_kv,
+                seq_len,
+                pos_start,
+                resident.kv_len,
+                resident.cached_k_f16,
+                resident.cached_v_f16,
+                layout.num_heads,
+                layout.num_kv_heads,
+                layout.head_dim,
+                hidden_dim,
+                layout.q_dim,
+                layout.kv_dim,
+                rope_theta,
+                resolve_attention_scale(metadata, architecture),
+                norm_eps,
+                sliding_window,
+                resolve_attention_softcap(architecture),
+            )?;
+            let Some(out) = out else {
+                return Ok(None);
+            };
+            let projected = Tensor::from_vec(out.hidden, &[seq_len, hidden_dim]);
+            let hidden = super::attention_output::finish_prefill_attention_projection(
+                metadata,
+                architecture,
+                gemma_runtime_flavor,
+                hidden.clone(),
+                w,
+                projected,
+                layer_idx,
+                seq_len,
+                norm_eps,
+            )?;
+            return Ok(Some(GemmaPrefillMetalLayer {
+                hidden,
+                k_bits: out.k_bits,
+                v_bits: out.v_bits,
+                final_hidden: false,
+            }));
+        }
         let full_out = if w.moe.is_none()
             && w.shared_expert_moe.is_none()
             && w.ffn_gate_up_fused.is_none()
@@ -501,6 +581,7 @@ pub(super) fn try_prefill_gemma_qkv_o_tail_metal(
             seq_len,
             pos_start,
             norm_eps,
+            resident,
         );
         Ok(None)
     }

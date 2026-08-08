@@ -140,6 +140,55 @@ kernel void prefill_neox_qk_norm(
         out[base + col] = in[base + col] * inv_rms * weight[col];
     }
 }
+// Continuation-only exact-baseline path. The host supplies the same f32
+// cos/sin table produced by the CPU NeoX implementation. Lane 0 preserves the
+// scalar f32 RMS reduction and division order used by Gemma unit-offset Q/K
+// normalization; volatile intermediates prevent contraction across the CPU
+// stage boundaries.
+kernel void prefill_neox_qk_norm_table(
+    device const float* in             [[buffer(0)]],
+    device const float* weight         [[buffer(1)]],
+    device float*       out            [[buffer(2)]],
+    device const float2* rope_cos_sin  [[buffer(3)]],
+    constant uint&      num_heads      [[buffer(4)]],
+    constant uint&      head_dim       [[buffer(5)]],
+    constant float&     eps            [[buffer(6)]],
+    uint group   [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    uint token = group / num_heads;
+    uint base = group * head_dim;
+    uint half_rot = head_dim / 2u;
+    threadgroup float rms_value;
+
+    if (tid == 0u) {
+        float sum = 0.0f;
+        for (uint col = 0u; col < head_dim; ++col) {
+            float value = in[base + col];
+            volatile float square = value * value;
+            sum += square;
+        }
+        volatile float mean_square = sum / (float)head_dim;
+        volatile float mean_with_eps = mean_square + eps;
+        rms_value = sqrt(mean_with_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint table_base = token * half_rot;
+    for (uint pair = tid; pair < half_rot; pair += tg_size) {
+        uint right = half_rot + pair;
+        float2 cos_sin = rope_cos_sin[table_base + pair];
+        volatile float x0 = (in[base + pair] / rms_value) * weight[pair];
+        volatile float x1 = (in[base + right] / rms_value) * weight[right];
+        volatile float x0_cos = x0 * cos_sin.x;
+        volatile float x1_sin = x1 * cos_sin.y;
+        volatile float x0_sin = x0 * cos_sin.y;
+        volatile float x1_cos = x1 * cos_sin.x;
+        out[base + pair] = x0_cos - x1_sin;
+        out[base + right] = x0_sin + x1_cos;
+    }
+}
 kernel void prefill_rope_only(
     device const float* in           [[buffer(0)]],
     device float*       out          [[buffer(1)]],

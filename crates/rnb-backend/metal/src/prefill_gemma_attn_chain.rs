@@ -22,7 +22,7 @@ use std::cell::OnceCell;
 
 use crate::compute::{
     self, encode_cast_f32_to_f16, encode_flash_attn_prefill_gemma, encode_prefill_neox_qk_norm,
-    MetalContext,
+    encode_prefill_neox_qk_norm_table, MetalContext,
 };
 use crate::ffn_chain::{
     empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, private_f16_buf,
@@ -57,6 +57,7 @@ pub(crate) struct GemmaPrefillQkvOTailCarrier {
     attn_out_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     o_proj_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     seq_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    kv_len_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     num_heads_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     num_kv_heads_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     head_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -72,6 +73,34 @@ pub(crate) struct GemmaPrefillQkvOTailCarrier {
     normed_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kv_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+pub(crate) struct GemmaPrefillQkvOResidentCarrier {
+    attention: GemmaPrefillQkvOTailCarrier,
+    rope_cos_sin_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    rope_theta: f32,
+}
+
+fn gemma_neox_rope_cos_sin_table(
+    seq_len: usize,
+    pos_start: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    freq_factors: Option<&[f32]>,
+) -> Vec<f32> {
+    let half = head_dim / 2;
+    let theta_scale = rope_theta.powf(-2.0f32 / head_dim as f32);
+    let mut table = Vec::with_capacity(seq_len * head_dim);
+    for token in 0..seq_len {
+        let mut theta_base = (pos_start + token) as f32;
+        for pair in 0..half {
+            let angle = theta_base / freq_factors.map_or(1.0, |factors| factors[pair]);
+            table.push(angle.cos());
+            table.push(angle.sin());
+            theta_base *= theta_scale;
+        }
+    }
+    table
 }
 
 pub(crate) struct GemmaPrefillFullLayerCarrier {
@@ -246,6 +275,7 @@ impl GemmaPrefillQkvOTailCarrier {
             attn_out_f16_dev: empty_f16_buf(ctx, seq_len * q_dim),
             o_proj_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
             seq_buf: u32_buf(ctx, seq_len as u32),
+            kv_len_buf: u32_buf(ctx, seq_len as u32),
             num_heads_buf: u32_buf(ctx, num_heads as u32),
             num_kv_heads_buf: u32_buf(ctx, num_kv_heads as u32),
             head_dim_buf: u32_buf(ctx, head_dim as u32),
@@ -267,13 +297,15 @@ impl GemmaPrefillQkvOTailCarrier {
     fn upload_weights(
         &self,
         q_norm_w: &[f32],
-        k_norm_w: &[f32],
+        k_norm_w: Option<&[f32]>,
         rope_freq_factors: Option<&[f32]>,
     ) {
         debug_assert_eq!(q_norm_w.len(), self.head_dim);
-        debug_assert_eq!(k_norm_w.len(), self.head_dim);
         copy_f32(q_norm_w, &self.q_norm_w_dev);
-        copy_f32(k_norm_w, &self.k_norm_w_dev);
+        if let Some(k_norm_w) = k_norm_w {
+            debug_assert_eq!(k_norm_w.len(), self.head_dim);
+            copy_f32(k_norm_w, &self.k_norm_w_dev);
+        }
         if let Some(factors) = rope_freq_factors {
             debug_assert_eq!(factors.len(), self.head_dim / 2);
             copy_f32(factors, &self.rope_freq_factors_dev);
@@ -297,7 +329,23 @@ impl GemmaPrefillQkvOTailCarrier {
     ) {
         debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
         copy_f32(normed, &self.normed_dev);
+        self.upload_weights(q_norm_w, Some(k_norm_w), rope_freq_factors);
+    }
+
+    fn upload_continuation(
+        &self,
+        normed: &[f32],
+        q_norm_w: &[f32],
+        k_norm_w: Option<&[f32]>,
+        rope_freq_factors: Option<&[f32]>,
+        pos_start: usize,
+        kv_len: usize,
+    ) {
+        debug_assert_eq!(normed.len(), self.seq_len * self.hidden_dim);
+        copy_f32(normed, &self.normed_dev);
         self.upload_weights(q_norm_w, k_norm_w, rope_freq_factors);
+        copy_u32(pos_start as u32, &self.pos_start_buf);
+        copy_u32(kv_len as u32, &self.kv_len_buf);
     }
 
     fn primary_buffers(&self) -> GemmaPrefillAttentionBufferRefs<'_> {
@@ -308,6 +356,66 @@ impl GemmaPrefillQkvOTailCarrier {
             k_f16_dev: &self.k_f16_dev,
             v_f16_dev: &self.v_f16_dev,
         }
+    }
+}
+
+impl GemmaPrefillQkvOResidentCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_dim: usize,
+        q_dim: usize,
+        rope_theta: f32,
+        scale: f32,
+        norm_eps: f32,
+    ) -> Self {
+        Self {
+            attention: GemmaPrefillQkvOTailCarrier::new(
+                ctx,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                rope_theta,
+                scale,
+                norm_eps,
+            ),
+            rope_cos_sin_dev: empty_f32_buf(ctx, seq_len * head_dim),
+            rope_theta,
+        }
+    }
+
+    fn upload(
+        &self,
+        normed: &[f32],
+        q_norm_w: &[f32],
+        k_norm_w: Option<&[f32]>,
+        rope_freq_factors: Option<&[f32]>,
+        pos_start: usize,
+        kv_len: usize,
+    ) {
+        let rope_cos_sin = gemma_neox_rope_cos_sin_table(
+            self.attention.seq_len,
+            pos_start,
+            self.attention.head_dim,
+            self.rope_theta,
+            rope_freq_factors,
+        );
+        copy_f32(&rope_cos_sin, &self.rope_cos_sin_dev);
+        self.attention.upload_continuation(
+            normed,
+            q_norm_w,
+            k_norm_w,
+            rope_freq_factors,
+            pos_start,
+            kv_len,
+        );
     }
 }
 
@@ -447,6 +555,14 @@ pub(crate) struct GemmaPrefillQkvOTailDispatchRequest<'a> {
     pub spec: GemmaPrefillQkvODispatchSpec<'a>,
 }
 
+pub(crate) struct GemmaPrefillQkvOResidentDispatchRequest<'a> {
+    pub normed: &'a [f32],
+    pub spec: GemmaPrefillQkvODispatchSpec<'a>,
+    pub owns_kv: bool,
+    pub pos_start: usize,
+    pub kv_len: usize,
+}
+
 pub(crate) struct GemmaPrefillFfnDispatchSpec<'a> {
     pub ffn_gate_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub ffn_gate_w_off: u32,
@@ -474,6 +590,10 @@ fn encode_gemma_qkv_o(
     carrier: &GemmaPrefillQkvOTailCarrier,
     buffers: GemmaPrefillAttentionBufferRefs<'_>,
     req: &GemmaPrefillQkvODispatchSpec<'_>,
+    qk_rope_table: Option<&ProtocolObject<dyn MTLBuffer>>,
+    project_kv: bool,
+    kv_dst_byte_offset: usize,
+    kv_len_buf: &ProtocolObject<dyn MTLBuffer>,
 ) {
     encode_cast_f32_to_f16(
         ctx,
@@ -495,7 +615,7 @@ fn encode_gemma_qkv_o(
             &carrier.q_dim_buf,
         ),
         (
-            true,
+            project_kv,
             req.k_quant,
             req.k_w_buf,
             req.k_w_off,
@@ -504,7 +624,7 @@ fn encode_gemma_qkv_o(
             &carrier.kv_dim_buf,
         ),
         (
-            !req.v_from_k,
+            project_kv && !req.v_from_k,
             req.v_quant,
             req.v_w_buf,
             req.v_w_off,
@@ -532,76 +652,134 @@ fn encode_gemma_qkv_o(
         );
     }
     compute::chain_barrier(ctx, encoder);
-    encode_prefill_neox_qk_norm(
-        ctx,
-        encoder,
-        &carrier.q_dev,
-        buffers.q_norm_w_dev,
-        &carrier.q_rope_dev,
-        &carrier.num_heads_buf,
-        &carrier.head_dim_buf,
-        &carrier.n_rot_buf,
-        &carrier.theta_buf,
-        &carrier.eps_buf,
-        &carrier.pos_start_buf,
-        buffers.rope_freq_factors_dev,
-        carrier.seq_len,
-        carrier.num_heads,
-    );
-    encode_prefill_neox_qk_norm(
-        ctx,
-        encoder,
-        &carrier.k_dev,
-        buffers.k_norm_w_dev,
-        &carrier.k_rope_dev,
-        &carrier.num_kv_heads_buf,
-        &carrier.head_dim_buf,
-        &carrier.n_rot_buf,
-        &carrier.theta_buf,
-        &carrier.eps_buf,
-        &carrier.pos_start_buf,
-        buffers.rope_freq_factors_dev,
-        carrier.seq_len,
-        carrier.num_kv_heads,
-    );
-    encode_prefill_neox_qk_norm(
-        ctx,
-        encoder,
-        if req.v_from_k {
-            &carrier.k_dev
+    if let Some(rope_cos_sin) = qk_rope_table {
+        encode_prefill_neox_qk_norm_table(
+            ctx,
+            encoder,
+            &carrier.q_dev,
+            buffers.q_norm_w_dev,
+            &carrier.q_rope_dev,
+            rope_cos_sin,
+            &carrier.num_heads_buf,
+            &carrier.head_dim_buf,
+            &carrier.eps_buf,
+            carrier.seq_len,
+            carrier.num_heads,
+        );
+        if project_kv {
+            encode_prefill_neox_qk_norm_table(
+                ctx,
+                encoder,
+                &carrier.k_dev,
+                buffers.k_norm_w_dev,
+                &carrier.k_rope_dev,
+                rope_cos_sin,
+                &carrier.num_kv_heads_buf,
+                &carrier.head_dim_buf,
+                &carrier.eps_buf,
+                carrier.seq_len,
+                carrier.num_kv_heads,
+            );
+        }
+    } else {
+        encode_prefill_neox_qk_norm(
+            ctx,
+            encoder,
+            &carrier.q_dev,
+            buffers.q_norm_w_dev,
+            &carrier.q_rope_dev,
+            &carrier.num_heads_buf,
+            &carrier.head_dim_buf,
+            &carrier.n_rot_buf,
+            &carrier.theta_buf,
+            &carrier.eps_buf,
+            &carrier.pos_start_buf,
+            buffers.rope_freq_factors_dev,
+            carrier.seq_len,
+            carrier.num_heads,
+        );
+        if project_kv {
+            encode_prefill_neox_qk_norm(
+                ctx,
+                encoder,
+                &carrier.k_dev,
+                buffers.k_norm_w_dev,
+                &carrier.k_rope_dev,
+                &carrier.num_kv_heads_buf,
+                &carrier.head_dim_buf,
+                &carrier.n_rot_buf,
+                &carrier.theta_buf,
+                &carrier.eps_buf,
+                &carrier.pos_start_buf,
+                buffers.rope_freq_factors_dev,
+                carrier.seq_len,
+                carrier.num_kv_heads,
+            );
+        }
+    }
+    if project_kv {
+        encode_prefill_neox_qk_norm(
+            ctx,
+            encoder,
+            if req.v_from_k {
+                &carrier.k_dev
+            } else {
+                &carrier.v_dev
+            },
+            &carrier.v_norm_w_dev,
+            &carrier.v_norm_dev,
+            &carrier.num_kv_heads_buf,
+            &carrier.head_dim_buf,
+            &carrier.zero_rot_buf,
+            &carrier.theta_buf,
+            &carrier.eps_buf,
+            &carrier.pos_start_buf,
+            buffers.rope_freq_factors_dev,
+            carrier.seq_len,
+            carrier.num_kv_heads,
+        );
+    }
+    compute::chain_barrier(ctx, encoder);
+    if project_kv {
+        if kv_dst_byte_offset == 0 {
+            encode_cast_f32_to_f16(
+                ctx,
+                encoder,
+                &carrier.k_rope_dev,
+                buffers.k_f16_dev,
+                &carrier.kv_elems_buf,
+                carrier.seq_len * carrier.kv_dim,
+            );
+            encode_cast_f32_to_f16(
+                ctx,
+                encoder,
+                &carrier.v_norm_dev,
+                buffers.v_f16_dev,
+                &carrier.kv_elems_buf,
+                carrier.seq_len * carrier.kv_dim,
+            );
         } else {
-            &carrier.v_dev
-        },
-        &carrier.v_norm_w_dev,
-        &carrier.v_norm_dev,
-        &carrier.num_kv_heads_buf,
-        &carrier.head_dim_buf,
-        &carrier.zero_rot_buf,
-        &carrier.theta_buf,
-        &carrier.eps_buf,
-        &carrier.pos_start_buf,
-        buffers.rope_freq_factors_dev,
-        carrier.seq_len,
-        carrier.num_kv_heads,
-    );
-    compute::chain_barrier(ctx, encoder);
-    encode_cast_f32_to_f16(
-        ctx,
-        encoder,
-        &carrier.k_rope_dev,
-        buffers.k_f16_dev,
-        &carrier.kv_elems_buf,
-        carrier.seq_len * carrier.kv_dim,
-    );
-    encode_cast_f32_to_f16(
-        ctx,
-        encoder,
-        &carrier.v_norm_dev,
-        buffers.v_f16_dev,
-        &carrier.kv_elems_buf,
-        carrier.seq_len * carrier.kv_dim,
-    );
-    compute::chain_barrier(ctx, encoder);
+            compute::encode_cast_f32_to_f16_offset(
+                ctx,
+                encoder,
+                &carrier.k_rope_dev,
+                buffers.k_f16_dev,
+                kv_dst_byte_offset,
+                carrier.seq_len * carrier.kv_dim,
+            )
+            .expect("validated Gemma K append range");
+            compute::encode_cast_f32_to_f16_offset(
+                ctx,
+                encoder,
+                &carrier.v_norm_dev,
+                buffers.v_f16_dev,
+                kv_dst_byte_offset,
+                carrier.seq_len * carrier.kv_dim,
+            )
+            .expect("validated Gemma V append range");
+        }
+        compute::chain_barrier(ctx, encoder);
+    }
     encode_flash_attn_prefill_gemma(
         ctx,
         encoder,
@@ -611,7 +789,7 @@ fn encode_gemma_qkv_o(
         &carrier.attn_out_dev,
         &carrier.num_heads_buf,
         &carrier.num_kv_heads_buf,
-        &carrier.seq_buf,
+        kv_len_buf,
         &carrier.seq_buf,
         &carrier.scale_buf,
         req.sliding_window,
@@ -665,7 +843,17 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
     let encoder = command
         .computeCommandEncoder()
         .ok_or_else(|| "Metal Gemma prefill carrier: encoder creation failed".to_string())?;
-    encode_gemma_qkv_o(ctx, &encoder, carrier, carrier.primary_buffers(), &req.spec);
+    encode_gemma_qkv_o(
+        ctx,
+        &encoder,
+        carrier,
+        carrier.primary_buffers(),
+        &req.spec,
+        None,
+        true,
+        0,
+        &carrier.seq_buf,
+    );
     encoder.endEncoding();
     command.commit();
     command.waitUntilCompleted();
@@ -674,6 +862,82 @@ pub(crate) fn prefill_gemma_qkv_o_tail_dispatch(
         readback_f32(&carrier.o_proj_dev, carrier.seq_len * carrier.hidden_dim),
         readback_u16(&carrier.k_f16_dev, carrier.seq_len * carrier.kv_dim),
         readback_u16(&carrier.v_f16_dev, carrier.seq_len * carrier.kv_dim),
+    ))
+}
+
+pub(crate) fn prefill_gemma_qkv_o_resident_dispatch(
+    ctx: &MetalContext,
+    carrier: &GemmaPrefillQkvOResidentCarrier,
+    resident: &mut compute::KvResident,
+    req: GemmaPrefillQkvOResidentDispatchRequest<'_>,
+) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
+    let attention = &carrier.attention;
+    debug_assert!(!resident.kv_int8);
+    debug_assert_eq!(resident.num_kv_heads, attention.num_kv_heads);
+    debug_assert_eq!(resident.head_dim, attention.head_dim);
+    debug_assert!(resident.capacity >= req.kv_len.next_multiple_of(64));
+    debug_assert!(resident.filled >= req.pos_start);
+    if !req.owns_kv {
+        debug_assert!(resident.filled >= req.kv_len);
+    }
+    carrier.upload(
+        req.normed,
+        req.spec.q_norm_w,
+        req.owns_kv.then_some(req.spec.k_norm_w),
+        req.spec.rope_freq_factors,
+        req.pos_start,
+        req.kv_len,
+    );
+
+    let command = ctx.queue.commandBuffer().ok_or_else(|| {
+        "Metal Gemma resident carrier: command buffer creation failed".to_string()
+    })?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Gemma resident carrier: encoder creation failed".to_string())?;
+    let buffers = GemmaPrefillAttentionBufferRefs {
+        q_norm_w_dev: &attention.q_norm_w_dev,
+        k_norm_w_dev: &attention.k_norm_w_dev,
+        rope_freq_factors_dev: &attention.rope_freq_factors_dev,
+        k_f16_dev: &resident.k_buf,
+        v_f16_dev: &resident.v_buf,
+    };
+    encode_gemma_qkv_o(
+        ctx,
+        &encoder,
+        attention,
+        buffers,
+        &req.spec,
+        Some(&carrier.rope_cos_sin_dev),
+        req.owns_kv,
+        req.pos_start * attention.kv_dim * std::mem::size_of::<u16>(),
+        &attention.kv_len_buf,
+    );
+    encoder.endEncoding();
+    command.commit();
+    command.waitUntilCompleted();
+    ensure_command_completed(&command)?;
+
+    if req.owns_kv {
+        resident.filled = req.kv_len;
+    }
+    let kv_offset = req.pos_start * attention.kv_dim;
+    let kv_elems = attention.seq_len * attention.kv_dim;
+    let (k_bits, v_bits) = if req.owns_kv {
+        (
+            readback_u16_range(&resident.k_buf, kv_offset, kv_elems),
+            readback_u16_range(&resident.v_buf, kv_offset, kv_elems),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok((
+        readback_f32(
+            &attention.o_proj_dev,
+            attention.seq_len * attention.hidden_dim,
+        ),
+        k_bits,
+        v_bits,
     ))
 }
 
@@ -847,6 +1111,10 @@ pub(crate) fn prefill_gemma_full_layer_dispatch(
         attention,
         buffers.attention,
         &req.attention.spec,
+        None,
+        true,
+        0,
+        &attention.seq_buf,
     );
     encode_gemma_full_layer_tail(
         ctx,
@@ -882,10 +1150,134 @@ fn copy_f32(src: &[f32], dst: &ProtocolObject<dyn MTLBuffer>) {
     }
 }
 
+fn copy_u32(value: u32, dst: &ProtocolObject<dyn MTLBuffer>) {
+    unsafe {
+        dst.contents().as_ptr().cast::<u32>().write(value);
+    }
+}
+
 fn readback_f32(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<f32>(), len).to_vec() }
 }
 
 fn readback_u16(buf: &ProtocolObject<dyn MTLBuffer>, len: usize) -> Vec<u16> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u16>(), len).to_vec() }
+}
+
+fn readback_u16_range(buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, len: usize) -> Vec<u16> {
+    unsafe {
+        std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u16>().add(offset), len).to_vec()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn gemma_prefill_qkv_o_neox_qk_norm_table_matches_cpu_baseline() {
+        let ctx = compute::build_metal_context().expect("Metal context");
+        let (seq_len, num_heads, norm_eps, rope_theta, pos_start) =
+            (3usize, 2usize, 1.0e-6f32, 1_000_000.0f32, 1_115usize);
+        for (head_dim, freq_factors) in [
+            (256usize, None),
+            (
+                512usize,
+                Some(
+                    (0..256)
+                        .map(|index| 1.0 + (index % 7) as f32 * 0.125)
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ] {
+            let input = (0..seq_len * num_heads * head_dim)
+                .map(|index| ((index * 17 % 101) as f32 - 50.0) * 0.019)
+                .collect::<Vec<_>>();
+            let stored_weight = (0..head_dim)
+                .map(|index| ((index * 13 % 31) as f32 - 15.0) * 0.003)
+                .collect::<Vec<_>>();
+            let effective_weight = stored_weight
+                .iter()
+                .map(|weight| weight + 1.0)
+                .collect::<Vec<_>>();
+            let table = gemma_neox_rope_cos_sin_table(
+                seq_len,
+                pos_start,
+                head_dim,
+                rope_theta,
+                freq_factors.as_deref(),
+            );
+
+            let mut cpu_normed = vec![0.0f32; input.len()];
+            for (src, dst) in input
+                .chunks_exact(head_dim)
+                .zip(cpu_normed.chunks_exact_mut(head_dim))
+            {
+                rnb_cpu::kernels::norm::rms_norm_unit_offset_into(
+                    src,
+                    &stored_weight,
+                    norm_eps,
+                    dst,
+                );
+            }
+            let cpu_normed =
+                rnb_core::tensor::Tensor::from_vec(cpu_normed, &[seq_len, num_heads * head_dim]);
+            let cpu = if let Some(factors) = freq_factors.as_deref() {
+                rnb_cpu::kernels::rope::rope_neox_with_factors(
+                    &cpu_normed,
+                    pos_start,
+                    head_dim,
+                    rope_theta,
+                    factors,
+                )
+            } else {
+                rnb_cpu::kernels::rope::rope_neox(&cpu_normed, pos_start, head_dim, rope_theta)
+            }
+            .expect("CPU NeoX RoPE");
+
+            let input_buf = shared_f32_buf(&ctx, &input);
+            let weight_buf = shared_f32_buf(&ctx, &effective_weight);
+            let output_buf = empty_f32_buf(&ctx, input.len());
+            let table_buf = shared_f32_buf(&ctx, &table);
+            let num_heads_buf = u32_buf(&ctx, num_heads as u32);
+            let head_dim_buf = u32_buf(&ctx, head_dim as u32);
+            let eps_buf = f32_buf(&ctx, norm_eps);
+            let command = ctx.queue.commandBuffer().expect("Metal command buffer");
+            let encoder = command
+                .computeCommandEncoder()
+                .expect("Metal compute encoder");
+            encode_prefill_neox_qk_norm_table(
+                &ctx,
+                &encoder,
+                &input_buf,
+                &weight_buf,
+                &output_buf,
+                &table_buf,
+                &num_heads_buf,
+                &head_dim_buf,
+                &eps_buf,
+                seq_len,
+                num_heads,
+            );
+            encoder.endEncoding();
+            command.commit();
+            command.waitUntilCompleted();
+            ensure_command_completed(&command).expect("Metal exact Q/K normalization");
+
+            let actual = readback_f32(&output_buf, input.len());
+            let expected = rnb_cpu::kernels::tensor_as_f32_slice(&cpu);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "HD{head_dim} exact continuation Q/K preprocessing"
+            );
+        }
+    }
 }
