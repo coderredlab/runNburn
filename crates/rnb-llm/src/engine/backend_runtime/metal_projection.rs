@@ -247,6 +247,98 @@ pub(in crate::engine) fn metal_prefill_ffn_chain_into_if_supported(
     }
 }
 
+pub(in crate::engine) fn metal_gemma_moe_tensorops_requested() -> bool {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        return metal_runtime::metal_gemma_moe_tensorops_requested();
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "metal"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn metal_gemma_moe_tensorops_prefill_if_supported(
+    gate_up_quant: rnb_loader::GGMLType,
+    gate_up_all: &[u8],
+    down_quant: rnb_loader::GGMLType,
+    down_all: &[u8],
+    gate_expert_bytes: usize,
+    down_expert_bytes: usize,
+    selected_experts: &[u32],
+    route_weights: &[f32],
+    shared_gate_weight: &QuantizedWeight,
+    shared_up_weight: &QuantizedWeight,
+    shared_down_weight: &QuantizedWeight,
+    selected_input: &[f32],
+    shared_input: &[f32],
+    seq_len: usize,
+    hidden_dim: usize,
+    selected_ffn_dim: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> crate::error::Result<Option<(Vec<f32>, Vec<f32>)>> {
+    let (Some(shared_gate), Some(shared_up), Some(shared_down)) = (
+        shared_gate_weight.backend_view(),
+        shared_up_weight.backend_view(),
+        shared_down_weight.backend_view(),
+    ) else {
+        return Ok(None);
+    };
+    if shared_gate.rows() != shared_up.rows()
+        || shared_gate.cols() != hidden_dim
+        || shared_up.cols() != hidden_dim
+        || shared_down.rows() != hidden_dim
+        || shared_down.cols() != shared_gate.rows()
+    {
+        return Ok(None);
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let output = metal_runtime::metal_gemma_moe_tensorops_prefill_if_supported(
+            metal_runtime::MetalGemmaMoeTensoropsPrefillRequest {
+                gate_up_ggml: gate_up_quant,
+                gate_up_all,
+                down_ggml: down_quant,
+                down_all,
+                gate_expert_bytes,
+                down_expert_bytes,
+                selected_experts,
+                route_weights,
+                shared_gate_ggml: backend_ggml_type(shared_gate.quant()),
+                shared_gate: shared_gate.raw(),
+                shared_up_ggml: backend_ggml_type(shared_up.quant()),
+                shared_up: shared_up.raw(),
+                shared_down_ggml: backend_ggml_type(shared_down.quant()),
+                shared_down: shared_down.raw(),
+                selected_input,
+                shared_input,
+                seq_len,
+                hidden_dim,
+                selected_ffn_dim,
+                shared_ffn_dim: shared_gate.rows(),
+                n_expert,
+                n_expert_used,
+            },
+        )
+        .map_err(crate::error::LlmError::Forward)?;
+        return Ok(output.map(|output| (output.selected_values, output.shared_values)));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (
+            shared_gate,
+            shared_up,
+            shared_down,
+            gate_up_quant,
+            down_quant,
+        );
+        Ok(None)
+    }
+}
+
 /// pm35 M2: prefill GDN proj(in_proj/gate) single batch GEMM seam. FFN prefill chain 의 single
 /// GEMM 아날로그. n_out=view.rows()(=conv_ch(in_proj) 또는 d_inner(gate)). 성공 시 Some(out[seq*n_out]).
 #[cfg(all(feature = "metal", not(feature = "cuda")))]

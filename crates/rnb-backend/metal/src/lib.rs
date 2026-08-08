@@ -75,6 +75,33 @@ pub struct QwenMoeLlamaIdPrefillOutput {
 }
 
 #[cfg(target_os = "macos")]
+pub struct GemmaMoeTensoropsPrefillRequest<'a> {
+    pub gate_up_all: &'a [u8],
+    pub down_all: &'a [u8],
+    pub gate_expert_bytes: usize,
+    pub down_expert_bytes: usize,
+    pub selected_experts: &'a [u32],
+    pub route_weights: &'a [f32],
+    pub shared_gate: &'a [u8],
+    pub shared_up: &'a [u8],
+    pub shared_down: &'a [u8],
+    pub selected_input: &'a [f32],
+    pub shared_input: &'a [f32],
+    pub seq_len: usize,
+    pub hidden_dim: usize,
+    pub selected_ffn_dim: usize,
+    pub shared_ffn_dim: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+}
+
+#[cfg(target_os = "macos")]
+pub struct GemmaMoeTensoropsPrefillOutput {
+    pub selected_values: Vec<f32>,
+    pub shared_values: Vec<f32>,
+}
+
+#[cfg(target_os = "macos")]
 mod attn_chain;
 
 #[cfg(target_os = "macos")]
@@ -1796,6 +1823,9 @@ pub struct MetalBackend {
         RefCell<HashMap<ffn_chain::QwenMoeLlamaIdPlan, Vec<ffn_chain::QwenMoeLlamaIdCarrier>>>,
     qwen_prefill_chain_moe_carrier_pool:
         RefCell<HashMap<ffn_chain::QwenMoeLlamaIdPlan, Vec<ffn_chain::QwenMoeLlamaIdCarrier>>>,
+    gemma_moe_tensorops_carriers: RefCell<
+        HashMap<(ffn_chain::QwenMoeLlamaIdPlan, usize), ffn_chain::GemmaMoeTensoropsCarrier>,
+    >,
     /// (slots, hidden_dim, ffn_dim) → Qwen MoE id gate/up prefill scratch. Opt-in only.
     qwen_moe_prefill_id_gate_up_carriers:
         RefCell<HashMap<(usize, usize, usize), ffn_chain::QwenMoePrefillIdGateUpCarrier>>,
@@ -2129,6 +2159,7 @@ impl MetalBackend {
                 qwen_moe_prefill_id_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_llama_id_carrier_pool: RefCell::new(HashMap::new()),
                 qwen_prefill_chain_moe_carrier_pool: RefCell::new(HashMap::new()),
+                gemma_moe_tensorops_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_prefill_id_gate_up_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_prefill_id_gate_up_f16_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_prefill_mulmmid_v3_carriers: RefCell::new(HashMap::new()),
@@ -2365,6 +2396,7 @@ impl MetalBackend {
             qwen_moe_prefill_id_carriers: RefCell::new(HashMap::new()),
             qwen_moe_llama_id_carrier_pool: RefCell::new(HashMap::new()),
             qwen_prefill_chain_moe_carrier_pool: RefCell::new(HashMap::new()),
+            gemma_moe_tensorops_carriers: RefCell::new(HashMap::new()),
             qwen_moe_prefill_id_gate_up_carriers: RefCell::new(HashMap::new()),
             qwen_moe_prefill_id_gate_up_f16_carriers: RefCell::new(HashMap::new()),
             qwen_moe_prefill_mulmmid_v3_carriers: RefCell::new(HashMap::new()),
@@ -6543,6 +6575,185 @@ impl MetalBackend {
                 shared_token_ids,
             )),
         )
+    }
+
+    pub fn gemma_moe_tensorops_prefill(
+        &self,
+        request: GemmaMoeTensoropsPrefillRequest<'_>,
+    ) -> Result<Option<GemmaMoeTensoropsPrefillOutput>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if request.seq_len < 32
+            || request.hidden_dim == 0
+            || request.hidden_dim % 256 != 0
+            || request.selected_ffn_dim == 0
+            || request.selected_ffn_dim % 32 != 0
+            || request.shared_ffn_dim == 0
+            || request.shared_ffn_dim % 32 != 0
+            || request.n_expert == 0
+            || request.n_expert_used == 0
+            || request.n_expert_used > request.n_expert
+            || request.n_expert_used > 8
+        {
+            return Ok(None);
+        }
+        if !ctx.tensorops_capable
+            || ctx.gemm_q8_0_tensorops_pipeline.is_none()
+            || ctx.qwen_moe_llama_id_map0_pipeline().is_none()
+            || ctx.qwen_moe_llama_mul_mm_id_q4k_f32_pipeline().is_none()
+            || ctx.gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline().is_none()
+            || ctx
+                .qwen_moe_llama_expert_order_reduce_f32_pipeline()
+                .is_none()
+        {
+            return Ok(None);
+        }
+
+        let matrix_bytes = |rows: usize,
+                            columns: usize,
+                            block_elements: usize,
+                            block_bytes: usize|
+         -> Option<usize> {
+            (columns % block_elements == 0)
+                .then_some(())
+                .and_then(|()| rows.checked_mul(columns / block_elements))
+                .and_then(|blocks| blocks.checked_mul(block_bytes))
+        };
+        let expected_gate_expert =
+            matrix_bytes(request.selected_ffn_dim, request.hidden_dim, 256, 144)
+                .ok_or_else(|| "invalid Gemma Q4_K gate shape".to_string())?;
+        let expected_down_expert =
+            matrix_bytes(request.hidden_dim, request.selected_ffn_dim, 32, 24)
+                .ok_or_else(|| "invalid Gemma Q5_1 down shape".to_string())?;
+        let expected_gate_up_all = request
+            .n_expert
+            .checked_mul(expected_gate_expert)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| "Gemma gate/up arena size overflow".to_string())?;
+        let expected_down_all = request
+            .n_expert
+            .checked_mul(expected_down_expert)
+            .ok_or_else(|| "Gemma down arena size overflow".to_string())?;
+        let expected_shared_gate = matrix_bytes(request.shared_ffn_dim, request.hidden_dim, 32, 34)
+            .ok_or_else(|| "invalid shared Q8_0 gate shape".to_string())?;
+        let expected_shared_down = matrix_bytes(request.hidden_dim, request.shared_ffn_dim, 32, 34)
+            .ok_or_else(|| "invalid shared Q8_0 down shape".to_string())?;
+        let slots = request
+            .seq_len
+            .checked_mul(request.n_expert_used)
+            .ok_or_else(|| "Gemma route slot count overflow".to_string())?;
+        let input_elements = request
+            .seq_len
+            .checked_mul(request.hidden_dim)
+            .ok_or_else(|| "Gemma input size overflow".to_string())?;
+        if request.gate_expert_bytes != expected_gate_expert
+            || request.down_expert_bytes != expected_down_expert
+            || request.gate_up_all.len() != expected_gate_up_all
+            || request.down_all.len() != expected_down_all
+            || request.shared_gate.len() != expected_shared_gate
+            || request.shared_up.len() != expected_shared_gate
+            || request.shared_down.len() != expected_shared_down
+            || request.selected_experts.len() != slots
+            || request.route_weights.len() != slots
+            || request.selected_input.len() != input_elements
+            || request.shared_input.len() != input_elements
+        {
+            return Err("Gemma TensorOps MoE request layout mismatch".to_string());
+        }
+
+        let plan = match ffn_chain::qwen_moe_llama_id_preflight(
+            true,
+            true,
+            request.seq_len,
+            request.n_expert,
+            request.n_expert_used,
+            request.hidden_dim,
+            request.selected_ffn_dim,
+            QWEN_MOE_LLAMA_ID_SCRATCH_BUDGET_BYTES,
+        )
+        .map_err(qwen_moe_llama_id_error)?
+        {
+            ffn_chain::QwenMoeLlamaIdPreflight::Run(plan) => plan,
+            ffn_chain::QwenMoeLlamaIdPreflight::Fallback(_) => return Ok(None),
+        };
+
+        let resident_weight = |raw: &[u8]| {
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
+                .entry(resident_key(raw))
+                .or_insert_with(|| resident_cache_entry(ctx, raw));
+            (entry.0.clone(), entry.1)
+        };
+        let (gate_up_all, gate_up_offset) = resident_weight(request.gate_up_all);
+        let (down_all, down_offset) = resident_weight(request.down_all);
+        let (shared_gate, shared_gate_offset) = resident_weight(request.shared_gate);
+        let (shared_up, shared_up_offset) = resident_weight(request.shared_up);
+        let (shared_down, shared_down_offset) = resident_weight(request.shared_down);
+
+        let key = (plan, request.shared_ffn_dim);
+        let mut carriers = self.gemma_moe_tensorops_carriers.borrow_mut();
+        if !carriers.contains_key(&key) {
+            let carrier = ffn_chain::GemmaMoeTensoropsCarrier::new(
+                ctx,
+                plan,
+                request.shared_ffn_dim,
+                request.selected_experts,
+                request.route_weights,
+            )
+            .map_err(qwen_moe_llama_id_error)?;
+            carriers.insert(key, carrier);
+        }
+        let carrier = carriers
+            .get_mut(&key)
+            .ok_or_else(|| "Gemma TensorOps carrier cache insertion failed".to_string())?;
+        carrier
+            .refresh_routes(request.selected_experts, request.route_weights)
+            .map_err(qwen_moe_llama_id_error)?;
+        carrier
+            .upload_inputs(request.selected_input, request.shared_input)
+            .map_err(qwen_moe_llama_id_error)?;
+
+        let command = ctx
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| "Gemma TensorOps command buffer unavailable".to_string())?;
+        let encoder = crate::compute::chain_compute_encoder(ctx, &command);
+        if let Err(error) = ffn_chain::gemma_moe_tensorops_prefill_encode(
+            ctx,
+            &encoder,
+            carrier,
+            &gate_up_all,
+            gate_up_offset as usize,
+            request.gate_expert_bytes,
+            &down_all,
+            down_offset as usize,
+            request.down_expert_bytes,
+            &shared_gate,
+            shared_gate_offset,
+            &shared_up,
+            shared_up_offset,
+            &shared_down,
+            shared_down_offset,
+        ) {
+            encoder.endEncoding();
+            return Err(qwen_moe_llama_id_error(error));
+        }
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        qwen_moe_llama_id_command_result(
+            command.status(),
+            command.error().map(|error| format!("{error:?}")),
+        )?;
+
+        let selected_values =
+            ffn_chain::readback(carrier.selected_output(), carrier.output_elements());
+        let shared_values = ffn_chain::readback(carrier.shared_output(), carrier.output_elements());
+        Ok(Some(GemmaMoeTensoropsPrefillOutput {
+            selected_values,
+            shared_values,
+        }))
     }
 
     pub fn qwen_moe_llama_id_prefill(

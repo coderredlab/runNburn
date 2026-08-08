@@ -763,6 +763,8 @@ pub struct MetalContext {
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) qwen_moe_llama_mul_mm_id_q5k_f16_pipeline:
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline:
+        OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) qwen_moe_llama_mul_mm_id_q6k_f32_pipeline:
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) qwen_moe_llama_mul_mm_id_q6k_f16_pipeline:
@@ -1224,6 +1226,18 @@ impl MetalContext {
         })
     }
 
+    pub(crate) fn gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline(
+        &self,
+    ) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        self.tensorops_capable.then(|| {
+            lazy_qwen_moe_llama_pipeline(
+                self,
+                &self.gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline,
+                "gemma_moe_llama_mul_mm_id_q5_1_f32",
+            )
+        })
+    }
+
     pub(crate) fn qwen_moe_llama_mul_mm_id_q5k_f16_pipeline(
         &self,
     ) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
@@ -1451,13 +1465,14 @@ mod qwen_moe_llama_lazy_pipeline_tests {
     type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
     type Getter = for<'a> fn(&'a MetalContext) -> Option<&'a Pipeline>;
 
-    const GETTERS: [Getter; 15] = [
+    const GETTERS: [Getter; 16] = [
         MetalContext::qwen_moe_llama_id_map0_pipeline,
         MetalContext::qwen_moe_llama_id_build_blocks_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q4k_f32_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q4k_f16_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q5k_f32_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q5k_f16_pipeline,
+        MetalContext::gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q6k_f32_pipeline,
         MetalContext::qwen_moe_llama_mul_mm_id_q6k_f16_pipeline,
         MetalContext::qwen_moe_shared_mul_mm_q4k_f32_pipeline,
@@ -1655,6 +1670,7 @@ pub fn build_metal_context_with_opts(
     let qwen_moe_llama_mul_mm_id_q4k_f16_pipeline = OnceLock::new();
     let qwen_moe_llama_mul_mm_id_q5k_f32_pipeline = OnceLock::new();
     let qwen_moe_llama_mul_mm_id_q5k_f16_pipeline = OnceLock::new();
+    let gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline = OnceLock::new();
     let qwen_moe_llama_mul_mm_id_q6k_f32_pipeline = OnceLock::new();
     let qwen_moe_llama_mul_mm_id_q6k_f16_pipeline = OnceLock::new();
     let qwen_moe_shared_mul_mm_q4k_f32_pipeline = OnceLock::new();
@@ -2592,6 +2608,7 @@ pub fn build_metal_context_with_opts(
         qwen_moe_llama_mul_mm_id_q4k_f16_pipeline,
         qwen_moe_llama_mul_mm_id_q5k_f32_pipeline,
         qwen_moe_llama_mul_mm_id_q5k_f16_pipeline,
+        gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline,
         qwen_moe_llama_mul_mm_id_q6k_f32_pipeline,
         qwen_moe_llama_mul_mm_id_q6k_f16_pipeline,
         qwen_moe_chain_small_pipelines,

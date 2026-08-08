@@ -223,6 +223,7 @@ pub(super) use metal_projection::{
     metal_attention_o_chain_into_if_supported, metal_ffn_chain_into_if_supported,
     metal_gemma_attention_o_ffn_chain_into_if_supported,
     metal_gemma_attention_o_ffn_qkv_chain_into_if_supported,
+    metal_gemma_moe_tensorops_prefill_if_supported, metal_gemma_moe_tensorops_requested,
     metal_prefill_ffn_chain_into_if_supported,
 };
 pub(super) use metal_projection::{

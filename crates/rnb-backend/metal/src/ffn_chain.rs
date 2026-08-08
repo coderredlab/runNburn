@@ -1115,6 +1115,7 @@ pub(crate) struct QwenMoeLlamaIdMatmulShape {
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub expert_weight_bytes: usize,
+    pub expert_stride_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1422,6 +1423,12 @@ pub(crate) struct QwenMoeLlamaIdCarrier {
     sparse_moe_out_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     shared_out_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     prefill_route: Option<QwenMoePrefillRouteScratch>,
+}
+
+pub(crate) struct GemmaMoeTensoropsCarrier {
+    selected: QwenMoeLlamaIdCarrier,
+    shared: PrefillFfnCarrier,
+    selected_activation_dim_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,21 +1770,17 @@ fn qwen_moe_llama_carrier_allocation_bytes(plan: QwenMoeLlamaIdPlan) -> [usize; 
     ]
 }
 
-fn qwen_moe_llama_validate_routes(
+fn qwen_moe_llama_validate_selected_routes(
     n_tokens: usize,
     n_expert: usize,
     n_expert_used: usize,
     selected_experts: &[u32],
     route_weights: &[f32],
-    shared_route_weights: &[f32],
 ) -> Result<(), QwenMoeLlamaIdError> {
     let slots = n_tokens
         .checked_mul(n_expert_used)
         .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
-    if selected_experts.len() != slots
-        || route_weights.len() != slots
-        || shared_route_weights.len() != n_tokens
-    {
+    if selected_experts.len() != slots || route_weights.len() != slots {
         return Err(QwenMoeLlamaIdError::InvalidSelectedExpertLayout);
     }
     for token_routes in selected_experts.chunks_exact(n_expert_used) {
@@ -1789,6 +1792,27 @@ fn qwen_moe_llama_validate_routes(
                 return Err(QwenMoeLlamaIdError::InvalidSelectedExpertLayout);
             }
         }
+    }
+    Ok(())
+}
+
+fn qwen_moe_llama_validate_routes(
+    n_tokens: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+    selected_experts: &[u32],
+    route_weights: &[f32],
+    shared_route_weights: &[f32],
+) -> Result<(), QwenMoeLlamaIdError> {
+    qwen_moe_llama_validate_selected_routes(
+        n_tokens,
+        n_expert,
+        n_expert_used,
+        selected_experts,
+        route_weights,
+    )?;
+    if shared_route_weights.len() != n_tokens {
+        return Err(QwenMoeLlamaIdError::InvalidSelectedExpertLayout);
     }
     Ok(())
 }
@@ -2039,6 +2063,33 @@ impl QwenMoeLlamaIdCarrier {
         Ok(())
     }
 
+    pub(crate) fn refresh_selected_routes(
+        &mut self,
+        selected_experts: &[u32],
+        route_weights: &[f32],
+    ) -> Result<(), QwenMoeLlamaIdError> {
+        qwen_moe_llama_validate_selected_routes(
+            self.n_tokens,
+            self.n_expert,
+            self.n_expert_used,
+            selected_experts,
+            route_weights,
+        )?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                selected_experts.as_ptr(),
+                self.selected_experts_dev.contents().as_ptr() as *mut u32,
+                selected_experts.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                route_weights.as_ptr(),
+                self.route_weights_dev.contents().as_ptr() as *mut f32,
+                route_weights.len(),
+            );
+        }
+        Ok(())
+    }
+
     fn write_routes(
         &mut self,
         selected_experts: &[u32],
@@ -2162,7 +2213,108 @@ impl QwenMoeLlamaIdCarrier {
         }
         total
     }
+}
 
+impl GemmaMoeTensoropsCarrier {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        selected_plan: QwenMoeLlamaIdPlan,
+        shared_ffn_dim: usize,
+        selected_experts: &[u32],
+        route_weights: &[f32],
+    ) -> Result<Self, QwenMoeLlamaIdError> {
+        if shared_ffn_dim == 0 {
+            return Err(QwenMoeLlamaIdError::InvalidShape);
+        }
+        let shared_route_weights = vec![1.0f32; selected_plan.n_tokens];
+        let mut selected = QwenMoeLlamaIdCarrier::new(
+            ctx,
+            selected_plan,
+            selected_experts,
+            route_weights,
+            &shared_route_weights,
+        )?;
+        // The Gemma path consumes F32 input directly and does not quantize Q8_K.
+        // GeGLU also finishes reading `up` before Q5_1 down starts writing route
+        // output, so both otherwise-disjoint scratch ranges can be aliased.
+        selected.q8_dev = selected.gate_dev.clone();
+        selected.up_dev = selected.down_rank_dev.clone();
+        // The selected input is dead before the final reducer writes its
+        // token-major output.
+        selected.shared_out_dev = selected.sparse_moe_out_dev.clone();
+        let mut shared = PrefillFfnCarrier::new(
+            ctx,
+            selected_plan.hidden_dim,
+            shared_ffn_dim,
+            selected_plan.n_tokens,
+        );
+        // The fixed shared Q8_0 chain stays F32 throughout.
+        shared.normed_f16_dev = shared.normed_dev.clone();
+        shared.act_f16_dev = shared.gate_dev.clone();
+        // Shared gate/up finish reading the normalized input before down writes
+        // the final hidden rows.
+        shared.down_dev = shared.normed_dev.clone();
+        let selected_activation_elements = selected_plan
+            .n_tokens
+            .checked_mul(selected_plan.n_expert_used)
+            .and_then(|slots| slots.checked_mul(selected_plan.ffn_dim))
+            .and_then(|elements| u32::try_from(elements).ok())
+            .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+        let selected_activation_dim_dev = u32_buf(ctx, selected_activation_elements);
+        Ok(Self {
+            selected,
+            shared,
+            selected_activation_dim_dev,
+        })
+    }
+
+    pub(crate) fn refresh_routes(
+        &mut self,
+        selected_experts: &[u32],
+        route_weights: &[f32],
+    ) -> Result<(), QwenMoeLlamaIdError> {
+        self.selected
+            .refresh_selected_routes(selected_experts, route_weights)
+    }
+
+    pub(crate) fn upload_inputs(
+        &self,
+        selected_input: &[f32],
+        shared_input: &[f32],
+    ) -> Result<(), QwenMoeLlamaIdError> {
+        let input_elements = self
+            .selected
+            .n_tokens
+            .checked_mul(self.selected.hidden_dim)
+            .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+        if selected_input.len() != input_elements || shared_input.len() != input_elements {
+            return Err(QwenMoeLlamaIdError::InvalidShape);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                selected_input.as_ptr(),
+                self.selected.shared_out_dev.contents().as_ptr() as *mut f32,
+                input_elements,
+            );
+        }
+        self.shared.upload_normed(shared_input);
+        Ok(())
+    }
+
+    pub(crate) fn selected_output(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.selected.sparse_moe_out_dev
+    }
+
+    pub(crate) fn shared_output(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.shared.down_dev
+    }
+
+    pub(crate) fn output_elements(&self) -> usize {
+        self.selected.n_tokens * self.selected.hidden_dim
+    }
+}
+
+impl QwenMoeLlamaIdCarrier {
     #[cfg(test)]
     fn prefill_route_norm_aliases_sparse_output(&self) -> bool {
         self.prefill_route.as_ref().is_some_and(|route| {
@@ -2415,7 +2567,9 @@ fn qwen_moe_llama_mul_mm_id_encode_inner(
     };
     let expected_expert_bytes =
         qwen_moe_llama_id_checked_bytes(&[shape.output_dim, shape.input_dim / 256], block_bytes)?;
-    if shape.expert_weight_bytes != expected_expert_bytes {
+    if shape.expert_weight_bytes != expected_expert_bytes
+        || shape.expert_stride_bytes < shape.expert_weight_bytes
+    {
         return Err(QwenMoeLlamaIdError::ExpertArenaMismatch);
     }
 
@@ -2423,10 +2577,14 @@ fn qwen_moe_llama_mul_mm_id_encode_inner(
         QwenMoeLlamaIdInput::F32 => std::mem::size_of::<f32>(),
         QwenMoeLlamaIdInput::F16 => std::mem::size_of::<u16>(),
     };
-    let weight_bytes =
-        qwen_moe_llama_id_checked_bytes(&[shape.n_expert, shape.expert_weight_bytes], 1)?;
+    let last_expert_offset = shape
+        .n_expert
+        .checked_sub(1)
+        .and_then(|expert| expert.checked_mul(shape.expert_stride_bytes))
+        .ok_or(QwenMoeLlamaIdError::InvalidExpertArena)?;
     let weight_end = weight_offset
-        .checked_add(weight_bytes)
+        .checked_add(last_expert_offset)
+        .and_then(|bytes| bytes.checked_add(shape.expert_weight_bytes))
         .ok_or(QwenMoeLlamaIdError::InvalidExpertArena)?;
     let input_bytes =
         qwen_moe_llama_id_checked_bytes(&[shape.n_tokens, shape.input_dim], input_element_bytes)?;
@@ -2497,7 +2655,7 @@ fn qwen_moe_llama_mul_mm_id_encode_inner(
         u32::try_from(shape.n_tokens).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
     let n_expert_used = u32::try_from(shape.n_expert_used)
         .map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
-    let expert_weight_bytes = u32::try_from(shape.expert_weight_bytes)
+    let expert_stride_bytes = u32::try_from(shape.expert_stride_bytes)
         .map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
     let token_tiles = qwen_moe_llama_id_checked_tiles(shape.n_tokens, 32)?;
     let row_tiles = qwen_moe_llama_id_checked_tiles(shape.output_dim, 64)?;
@@ -2515,7 +2673,7 @@ fn qwen_moe_llama_mul_mm_id_encode_inner(
     set_u32_bytes(enc, input_dim, 6);
     set_u32_bytes(enc, n_tokens, 7);
     set_u32_bytes(enc, n_expert_used, 8);
-    set_u32_bytes(enc, expert_weight_bytes, 9);
+    set_u32_bytes(enc, expert_stride_bytes, 9);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: token_tiles,
@@ -2559,6 +2717,123 @@ pub(crate) fn qwen_moe_llama_mul_mm_id_encode(
         shape,
         false,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemma_moe_llama_mul_mm_id_q5_1_encode(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    weights: &ProtocolObject<dyn MTLBuffer>,
+    weight_offset: usize,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    tpe: &ProtocolObject<dyn MTLBuffer>,
+    ids: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    shape: QwenMoeLlamaIdMatmulShape,
+) -> Result<(), QwenMoeLlamaIdError> {
+    const Q5_1_BLOCK_ELEMENTS: usize = 32;
+    const Q5_1_BLOCK_BYTES: usize = 24;
+
+    if shape.input_dim == 0
+        || shape.input_dim % Q5_1_BLOCK_ELEMENTS != 0
+        || shape.output_dim == 0
+        || shape.n_tokens == 0
+        || shape.n_expert == 0
+        || shape.n_expert_used == 0
+        || shape.n_expert_used > shape.n_expert
+        || weight_offset % std::mem::align_of::<u16>() != 0
+    {
+        return Err(QwenMoeLlamaIdError::InvalidShape);
+    }
+
+    let expected_expert_bytes = qwen_moe_llama_id_checked_bytes(
+        &[shape.output_dim, shape.input_dim / Q5_1_BLOCK_ELEMENTS],
+        Q5_1_BLOCK_BYTES,
+    )?;
+    if shape.expert_weight_bytes != expected_expert_bytes
+        || shape.expert_stride_bytes < shape.expert_weight_bytes
+    {
+        return Err(QwenMoeLlamaIdError::ExpertArenaMismatch);
+    }
+    let last_expert_offset = shape
+        .n_expert
+        .checked_sub(1)
+        .and_then(|expert| expert.checked_mul(shape.expert_stride_bytes))
+        .ok_or(QwenMoeLlamaIdError::InvalidExpertArena)?;
+    let weight_end = weight_offset
+        .checked_add(last_expert_offset)
+        .and_then(|bytes| bytes.checked_add(shape.expert_weight_bytes))
+        .ok_or(QwenMoeLlamaIdError::InvalidExpertArena)?;
+    let input_bytes = qwen_moe_llama_id_checked_bytes(
+        &[shape.n_tokens, shape.input_dim],
+        std::mem::size_of::<f32>(),
+    )?;
+    let tpe_bytes = qwen_moe_llama_id_checked_bytes(&[shape.n_expert], std::mem::size_of::<u32>())?;
+    let ids_bytes = qwen_moe_llama_id_checked_bytes(
+        &[shape.n_expert, shape.n_tokens],
+        std::mem::size_of::<i32>(),
+    )?;
+    let output_bytes = qwen_moe_llama_id_checked_bytes(
+        &[shape.n_tokens, shape.n_expert_used, shape.output_dim],
+        std::mem::size_of::<f32>(),
+    )?;
+    if weights.length() < weight_end {
+        return Err(QwenMoeLlamaIdError::InvalidExpertArena);
+    }
+    if input.length() < input_bytes
+        || tpe.length() < tpe_bytes
+        || ids.length() < ids_bytes
+        || output.length() < output_bytes
+    {
+        return Err(QwenMoeLlamaIdError::InvalidShape);
+    }
+
+    let pipeline = ctx
+        .gemma_moe_llama_mul_mm_id_q5_1_f32_pipeline()
+        .ok_or(QwenMoeLlamaIdError::CommandBufferFailed)?;
+    if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
+        return Err(QwenMoeLlamaIdError::DispatchGridOverflow);
+    }
+    let output_dim =
+        u32::try_from(shape.output_dim).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let input_dim =
+        u32::try_from(shape.input_dim).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let n_tokens =
+        u32::try_from(shape.n_tokens).map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let n_expert_used = u32::try_from(shape.n_expert_used)
+        .map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let expert_stride_bytes = u32::try_from(shape.expert_stride_bytes)
+        .map_err(|_| QwenMoeLlamaIdError::DispatchGridOverflow)?;
+    let token_tiles = qwen_moe_llama_id_checked_tiles(shape.n_tokens, 32)?;
+    let row_tiles = qwen_moe_llama_id_checked_tiles(shape.output_dim, 64)?;
+
+    enc.setComputePipelineState(pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(weights), weight_offset, 0);
+        enc.setBuffer_offset_atIndex(Some(input), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(tpe), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(ids), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(output), 0, 4);
+        enc.setThreadgroupMemoryLength_atIndex(8192, 0);
+    }
+    set_u32_bytes(enc, output_dim, 5);
+    set_u32_bytes(enc, input_dim, 6);
+    set_u32_bytes(enc, n_tokens, 7);
+    set_u32_bytes(enc, n_expert_used, 8);
+    set_u32_bytes(enc, expert_stride_bytes, 9);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: token_tiles,
+            height: row_tiles,
+            depth: shape.n_expert,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
 }
 
 pub(crate) fn qwen_moe_llama_quantize_q8k_f32_encode(
@@ -3664,9 +3939,19 @@ fn qwen_moe_llama_prefill_encode_inner(
             carrier.hidden_dim,
             carrier.ffn_dim,
         )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.gate,
+            carrier.hidden_dim,
+            carrier.ffn_dim,
+        )?,
     };
     let up_shape = QwenMoeLlamaIdMatmulShape {
         expert_weight_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.up,
+            carrier.hidden_dim,
+            carrier.ffn_dim,
+        )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
             sparse_quant.up,
             carrier.hidden_dim,
             carrier.ffn_dim,
@@ -3682,6 +3967,11 @@ fn qwen_moe_llama_prefill_encode_inner(
         // route_slot while preserving the original expert-major map stride.
         n_expert_used: 1,
         expert_weight_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.down,
+            carrier.ffn_dim,
+            carrier.hidden_dim,
+        )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
             sparse_quant.down,
             carrier.ffn_dim,
             carrier.hidden_dim,
@@ -4930,9 +5220,19 @@ pub(crate) fn qwen_moe_llama_prefill_trace_split(
             carrier.hidden_dim,
             carrier.ffn_dim,
         )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.gate,
+            carrier.hidden_dim,
+            carrier.ffn_dim,
+        )?,
     };
     let up_shape = QwenMoeLlamaIdMatmulShape {
         expert_weight_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.up,
+            carrier.hidden_dim,
+            carrier.ffn_dim,
+        )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
             sparse_quant.up,
             carrier.hidden_dim,
             carrier.ffn_dim,
@@ -4946,6 +5246,11 @@ pub(crate) fn qwen_moe_llama_prefill_trace_split(
         n_expert: carrier.n_expert,
         n_expert_used: 1,
         expert_weight_bytes: qwen_moe_llama_expert_weight_bytes(
+            sparse_quant.down,
+            carrier.ffn_dim,
+            carrier.hidden_dim,
+        )?,
+        expert_stride_bytes: qwen_moe_llama_expert_weight_bytes(
             sparse_quant.down,
             carrier.ffn_dim,
             carrier.hidden_dim,
@@ -11690,6 +11995,179 @@ fn prefill_ffn_q8_0_gemm_encode(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn gemma_moe_tensorops_prefill_encode(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &GemmaMoeTensoropsCarrier,
+    gate_up_weights: &ProtocolObject<dyn MTLBuffer>,
+    gate_up_offset: usize,
+    gate_expert_bytes: usize,
+    down_weights: &ProtocolObject<dyn MTLBuffer>,
+    down_offset: usize,
+    down_expert_bytes: usize,
+    shared_gate: &ProtocolObject<dyn MTLBuffer>,
+    shared_gate_offset: u32,
+    shared_up: &ProtocolObject<dyn MTLBuffer>,
+    shared_up_offset: u32,
+    shared_down: &ProtocolObject<dyn MTLBuffer>,
+    shared_down_offset: u32,
+) -> Result<(), QwenMoeLlamaIdError> {
+    let selected = &carrier.selected;
+    let shared = &carrier.shared;
+    let gate_up_expert_stride = gate_expert_bytes
+        .checked_mul(2)
+        .ok_or(QwenMoeLlamaIdError::InvalidShape)?;
+    let up_offset = gate_up_offset
+        .checked_add(gate_expert_bytes)
+        .ok_or(QwenMoeLlamaIdError::InvalidExpertArena)?;
+
+    let gate_shape = QwenMoeLlamaIdMatmulShape {
+        input_dim: selected.hidden_dim,
+        output_dim: selected.ffn_dim,
+        n_tokens: selected.n_tokens,
+        n_expert: selected.n_expert,
+        n_expert_used: selected.n_expert_used,
+        expert_weight_bytes: gate_expert_bytes,
+        expert_stride_bytes: gate_up_expert_stride,
+    };
+    let up_shape = gate_shape;
+    let down_shape = QwenMoeLlamaIdMatmulShape {
+        input_dim: selected.ffn_dim,
+        output_dim: selected.hidden_dim,
+        n_tokens: selected.n_tokens,
+        n_expert: selected.n_expert,
+        n_expert_used: 1,
+        expert_weight_bytes: down_expert_bytes,
+        expert_stride_bytes: down_expert_bytes,
+    };
+
+    qwen_moe_llama_id_map0_encode(
+        ctx,
+        enc,
+        &selected.selected_experts_dev,
+        &selected.tpe_dev,
+        &selected.ids_dev,
+        selected.n_tokens,
+        selected.n_expert_used,
+        selected.n_expert,
+    )?;
+    crate::compute::chain_barrier(ctx, enc);
+
+    qwen_moe_llama_mul_mm_id_encode(
+        ctx,
+        enc,
+        QwenMoeLlamaIdQuant::Q4K,
+        QwenMoeLlamaIdInput::F32,
+        gate_up_weights,
+        gate_up_offset,
+        &selected.shared_out_dev,
+        &selected.tpe_dev,
+        &selected.ids_dev,
+        &selected.gate_dev,
+        gate_shape,
+    )?;
+    qwen_moe_llama_mul_mm_id_encode(
+        ctx,
+        enc,
+        QwenMoeLlamaIdQuant::Q4K,
+        QwenMoeLlamaIdInput::F32,
+        gate_up_weights,
+        up_offset,
+        &selected.shared_out_dev,
+        &selected.tpe_dev,
+        &selected.ids_dev,
+        &selected.up_dev,
+        up_shape,
+    )?;
+    prefill_ffn_q8_0_gemm_encode(
+        ctx,
+        enc,
+        shared_gate,
+        shared_gate_offset,
+        &shared.normed_dev,
+        &shared.gate_dev,
+        &shared.fdim_buf,
+        &shared.k_hidden_buf,
+        &shared.m_buf,
+        shared.ffn_dim,
+        shared.seq_len,
+        false,
+    );
+    prefill_ffn_q8_0_gemm_encode(
+        ctx,
+        enc,
+        shared_up,
+        shared_up_offset,
+        &shared.normed_dev,
+        &shared.up_dev,
+        &shared.fdim_buf,
+        &shared.k_hidden_buf,
+        &shared.m_buf,
+        shared.ffn_dim,
+        shared.seq_len,
+        false,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+
+    encode_gelu_mul(
+        ctx,
+        enc,
+        &selected.gate_dev,
+        &selected.up_dev,
+        &carrier.selected_activation_dim_dev,
+        selected.n_tokens * selected.n_expert_used * selected.ffn_dim,
+    );
+    encode_gelu_mul(
+        ctx,
+        enc,
+        &shared.gate_dev,
+        &shared.up_dev,
+        &shared.act_dim_buf,
+        shared.seq_len * shared.ffn_dim,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+
+    gemma_moe_llama_mul_mm_id_q5_1_encode(
+        ctx,
+        enc,
+        down_weights,
+        down_offset,
+        &selected.gate_dev,
+        &selected.tpe_dev,
+        &selected.ids_dev,
+        &selected.down_rank_dev,
+        down_shape,
+    )?;
+    prefill_ffn_q8_0_gemm_encode(
+        ctx,
+        enc,
+        shared_down,
+        shared_down_offset,
+        &shared.gate_dev,
+        &shared.down_dev,
+        &shared.hdim_buf,
+        &shared.k_ffn_buf,
+        &shared.m_buf,
+        shared.hidden_dim,
+        shared.seq_len,
+        false,
+    );
+    crate::compute::chain_barrier(ctx, enc);
+
+    qwen_moe_llama_expert_order_reduce_f32_encode(
+        ctx,
+        enc,
+        &selected.down_rank_dev,
+        &selected.route_weights_dev,
+        &selected.selected_experts_dev,
+        &selected.sparse_moe_out_dev,
+        selected.n_tokens,
+        selected.n_expert_used,
+        selected.hidden_dim,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_ffn_q8_0_chain_dispatch(
     ctx: &MetalContext,
     carrier: &PrefillFfnCarrier,
@@ -14312,6 +14790,7 @@ mod tests {
                 n_expert: N_EXPERT,
                 n_expert_used: N_EXPERT_USED,
                 expert_weight_bytes,
+                expert_stride_bytes: expert_weight_bytes,
             };
             let reference_out = empty_f32_buf(&ctx, N_TOKENS * DIM);
             let hybrid_out = empty_f32_buf(&ctx, N_TOKENS * DIM);
@@ -18596,6 +19075,7 @@ mod tests {
                                 n_expert: N_EXPERT,
                                 n_expert_used: N_EXPERT_USED,
                                 expert_weight_bytes,
+                                expert_stride_bytes: expert_weight_bytes,
                             },
                         )
                         .expect("ID matmul encode");
@@ -18796,6 +19276,7 @@ mod tests {
                         n_expert: 1,
                         n_expert_used: 1,
                         expert_weight_bytes: weight_bytes.len(),
+                        expert_stride_bytes: weight_bytes.len(),
                     },
                 )
                 .expect("exact sparse q8k");
@@ -18891,6 +19372,51 @@ mod tests {
                         .map(|value| half::f16::from_f32(value).to_f32()),
                 );
                 weights.extend_from_slice(&block);
+            }
+        }
+        (weights, dequantized)
+    }
+
+    fn gemma_moe_test_q5_1_sparse_matrix(
+        n_expert: usize,
+        output_dim: usize,
+        input_dim: usize,
+        seed_base: usize,
+    ) -> (Vec<u8>, Vec<f32>) {
+        assert_eq!(input_dim % 32, 0);
+        let mut weights = Vec::with_capacity(n_expert * output_dim * (input_dim / 32) * 24);
+        let mut dequantized = Vec::with_capacity(n_expert * output_dim * input_dim);
+        for expert in 0..n_expert {
+            for row in 0..output_dim {
+                for block_index in 0..input_dim / 32 {
+                    let seed = seed_base + expert * 1009 + row * 29 + block_index * 11;
+                    let d = half::f16::from_f32(0.003 + (seed % 17) as f32 * 0.0002);
+                    let m = half::f16::from_f32(-0.04 + (seed % 9) as f32 * 0.003);
+                    let qh = (0..32).fold(0u32, |bits, bit| {
+                        bits | ((((seed + bit * 7) % 5 == 0) as u32) << bit)
+                    });
+                    let mut qs = [0u8; 16];
+                    for (index, packed) in qs.iter_mut().enumerate() {
+                        let low = ((seed * 3 + index * 5) % 16) as u8;
+                        let high = ((seed * 7 + index * 11) % 16) as u8;
+                        *packed = low | (high << 4);
+                    }
+                    weights.extend_from_slice(&d.to_le_bytes());
+                    weights.extend_from_slice(&m.to_le_bytes());
+                    weights.extend_from_slice(&qh.to_le_bytes());
+                    weights.extend_from_slice(&qs);
+                    for index in 0..32 {
+                        let low = if index < 16 {
+                            qs[index] & 0x0f
+                        } else {
+                            qs[index - 16] >> 4
+                        };
+                        let high = ((qh >> index) & 1) as u8;
+                        let quant = (low | (high << 4)) as f32;
+                        dequantized
+                            .push(half::f16::from_f32(d.to_f32() * quant + m.to_f32()).to_f32());
+                    }
+                }
             }
         }
         (weights, dequantized)
@@ -19013,6 +19539,229 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    #[ignore = "requires a TensorOps-capable Metal device"]
+    fn gemma_moe_tensorops_carrier_matches_cpu_oracle() {
+        let ctx =
+            crate::compute::build_metal_context_with_opts(false, true).expect("no metal device");
+        if !ctx.tensorops_capable {
+            eprintln!("skipping: Metal tensor operations unavailable");
+            return;
+        }
+
+        const N_TOKENS: usize = 32;
+        const N_EXPERT: usize = 4;
+        const N_EXPERT_USED: usize = 2;
+        const HIDDEN_DIM: usize = 256;
+        const SELECTED_FFN_DIM: usize = 64;
+        const SHARED_FFN_DIM: usize = 64;
+
+        let selected_input = qwen_moe_llama_test_input(N_TOKENS, HIDDEN_DIM);
+        let mut shared_input = qwen_moe_llama_test_input(N_TOKENS, HIDDEN_DIM);
+        for value in &mut shared_input {
+            *value = *value * -0.75 + 0.03125;
+        }
+        let mut selected_experts = Vec::with_capacity(N_TOKENS * N_EXPERT_USED);
+        let mut route_weights = Vec::with_capacity(N_TOKENS * N_EXPERT_USED);
+        for token in 0..N_TOKENS {
+            selected_experts.push((token % N_EXPERT) as u32);
+            selected_experts.push(((token + 1) % N_EXPERT) as u32);
+            route_weights.extend_from_slice(&[0.625, 0.375]);
+        }
+
+        let mut gate_up_bytes = Vec::new();
+        let mut gate_values = Vec::new();
+        let mut up_values = Vec::new();
+        let mut gate_expert_bytes = 0;
+        for expert in 0..N_EXPERT {
+            let (gate, gate_dequantized) = qwen_moe_llama_test_sparse_matrix(
+                QwenMoeLlamaIdQuant::Q4K,
+                1,
+                SELECTED_FFN_DIM,
+                HIDDEN_DIM,
+                7101 + expert * 101,
+            );
+            let (up, up_dequantized) = qwen_moe_llama_test_sparse_matrix(
+                QwenMoeLlamaIdQuant::Q4K,
+                1,
+                SELECTED_FFN_DIM,
+                HIDDEN_DIM,
+                9101 + expert * 103,
+            );
+            gate_expert_bytes = gate.len();
+            gate_up_bytes.extend_from_slice(&gate);
+            gate_up_bytes.extend_from_slice(&up);
+            gate_values.extend(gate_dequantized);
+            up_values.extend(up_dequantized);
+        }
+        let (down_bytes, down_values) =
+            gemma_moe_test_q5_1_sparse_matrix(N_EXPERT, HIDDEN_DIM, SELECTED_FFN_DIM, 11101);
+        let down_expert_bytes = down_bytes.len() / N_EXPERT;
+        let (shared_gate_bytes, shared_gate_values) =
+            qwen_moe_llama_test_q8_matrix(SHARED_FFN_DIM, HIDDEN_DIM, 13101);
+        let (shared_up_bytes, shared_up_values) =
+            qwen_moe_llama_test_q8_matrix(SHARED_FFN_DIM, HIDDEN_DIM, 15101);
+        let (shared_down_bytes, shared_down_values) =
+            qwen_moe_llama_test_q8_matrix(HIDDEN_DIM, SHARED_FFN_DIM, 17101);
+
+        let plan = match qwen_moe_llama_id_preflight(
+            true,
+            true,
+            N_TOKENS,
+            N_EXPERT,
+            N_EXPERT_USED,
+            HIDDEN_DIM,
+            SELECTED_FFN_DIM,
+            usize::MAX,
+        )
+        .expect("Gemma carrier preflight")
+        {
+            QwenMoeLlamaIdPreflight::Run(plan) => plan,
+            QwenMoeLlamaIdPreflight::Fallback(reason) => {
+                panic!("unexpected Gemma carrier fallback: {reason:?}")
+            }
+        };
+        let mut carrier = GemmaMoeTensoropsCarrier::new(
+            &ctx,
+            plan,
+            SHARED_FFN_DIM,
+            &selected_experts,
+            &route_weights,
+        )
+        .expect("Gemma carrier");
+        carrier
+            .refresh_routes(&selected_experts, &route_weights)
+            .expect("Gemma routes");
+        carrier
+            .upload_inputs(&selected_input, &shared_input)
+            .expect("Gemma inputs");
+
+        let gate_up = shared_u8_buf(&ctx, &gate_up_bytes);
+        let down = shared_u8_buf(&ctx, &down_bytes);
+        let shared_gate = shared_u8_buf(&ctx, &shared_gate_bytes);
+        let shared_up = shared_u8_buf(&ctx, &shared_up_bytes);
+        let shared_down = shared_u8_buf(&ctx, &shared_down_bytes);
+        let command = ctx.queue.commandBuffer().expect("command buffer");
+        let encoder = crate::compute::chain_compute_encoder(&ctx, &command);
+        gemma_moe_tensorops_prefill_encode(
+            &ctx,
+            &encoder,
+            &carrier,
+            &gate_up,
+            0,
+            gate_expert_bytes,
+            &down,
+            0,
+            down_expert_bytes,
+            &shared_gate,
+            0,
+            &shared_up,
+            0,
+            &shared_down,
+            0,
+        )
+        .expect("Gemma TensorOps encode");
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+        let selected_got = readback(carrier.selected_output(), N_TOKENS * HIDDEN_DIM);
+        let shared_got = readback(carrier.shared_output(), N_TOKENS * HIDDEN_DIM);
+
+        let gelu = |gate: f32, up: f32| {
+            let inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate);
+            0.5 * gate * (1.0 + inner.tanh()) * up
+        };
+        let mut selected_want = vec![0.0f32; N_TOKENS * HIDDEN_DIM];
+        let mut shared_want = vec![0.0f32; N_TOKENS * HIDDEN_DIM];
+        for token in 0..N_TOKENS {
+            let selected_row = &selected_input[token * HIDDEN_DIM..(token + 1) * HIDDEN_DIM];
+            for rank in 0..N_EXPERT_USED {
+                let slot = token * N_EXPERT_USED + rank;
+                let expert = selected_experts[slot] as usize;
+                let gate_base = expert * SELECTED_FFN_DIM * HIDDEN_DIM;
+                let down_base = expert * HIDDEN_DIM * SELECTED_FFN_DIM;
+                let gate = qwen_moe_llama_test_matmul(
+                    &gate_values[gate_base..gate_base + SELECTED_FFN_DIM * HIDDEN_DIM],
+                    selected_row,
+                    SELECTED_FFN_DIM,
+                    HIDDEN_DIM,
+                );
+                let up = qwen_moe_llama_test_matmul(
+                    &up_values[gate_base..gate_base + SELECTED_FFN_DIM * HIDDEN_DIM],
+                    selected_row,
+                    SELECTED_FFN_DIM,
+                    HIDDEN_DIM,
+                );
+                let activation = gate
+                    .iter()
+                    .zip(&up)
+                    .map(|(&gate, &up)| gelu(gate, up))
+                    .collect::<Vec<_>>();
+                let down = qwen_moe_llama_test_matmul(
+                    &down_values[down_base..down_base + HIDDEN_DIM * SELECTED_FFN_DIM],
+                    &activation,
+                    HIDDEN_DIM,
+                    SELECTED_FFN_DIM,
+                );
+                for row in 0..HIDDEN_DIM {
+                    selected_want[token * HIDDEN_DIM + row] += route_weights[slot] * down[row];
+                }
+            }
+
+            let shared_row = &shared_input[token * HIDDEN_DIM..(token + 1) * HIDDEN_DIM];
+            let shared_gate = qwen_moe_llama_test_matmul(
+                &shared_gate_values,
+                shared_row,
+                SHARED_FFN_DIM,
+                HIDDEN_DIM,
+            );
+            let shared_up = qwen_moe_llama_test_matmul(
+                &shared_up_values,
+                shared_row,
+                SHARED_FFN_DIM,
+                HIDDEN_DIM,
+            );
+            let shared_activation = shared_gate
+                .iter()
+                .zip(&shared_up)
+                .map(|(&gate, &up)| gelu(gate, up))
+                .collect::<Vec<_>>();
+            let shared_result = qwen_moe_llama_test_matmul(
+                &shared_down_values,
+                &shared_activation,
+                HIDDEN_DIM,
+                SHARED_FFN_DIM,
+            );
+            shared_want[token * HIDDEN_DIM..(token + 1) * HIDDEN_DIM]
+                .copy_from_slice(&shared_result);
+        }
+
+        let max_error = |got: &[f32], want: &[f32]| {
+            got.iter()
+                .zip(want)
+                .fold((0.0f32, 0.0f32), |(max_abs, max_rel), (&got, &want)| {
+                    let abs = (got - want).abs();
+                    let rel = abs / want.abs().max(1.0e-6);
+                    (max_abs.max(abs), max_rel.max(rel))
+                })
+        };
+        let selected_error = max_error(&selected_got, &selected_want);
+        let shared_error = max_error(&shared_got, &shared_want);
+        eprintln!(
+            "Gemma TensorOps oracle selected_max_abs={} selected_max_rel={} shared_max_abs={} shared_max_rel={}",
+            selected_error.0, selected_error.1, shared_error.0, shared_error.1
+        );
+        assert!(
+            selected_error.0 <= 0.02 && selected_error.1 <= 0.02,
+            "selected error: {selected_error:?}"
+        );
+        assert!(
+            shared_error.0 <= 0.02 && shared_error.1 <= 0.02,
+            "shared error: {shared_error:?}"
+        );
     }
 
     #[test]
@@ -19596,9 +20345,11 @@ mod tests {
             n_expert: N_EXPERT,
             n_expert_used: N_EXPERT_USED,
             expert_weight_bytes: gate_expert_bytes,
+            expert_stride_bytes: gate_expert_bytes,
         };
         let up_shape = QwenMoeLlamaIdMatmulShape {
             expert_weight_bytes: up_expert_bytes,
+            expert_stride_bytes: up_expert_bytes,
             ..gate_shape
         };
         let down_shape = QwenMoeLlamaIdMatmulShape {
@@ -19608,6 +20359,7 @@ mod tests {
             n_expert: N_EXPERT,
             n_expert_used: 1,
             expert_weight_bytes: down_expert_bytes,
+            expert_stride_bytes: down_expert_bytes,
         };
         submit(&ctx, |encoder| {
             qwen_moe_llama_mul_mm_id_encode(

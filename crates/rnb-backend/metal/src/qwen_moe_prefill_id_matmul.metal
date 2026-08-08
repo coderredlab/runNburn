@@ -1832,6 +1832,13 @@ struct qwen_llama_block_q5_K {
     uchar qs[128];
 };
 
+struct qwen_llama_block_q5_1 {
+    half d;
+    half m;
+    uchar qh[4];
+    uchar qs[16];
+};
+
 struct qwen_llama_block_q6_K {
     uchar ql[128];
     uchar qh[64];
@@ -2051,6 +2058,27 @@ static inline void qwen_llama_dequantize_q5_K(
     }
 }
 
+static inline void qwen_llama_dequantize_q5_1(
+    device const qwen_llama_block_q5_1 *xb,
+    short il,
+    thread half4x4 &reg)
+{
+    const uint qh =
+        (uint)xb->qh[0] |
+        ((uint)xb->qh[1] << 8) |
+        ((uint)xb->qh[2] << 16) |
+        ((uint)xb->qh[3] << 24);
+    const short bit_offset = 16 * il;
+
+    for (short i = 0; i < 16; ++i) {
+        const uchar packed = xb->qs[i];
+        const uchar low = il == 0 ? (packed & 0x0f) : (packed >> 4);
+        const uchar high = (uchar)((qh >> (bit_offset + i)) & 1u);
+        const float quant = (float)(low | (high << 4));
+        reg[i / 4][i % 4] = (half)((float)xb->d * quant + (float)xb->m);
+    }
+}
+
 static inline void qwen_llama_dequantize_q6_K(
     device const qwen_llama_block_q6_K *xb,
     short il,
@@ -2104,6 +2132,7 @@ static inline void qwen_llama_dequantize_q8_0(
 
 template<
     bool SMALL_ONLY,
+    short QK,
     typename block_q,
     void (*dequantize_func)(device const block_q *, short, thread half4x4 &),
     typename input_t,
@@ -2130,7 +2159,7 @@ static inline void qwen_moe_llama_mul_mm_id_impl(
     constexpr short NK = 32;
     constexpr short NL0 = NK / 16;
     constexpr short NL1 = NK / 8;
-    constexpr short NL = 16;
+    constexpr short NL = QK / 16;
 
     const uint expert = tgid.z;
     const uint row0 = tgid.y * NR0;
@@ -2151,7 +2180,7 @@ static inline void qwen_moe_llama_mul_mm_id_impl(
 
     const uint route_slot = (uint)ids[expert * N_TOKENS + local0 + lr1];
     const uint token = route_slot / TOP_K;
-    const uint blocks_per_row = K / 256u;
+    const uint blocks_per_row = K / (uint)QK;
     device const uchar *expert_weight = weight_bytes + expert * EXPERT_STRIDE_BYTES;
     device const block_q *x =
         (device const block_q *)expert_weight + (row0 + lr0) * blocks_per_row;
@@ -2243,64 +2272,69 @@ static inline void qwen_moe_llama_mul_mm_id_impl(
     ushort lane [[thread_index_in_simdgroup]], \
     ushort simdgroup [[simdgroup_index_in_threadgroup]]
 
-#define QWEN_LLAMA_ID_CALL(SMALL_ONLY, BLOCK_T, DEQUANT, INPUT_T, INPUT_VEC_T) \
-    qwen_moe_llama_mul_mm_id_impl<SMALL_ONLY, BLOCK_T, DEQUANT, INPUT_T, INPUT_VEC_T>( \
+#define QWEN_LLAMA_ID_CALL(SMALL_ONLY, QK, BLOCK_T, DEQUANT, INPUT_T, INPUT_VEC_T) \
+    qwen_moe_llama_mul_mm_id_impl<SMALL_ONLY, QK, BLOCK_T, DEQUANT, INPUT_T, INPUT_VEC_T>( \
         weight_bytes, input, tpe, ids, out, N, K, N_TOKENS, TOP_K, \
         EXPERT_STRIDE_BYTES, shmem, tgid, tid, lane, simdgroup)
 
 kernel void qwen_moe_llama_mul_mm_id_q4k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, float, float2x4);
+        false, 256, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, float, float2x4);
 }
 
 kernel void qwen_moe_llama_mul_mm_id_q4k_f16(QWEN_LLAMA_ID_KERNEL_ARGS(half))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, half, half2x4);
+        false, 256, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, half, half2x4);
 }
 
 kernel void qwen_moe_llama_mul_mm_id_q5k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, float, float2x4);
+        false, 256, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, float, float2x4);
 }
 
 kernel void qwen_moe_llama_mul_mm_id_q5k_f16(QWEN_LLAMA_ID_KERNEL_ARGS(half))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, half, half2x4);
+        false, 256, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, half, half2x4);
 }
 
 kernel void qwen_moe_llama_mul_mm_id_q6k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, float, float2x4);
+        false, 256, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, float, float2x4);
 }
 
 kernel void qwen_moe_llama_mul_mm_id_q6k_f16(QWEN_LLAMA_ID_KERNEL_ARGS(half))
 {
     QWEN_LLAMA_ID_CALL(
-        false, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, half, half2x4);
+        false, 256, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, half, half2x4);
 }
 
+kernel void gemma_moe_llama_mul_mm_id_q5_1_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
+{
+    QWEN_LLAMA_ID_CALL(
+        false, 32, qwen_llama_block_q5_1, qwen_llama_dequantize_q5_1, float, float2x4);
+}
 
 kernel void qwen_moe_chain_small_q4k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        true, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, float, float2x4);
+        true, 256, qwen_llama_block_q4_K, qwen_llama_dequantize_q4_K, float, float2x4);
 }
 
 kernel void qwen_moe_chain_small_q5k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        true, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, float, float2x4);
+        true, 256, qwen_llama_block_q5_K, qwen_llama_dequantize_q5_K, float, float2x4);
 }
 
 kernel void qwen_moe_chain_small_q6k_f32(QWEN_LLAMA_ID_KERNEL_ARGS(float))
 {
     QWEN_LLAMA_ID_CALL(
-        true, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, float, float2x4);
+        true, 256, qwen_llama_block_q6_K, qwen_llama_dequantize_q6_K, float, float2x4);
 }
 
 template<

@@ -238,6 +238,7 @@ fn encode_candidate(
             n_expert: fixture.n_expert,
             n_expert_used: fixture.top_k,
             expert_weight_bytes: expert_stride,
+            expert_stride_bytes: expert_stride,
         },
     )
     .expect("production Q4_K/F32 ID encode");

@@ -304,10 +304,6 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
         "norms",
         norms_start,
     );
-    #[cfg(target_arch = "aarch64")]
-    let moe_input_q8k = quantize_raw_q8k(&moe_input);
-    #[cfg(target_arch = "aarch64")]
-    drop(moe_input);
     let gate_up_rows = moe_w.n_ff * 2;
     let per_gate_up = gate_up_bytes.len() / moe_w.n_expert;
     let gate_up_bytes_per_row = per_gate_up / gate_up_rows;
@@ -342,11 +338,105 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
     };
 
     #[cfg(target_arch = "aarch64")]
-    let (mut shared_output, slots, precomputed_group_results) =
-        if gemma_shared_sparse_overlap_enabled() {
-            let slots = compute_slots();
-            let (shared_result, group_result) = rayon::join(
-                || {
+    let (
+        mut shared_output,
+        slots,
+        precomputed_group_results,
+        selected_tensorops_output,
+        selected_tensorops_elapsed,
+    ) = {
+        let slots = compute_slots();
+        let candidate_start = profile_enabled.then(Instant::now);
+        #[cfg(all(feature = "metal", not(feature = "cuda"), target_os = "macos"))]
+        let tensorops_output = if backend_runtime::metal_gemma_moe_tensorops_requested() {
+            let mut selected_experts = vec![0u32; slots.len()];
+            let mut route_weights = vec![0.0f32; slots.len()];
+            for slot in &slots {
+                let route = slot.token * moe_w.n_expert_used + slot.rank;
+                selected_experts[route] = slot.expert as u32;
+                route_weights[route] = slot.weight * down_scale[slot.expert];
+            }
+            backend_runtime::metal_gemma_moe_tensorops_prefill_if_supported(
+                moe_w.gate_up_quant,
+                gate_up_bytes,
+                moe_w.down_quant,
+                down_bytes,
+                per_gate_up / 2,
+                per_down,
+                &selected_experts,
+                &route_weights,
+                &w.ffn_gate_weight,
+                &w.ffn_up_weight,
+                &w.ffn_down_weight,
+                &moe_input,
+                &shared_norm,
+                seq_len,
+                hidden_dim,
+                moe_w.n_ff,
+                moe_w.n_expert,
+                moe_w.n_expert_used,
+            )?
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"), target_os = "macos")))]
+        let tensorops_output = None::<(Vec<f32>, Vec<f32>)>;
+        let tensorops_elapsed = candidate_start.map_or(Duration::ZERO, |start| start.elapsed());
+
+        if let Some((selected_output, shared_down)) = tensorops_output {
+            drop(moe_input);
+            let mut shared_output = vec![0.0f32; seq_len * hidden_dim];
+            apply_model_norm_into(
+                &shared_down,
+                post_norm_1_data,
+                norm_eps,
+                &mut shared_output,
+                architecture,
+            );
+            (
+                shared_output,
+                slots,
+                None,
+                Some(selected_output),
+                tensorops_elapsed,
+            )
+        } else {
+            let moe_input_q8k = quantize_raw_q8k(&moe_input);
+            drop(moe_input);
+            let (shared_result, group_result) = if gemma_shared_sparse_overlap_enabled() {
+                rayon::join(
+                    || {
+                        compute_shared_output(
+                            architecture,
+                            w,
+                            &shared_norm,
+                            post_norm_1_data,
+                            seq_len,
+                            hidden_dim,
+                            norm_eps,
+                            layer_idx,
+                            profile_enabled,
+                        )
+                    },
+                    || {
+                        compute_expert_groups(
+                            &slots,
+                            &moe_input_q8k,
+                            gate_up_bytes,
+                            down_bytes,
+                            per_gate_up,
+                            gate_up_bytes_per_row,
+                            per_down,
+                            down_bytes_per_row,
+                            moe_w.n_ff,
+                            hidden_dim,
+                            moe_w.down_quant,
+                            profile_enabled,
+                        )
+                    },
+                )
+            } else {
+                (
                     compute_shared_output(
                         architecture,
                         w,
@@ -357,9 +447,7 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
                         norm_eps,
                         layer_idx,
                         profile_enabled,
-                    )
-                },
-                || {
+                    ),
                     compute_expert_groups(
                         &slots,
                         &moe_input_q8k,
@@ -373,27 +461,18 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
                         hidden_dim,
                         moe_w.down_quant,
                         profile_enabled,
-                    )
-                },
-            );
-            (shared_result?, slots, Some(group_result?))
-        } else {
+                    ),
+                )
+            };
             (
-                compute_shared_output(
-                    architecture,
-                    w,
-                    &shared_norm,
-                    post_norm_1_data,
-                    seq_len,
-                    hidden_dim,
-                    norm_eps,
-                    layer_idx,
-                    profile_enabled,
-                )?,
-                compute_slots(),
+                shared_result?,
+                slots,
+                Some(group_result?),
                 None,
+                Duration::ZERO,
             )
-        };
+        }
+    };
 
     #[cfg(not(target_arch = "aarch64"))]
     let (mut shared_output, slots) = (
@@ -450,7 +529,10 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
             selected_start.map_or(Duration::ZERO, |start| start.elapsed()),
         )
     };
-    #[cfg(not(all(not(target_arch = "aarch64"), feature = "cuda")))]
+    #[cfg(target_arch = "aarch64")]
+    let (selected_fused_output, selected_fused_elapsed) =
+        (selected_tensorops_output, selected_tensorops_elapsed);
+    #[cfg(all(not(target_arch = "aarch64"), not(feature = "cuda")))]
     let (selected_fused_output, selected_fused_elapsed) = (None::<Vec<f32>>, Duration::ZERO);
     let scratch_start = profile_enabled.then(Instant::now);
 
@@ -487,42 +569,29 @@ pub(super) fn forward_ffn_gemma4_moe_expert_major(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let group_results = if let Some(group_results) = precomputed_group_results {
-            group_results
-        } else {
-            compute_expert_groups(
-                &slots,
-                &moe_input_q8k,
-                gate_up_bytes,
-                down_bytes,
-                per_gate_up,
-                gate_up_bytes_per_row,
-                per_down,
-                down_bytes_per_row,
-                moe_w.n_ff,
-                hidden_dim,
-                moe_w.down_quant,
-                profile_enabled,
-            )?
-        };
-        for group in group_results {
-            gather_elapsed += group.gather_elapsed;
-            gate_up_elapsed += group.gate_up_elapsed;
-            activation_elapsed += group.activation_elapsed;
-            down_elapsed += group.down_elapsed;
+        if selected_fused_output.is_none() {
+            let group_results = precomputed_group_results.ok_or_else(|| {
+                crate::error::LlmError::Forward("Gemma expert groups missing".into())
+            })?;
+            for group in group_results {
+                gather_elapsed += group.gather_elapsed;
+                gate_up_elapsed += group.gate_up_elapsed;
+                activation_elapsed += group.activation_elapsed;
+                down_elapsed += group.down_elapsed;
 
-            let scatter_start = profile_enabled.then(Instant::now);
-            let expert = slots[group.start].expert;
-            scatter_weighted_expert_group(
-                &slots[group.start..group.end],
-                &group.output,
-                down_scale[expert],
-                moe_w.n_expert_used,
-                hidden_dim,
-                &mut ranked_output,
-            );
-            if let Some(scatter_start) = scatter_start {
-                scatter_elapsed += scatter_start.elapsed();
+                let scatter_start = profile_enabled.then(Instant::now);
+                let expert = slots[group.start].expert;
+                scatter_weighted_expert_group(
+                    &slots[group.start..group.end],
+                    &group.output,
+                    down_scale[expert],
+                    moe_w.n_expert_used,
+                    hidden_dim,
+                    &mut ranked_output,
+                );
+                if let Some(scatter_start) = scatter_start {
+                    scatter_elapsed += scatter_start.elapsed();
+                }
             }
         }
     }

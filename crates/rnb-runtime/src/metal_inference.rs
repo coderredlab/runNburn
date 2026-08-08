@@ -1,12 +1,37 @@
 pub use rnb_backend_api::{KvarnChainView, KvarnDecodeRequest};
-pub use rnb_backend_metal::QwenMoeLlamaIdPrefillOutput;
+pub use rnb_backend_metal::{GemmaMoeTensoropsPrefillOutput, QwenMoeLlamaIdPrefillOutput};
 use rnb_backend_metal::{
-    QwenMoeLlamaIdPrefillRequest, QwenMoeLlamaIdQuant, QwenMoeLlamaIdQuantSet, TensoropsQuant,
+    GemmaMoeTensoropsPrefillRequest, QwenMoeLlamaIdPrefillRequest, QwenMoeLlamaIdQuant,
+    QwenMoeLlamaIdQuantSet, TensoropsQuant,
 };
 use rnb_loader::GGMLType;
 
 type Result<T> = std::result::Result<T, String>;
 
+pub struct MetalGemmaMoeTensoropsPrefillRequest<'a> {
+    pub gate_up_ggml: GGMLType,
+    pub gate_up_all: &'a [u8],
+    pub down_ggml: GGMLType,
+    pub down_all: &'a [u8],
+    pub gate_expert_bytes: usize,
+    pub down_expert_bytes: usize,
+    pub selected_experts: &'a [u32],
+    pub route_weights: &'a [f32],
+    pub shared_gate_ggml: GGMLType,
+    pub shared_gate: &'a [u8],
+    pub shared_up_ggml: GGMLType,
+    pub shared_up: &'a [u8],
+    pub shared_down_ggml: GGMLType,
+    pub shared_down: &'a [u8],
+    pub selected_input: &'a [f32],
+    pub shared_input: &'a [f32],
+    pub seq_len: usize,
+    pub hidden_dim: usize,
+    pub selected_ffn_dim: usize,
+    pub shared_ffn_dim: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+}
 #[derive(Clone, Copy, Debug)]
 pub struct MetalPrefillProjTrace {
     pub role: &'static str,
@@ -3829,6 +3854,59 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     Ok(true)
 }
 
+fn metal_gemma_moe_tensorops_policy(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+pub fn metal_gemma_moe_tensorops_requested() -> bool {
+    let value = std::env::var("RNB_METAL_GEMMA_MOE_TENSOROPS").ok();
+    metal_gemma_moe_tensorops_policy(value.as_deref())
+}
+
+pub fn metal_gemma_moe_tensorops_prefill_if_supported(
+    request: MetalGemmaMoeTensoropsPrefillRequest<'_>,
+) -> Result<Option<GemmaMoeTensoropsPrefillOutput>> {
+    if !metal_gemma_moe_tensorops_requested() {
+        return Ok(None);
+    }
+    if request.gate_up_ggml != GGMLType::Q4_K
+        || request.down_ggml != GGMLType::Q5_1
+        || request.shared_gate_ggml != GGMLType::Q8_0
+        || request.shared_up_ggml != GGMLType::Q8_0
+        || request.shared_down_ggml != GGMLType::Q8_0
+    {
+        return Ok(None);
+    }
+    METAL.with(|backend| {
+        backend.gemma_moe_tensorops_prefill(GemmaMoeTensoropsPrefillRequest {
+            gate_up_all: request.gate_up_all,
+            down_all: request.down_all,
+            gate_expert_bytes: request.gate_expert_bytes,
+            down_expert_bytes: request.down_expert_bytes,
+            selected_experts: request.selected_experts,
+            route_weights: request.route_weights,
+            shared_gate: request.shared_gate,
+            shared_up: request.shared_up,
+            shared_down: request.shared_down,
+            selected_input: request.selected_input,
+            shared_input: request.shared_input,
+            seq_len: request.seq_len,
+            hidden_dim: request.hidden_dim,
+            selected_ffn_dim: request.selected_ffn_dim,
+            shared_ffn_dim: request.shared_ffn_dim,
+            n_expert: request.n_expert,
+            n_expert_used: request.n_expert_used,
+        })
+    })
+}
+
 #[cfg(test)]
 mod metal_prefill_ffn_quant_mode_tests {
     use super::*;
@@ -3859,6 +3937,17 @@ mod metal_prefill_ffn_quant_mode_tests {
             metal_prefill_ffn_quant_mode(GGMLType::Q8_0, GGMLType::Q4_K, GGMLType::Q8_0, true,),
             None
         );
+    }
+
+    #[test]
+    fn gemma_moe_tensorops_defaults_on_with_falsey_opt_out() {
+        assert!(metal_gemma_moe_tensorops_policy(None));
+        for value in ["0", "false", "OFF", "No"] {
+            assert!(!metal_gemma_moe_tensorops_policy(Some(value)), "{value}");
+        }
+        for value in ["1", "true", "on", "yes"] {
+            assert!(metal_gemma_moe_tensorops_policy(Some(value)), "{value}");
+        }
     }
 }
 
