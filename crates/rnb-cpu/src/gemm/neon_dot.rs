@@ -3325,6 +3325,18 @@ pub fn gemv_q4_k_int8(
                     };
                 }
             });
+    } else if use_neon && !dot_q4k_use_ggml_align() {
+        let out_addr = output.as_mut_ptr() as usize;
+        (0..rows).into_par_iter().for_each(move |row| {
+            let out_ptr = out_addr as *mut f32;
+            let rb = &bytes[row * bytes_per_row..(row + 1) * bytes_per_row];
+            for s in 0..seq_len {
+                let q8k_s = &q8k[s * n_blocks..(s + 1) * n_blocks];
+                unsafe {
+                    *out_ptr.add(s * rows + row) = dot_q4_k_q8k_neon(rb, q8k_s, n_blocks);
+                }
+            }
+        });
     } else if seq_len > 1 && std::arch::is_aarch64_feature_detected!("i8mm") && rows >= 16 {
         let packed_q8k = unsafe { pack_q8k_i8mm_token_pairs(q8k, n_blocks, seq_len) };
         let out_addr = output.as_mut_ptr() as usize;
@@ -3388,7 +3400,11 @@ pub fn gemv_q4_k_int8_dual(
     seq_len: usize,
     bytes_per_row: usize,
 ) {
-    if seq_len > 1 && std::arch::is_aarch64_feature_detected!("i8mm") && rows >= 16 {
+    if seq_len > 1
+        && dot_q4k_use_ggml_align()
+        && std::arch::is_aarch64_feature_detected!("i8mm")
+        && rows >= 16
+    {
         let n_blocks = cols / 256;
         let packed_q8k = unsafe { pack_q8k_i8mm_token_pairs(q8k, n_blocks, seq_len) };
         let left_out_addr = left_output.as_mut_ptr() as usize;
