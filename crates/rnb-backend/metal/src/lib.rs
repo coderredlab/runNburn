@@ -15425,7 +15425,7 @@ mod tests {
     #[ignore = "requires a Metal device"]
     fn prefill_q8_0_gelu_ffn_chain_matches_cpu() {
         let backend = MetalBackend::new();
-        let (hid, ffn, m) = (256usize, 512usize, 17usize);
+        let (hid, ffn) = (256usize, 512usize);
         let gate_w = build_q8_0_rows(ffn, hid);
         let up_w = build_q8_0_rows(ffn, hid);
         let down_w = build_q8_0_rows(hid, ffn);
@@ -15435,45 +15435,48 @@ mod tests {
         let gate_raw = gate_mapped.as_bytes().expect("gate bytes");
         let up_raw = up_mapped.as_bytes().expect("up bytes");
         let down_raw = down_mapped.as_bytes().expect("down bytes");
-        let normed = det_vals(m * hid, 0.1);
-        let g = cpu_q8_0_gemm_reference(&gate_w, ffn, hid, &normed, m);
-        let u = cpu_q8_0_gemm_reference(&up_w, ffn, hid, &normed, m);
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-        let act: Vec<f32> = g
-            .iter()
-            .zip(&u)
-            .map(|(&a, &b)| {
-                let gelu = if a >= 10.0 {
-                    a
-                } else if a <= -10.0 {
-                    0.0
-                } else {
-                    0.5 * a * (1.0 + (sqrt_2_over_pi * (a + 0.044715 * a.powi(3))).tanh())
-                };
-                gelu * b
-            })
-            .collect();
-        let cpu = cpu_q8_0_gemm_reference(&down_w, hid, ffn, &act, m);
-        let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
-        );
-        let mut max_abs = 0f32;
-        let mut max_w = 0f32;
-        for i in 0..m * hid {
-            max_abs = max_abs.max((gpu[i] - cpu[i]).abs());
-            max_w = max_w.max(cpu[i].abs());
+
+        for m in [17usize, 65, 129] {
+            let normed = det_vals(m * hid, 0.1);
+            let g = cpu_q8_0_gemm_reference(&gate_w, ffn, hid, &normed, m);
+            let u = cpu_q8_0_gemm_reference(&up_w, ffn, hid, &normed, m);
+            let act: Vec<f32> = g
+                .iter()
+                .zip(&u)
+                .map(|(&a, &b)| {
+                    let gelu = if a >= 10.0 {
+                        a
+                    } else if a <= -10.0 {
+                        0.0
+                    } else {
+                        0.5 * a * (1.0 + (sqrt_2_over_pi * (a + 0.044715 * a.powi(3))).tanh())
+                    };
+                    gelu * b
+                })
+                .collect();
+            let cpu = cpu_q8_0_gemm_reference(&down_w, hid, ffn, &act, m);
+            let gpu = backend.prefill_ffn_chain(
+                &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
+            );
+            let mut max_abs = 0f32;
+            let mut max_w = 0f32;
+            for i in 0..m * hid {
+                max_abs = max_abs.max((gpu[i] - cpu[i]).abs());
+                max_w = max_w.max(cpu[i].abs());
+            }
+            let global_rel = max_abs / max_w.max(1e-3);
+            assert!(
+                global_rel < 1e-3,
+                "prefill Q8_0 GeGLU FFN mismatch for M={m}: global_rel={global_rel}"
+            );
         }
-        let global_rel = max_abs / max_w.max(1e-3);
-        assert!(
-            global_rel < 1e-3,
-            "prefill Q8_0 GeGLU FFN mismatch: global_rel={global_rel}"
-        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires TensorOps-capable Metal device; sets env, run single-threaded"]
-    fn prefill_q8_0_small_m_chain_matches_default_chain_exactly() {
+    fn prefill_q8_0_small_m_chain_numerically_matches_default_chain() {
         let _env_lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -15530,9 +15533,20 @@ mod tests {
                     &pipeline_address,
                     "tiny-M pipeline must initialize exactly once"
                 );
-                assert_eq!(
-                    small_m, default,
-                    "Q8_0 tiny-M chain mismatch for M={m}, use_gelu={use_gelu}"
+                let max_abs = small_m
+                    .iter()
+                    .zip(&default)
+                    .map(|(&candidate, &baseline)| (candidate - baseline).abs())
+                    .fold(0.0f32, f32::max);
+                let max_w = default
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0f32, f32::max);
+                let global_rel = max_abs / max_w.max(1e-3);
+                assert!(
+                    global_rel < 1e-5,
+                    "Q8_0 tiny-M chain mismatch for M={m}, use_gelu={use_gelu}: \
+                     max_abs={max_abs}, global_rel={global_rel}"
                 );
             }
         }

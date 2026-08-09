@@ -11978,7 +11978,7 @@ fn prefill_ffn_q8_0_gemm_encode(
             m,
         );
     } else {
-        crate::compute::encode_gemm_q8_0_tensorops(
+        crate::compute::encode_gemm_q8_0_tensorops_cooperative(
             ctx,
             enc,
             w_buf,

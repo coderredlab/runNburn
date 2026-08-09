@@ -1305,7 +1305,7 @@ kernel void gemm_q5k_tensorops(
 // NK=32(block 1개) 고정: K % 32 == 0 은 Q8_0 quant 가 항상 보장(K%64 가정 회피).
 //
 // v2 (pm40 llama 패턴, gemm_q4k_v2_tmpl 구조 1:1 — dequant 만 Q8_0): weight threadgroup
-// dequant + activation f16 device-direct tensor + C cooperative. threadgroup = NRA*NK half.
+// dequant + activation f16 device-direct + C cooperative. threadgroup = NRA*NK half.
 template<uint NRA, uint NRB, uint NSG>
 static void gemm_q8_0_v2_tmpl(
     device const uchar *weight_bytes,
@@ -1377,6 +1377,7 @@ kernel void gemm_q8_0_tensorops_v2_64x128(
 {
     gemm_q8_0_v2_tmpl<64u, 128u, 4u>(weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
 }
+
 
 // v1 (A+B+C threadgroup staging, input f32). KC=32(Q8_0 block), BN=32,
 // tg=128. BM=64 is the default path; BM=8 avoids oversized staging for tiny M.
@@ -1453,6 +1454,84 @@ static void gemm_q8_0_v1_tmpl(
             out[tok * N + row] = C_stage[t * BN + r];
         }
     }
+}
+
+template<uint BM>
+static void gemm_q8_0_cooperative_tmpl(
+    device const uchar *weight_bytes,
+    device const float *input,
+    device float       *out,
+    constant uint      &N,
+    constant uint      &K,
+    constant uint      &M,
+    threadgroup half   *A_stage,
+    threadgroup half   *B_stage,
+    uint2 tgid,
+    uint  tid)
+{
+    constexpr uint BN = 32u;
+    constexpr uint KC = 32u;
+    uint row0 = tgid.x * BN;
+    uint tok0 = tgid.y * BM;
+    uint num_blk = K / KC;
+
+    auto A = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
+        A_stage, dextents<int32_t, 2>(KC, BM));
+    auto B = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(
+        B_stage, dextents<int32_t, 2>(KC, BN));
+    constexpr auto desc = matmul2d_descriptor(
+        BM, BN, KC, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto cT = op.template get_destination_cooperative_tensor<decltype(A), decltype(B), float>();
+
+    for (uint c = 0; c < num_blk; c++) {
+        for (uint i = tid; i < BM * KC; i += 128u) {
+            uint t = i / KC;
+            uint kk = i % KC;
+            uint tok = tok0 + t;
+            A_stage[i] = (tok < M) ? (half)input[tok * K + c * KC + kk] : (half)0;
+        }
+        if (tid < BN) {
+            uint row = row0 + tid;
+            if (row < N) {
+                device const uchar *blk = weight_bytes + (row * num_blk + c) * 34u;
+                ushort d_bits = (ushort)blk[0] | ((ushort)blk[1] << 8);
+                float d = (float)as_type<half>(d_bits);
+                device const char *qs = (device const char *)(blk + 2);
+                for (uint l = 0; l < KC; l++) {
+                    B_stage[l * BN + tid] = (half)(d * (float)qs[l]);
+                }
+            } else {
+                for (uint k = 0; k < KC; k++) {
+                    B_stage[k * BN + tid] = (half)0;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(A, B, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto tD = tensor(out, dextents<int32_t, 2>((int)N, (int)M),
+                     array<int, 2>({1, (int)N}));
+    cT.store(tD.slice((int)row0, (int)tok0));
+}
+
+kernel void gemm_q8_0_tensorops_cooperative(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const float *input        [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N            [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M            [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup half A_stage[64 * 32];
+    threadgroup half B_stage[32 * 32];
+    gemm_q8_0_cooperative_tmpl<64u>(
+        weight_bytes, input, out, N, K, M, A_stage, B_stage, tgid, tid);
 }
 
 kernel void gemm_q8_0_tensorops(

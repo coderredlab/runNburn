@@ -731,6 +731,9 @@ pub struct MetalContext {
     /// Q8_0 tensorops GEMM for tiny M. 첫 사용 때 공유 library에서 pipeline만 생성한다.
     pub(crate) gemm_q8_0_tensorops_small_m_pipeline:
         OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Q8_0 large-M cooperative destination. 공유 library에서 lazy 생성한다.
+    pub(crate) gemm_q8_0_tensorops_cooperative_pipeline:
+        OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Q8_0 v2 tensorops GEMM(llama 패턴 64×128, NK=32). GDN in_proj/ATN proj/ssm_out(Q8_0).
     pub(crate) gemm_q8_0_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -993,6 +996,18 @@ fn lazy_gemm_q8_0_tensorops_small_m_pipeline(
     Some(ctx.gemm_q8_0_tensorops_small_m_pipeline.get_or_init(|| {
         build_pipeline_from_library(&ctx.device, library, "gemm_q8_0_tensorops_small_m")
     }))
+}
+
+fn lazy_gemm_q8_0_tensorops_cooperative_pipeline(
+    ctx: &MetalContext,
+) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+    let library = ctx.gemm_q8_0_tensorops_library.as_ref()?;
+    Some(
+        ctx.gemm_q8_0_tensorops_cooperative_pipeline
+            .get_or_init(|| {
+                build_pipeline_from_library(&ctx.device, library, "gemm_q8_0_tensorops_cooperative")
+            }),
+    )
 }
 
 impl MetalContext {
@@ -1744,6 +1759,7 @@ pub fn build_metal_context_with_opts(
         .as_ref()
         .map(|library| build_pipeline_from_library(&device, library, "gemm_q8_0_tensorops"));
     let gemm_q8_0_tensorops_small_m_pipeline = OnceLock::new();
+    let gemm_q8_0_tensorops_cooperative_pipeline = OnceLock::new();
     // pm42 M3: production v2 GEMM(64×128 winner 타일) + cast. 같은 src, fn명만 다름. capability 시만.
     let gemm_q4k_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2591,6 +2607,7 @@ pub fn build_metal_context_with_opts(
         gemm_q8_0_tensorops_library,
         gemm_q8_0_tensorops_pipeline,
         gemm_q8_0_tensorops_small_m_pipeline,
+        gemm_q8_0_tensorops_cooperative_pipeline,
         gemm_q8_0_tensorops_v2_pipeline,
         gemm_q4k_tensorops_v2_scatter_accum_pipeline,
         gemm_q6k_tensorops_v2_scatter_accum_pipeline,
@@ -6043,6 +6060,42 @@ pub(crate) fn encode_gemm_q8_0_tensorops(
         .gemm_q8_0_tensorops_pipeline
         .as_ref()
         .expect("gemm_q8_0_tensorops_pipeline missing (capability=false?)");
+    encode_tensorops_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        32,
+        4,
+    );
+}
+
+/// Q8_0 tensorops GEMM: F32→F16 input/weight staging + cooperative destination.
+/// v1과 같은 64×32 출력 타일, KC=32, 4 simdgroup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q8_0_tensorops_cooperative(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = lazy_gemm_q8_0_tensorops_cooperative_pipeline(ctx)
+        .expect("gemm_q8_0_tensorops_cooperative_pipeline missing (capability=false?)");
     encode_tensorops_dispatch(
         pipeline,
         enc,
