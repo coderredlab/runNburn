@@ -1045,7 +1045,7 @@ pub fn prewarm_q4k_weights_pinned(weights: &[&[u8]]) -> Result<usize, String> {
     let state = guard.as_mut().expect("cuda compute state initialized");
     let mut warmed = 0usize;
     for weight in weights {
-        state.resident_q4k_weights_ptr_pinned(weight)?;
+        let (_ptr, _new_pin) = state.resident_q4k_weights_ptr_pinned_with_lease(weight)?;
         warmed += 1;
     }
     state.stream_synchronize()?;

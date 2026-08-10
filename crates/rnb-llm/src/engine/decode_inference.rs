@@ -225,16 +225,7 @@ impl Engine {
         &mut self,
         token: u32,
     ) -> crate::error::Result<Option<u32>> {
-        let needs_static_weight_prewarm = self
-            .scratch
-            .as_ref()
-            .is_some_and(|scratch| !scratch.device_verify_static_weights_warmed);
-        if needs_static_weight_prewarm {
-            self.prewarm_mtp_device_verify_static_weights()?;
-            if let Some(scratch) = self.scratch.as_mut() {
-                scratch.device_verify_static_weights_warmed = true;
-            }
-        }
+        self.ensure_mtp_device_verify_static_weights_prewarmed()?;
         let request = crate::engine::verify_window::MtpVerifyWindowRequest::new(
             token,
             &[],
@@ -339,6 +330,7 @@ impl Engine {
             target_tokens,
             output_logits: Vec::new(),
             mtp_hidden_rows,
+            output_hidden_rows: Vec::new(),
             hidden_dim,
             prefix_state: None,
             prefix_states: Vec::new(),
@@ -715,6 +707,7 @@ impl Engine {
             target_tokens,
             output_logits,
             mtp_hidden_rows: hidden,
+            output_hidden_rows: Vec::new(),
             hidden_dim,
             prefix_state: None,
             prefix_states: Vec::new(),

@@ -91,6 +91,16 @@ impl Engine {
                 match layer {
                     crate::engine::layer_weights::LayerType::Attention(attn) => {
                         push_attention_weights(&mut slices, attn);
+                        if self.architecture == rnb_loader::Architecture::Gemma4 {
+                            if let Some(moe) = attn.moe.as_ref() {
+                                if let Some(raw) = moe.gate_up_bytes() {
+                                    slices.push(raw);
+                                }
+                                if let Some(raw) = moe.down_bytes() {
+                                    slices.push(raw);
+                                }
+                            }
+                        }
                     }
                     crate::engine::layer_weights::LayerType::GatedDeltaNet(gdn) => {
                         for weight in [
@@ -130,6 +140,26 @@ impl Engine {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = weights;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_mtp_device_verify_static_weights_prewarmed(
+        &mut self,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let needs_prewarm = self
+                .scratch
+                .as_ref()
+                .is_some_and(|scratch| !scratch.device_verify_static_weights_warmed);
+            if !needs_prewarm {
+                return Ok(());
+            }
+            self.prewarm_mtp_device_verify_static_weights()?;
+            if let Some(scratch) = self.scratch.as_mut() {
+                scratch.device_verify_static_weights_warmed = true;
+            }
         }
         Ok(())
     }

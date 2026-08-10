@@ -5,6 +5,9 @@ pub(crate) struct VerifyWindowResult {
     /// target 분포. greedy 경로에서는 비어 있다.
     pub(crate) output_logits: Vec<f32>,
     pub(crate) mtp_hidden_rows: Vec<f32>,
+    /// output norm 적용 후 lm_head 입력. device verify의 last-hidden 복원과
+    /// ignored-EOS 재투영에 쓰며 MTP 관측용 raw hidden과 섞지 않는다.
+    pub(crate) output_hidden_rows: Vec<f32>,
     pub(crate) hidden_dim: usize,
     pub(crate) prefix_state: Option<VerifyWindowPrefixState>,
     pub(crate) prefix_states: Vec<VerifyWindowPrefixState>,
@@ -19,12 +22,14 @@ impl VerifyWindowResult {
     pub(crate) fn from_device_result(
         target_tokens: Vec<u32>,
         mtp_hidden_rows: Vec<f32>,
+        output_hidden_rows: Vec<f32>,
         hidden_dim: usize,
     ) -> crate::error::Result<Self> {
         Self::from_device_parts(
             target_tokens,
             Vec::new(),
             mtp_hidden_rows,
+            output_hidden_rows,
             hidden_dim,
             Vec::new(),
             Vec::new(),
@@ -37,6 +42,7 @@ impl VerifyWindowResult {
     pub(crate) fn from_device_result_with_prefix_states(
         target_tokens: Vec<u32>,
         mtp_hidden_rows: Vec<f32>,
+        output_hidden_rows: Vec<f32>,
         hidden_dim: usize,
         prefix_states: Vec<crate::engine::cuda_runtime::MtpDeviceVerifyPrefixState>,
     ) -> crate::error::Result<Self> {
@@ -44,6 +50,7 @@ impl VerifyWindowResult {
             target_tokens,
             Vec::new(),
             mtp_hidden_rows,
+            output_hidden_rows,
             hidden_dim,
             prefix_states,
             Vec::new(),
@@ -56,6 +63,7 @@ impl VerifyWindowResult {
         target_tokens: Vec<u32>,
         output_logits: Vec<f32>,
         mtp_hidden_rows: Vec<f32>,
+        output_hidden_rows: Vec<f32>,
         hidden_dim: usize,
         prefix_states: Vec<crate::engine::cuda_runtime::MtpDeviceVerifyPrefixState>,
         ssm_final_states: Vec<crate::engine::cuda_runtime::MtpDeviceVerifySsmLayerFinalState>,
@@ -102,6 +110,7 @@ impl VerifyWindowResult {
             target_tokens,
             output_logits,
             mtp_hidden_rows,
+            output_hidden_rows,
             hidden_dim,
             prefix_states,
             ssm_final_states,
@@ -114,6 +123,7 @@ impl VerifyWindowResult {
         target_tokens: Vec<u32>,
         output_logits: Vec<f32>,
         mtp_hidden_rows: Vec<f32>,
+        output_hidden_rows: Vec<f32>,
         hidden_dim: usize,
         prefix_states: Vec<VerifyWindowPrefixState>,
         ssm_final_states: Vec<VerifyWindowSsmLayerFinalState>,
@@ -136,10 +146,18 @@ impl VerifyWindowResult {
                 expected
             )));
         }
+        if output_hidden_rows.len() != expected {
+            return Err(crate::error::LlmError::Forward(format!(
+                "MTP device verify output hidden rows mismatch: got {}, expected {}",
+                output_hidden_rows.len(),
+                expected
+            )));
+        }
         Ok(Self {
             target_tokens,
             output_logits,
             mtp_hidden_rows,
+            output_hidden_rows,
             hidden_dim,
             prefix_state: None,
             prefix_states,
@@ -498,6 +516,7 @@ mod tests {
             output_logits: Vec::new(),
             target_tokens: vec![10, 20],
             mtp_hidden_rows: vec![0.0; 4],
+            output_hidden_rows: vec![0.0; 4],
             hidden_dim: 2,
             prefix_state: None,
             prefix_states: Vec::new(),
@@ -542,6 +561,7 @@ mod tests {
             output_logits: Vec::new(),
             target_tokens: vec![10, 20, 30],
             mtp_hidden_rows: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            output_hidden_rows: Vec::new(),
             hidden_dim: 2,
             prefix_state: None,
             prefix_states: Vec::new(),
@@ -561,6 +581,7 @@ mod tests {
             output_logits: Vec::new(),
             target_tokens: vec![10, 20, 30],
             mtp_hidden_rows: Vec::new(),
+            output_hidden_rows: Vec::new(),
             hidden_dim: 2,
             prefix_state: None,
             prefix_states: vec![
@@ -600,21 +621,42 @@ mod tests {
     }
 
     #[test]
-    fn device_verify_result_requires_one_hidden_row_per_target_token() {
-        let err = VerifyWindowResult::from_device_result(vec![10, 20], vec![1.0, 2.0], 2)
-            .expect_err("hidden rows should be incomplete");
-
+    fn device_verify_result_requires_one_raw_and_output_hidden_row_per_target_token() {
+        let err = VerifyWindowResult::from_device_result(
+            vec![10, 20],
+            vec![1.0, 2.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            2,
+        )
+        .expect_err("raw hidden rows should be incomplete");
         assert!(err
             .to_string()
             .contains("MTP device verify hidden rows mismatch"));
+
+        let err = VerifyWindowResult::from_device_result(
+            vec![10, 20],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0],
+            2,
+        )
+        .expect_err("output hidden rows should be incomplete");
+        assert!(err
+            .to_string()
+            .contains("MTP device verify output hidden rows mismatch"));
     }
 
     #[test]
-    fn device_verify_result_accepts_exact_hidden_rows() {
-        let result =
-            VerifyWindowResult::from_device_result(vec![10, 20], vec![1.0, 2.0, 3.0, 4.0], 2)
-                .unwrap();
+    fn device_verify_result_keeps_raw_and_output_hidden_rows_distinct() {
+        let result = VerifyWindowResult::from_device_result(
+            vec![10, 20],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            2,
+        )
+        .unwrap();
 
+        assert_eq!(result.mtp_hidden_rows, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(result.output_hidden_rows, vec![5.0, 6.0, 7.0, 8.0]);
         assert_eq!(result.len(), 2);
         assert_eq!(result.hidden_rows(), 2);
     }
@@ -626,6 +668,7 @@ mod tests {
             vec![10, 20],
             Vec::new(),
             vec![1.0, 2.0, 3.0, 4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
             2,
             vec![crate::engine::cuda_runtime::MtpDeviceVerifyPrefixState {
                 prefix_tokens: 1,

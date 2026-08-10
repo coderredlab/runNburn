@@ -133,7 +133,7 @@ pub mod compute {
         sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu, ssm_conv1d_silu,
         sync_delta_state_cache, upload_gemma_ple_base, CudaMemoryInfo, DeltaStateSnapshot,
         GdnPrefillChainPlan, GdnPrefillChainQ4KOutput, GdnPrefillChainQ4KRequest,
-        GdnPrefillChainShape, MtpVerifyBufferPlan,
+        GdnPrefillChainShape, GemmaMtp2MoeLayer, MtpVerifyBufferPlan,
         NemotronDeviceRoutePack as BackendNemotronDeviceRoutePack, Qwen35MtpDeviceDraftRequest,
         Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
         Qwen35MtpDeviceVerifyAttentionMoeLayer, Qwen35MtpDeviceVerifyGdnMoeLayer,

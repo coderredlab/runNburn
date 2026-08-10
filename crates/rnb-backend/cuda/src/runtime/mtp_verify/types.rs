@@ -385,6 +385,27 @@ pub struct Qwen35MtpDeviceVerifyGdnMoeLayer<'a> {
     pub ffn_down_cols: usize,
 }
 
+#[derive(Debug)]
+pub struct GemmaMtp2MoeLayer<'a> {
+    pub router_w: &'a [f32],
+    pub router_scale: &'a [f32],
+    pub gate_up_experts: &'a [u8],
+    pub gate_up_quant: u32,
+    pub down_experts: &'a [u8],
+    pub down_scale: &'a [f32],
+    pub down_quant: u32,
+    pub pre_ffw_norm_2: &'a [f32],
+    pub post_ffw_norm_1: &'a [f32],
+    pub post_ffw_norm_2: &'a [f32],
+    pub n_ff: usize,
+    pub n_embd: usize,
+    pub n_expert: usize,
+    pub shared_gate_quant: u32,
+    pub shared_up_quant: u32,
+    pub shared_down_quant: u32,
+    pub n_expert_used: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct Qwen35MtpDeviceVerifyAttentionMoeLayer<'a> {
     pub layer_index: usize,
@@ -464,6 +485,7 @@ pub struct Qwen35MtpDeviceVerifyAttentionMoeLayer<'a> {
     pub shared_down_quant: u32,
     pub n_ff: usize,
     pub n_embd: usize,
+    pub gemma_mtp2_moe: Option<GemmaMtp2MoeLayer<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +554,8 @@ pub struct Qwen35MtpDeviceVerifyResult {
     /// `collect_output_logits`가 켜졌을 때의 `window_tokens x vocab` row-major logits.
     pub output_logits: Vec<f32>,
     pub mtp_hidden_rows: Vec<f32>,
+    /// Output norm 적용 후 lm_head 입력. MTP 관측용 raw hidden과 분리한다.
+    pub output_hidden_rows: Vec<f32>,
     pub hidden_dim: usize,
     pub prefix_states: Vec<Qwen35MtpDeviceVerifyPrefixState>,
     pub ssm_final_states: Vec<Qwen35MtpDeviceVerifySsmLayerFinalState>,

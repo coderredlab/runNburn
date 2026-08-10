@@ -11,6 +11,8 @@ use rnb_memory::{ExpertBundleCacheStats, ExpertBundleObservationReceipt};
 
 #[path = "tests/dspark.rs"]
 mod dspark_tests;
+#[path = "tests/gemma_mtp2.rs"]
+mod gemma_mtp2_tests;
 #[path = "tests/mtp_verify.rs"]
 mod mtp_verify_tests;
 
@@ -1165,6 +1167,39 @@ fn cuda_q4_raw_resident_admission_records_raw_quant_without_expanded() {
 
 #[test]
 #[ignore = "requires CUDA"]
+fn cuda_q4_raw_pinned_parent_serves_contained_weight_without_duplicate_upload() {
+    let _guard = runtime_test_lock();
+    let _arena = EnvVarGuard::set("RNB_CUDA_RESIDENT_Q4K_ARENA", "0");
+    let mut state = CudaState::open().expect("open CUDA state");
+    state.resident_q4k_limit = usize::MAX;
+    let storage = std::sync::Arc::new(rnb_core::tensor::Storage::Owned(
+        rnb_core::tensor::Buffer::from_vec(vec![0x5a; 4096]),
+    ));
+    let tensor =
+        rnb_core::tensor::Tensor::from_mmap(storage, 0, &[4096], rnb_core::tensor::DType::U8)
+            .unwrap();
+    let parent = tensor.as_bytes().unwrap();
+    let child = &parent[512..1536];
+
+    let parent_ptr = state
+        .resident_q4k_weights_ptr_pinned(parent)
+        .expect("admit pinned parent");
+    let resident_bytes = state.resident_q4k_bytes;
+    let before = state.weight_residency_counters();
+    let child_ptr = state
+        .resident_q4k_weights_ptr(child)
+        .expect("resolve contained child");
+    let delta = state.weight_residency_counters().delta(before);
+
+    assert_eq!(child_ptr, parent_ptr + 512);
+    assert_eq!(state.resident_q4k_bytes, resident_bytes);
+    assert!(!state.resident_q4k.contains_key(&q4k_resident_key(child)));
+    assert_eq!(delta.raw_quant_bytes, 0);
+    assert_eq!(delta.transient_quant_upload_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn cuda_q4_raw_temp_upload_records_transient_h2d_without_raw_resident() {
     let _guard = runtime_test_lock();
     let mut state = CudaState::open().expect("open CUDA state");
@@ -1183,6 +1218,67 @@ fn cuda_q4_raw_temp_upload_records_transient_h2d_without_raw_resident() {
     assert_eq!(delta.transient_quant_upload_bytes, weights.len() as u64);
     assert_eq!(delta.expanded_diag_bytes, 0);
     assert_eq!(delta.packed_q8dot_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_q4_pinned_lease_rejects_nonresident_temp_upload() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    state.resident_q4k_limit = 0;
+    let weights = make_test_q4k_weights(1, 4, 1, 29).pop().unwrap();
+    let before = state.weight_residency_counters();
+
+    let err = state
+        .resident_q4k_weights_ptr_pinned_with_lease(&weights)
+        .expect_err("strict pinned lease must reject a transient upload");
+    let delta = state.weight_residency_counters().delta(before);
+
+    assert!(err.contains("pinned resident Q4_K admission failed"));
+    assert!(!state.resident_q4k.contains_key(&q4k_resident_key(&weights)));
+    assert_eq!(delta.q4_transient_quant_upload_bytes, 0);
+    assert_eq!(delta.transient_quant_upload_bytes, 0);
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_gemma_mtp2_down_admission_failure_releases_gate_pin_after_sync() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let hidden_dim = 256usize;
+    let n_ff = 32usize;
+    let gate_up_weights = make_test_q4k_weights(1, n_ff * 2, hidden_dim / 256, 31)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let down_weights = vec![0u8; hidden_dim * 24];
+    state.resident_q4k_limit = gate_up_weights.len();
+
+    let err = state
+        .stage_gemma_mtp2_selected_sparse(GemmaMtp2SelectedSparseRequest {
+            normalized_dev: 1,
+            expert_ids_dev: 1,
+            route_weights_dev: 1,
+            gate_up_weights: &gate_up_weights,
+            down_weights: &down_weights,
+            down_scale: &[1.0],
+            tokens: 1,
+            hidden_dim,
+            n_ff,
+            n_expert: 1,
+            top_k: 1,
+            down_quant: 7,
+            finalize: None,
+        })
+        .expect_err("down admission must fail while the gate/up resident is pinned");
+
+    assert!(err.contains("pinned resident Q4_K admission failed"));
+    assert!(state.gemma_mtp2_ctx.pending_weight_pins.is_empty());
+    let gate_entry = state
+        .resident_q4k
+        .get(&q4k_resident_key(&gate_up_weights))
+        .expect("gate/up resident remains cached after pin release");
+    assert!(!gate_entry.pinned);
 }
 
 #[test]

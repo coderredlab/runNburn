@@ -129,6 +129,27 @@ pub struct MtpDeviceVerifyGdnMoeLayer<'a> {
 }
 
 #[derive(Debug)]
+pub struct GemmaMtp2MoeLayer<'a> {
+    pub router_w: &'a [f32],
+    pub router_scale: &'a [f32],
+    pub gate_up_experts: &'a [u8],
+    pub gate_up_quant: GGMLType,
+    pub down_experts: &'a [u8],
+    pub down_scale: &'a [f32],
+    pub down_quant: GGMLType,
+    pub pre_ffw_norm_2: &'a [f32],
+    pub post_ffw_norm_1: &'a [f32],
+    pub post_ffw_norm_2: &'a [f32],
+    pub n_ff: usize,
+    pub n_embd: usize,
+    pub n_expert: usize,
+    pub shared_gate_quant: GGMLType,
+    pub shared_up_quant: GGMLType,
+    pub shared_down_quant: GGMLType,
+    pub n_expert_used: usize,
+}
+
+#[derive(Debug)]
 pub struct MtpDeviceVerifyAttentionMoeLayer<'a> {
     pub layer_index: usize,
     pub kv_source_layer: Option<usize>,
@@ -206,6 +227,7 @@ pub struct MtpDeviceVerifyAttentionMoeLayer<'a> {
     pub shared_down_quant: GGMLType,
     pub n_ff: usize,
     pub n_embd: usize,
+    pub gemma_mtp2_moe: Option<GemmaMtp2MoeLayer<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +296,8 @@ pub struct MtpDeviceVerifyWindowResult {
     /// `collect_output_logits` 요청 시의 `window_tokens x vocab` row-major logits.
     pub output_logits: Vec<f32>,
     pub mtp_hidden_rows: Vec<f32>,
+    /// Output norm 적용 후 lm_head 입력. MTP 관측용 raw hidden과 분리한다.
+    pub output_hidden_rows: Vec<f32>,
     pub hidden_dim: usize,
     pub prefix_states: Vec<MtpDeviceVerifyPrefixState>,
     pub ssm_final_states: Vec<MtpDeviceVerifySsmLayerFinalState>,
@@ -393,6 +417,28 @@ fn backend_attention_moe_layer<'a>(
         shared_down_quant: layer.shared_down_quant as u32,
         n_ff: layer.n_ff,
         n_embd: layer.n_embd,
+        gemma_mtp2_moe: layer
+            .gemma_mtp2_moe
+            .as_ref()
+            .map(|moe| backend::GemmaMtp2MoeLayer {
+                router_w: moe.router_w,
+                router_scale: moe.router_scale,
+                gate_up_experts: moe.gate_up_experts,
+                gate_up_quant: moe.gate_up_quant as u32,
+                down_experts: moe.down_experts,
+                down_scale: moe.down_scale,
+                down_quant: moe.down_quant as u32,
+                pre_ffw_norm_2: moe.pre_ffw_norm_2,
+                post_ffw_norm_1: moe.post_ffw_norm_1,
+                post_ffw_norm_2: moe.post_ffw_norm_2,
+                n_ff: moe.n_ff,
+                n_embd: moe.n_embd,
+                n_expert: moe.n_expert,
+                shared_gate_quant: moe.shared_gate_quant as u32,
+                shared_up_quant: moe.shared_up_quant as u32,
+                shared_down_quant: moe.shared_down_quant as u32,
+                n_expert_used: moe.n_expert_used,
+            }),
     }
 }
 
@@ -609,6 +655,7 @@ pub fn qwen35_mtp_device_verify_window(
         target_tokens: result.target_tokens,
         output_logits: result.output_logits,
         mtp_hidden_rows: result.mtp_hidden_rows,
+        output_hidden_rows: result.output_hidden_rows,
         hidden_dim: result.hidden_dim,
         prefix_states: result
             .prefix_states

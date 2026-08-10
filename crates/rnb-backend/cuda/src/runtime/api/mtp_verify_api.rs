@@ -28,7 +28,9 @@ fn trace_mtp_verify_stage(
     start: Instant,
 ) -> Result<(), String> {
     if enabled {
-        state.stream_synchronize()?;
+        let sync_result = state.stream_synchronize();
+        state.release_gemma_mtp2_weight_pins_after_sync();
+        sync_result?;
         eprintln!(
             "[mtp-verify-trace] {label} {:.3}ms",
             trace_elapsed_ms(start)
@@ -385,7 +387,7 @@ pub fn qwen35_mtp_device_verify_window(
     trace_mtp_verify_stage(trace, state, "token_embeddings", stage_start)?;
     let prefix_capture_tokens = request.prefix_tokens;
     let stage_start = Instant::now();
-    let mut state_capture = stage_qwen35_mtp_device_verify_ordered_layers(
+    let mut state_capture = match stage_qwen35_mtp_device_verify_ordered_layers(
         state,
         &buffers,
         request.layer_order,
@@ -398,7 +400,17 @@ pub fn qwen35_mtp_device_verify_window(
         request.pos_start,
         request.rope_pos_start,
         request.norm_eps,
-    )?;
+    ) {
+        Ok(state_capture) => state_capture,
+        Err(err) => {
+            if let Err(cleanup_err) = state.flush_gemma_mtp2_weight_pins() {
+                return Err(format!(
+                    "{err}; failed to release Gemma MTP2 weight pins: {cleanup_err}"
+                ));
+            }
+            return Err(err);
+        }
+    };
     trace_mtp_verify_stage(trace, state, "ordered_layers", stage_start)?;
     if request.layer_order.is_empty() {
         let stage_start = Instant::now();
@@ -428,6 +440,11 @@ pub fn qwen35_mtp_device_verify_window(
         ) {
             Ok(logits) => output_logits = logits,
             Err(err) => {
+                if let Err(cleanup_err) = state.flush_gemma_mtp2_weight_pins() {
+                    return Err(format!(
+                        "{err}; failed to release Gemma MTP2 weight pins: {cleanup_err}"
+                    ));
+                }
                 if let Err(free_err) =
                     state.free_mtp_verify_prefix_state_snapshots(state_capture.prefix_states)
                 {
@@ -469,6 +486,11 @@ pub fn qwen35_mtp_device_verify_window(
         )),
     };
     if let Err(err) = output_argmax {
+        if let Err(cleanup_err) = state.flush_gemma_mtp2_weight_pins() {
+            return Err(format!(
+                "{err}; failed to release Gemma MTP2 weight pins: {cleanup_err}"
+            ));
+        }
         if let Err(free_err) =
             state.free_mtp_verify_prefix_state_snapshots(state_capture.prefix_states)
         {
@@ -494,8 +516,16 @@ pub fn qwen35_mtp_device_verify_window(
     }
     let stage_start = Instant::now();
     let mut result = match state.collect_mtp_verify_result(&plan) {
-        Ok(result) => result,
+        Ok(result) => {
+            state.release_gemma_mtp2_weight_pins_after_sync();
+            result
+        }
         Err(err) => {
+            if let Err(cleanup_err) = state.flush_gemma_mtp2_weight_pins() {
+                return Err(format!(
+                    "{err}; failed to release Gemma MTP2 weight pins: {cleanup_err}"
+                ));
+            }
             if let Err(free_err) =
                 state.free_mtp_verify_prefix_state_snapshots(state_capture.prefix_states)
             {

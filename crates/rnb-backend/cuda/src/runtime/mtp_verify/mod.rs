@@ -4,8 +4,8 @@ mod types;
 mod validation;
 
 pub use types::{
-    qwen35_mtp_verify_buffer_plan, MtpVerifyBufferPlan, Qwen35MtpDeviceDraftRequest,
-    Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
+    qwen35_mtp_verify_buffer_plan, GemmaMtp2MoeLayer, MtpVerifyBufferPlan,
+    Qwen35MtpDeviceDraftRequest, Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
     Qwen35MtpDeviceVerifyAttentionMoeLayer, Qwen35MtpDeviceVerifyGdnMoeLayer,
     Qwen35MtpDeviceVerifyLayerKind, Qwen35MtpDeviceVerifyPrefixState, Qwen35MtpDeviceVerifyRequest,
     Qwen35MtpDeviceVerifyResult, Qwen35MtpDeviceVerifySsmLayerFinalState,
@@ -90,7 +90,9 @@ impl super::CudaState {
         start: std::time::Instant,
     ) -> Result<(), String> {
         if enabled {
-            self.stream_synchronize()?;
+            let sync_result = self.stream_synchronize();
+            self.release_gemma_mtp2_weight_pins_after_sync();
+            sync_result?;
             let layer = layer_index
                 .map(|index| index.to_string())
                 .unwrap_or_else(|| "?".to_string());
@@ -1717,12 +1719,21 @@ impl super::CudaState {
                 plan.hidden_dim
             ));
         }
-        if output_cols % 256 != 0 {
+        let block_width = match output_quant {
+            GGML_Q4_K | GGML_Q6_K => 256,
+            GGML_Q8_0 => 32,
+            other => {
+                return Err(format!(
+                    "MTP verify logits output quant must be Q4_K, Q6_K or Q8_0, got {other}"
+                ));
+            }
+        };
+        if output_cols % block_width != 0 {
             return Err(format!(
-                "MTP verify logits output cols must be divisible by 256, got {output_cols}"
+                "MTP verify logits output cols must be divisible by {block_width}, got {output_cols}"
             ));
         }
-        let blocks_per_row = output_cols / 256;
+        let blocks_per_row = output_cols / block_width;
         let logit_values = plan
             .window_tokens
             .checked_mul(output_rows)
@@ -1750,11 +1761,15 @@ impl super::CudaState {
                 buffers.scratch_hidden_dev,
                 logits_dev,
             )?,
-            other => {
-                return Err(format!(
-                    "MTP verify logits output quant must be Q4_K or Q6_K, got {other}"
-                ));
-            }
+            GGML_Q8_0 => self.launch_q8_0_gemv_batch_to_dev(
+                output_weight,
+                output_rows,
+                blocks_per_row,
+                plan.window_tokens,
+                buffers.scratch_hidden_dev,
+                logits_dev,
+            )?,
+            other => unreachable!("validated output quant {other}"),
         }
 
         let mut logits = vec![0.0f32; logit_values];
@@ -4518,6 +4533,259 @@ impl super::CudaState {
         Ok(router_buffers)
     }
 
+    fn stage_mtp_verify_gemma_mtp2_hybrid(
+        &mut self,
+        buffers: &MtpVerifyDeviceBuffers,
+        layer: &Qwen35MtpDeviceVerifyAttentionMoeLayer<'_>,
+        moe: &GemmaMtp2MoeLayer<'_>,
+        norm_eps: f32,
+    ) -> Result<MtpVerifyQwen35RouterBuffers, String> {
+        let plan = &buffers.plan;
+        if moe.n_embd != plan.hidden_dim {
+            return Err(format!(
+                "Gemma MTP2 hidden mismatch: descriptor={}, verify={}",
+                moe.n_embd, plan.hidden_dim
+            ));
+        }
+        if moe.gate_up_quant != GGML_Q4_K {
+            return Err(format!(
+                "Gemma MTP2 gate/up must be Q4_K({GGML_Q4_K}), got {}",
+                moe.gate_up_quant
+            ));
+        }
+        for (name, values) in [
+            ("router_scale", moe.router_scale),
+            ("pre_ffw_norm_2", moe.pre_ffw_norm_2),
+            ("post_ffw_norm_1", moe.post_ffw_norm_1),
+            ("post_ffw_norm_2", moe.post_ffw_norm_2),
+        ] {
+            if values.len() != plan.hidden_dim {
+                return Err(format!(
+                    "Gemma MTP2 {name} length mismatch: got {}, expected {}",
+                    values.len(),
+                    plan.hidden_dim
+                ));
+            }
+        }
+
+        let hidden_bytes = plan
+            .window_tokens
+            .checked_mul(plan.hidden_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "Gemma MTP2 hidden scratch byte size overflow".to_string())?;
+        let shared_output = super::ensure_device_buffer(
+            &self.api,
+            &mut self.gemma_mtp2_ctx.shared_output,
+            &mut self.gemma_mtp2_ctx.shared_output_capacity,
+            hidden_bytes,
+        )?;
+        let sparse_input = super::ensure_device_buffer(
+            &self.api,
+            &mut self.gemma_mtp2_ctx.sparse_input,
+            &mut self.gemma_mtp2_ctx.sparse_input_capacity,
+            hidden_bytes,
+        )?;
+
+        if layer.ffn_gate_rows != layer.ffn_up_rows
+            || layer.ffn_gate_cols != plan.hidden_dim
+            || layer.ffn_up_cols != plan.hidden_dim
+            || layer.ffn_down_rows != plan.hidden_dim
+            || layer.ffn_down_cols != layer.ffn_gate_rows
+        {
+            return Err(format!(
+                "Gemma MTP2 shared FFN shape mismatch: gate=[{}x{}] up=[{}x{}] down=[{}x{}] hidden={}",
+                layer.ffn_gate_rows,
+                layer.ffn_gate_cols,
+                layer.ffn_up_rows,
+                layer.ffn_up_cols,
+                layer.ffn_down_rows,
+                layer.ffn_down_cols,
+                plan.hidden_dim
+            ));
+        }
+        let gate_blocks = validate_mtp_verify_k_quant_matrix(
+            "Gemma MTP2 shared gate",
+            moe.shared_gate_quant,
+            layer.ffn_gate_q4k,
+            layer.ffn_gate_rows,
+            layer.ffn_gate_cols,
+            plan.hidden_dim,
+        )?;
+        let up_blocks = validate_mtp_verify_k_quant_matrix(
+            "Gemma MTP2 shared up",
+            moe.shared_up_quant,
+            layer.ffn_up_q4k,
+            layer.ffn_up_rows,
+            layer.ffn_up_cols,
+            plan.hidden_dim,
+        )?;
+        let down_blocks = validate_mtp_verify_k_quant_matrix(
+            "Gemma MTP2 shared down",
+            moe.shared_down_quant,
+            layer.ffn_down,
+            layer.ffn_down_rows,
+            layer.ffn_down_cols,
+            layer.ffn_gate_rows,
+        )?;
+        let mid_bytes = plan
+            .window_tokens
+            .checked_mul(layer.ffn_gate_rows)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "Gemma MTP2 shared intermediate byte size overflow".to_string())?;
+        let gate_dev = self.compute_mid_a_ptr(mid_bytes)?;
+        let up_dev = self.compute_mid_b_ptr(mid_bytes)?;
+        self.stage_mtp_verify_k_quant_projection_to_dev(
+            "Gemma MTP2 shared gate",
+            moe.shared_gate_quant,
+            layer.ffn_gate_q4k,
+            layer.ffn_gate_rows,
+            gate_blocks,
+            plan.window_tokens,
+            buffers.scratch_hidden_dev,
+            gate_dev,
+        )?;
+        self.stage_mtp_verify_k_quant_projection_to_dev(
+            "Gemma MTP2 shared up",
+            moe.shared_up_quant,
+            layer.ffn_up_q4k,
+            layer.ffn_up_rows,
+            up_blocks,
+            plan.window_tokens,
+            buffers.scratch_hidden_dev,
+            up_dev,
+        )?;
+        self.launch_gelu_mul(gate_dev, up_dev, plan.window_tokens * layer.ffn_gate_rows)?;
+        self.stage_mtp_verify_k_quant_projection_to_dev(
+            "Gemma MTP2 shared down",
+            moe.shared_down_quant,
+            layer.ffn_down,
+            layer.ffn_down_rows,
+            down_blocks,
+            plan.window_tokens,
+            gate_dev,
+            shared_output,
+        )?;
+
+        let pre_norm_dev = self.resident_f32_ptr_stable_source(moe.pre_ffw_norm_2)?;
+        self.launch_rms_norm_rows_f32(
+            buffers.hidden_rows_dev,
+            pre_norm_dev,
+            sparse_input,
+            norm_eps,
+            plan.window_tokens,
+            plan.hidden_dim,
+            layer.ffn_norm_unit_offset,
+        )?;
+
+        let router_scale_dev = self.resident_f32_ptr_stable_source(moe.router_scale)?;
+        self.launch_rms_norm_rows_f32(
+            buffers.hidden_rows_dev,
+            router_scale_dev,
+            buffers.scratch_hidden_dev,
+            norm_eps,
+            plan.window_tokens,
+            plan.hidden_dim,
+            false,
+        )?;
+        self.launch_scale_f32_inplace(
+            buffers.scratch_hidden_dev,
+            1.0 / (plan.hidden_dim as f32).sqrt(),
+            plan.window_tokens * plan.hidden_dim,
+        )?;
+        let router_buffers = self.stage_mtp_verify_qwen35_router_topk(
+            buffers,
+            moe.router_w,
+            moe.n_expert,
+            moe.n_expert_used,
+        )?;
+        let finalize = if layer.post_ffw_norm.is_empty()
+            || !crate::tuning::gemma_mtp2_finalize_megakernel_enabled()
+        {
+            None
+        } else {
+            if layer.post_ffw_norm.len() != plan.hidden_dim {
+                return Err(format!(
+                    "Gemma MTP2 common post_ffw_norm length mismatch: got {}, expected {}",
+                    layer.post_ffw_norm.len(),
+                    plan.hidden_dim
+                ));
+            }
+            Some(super::GemmaMtp2FinalizeRequest {
+                residual_dev: buffers.hidden_rows_dev,
+                shared_raw_dev: shared_output,
+                post_norm_1: moe.post_ffw_norm_1,
+                post_norm_2: moe.post_ffw_norm_2,
+                common_post_norm: layer.post_ffw_norm,
+                norm_eps,
+                unit_offset: layer.post_ffw_norm_unit_offset,
+            })
+        };
+        let sparse_output =
+            self.stage_gemma_mtp2_selected_sparse(super::GemmaMtp2SelectedSparseRequest {
+                normalized_dev: sparse_input,
+                expert_ids_dev: router_buffers.expert_ids_dev,
+                route_weights_dev: router_buffers.route_weights_dev,
+                gate_up_weights: moe.gate_up_experts,
+                down_weights: moe.down_experts,
+                down_scale: moe.down_scale,
+                tokens: plan.window_tokens,
+                hidden_dim: plan.hidden_dim,
+                n_ff: moe.n_ff,
+                n_expert: moe.n_expert,
+                top_k: moe.n_expert_used,
+                down_quant: moe.down_quant,
+                finalize,
+            })?;
+        if finalize.is_some() {
+            return Ok(router_buffers);
+        }
+
+        let post_norm_1_dev = self.resident_f32_ptr_stable_source(moe.post_ffw_norm_1)?;
+        self.launch_rms_norm_rows_f32(
+            shared_output,
+            post_norm_1_dev,
+            buffers.scratch_hidden_dev,
+            norm_eps,
+            plan.window_tokens,
+            plan.hidden_dim,
+            layer.post_ffw_norm_unit_offset,
+        )?;
+        let post_norm_2_dev = self.resident_f32_ptr_stable_source(moe.post_ffw_norm_2)?;
+        self.launch_rms_norm_rows_f32(
+            sparse_output,
+            post_norm_2_dev,
+            sparse_input,
+            norm_eps,
+            plan.window_tokens,
+            plan.hidden_dim,
+            layer.post_ffw_norm_unit_offset,
+        )?;
+        self.launch_add_f32_inplace(
+            buffers.scratch_hidden_dev,
+            sparse_input,
+            plan.window_tokens * plan.hidden_dim,
+        )?;
+        if layer.post_ffw_norm.is_empty() {
+            self.launch_add_f32_inplace(
+                buffers.hidden_rows_dev,
+                buffers.scratch_hidden_dev,
+                plan.window_tokens * plan.hidden_dim,
+            )?;
+        } else {
+            let post_ffw_norm_dev = self.resident_f32_ptr_stable_source(layer.post_ffw_norm)?;
+            self.launch_rms_norm_add_rows_f32_inplace(
+                buffers.scratch_hidden_dev,
+                post_ffw_norm_dev,
+                buffers.hidden_rows_dev,
+                norm_eps,
+                plan.window_tokens,
+                plan.hidden_dim,
+                layer.post_ffw_norm_unit_offset,
+            )?;
+        }
+        Ok(router_buffers)
+    }
+
     fn collect_mtp_verify_qwen35_router_slots(
         &mut self,
         router_buffers: &MtpVerifyQwen35RouterBuffers,
@@ -6011,6 +6279,7 @@ impl super::CudaState {
                     && crate::tuning::mtp_verify_window2_graphs_enabled()))
             && run_ffn
             && collect_kv_state
+            && layer.gemma_mtp2_moe.is_none()
             && layer.post_ffw_norm.is_empty()
             && layer.ple_gate.is_empty()
             && layer.out_scale.is_empty()
@@ -6178,7 +6447,9 @@ impl super::CudaState {
             return Ok(None);
         }
         let stage_start = std::time::Instant::now();
-        let router_buffers = if layer.n_expert == 0 {
+        let router_buffers = if let Some(moe) = layer.gemma_mtp2_moe.as_ref() {
+            Some(self.stage_mtp_verify_gemma_mtp2_hybrid(buffers, layer, moe, norm_eps)?)
+        } else if layer.n_expert == 0 {
             self.stage_mtp_verify_attention_dense_ffn_residual_q4k(
                 buffers,
                 layer.ffn_gate_q4k,
@@ -7462,6 +7733,7 @@ impl super::CudaState {
             .checked_mul(plan.hidden_dim)
             .ok_or_else(|| "MTP verify result hidden rows length overflow".to_string())?;
         let mut mtp_hidden_rows = vec![0.0_f32; hidden_values];
+        let mut output_hidden_rows = vec![0.0_f32; hidden_values];
         unsafe {
             self.api.memcpy_dtoh_async(
                 target_tokens.as_mut_ptr().cast::<libc::c_void>(),
@@ -7475,11 +7747,18 @@ impl super::CudaState {
                 plan.hidden_row_bytes,
                 self.stream,
             )?;
+            self.api.memcpy_dtoh_async(
+                output_hidden_rows.as_mut_ptr().cast::<libc::c_void>(),
+                buffers.scratch_hidden_dev,
+                plan.hidden_row_bytes,
+                self.stream,
+            )?;
         }
         self.stream_synchronize()?;
         Ok(Qwen35MtpDeviceVerifyResult {
             target_tokens,
             mtp_hidden_rows,
+            output_hidden_rows,
             hidden_dim: plan.hidden_dim,
             output_logits: Vec::new(),
             prefix_states: Vec::new(),

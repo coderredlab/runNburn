@@ -118,7 +118,7 @@ fn cuda_qwen35_mtp_verify_stage_allows_empty_prefix_indices() {
 }
 
 #[test]
-fn cuda_qwen35_mtp_verify_collects_target_tokens_and_hidden_rows() {
+fn cuda_qwen35_mtp_verify_collects_raw_and_output_norm_hidden_rows_separately() {
     let _guard = runtime_test_lock();
     let mut state = CudaState::open().expect("open CUDA state");
     let plan = qwen35_mtp_verify_buffer_plan(2, 4, 0).unwrap();
@@ -126,6 +126,7 @@ fn cuda_qwen35_mtp_verify_collects_target_tokens_and_hidden_rows() {
         .ensure_mtp_verify_buffers(&plan)
         .expect("allocate verify buffers");
     let target_tokens = [101_u32, 202];
+    let raw_hidden_rows = [-1.0_f32, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0];
     let hidden_rows = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     unsafe {
         state
@@ -141,6 +142,15 @@ fn cuda_qwen35_mtp_verify_collects_target_tokens_and_hidden_rows() {
             .api
             .memcpy_htod_async(
                 buffers.hidden_rows_dev,
+                raw_hidden_rows.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(raw_hidden_rows.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+        state
+            .api
+            .memcpy_htod_async(
+                buffers.scratch_hidden_dev,
                 hidden_rows.as_ptr().cast::<libc::c_void>(),
                 std::mem::size_of_val(hidden_rows.as_slice()),
                 state.stream,
@@ -153,7 +163,8 @@ fn cuda_qwen35_mtp_verify_collects_target_tokens_and_hidden_rows() {
         .expect("collect verify result");
 
     assert_eq!(result.target_tokens, target_tokens);
-    assert_eq!(result.mtp_hidden_rows, hidden_rows);
+    assert_eq!(result.mtp_hidden_rows, raw_hidden_rows);
+    assert_eq!(result.output_hidden_rows, hidden_rows);
     assert_eq!(result.hidden_dim, 4);
 }
 
@@ -4945,6 +4956,59 @@ fn cuda_qwen35_mtp_verify_output_argmax_q8_0_writes_target_tokens() {
         .collect::<Vec<_>>();
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn cuda_qwen35_mtp_verify_output_logits_q8_0_match_cpu_reference() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let hidden_dim = 512usize;
+    let window_tokens = 3usize;
+    let vocab_rows = 19usize;
+    let output_weight = make_test_q8_0_weights(vocab_rows, hidden_dim, 317);
+    let output_norm = (0..hidden_dim)
+        .map(|i| 0.75 + ((i % 11) as f32) * 0.03125)
+        .collect::<Vec<_>>();
+    let hidden_rows = (0..window_tokens * hidden_dim)
+        .map(|i| ((i as f32 % 29.0) - 14.0) * 0.017578125)
+        .collect::<Vec<_>>();
+    let verify_tokens = [4_u32, 5, 6];
+    let plan = qwen35_mtp_verify_buffer_plan(window_tokens, hidden_dim, 0).unwrap();
+    let buffers = state
+        .stage_mtp_verify_window(&plan, &verify_tokens, &[])
+        .expect("stage verify tokens");
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                buffers.hidden_rows_dev,
+                hidden_rows.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(hidden_rows.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+    }
+
+    let actual = state
+        .stage_mtp_verify_output_logits(
+            &buffers,
+            &output_weight,
+            vocab_rows,
+            hidden_dim,
+            8,
+            &output_norm,
+            1.0e-5,
+        )
+        .expect("collect Q8_0 output logits");
+    let expected = hidden_rows
+        .chunks_exact(hidden_dim)
+        .flat_map(|hidden| {
+            let normed = cpu_rms_norm(hidden, &output_norm, 1.0e-5, false);
+            cpu_q8_0_rows(&output_weight, vocab_rows, hidden_dim, &normed)
+        })
+        .collect::<Vec<_>>();
+
+    assert_close_rows("MTP verify Q8_0 output logits", &actual, &expected, 0.02);
 }
 
 #[test]

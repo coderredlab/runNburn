@@ -288,7 +288,7 @@ impl CudaState {
             eprintln!(
                 "[cuda] q4k resident offloaded released={}MiB remaining={}MiB",
                 released / (1024 * 1024),
-                self.resident_q4k_bytes / (1024 * 1024)
+                self.resident_q4k_bytes / (1024 * 1024),
             );
         }
         Ok(released)
@@ -309,6 +309,21 @@ impl CudaState {
         }?;
         self.record_transient_quant_upload("Q4_K", weights.len());
         Ok(ptr)
+    }
+
+    fn upload_temp_q4k_weights_current_if_allowed(
+        &mut self,
+        weights: &[u8],
+        allow_temp: bool,
+    ) -> Result<u64, String> {
+        if allow_temp {
+            self.upload_temp_q4k_weights_current(weights)
+        } else {
+            Err(format!(
+                "pinned resident Q4_K admission failed for {} bytes",
+                weights.len()
+            ))
+        }
     }
 
     pub(in crate::runtime) fn resident_q4k_weights_ptr(
@@ -343,6 +358,7 @@ impl CudaState {
             weights,
             tuning::resident_q4k_arena_enabled(),
             false,
+            true,
         )
     }
 
@@ -351,7 +367,30 @@ impl CudaState {
         weights: &[u8],
     ) -> Result<u64, String> {
         self.set_current()?;
-        self.resident_q4k_weights_ptr_current_with_arena(weights, false, true)
+        self.resident_q4k_weights_ptr_current_with_arena(weights, false, true, true)
+    }
+
+    /// Returns a pointer backed by the resident cache and a key only when this
+    /// call acquired a temporary pin. A contained slice of an already-pinned
+    /// model-lifetime slab borrows the parent pin and therefore has no lease.
+    pub(in crate::runtime) fn resident_q4k_weights_ptr_pinned_with_lease(
+        &mut self,
+        weights: &[u8],
+    ) -> Result<(u64, Option<(usize, usize)>), String> {
+        self.set_current()?;
+        let key = q4k_resident_key(weights);
+        let was_pinned = self
+            .resident_q4k
+            .get(&key)
+            .is_some_and(|entry| entry.pinned);
+        let ptr = self.resident_q4k_weights_ptr_current_with_arena(weights, false, true, false)?;
+        if self.resident_q4k.contains_key(&key) {
+            Ok((ptr, (!was_pinned).then_some(key)))
+        } else {
+            // The strict lookup can reach this branch only through a contained
+            // slice of an already-pinned model-lifetime parent slab.
+            Ok((ptr, None))
+        }
     }
 
     // cu27: launch 시퀀스 안에서 q→k→v 등 다중 register시, 직전 register가
@@ -363,12 +402,18 @@ impl CudaState {
         }
     }
 
+    pub(in crate::runtime) fn unpin_resident_q4k_key(&mut self, key: (usize, usize)) {
+        if let Some(entry) = self.resident_q4k.get_mut(&key) {
+            entry.pinned = false;
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime) fn resident_q4k_weights_ptr_current_arena(
         &mut self,
         weights: &[u8],
     ) -> Result<u64, String> {
-        self.resident_q4k_weights_ptr_current_with_arena(weights, true, false)
+        self.resident_q4k_weights_ptr_current_with_arena(weights, true, false, true)
     }
 
     fn resident_q4k_weights_ptr_current_with_arena(
@@ -376,6 +421,7 @@ impl CudaState {
         weights: &[u8],
         use_arena: bool,
         pinned: bool,
+        allow_temp: bool,
     ) -> Result<u64, String> {
         cache_stats().lookups.fetch_add(1, Ordering::Relaxed);
         let key = q4k_resident_key(weights);
@@ -399,6 +445,27 @@ impl CudaState {
             return Ok(ptr);
         }
 
+        let source_identity = rnb_core::tensor::host_storage_identity(weights);
+        if let Some(ptr) = source_identity.and_then(|source| {
+            let source_end = source.byte_offset.checked_add(source.len)?;
+            self.resident_q4k.values().find_map(|entry| {
+                let resident = entry.source_identity?;
+                let resident_end = resident.byte_offset.checked_add(resident.len)?;
+                if entry.pinned
+                    && source.allocation_id == resident.allocation_id
+                    && source.byte_offset >= resident.byte_offset
+                    && source_end <= resident_end
+                {
+                    Some(entry.ptr + (source.byte_offset - resident.byte_offset) as u64)
+                } else {
+                    None
+                }
+            })
+        }) {
+            cache_stats().hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(ptr);
+        }
+
         cache_stats().misses.fetch_add(1, Ordering::Relaxed);
         let epoch = self.next_resident_q4k_epoch();
         if use_arena {
@@ -407,7 +474,7 @@ impl CudaState {
         if !self.prepare_quant_resident_admission(weights.len())?
             || self.resident_q4k_effective_limit() < weights.len()
         {
-            return self.upload_temp_q4k_weights_current(weights);
+            return self.upload_temp_q4k_weights_current_if_allowed(weights, allow_temp);
         }
 
         self.evict_resident_q4k_until(weights.len())?;
@@ -415,7 +482,7 @@ impl CudaState {
             || self.resident_q4k_bytes.saturating_add(weights.len())
                 > self.resident_q4k_effective_limit()
         {
-            return self.upload_temp_q4k_weights_current(weights);
+            return self.upload_temp_q4k_weights_current_if_allowed(weights, allow_temp);
         }
         let ptr = match self.resident_q4k_mem_alloc(weights.len()) {
             Ok(ptr) => ptr,
@@ -434,12 +501,15 @@ impl CudaState {
                             || self.resident_q4k_bytes.saturating_add(weights.len())
                                 > self.resident_q4k_effective_limit()
                         {
-                            return self.upload_temp_q4k_weights_current(weights);
+                            return self
+                                .upload_temp_q4k_weights_current_if_allowed(weights, allow_temp);
                         }
                         match self.resident_q4k_mem_alloc(weights.len()) {
                             Ok(ptr) => ptr,
                             Err(second) if cuda_mem_alloc_oom(&second) => {
-                                return self.upload_temp_q4k_weights_current(weights);
+                                return self.upload_temp_q4k_weights_current_if_allowed(
+                                    weights, allow_temp,
+                                );
                             }
                             Err(second) => return Err(second),
                         }
@@ -465,6 +535,7 @@ impl CudaState {
             ResidentQ4k {
                 ptr,
                 bytes: weights.len(),
+                source_identity,
                 epoch,
                 owned_alloc: true,
                 slab_base: None,
@@ -543,6 +614,7 @@ impl CudaState {
             ResidentQ4k {
                 ptr,
                 bytes: weights.len(),
+                source_identity: rnb_core::tensor::host_storage_identity(weights),
                 epoch,
                 owned_alloc: false,
                 slab_base: None,
@@ -614,6 +686,7 @@ impl CudaState {
             ResidentQ4k {
                 ptr,
                 bytes: weights.len(),
+                source_identity: rnb_core::tensor::host_storage_identity(weights),
                 epoch,
                 owned_alloc: true,
                 slab_base: None,
@@ -837,6 +910,7 @@ impl CudaState {
             ResidentQ4k {
                 ptr,
                 bytes: weights.len(),
+                source_identity: rnb_core::tensor::host_storage_identity(weights),
                 epoch,
                 owned_alloc: true,
                 slab_base: None,

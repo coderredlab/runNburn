@@ -695,6 +695,9 @@ pub fn mtp_verify_shared_scale_add_enabled() -> bool {
 pub fn mtp_verify_segment_graph_enabled() -> bool {
     env_bool("RNB_CUDA_MTP_VERIFY_SEGMENT_GRAPH", true)
 }
+pub fn gemma_mtp2_finalize_megakernel_enabled() -> bool {
+    env_bool("RNB_CUDA_GEMMA_MTP2_FINALIZE_M1", true)
+}
 
 pub fn mtp_verify_selected_q8_gate_up_enabled() -> bool {
     env_bool("RNB_CUDA_MTP_VERIFY_SELECTED_Q8_GATE_UP", true)

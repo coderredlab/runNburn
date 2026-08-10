@@ -377,7 +377,16 @@ impl Engine {
             );
         }
 
-        // Pre-dequantize all weights
+        let drafter_paths = load_stage!("external_drafter_candidates", {
+            if crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none() {
+                crate::engine::policy::env_string("RNB_DRAFTER_MODEL")
+                    .map(|path| vec![std::path::PathBuf::from(path)])
+                    .unwrap_or_else(|| crate::auto_drafter::find_sibling_drafter_candidates(path))
+            } else {
+                Vec::new()
+            }
+        });
+
         let mut weights = load_stage!("load_model_weights", {
             load_model_weights(
                 &model,
@@ -719,10 +728,6 @@ impl Engine {
             if !engine.mtp_runtime_ready()
                 && crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none()
             {
-                let drafter_paths = crate::engine::policy::env_string("RNB_DRAFTER_MODEL")
-                    .map(|path| vec![std::path::PathBuf::from(path)])
-                    .unwrap_or_else(|| crate::auto_drafter::find_sibling_drafter_candidates(path));
-
                 for drafter_path in &drafter_paths {
                     let attach_result = match rnb_loader::detect_model_architecture(drafter_path) {
                         Ok(ModelArchitecture::DFlash) => rnb_loader::load_model(drafter_path)
@@ -776,10 +781,7 @@ impl Engine {
         #[cfg(feature = "cuda")]
         load_stage!("mtp_device_verify_prepare", {
             if engine.mtp_spec_requested() && engine.mtp_device_verify_requested() {
-                engine.prewarm_mtp_device_verify_static_weights()?;
-                if let Some(scratch) = engine.scratch.as_mut() {
-                    scratch.device_verify_static_weights_warmed = true;
-                }
+                engine.ensure_mtp_device_verify_static_weights_prewarmed()?;
             }
         });
 

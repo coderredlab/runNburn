@@ -823,7 +823,7 @@ impl Engine {
                 collect_output_logits: _collect_output_logits,
             };
             let kernel_start = std::time::Instant::now();
-            let result =
+            let mut result =
                 crate::engine::cuda_runtime::qwen35_mtp_device_verify_window(device_request)
                     .map_err(|err| {
                         crate::error::LlmError::Forward(format!(
@@ -831,11 +831,18 @@ impl Engine {
                             self.architecture
                         ))
                     })?;
+            if _collect_output_logits {
+                super::models::gemma::apply_logit_softcapping(
+                    &mut result.output_logits,
+                    self.metadata.final_logit_softcapping,
+                );
+            }
             let kernel_ms = kernel_start.elapsed().as_secs_f64() * 1000.0;
             let result = crate::engine::verify_window::VerifyWindowResult::from_device_result_with_state_payload(
                 result.target_tokens,
                 result.output_logits,
                 result.mtp_hidden_rows,
+                result.output_hidden_rows,
                 result.hidden_dim,
                 result.prefix_states,
                 result.ssm_final_states,
@@ -881,6 +888,7 @@ impl Engine {
                         target_tokens: vec![token; tokens.len()],
                         output_logits: Vec::new(),
                         mtp_hidden_rows: Vec::new(),
+                        output_hidden_rows: Vec::new(),
                         hidden_dim: self.metadata.hidden_dim,
                         prefix_state: None,
                         prefix_states: Vec::new(),
@@ -1013,6 +1021,11 @@ impl Engine {
             self.last_layer_hidden_cached.clear();
             self.last_layer_hidden_cached.extend_from_slice(last_hidden);
         }
+        let (window_output_hidden_rows, external_output_hidden_rows) = if external_target_batch {
+            (Vec::new(), output_hidden_rows)
+        } else {
+            (output_hidden_rows, Vec::new())
+        };
         if verify_profiling {
             vp_ms[2] = vp_mark.elapsed().as_secs_f64() * 1000.0;
             vp_mark = std::time::Instant::now();
@@ -1051,6 +1064,7 @@ impl Engine {
                 target_tokens,
                 output_logits,
                 mtp_hidden_rows: mtp_hidden_rows.unwrap_or_default(),
+                output_hidden_rows: window_output_hidden_rows,
                 hidden_dim: self.metadata.hidden_dim,
                 prefix_state,
                 prefix_states,
@@ -1059,7 +1073,7 @@ impl Engine {
                 #[cfg(any(feature = "cuda", test))]
                 attention_kv_states: Vec::new(),
             },
-            output_hidden_rows,
+            external_output_hidden_rows,
         ))
     }
 
@@ -1266,6 +1280,17 @@ impl Engine {
             );
         }
         self.sync_sequence_cursor_to_kv_len()
+    }
+
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn commit_device_verify_window_prefix(
+        &mut self,
+        base_kv_len: usize,
+        result: &crate::engine::verify_window::VerifyWindowResult,
+        committed_tokens: usize,
+    ) -> crate::error::Result<()> {
+        self.commit_device_verify_window_prefix_states(base_kv_len, result, committed_tokens)?;
+        self.restore_batch_verify_last_hidden(&result.output_hidden_rows, committed_tokens)
     }
 
     #[cfg(any(feature = "cuda", test))]
@@ -1659,6 +1684,7 @@ impl Engine {
                     // device-resident와 sequential만 허용한다.
                     output_logits: Vec::new(),
                     mtp_hidden_rows,
+                    output_hidden_rows: Vec::new(),
                     hidden_dim: self.metadata.hidden_dim,
                     prefix_state: None,
                     prefix_states: Vec::new(),
@@ -2777,10 +2803,16 @@ fn build_mtp_device_verify_attention_moe_layers_inner<'weights, 'cache>(
                 moe.n_embd,
             )
         } else {
-            let ffn_gate_q4k =
-                q4k_weight_bytes_for_mtp_device(&attn.ffn_gate_weight, layer_idx, "ffn_gate")?;
-            let ffn_up_q4k =
-                q4k_weight_bytes_for_mtp_device(&attn.ffn_up_weight, layer_idx, "ffn_up")?;
+            let ffn_gate_q4k = if attn.moe.is_some() {
+                k_quant_weight_bytes_for_mtp_device(&attn.ffn_gate_weight, layer_idx, "ffn_gate")?.0
+            } else {
+                q4k_weight_bytes_for_mtp_device(&attn.ffn_gate_weight, layer_idx, "ffn_gate")?
+            };
+            let ffn_up_q4k = if attn.moe.is_some() {
+                k_quant_weight_bytes_for_mtp_device(&attn.ffn_up_weight, layer_idx, "ffn_up")?.0
+            } else {
+                q4k_weight_bytes_for_mtp_device(&attn.ffn_up_weight, layer_idx, "ffn_up")?
+            };
             let (ffn_down, ffn_down_quant) =
                 k_quant_weight_bytes_for_mtp_device(&attn.ffn_down_weight, layer_idx, "ffn_down")?;
             (
@@ -2813,6 +2845,72 @@ fn build_mtp_device_verify_attention_moe_layers_inner<'weights, 'cache>(
                 attn.ffn_gate_weight.rows,
                 metadata.hidden_dim,
             )
+        };
+        let gemma_mtp2_moe = if let Some(moe) = attn.moe.as_ref() {
+            if !gemma_block_semantics {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "MTP device verify layer {layer_idx} has Gemma hybrid MoE weights without Gemma block semantics"
+                )));
+            }
+            if moe.n_embd != metadata.hidden_dim {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "MTP device verify Gemma layer {layer_idx} MoE n_embd {} != hidden_dim {}",
+                    moe.n_embd, metadata.hidden_dim
+                )));
+            }
+            if moe.gate_up_quant != rnb_loader::GGMLType::Q4_K
+                || !matches!(
+                    moe.down_quant,
+                    rnb_loader::GGMLType::Q5_1 | rnb_loader::GGMLType::Q8_0
+                )
+            {
+                return Err(crate::error::LlmError::Forward(format!(
+                    "MTP device verify Gemma layer {layer_idx} unsupported expert quant: gate_up={:?} down={:?}",
+                    moe.gate_up_quant, moe.down_quant
+                )));
+            }
+            let router_w = moe.router_f32().ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "MTP device verify Gemma layer {layer_idx} router f32 missing"
+                ))
+            })?;
+            let gate_up_experts = moe.gate_up_bytes().ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "MTP device verify Gemma layer {layer_idx} gate/up bytes missing"
+                ))
+            })?;
+            let down_experts = moe.down_bytes().ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "MTP device verify Gemma layer {layer_idx} down bytes missing"
+                ))
+            })?;
+            Some(super::cuda_runtime::GemmaMtp2MoeLayer {
+                router_w,
+                router_scale: super::cpu_runtime::kernels::tensor_as_f32_slice(&moe.router_scale),
+                gate_up_experts,
+                gate_up_quant: moe.gate_up_quant,
+                down_experts,
+                down_scale: super::cpu_runtime::kernels::tensor_as_f32_slice(&moe.down_scale),
+                down_quant: moe.down_quant,
+                pre_ffw_norm_2: super::cpu_runtime::kernels::tensor_as_f32_slice(
+                    &moe.pre_ffw_norm_2,
+                ),
+                post_ffw_norm_1: super::cpu_runtime::kernels::tensor_as_f32_slice(
+                    &moe.post_ffw_norm_1,
+                ),
+                post_ffw_norm_2: super::cpu_runtime::kernels::tensor_as_f32_slice(
+                    &moe.post_ffw_norm_2,
+                ),
+                n_ff: moe.n_ff,
+                n_embd: moe.n_embd,
+                n_expert: moe.n_expert,
+                shared_gate_quant: attn.ffn_gate_weight.ggml_type,
+                shared_up_quant: attn.ffn_up_weight.ggml_type,
+                shared_down_quant: attn.ffn_down_weight.ggml_type,
+                n_expert_used: moe.n_expert_used,
+            })
+        } else {
+            None
         };
         let cache_layer_idx = kv_source_layer.unwrap_or(layer_idx);
         let cache_layer = cache_layers.get(cache_layer_idx).ok_or_else(|| {
@@ -3073,6 +3171,7 @@ fn build_mtp_device_verify_attention_moe_layers_inner<'weights, 'cache>(
             shared_down_quant,
             n_ff,
             n_embd,
+            gemma_mtp2_moe,
         });
         kvarn_priors.push(kvarn_prior);
     }
@@ -3253,6 +3352,7 @@ pub(in crate::engine) fn build_mtp_device_draft_attention_moe_layer<'a>(
         shared_down_quant,
         n_ff: moe.n_ff,
         n_embd: moe.n_embd,
+        gemma_mtp2_moe: None,
     })
 }
 

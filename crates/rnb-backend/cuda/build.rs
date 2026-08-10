@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/q4k_gemv.cu");
     println!("cargo:rerun-if-changed=cuda/nemotron_selected.cu");
     println!("cargo:rerun-if-changed=cuda/persistent_decode.cu");
+    println!("cargo:rerun-if-changed=cuda/gemma_mtp2_megakernel.cu");
     println!("cargo:rerun-if-changed=cuda/kernels");
     println!("cargo:rerun-if-env-changed=RNB_CUDA_ARCH");
 
@@ -36,6 +37,16 @@ fn main() {
         &arch,
         "cuda/persistent_decode.cu",
         &out_dir.join("persistent_decode.cubin"),
+    );
+    compile_ptx(
+        &arch,
+        "cuda/gemma_mtp2_megakernel.cu",
+        &out_dir.join("gemma_mtp2_megakernel.ptx"),
+    );
+    compile_cubin(
+        &arch,
+        "cuda/gemma_mtp2_megakernel.cu",
+        &out_dir.join("gemma_mtp2_megakernel.cubin"),
     );
 }
 

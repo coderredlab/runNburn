@@ -850,6 +850,7 @@ impl Engine {
         let runtime =
             crate::external_drafter::ExternalDrafterRuntime::new(std::sync::Arc::new(drafter));
         self.mtp_runtime = Some(EngineMtpRuntime::External(runtime));
+        self.mtp_auto_requested_cache.take();
         Ok(())
     }
 
@@ -859,6 +860,7 @@ impl Engine {
     ) -> Result<()> {
         runtime.validate_target(self.architecture, &self.metadata)?;
         self.mtp_runtime = Some(EngineMtpRuntime::Dspark(runtime));
+        self.mtp_auto_requested_cache.take();
         Ok(())
     }
 

@@ -268,6 +268,7 @@ fn device_verify_final_state_commit_updates_gdn_conv_state_and_len() {
         output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
+        output_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
         prefix_state: None,
         prefix_states: Vec::new(),
@@ -303,6 +304,7 @@ fn device_verify_final_state_commit_leaves_state_untouched_when_payload_is_inval
         output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
+        output_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
         prefix_state: None,
         prefix_states: Vec::new(),
@@ -376,6 +378,7 @@ fn device_verify_final_state_commit_writes_attention_kv_range() {
         output_logits: Vec::new(),
         target_tokens: vec![10, 11],
         mtp_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
+        output_hidden_rows: vec![0.0; 2 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
         prefix_state: None,
         prefix_states: Vec::new(),
@@ -413,6 +416,7 @@ fn device_verify_prefix_commit_writes_only_committed_attention_kv() {
         output_logits: Vec::new(),
         target_tokens: vec![10, 11, 12],
         mtp_hidden_rows: vec![0.0; 3 * engine.metadata.hidden_dim],
+        output_hidden_rows: vec![0.0; 3 * engine.metadata.hidden_dim],
         hidden_dim: engine.metadata.hidden_dim,
         prefix_state: None,
         prefix_states: Vec::new(),
@@ -435,6 +439,38 @@ fn device_verify_prefix_commit_writes_only_committed_attention_kv() {
     let (actual_k, actual_v) = engine.kv_cache.get_up_to(0, 6);
     assert_eq!(&actual_k[4 * kv_rows..], &k_bits[..2 * kv_rows]);
     assert_eq!(&actual_v[4 * kv_rows..], &v_bits[..2 * kv_rows]);
+}
+
+#[test]
+fn device_verify_prefix_commit_restores_committed_last_hidden() {
+    let mut engine = make_mock_engine(8);
+    engine.kv_cache.set_len(4);
+    let hidden_dim = engine.metadata.hidden_dim;
+    let mtp_hidden_rows = vec![-1.0; 3 * hidden_dim];
+    let output_hidden_rows = (0..3 * hidden_dim)
+        .map(|index| index as f32)
+        .collect::<Vec<_>>();
+    let result = verify_window::VerifyWindowResult {
+        output_logits: Vec::new(),
+        target_tokens: vec![10, 11, 12],
+        mtp_hidden_rows,
+        output_hidden_rows: output_hidden_rows.clone(),
+        hidden_dim,
+        prefix_state: None,
+        prefix_states: Vec::new(),
+        ssm_final_states: Vec::new(),
+        attention_kv_states: Vec::new(),
+    };
+
+    engine
+        .commit_device_verify_window_prefix(4, &result, 2)
+        .expect("commit device verify prefix");
+
+    assert_eq!(engine.kv_cache.current_len(), 6);
+    assert_eq!(
+        engine.last_hidden_for_decode(),
+        &output_hidden_rows[hidden_dim..2 * hidden_dim]
+    );
 }
 
 fn make_f32_weight(rows: usize, cols: usize, data: Vec<f32>) -> QuantizedWeight {

@@ -360,6 +360,8 @@ impl CudaState {
             q4k_gemv_module: None,
             nemotron_selected_module: None,
             persistent_decode_module: None,
+            gemma_mtp2_module: None,
+            gemma_mtp2_ctx: GemmaMtp2Reusable::default(),
             persistent_decode_ctx: None,
             qwen35_sparse_graphs: HashMap::new(),
             qwen35_compound_graphs: HashMap::new(),
@@ -785,6 +787,23 @@ impl Drop for CudaState {
             let _ = unsafe { self.api.module_unload(module as *mut libc::c_void) };
         }
         if let Some(module) = self.persistent_decode_module.take() {
+            let _ = unsafe { self.api.module_unload(module as *mut libc::c_void) };
+        }
+        for ptr in [
+            self.gemma_mtp2_ctx.normalized_qs.take(),
+            self.gemma_mtp2_ctx.normalized_ds.take(),
+            self.gemma_mtp2_ctx.gate_up.take(),
+            self.gemma_mtp2_ctx.rank_output.take(),
+            self.gemma_mtp2_ctx.output.take(),
+            self.gemma_mtp2_ctx.shared_output.take(),
+            self.gemma_mtp2_ctx.sparse_input.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = unsafe { self.api.mem_free(ptr) };
+        }
+        if let Some(module) = self.gemma_mtp2_module.take() {
             let _ = unsafe { self.api.module_unload(module as *mut libc::c_void) };
         }
         let _ = unsafe { self.api.stream_destroy(self.stream) };

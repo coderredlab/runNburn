@@ -33,14 +33,16 @@ pub(in crate::runtime) use dense::{
 mod gdn;
 mod gdn_decode_chain;
 mod gdn_prefill_chain;
+mod gemma_mtp2_megakernel;
 mod gemv;
 mod moe;
 mod mtp_verify;
+use gemma_mtp2_megakernel::{GemmaMtp2FinalizeRequest, GemmaMtp2SelectedSparseRequest};
 mod nemotron_mamba2;
 mod persistent_decode;
 pub use mtp_verify::{
-    qwen35_mtp_verify_buffer_plan, MtpVerifyBufferPlan, Qwen35MtpDeviceDraftRequest,
-    Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
+    qwen35_mtp_verify_buffer_plan, GemmaMtp2MoeLayer, MtpVerifyBufferPlan,
+    Qwen35MtpDeviceDraftRequest, Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
     Qwen35MtpDeviceVerifyAttentionMoeLayer, Qwen35MtpDeviceVerifyGdnMoeLayer,
     Qwen35MtpDeviceVerifyLayerKind, Qwen35MtpDeviceVerifyPrefixState, Qwen35MtpDeviceVerifyRequest,
     Qwen35MtpDeviceVerifyResult, Qwen35MtpDeviceVerifySsmLayerFinalState,

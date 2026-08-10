@@ -1143,6 +1143,29 @@ pub(super) const PERSISTENT_DECODE_CUBIN: &[u8] =
 )))]
 pub(super) const PERSISTENT_DECODE_CUBIN: &[u8] = &[];
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(super) const GEMMA_MTP2_MEGAKERNEL_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/gemma_mtp2_megakernel.ptx"));
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+)))]
+pub(super) const GEMMA_MTP2_MEGAKERNEL_PTX: &str = "";
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(super) const GEMMA_MTP2_MEGAKERNEL_CUBIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemma_mtp2_megakernel.cubin"));
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+)))]
+pub(super) const GEMMA_MTP2_MEGAKERNEL_CUBIN: &[u8] = &[];
+
 #[allow(dead_code)]
 pub(super) const Q4K_GEMV_PTX: &str = r#"
 .version 7.0

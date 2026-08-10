@@ -134,14 +134,15 @@ pub use runtime::{
     sparse_experts_iq2xxs_iq3xxs_by_token_clamped_swiglu, ssm_conv1d_silu, sync_delta_state_cache,
     upload_gemma_ple_base, validate_gdn_prefill_chain_shape, CudaMemoryInfo, CudaMoeJitLoader,
     DeltaStateSnapshot, GdnPrefillChainDims, GdnPrefillChainPlan, GdnPrefillChainQ4KOutput,
-    GdnPrefillChainQ4KRequest, GdnPrefillChainShape, MtpVerifyBufferPlan, NemotronDeviceRoutePack,
-    NemotronDeviceRouterLogitsOutput, NemotronMamba2DeviceOutput, NemotronPrefillWorkspaceConfig,
-    NemotronPrefillWorkspaceSummary, Qwen35MtpDeviceDraftRequest, Qwen35MtpDeviceDraftResult,
-    Qwen35MtpDeviceVerifyAttentionKvState, Qwen35MtpDeviceVerifyAttentionMoeLayer,
-    Qwen35MtpDeviceVerifyGdnMoeLayer, Qwen35MtpDeviceVerifyLayerKind,
-    Qwen35MtpDeviceVerifyPrefixState, Qwen35MtpDeviceVerifyRequest, Qwen35MtpDeviceVerifyResult,
-    Qwen35MtpDeviceVerifySsmLayerFinalState, Qwen35MtpDeviceVerifySsmLayerPrefixState,
-    Qwen35PrefillAttentionDeviceOutput, QwenGdnDecodeChainArgs,
+    GdnPrefillChainQ4KRequest, GdnPrefillChainShape, GemmaMtp2MoeLayer, MtpVerifyBufferPlan,
+    NemotronDeviceRoutePack, NemotronDeviceRouterLogitsOutput, NemotronMamba2DeviceOutput,
+    NemotronPrefillWorkspaceConfig, NemotronPrefillWorkspaceSummary, Qwen35MtpDeviceDraftRequest,
+    Qwen35MtpDeviceDraftResult, Qwen35MtpDeviceVerifyAttentionKvState,
+    Qwen35MtpDeviceVerifyAttentionMoeLayer, Qwen35MtpDeviceVerifyGdnMoeLayer,
+    Qwen35MtpDeviceVerifyLayerKind, Qwen35MtpDeviceVerifyPrefixState, Qwen35MtpDeviceVerifyRequest,
+    Qwen35MtpDeviceVerifyResult, Qwen35MtpDeviceVerifySsmLayerFinalState,
+    Qwen35MtpDeviceVerifySsmLayerPrefixState, Qwen35PrefillAttentionDeviceOutput,
+    QwenGdnDecodeChainArgs,
 };
 
 #[cfg(test)]

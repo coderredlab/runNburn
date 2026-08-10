@@ -76,7 +76,7 @@ pub use qwen_moe::{
     qwen_moe_prefill_sparse_experts_selected_base_by_token,
     qwen_moe_prefill_sparse_route_arrays_device_topk, qwen_moe_prefill_sparse_slots,
     qwen_moe_prefill_sparse_slots_device_topk, qwen_moe_prefill_sparse_slots_expert_major,
-    qwen_moe_register_layer, MtpDeviceDraftRequest, MtpDeviceDraftResult,
+    qwen_moe_register_layer, GemmaMtp2MoeLayer, MtpDeviceDraftRequest, MtpDeviceDraftResult,
     MtpDeviceVerifyAttentionKvState, MtpDeviceVerifyAttentionMoeLayer, MtpDeviceVerifyGdnMoeLayer,
     MtpDeviceVerifyLayerKind, MtpDeviceVerifyPrefixState, MtpDeviceVerifySsmLayerFinalState,
     MtpDeviceVerifySsmLayerPrefixState, MtpDeviceVerifyWindowRequest, MtpDeviceVerifyWindowResult,

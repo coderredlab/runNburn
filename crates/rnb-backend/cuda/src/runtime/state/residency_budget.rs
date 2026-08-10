@@ -135,8 +135,8 @@ impl CudaState {
         if std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {
             let (final_free_bytes, _) = unsafe { self.api.mem_get_info() }?;
             eprintln!(
-                "[cuda] unified residency reclaim: request={}MiB low_priority_released={}MiB free={}MiB reserve={}MiB",
-                requested_bytes / (1024 * 1024),
+                "[cuda] unified residency reclaim: request={} bytes low_priority_released={}MiB free={}MiB reserve={}MiB",
+                requested_bytes,
                 released_low_priority / (1024 * 1024),
                 final_free_bytes / (1024 * 1024),
                 transient_reserve_bytes / (1024 * 1024),

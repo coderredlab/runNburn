@@ -644,6 +644,31 @@ fn next_token_from_current_logits(
     Ok(sampler.sample(logits, generated_tokens, rng))
 }
 
+fn ignored_eos_hidden_row(
+    window: &VerifyWindowResult,
+    index: usize,
+) -> crate::error::Result<(&[f32], bool)> {
+    let start = index.checked_mul(window.hidden_dim).ok_or_else(|| {
+        crate::error::LlmError::Forward("MTP ignored-EOS hidden row offset overflow".to_string())
+    })?;
+    let end = start.checked_add(window.hidden_dim).ok_or_else(|| {
+        crate::error::LlmError::Forward("MTP ignored-EOS hidden row end overflow".to_string())
+    })?;
+    let is_output_hidden = !window.output_hidden_rows.is_empty();
+    let hidden_rows = if is_output_hidden {
+        &window.output_hidden_rows
+    } else {
+        &window.mtp_hidden_rows
+    };
+    let hidden = hidden_rows.get(start..end).ok_or_else(|| {
+        crate::error::LlmError::Forward(format!(
+            "MTP ignored-EOS {} hidden row missing at index {index}",
+            if is_output_hidden { "output" } else { "raw" }
+        ))
+    })?;
+    Ok((hidden, is_output_hidden))
+}
+
 fn replace_ignored_eos_targets(
     engine: &Engine,
     params: &GenerateParams,
@@ -657,20 +682,12 @@ fn replace_ignored_eos_targets(
         if window.target_tokens[index] != eos {
             continue;
         }
-        let start = index.checked_mul(window.hidden_dim).ok_or_else(|| {
-            crate::error::LlmError::Forward(
-                "MTP ignored-EOS hidden row offset overflow".to_string(),
-            )
-        })?;
-        let end = start.checked_add(window.hidden_dim).ok_or_else(|| {
-            crate::error::LlmError::Forward("MTP ignored-EOS hidden row end overflow".to_string())
-        })?;
-        let hidden = window.mtp_hidden_rows.get(start..end).ok_or_else(|| {
-            crate::error::LlmError::Forward(format!(
-                "MTP ignored-EOS hidden row missing at index {index}"
-            ))
-        })?;
-        window.target_tokens[index] = engine.target_argmax_excluding_from_hidden(hidden, eos)?;
+        let (hidden, is_output_hidden) = ignored_eos_hidden_row(window, index)?;
+        window.target_tokens[index] = if is_output_hidden {
+            engine.target_argmax_excluding_from_output_hidden(hidden, eos)?
+        } else {
+            engine.target_argmax_excluding_from_hidden(hidden, eos)?
+        };
     }
     Ok(())
 }
@@ -2435,7 +2452,7 @@ fn generate_with_external_drafter(
     let external_device_verify = engine.mtp_device_verify_requested();
     let sampled_verify = mtp_sampled_verify_allowed(params);
     if external_device_verify {
-        engine.prewarm_mtp_device_verify_static_weights()?;
+        engine.ensure_mtp_device_verify_static_weights_prewarmed()?;
     }
     let target_needs_sequential = mtp_target_needs_sequential(engine.architecture());
     let external_batch_verify = mtp_external_batch_verify_allowed(
@@ -2620,7 +2637,7 @@ fn generate_with_external_drafter(
             stats.accepted += accepted_draft_tokens;
             stats.add_target_verify(window.len(), 1);
             #[cfg(feature = "cuda")]
-            engine.commit_device_verify_window_prefix_states(
+            engine.commit_device_verify_window_prefix(
                 position_before_verify as usize,
                 &window,
                 1 + accepted_draft_tokens,
@@ -3446,6 +3463,32 @@ mod tests {
         assert_eq!(
             mtp_hidden_prefix_rows(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 2).unwrap(),
             &[1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn ignored_eos_hidden_rows_prefer_output_and_fall_back_to_raw() {
+        let mut window = VerifyWindowResult {
+            target_tokens: vec![2],
+            output_logits: Vec::new(),
+            mtp_hidden_rows: vec![1.0, 2.0],
+            output_hidden_rows: Vec::new(),
+            hidden_dim: 2,
+            prefix_state: None,
+            prefix_states: Vec::new(),
+            ssm_final_states: Vec::new(),
+            attention_kv_states: Vec::new(),
+        };
+
+        assert_eq!(
+            ignored_eos_hidden_row(&window, 0).unwrap(),
+            (&[1.0, 2.0][..], false)
+        );
+
+        window.output_hidden_rows = vec![3.0, 4.0];
+        assert_eq!(
+            ignored_eos_hidden_row(&window, 0).unwrap(),
+            (&[3.0, 4.0][..], true)
         );
     }
 

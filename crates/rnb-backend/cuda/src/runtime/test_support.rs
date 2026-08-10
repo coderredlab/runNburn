@@ -3303,3 +3303,323 @@ pub fn q6k_gemv_for_test(
 ) -> Result<Vec<f32>, String> {
     q6k_gemv(weights, rows, cols, input)
 }
+
+#[cfg(test)]
+pub struct GemmaMtp2FinalizeTestInput<'a> {
+    pub residual: &'a [f32],
+    pub shared_raw: &'a [f32],
+    pub post_norm_1: &'a [f32],
+    pub post_norm_2: &'a [f32],
+    pub common_post_norm: &'a [f32],
+    pub norm_eps: f32,
+    pub unit_offset: bool,
+}
+
+pub struct GemmaMtp2SelectedSparseTestResult {
+    pub output: Vec<f32>,
+    pub activation: Vec<f32>,
+    pub up: Vec<f32>,
+    pub rank_output: Vec<f32>,
+    pub finalized_residual: Option<Vec<f32>>,
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn gemma_mtp2_selected_sparse_for_test(
+    normalized: &[f32],
+    expert_ids: &[u32],
+    route_weights: &[f32],
+    gate_up_weights: &[u8],
+    down_weights: &[u8],
+    down_scale: &[f32],
+    tokens: usize,
+    hidden_dim: usize,
+    n_ff: usize,
+    n_expert: usize,
+    top_k: usize,
+    down_quant: u32,
+    finalize: Option<GemmaMtp2FinalizeTestInput<'_>>,
+) -> Result<GemmaMtp2SelectedSparseTestResult, String> {
+    if normalized.len() != tokens.saturating_mul(hidden_dim) {
+        return Err(format!(
+            "Gemma MTP2 test normalized length mismatch: got {}, expected {}",
+            normalized.len(),
+            tokens.saturating_mul(hidden_dim)
+        ));
+    }
+    let slots = tokens
+        .checked_mul(top_k)
+        .ok_or_else(|| "Gemma MTP2 test slot count overflow".to_string())?;
+    if expert_ids.len() != slots || route_weights.len() != slots {
+        return Err(format!(
+            "Gemma MTP2 test route length mismatch: ids={} weights={} expected={slots}",
+            expert_ids.len(),
+            route_weights.len()
+        ));
+    }
+
+    let finalize_values = tokens.saturating_mul(hidden_dim);
+    if let Some(finalize) = finalize.as_ref() {
+        if finalize.residual.len() != finalize_values
+            || finalize.shared_raw.len() != finalize_values
+        {
+            return Err(format!(
+                "Gemma MTP2 finalize test matrix mismatch: residual={} shared={} expected={finalize_values}",
+                finalize.residual.len(),
+                finalize.shared_raw.len()
+            ));
+        }
+    }
+
+    let mut state = CudaState::open()?;
+    for weights in [gate_up_weights, down_weights] {
+        let (_ptr, _new_pin) = state.resident_q4k_weights_ptr_pinned_with_lease(weights)?;
+    }
+    let normalized_dev = state.mem_alloc(std::mem::size_of_val(normalized))?;
+    let expert_ids_dev = state.mem_alloc(std::mem::size_of_val(expert_ids))?;
+    let route_weights_dev = state.mem_alloc(std::mem::size_of_val(route_weights))?;
+    let finalize_devs = if let Some(finalize) = finalize.as_ref() {
+        let residual_dev = state.mem_alloc(std::mem::size_of_val(finalize.residual))?;
+        let shared_raw_dev = state.mem_alloc(std::mem::size_of_val(finalize.shared_raw))?;
+        unsafe {
+            state.api.memcpy_htod_async(
+                residual_dev,
+                finalize.residual.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(finalize.residual),
+                state.stream,
+            )?;
+            state.api.memcpy_htod_async(
+                shared_raw_dev,
+                finalize.shared_raw.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(finalize.shared_raw),
+                state.stream,
+            )?;
+        }
+        Some((residual_dev, shared_raw_dev))
+    } else {
+        None
+    };
+    unsafe {
+        state.api.memcpy_htod_async(
+            normalized_dev,
+            normalized.as_ptr().cast::<libc::c_void>(),
+            std::mem::size_of_val(normalized),
+            state.stream,
+        )?;
+        state.api.memcpy_htod_async(
+            expert_ids_dev,
+            expert_ids.as_ptr().cast::<libc::c_void>(),
+            std::mem::size_of_val(expert_ids),
+            state.stream,
+        )?;
+        state.api.memcpy_htod_async(
+            route_weights_dev,
+            route_weights.as_ptr().cast::<libc::c_void>(),
+            std::mem::size_of_val(route_weights),
+            state.stream,
+        )?;
+    }
+    let result = state.stage_gemma_mtp2_selected_sparse(GemmaMtp2SelectedSparseRequest {
+        normalized_dev,
+        expert_ids_dev,
+        route_weights_dev,
+        gate_up_weights,
+        down_weights,
+        down_scale,
+        tokens,
+        hidden_dim,
+        n_ff,
+        n_expert,
+        top_k,
+        down_quant,
+        finalize: finalize.as_ref().zip(finalize_devs).map(
+            |(finalize, (residual_dev, shared_raw_dev))| GemmaMtp2FinalizeRequest {
+                residual_dev,
+                shared_raw_dev,
+                post_norm_1: finalize.post_norm_1,
+                post_norm_2: finalize.post_norm_2,
+                common_post_norm: finalize.common_post_norm,
+                norm_eps: finalize.norm_eps,
+                unit_offset: finalize.unit_offset,
+            },
+        ),
+    });
+    let output = match result {
+        Ok(output_dev) => {
+            let mut output = vec![0.0f32; tokens * hidden_dim];
+            let mut activation = vec![0.0f32; slots * n_ff];
+            let mut up = vec![0.0f32; slots * n_ff];
+            let mut finalized_residual = finalize_devs.map(|_| vec![0.0f32; finalize_values]);
+            let mut rank_output = vec![0.0f32; slots * hidden_dim];
+            let gate_up_dev = state
+                .gemma_mtp2_ctx
+                .gate_up
+                .ok_or_else(|| "missing Gemma MTP2 gate/up test buffer".to_string())?;
+            let rank_output_dev = state
+                .gemma_mtp2_ctx
+                .rank_output
+                .ok_or_else(|| "missing Gemma MTP2 rank output test buffer".to_string())?;
+            unsafe {
+                state.api.memcpy_dtoh_async(
+                    output.as_mut_ptr().cast::<libc::c_void>(),
+                    output_dev,
+                    std::mem::size_of_val(output.as_slice()),
+                    state.stream,
+                )?;
+                for slot in 0..slots {
+                    state.api.memcpy_dtoh_async(
+                        activation[slot * n_ff..]
+                            .as_mut_ptr()
+                            .cast::<libc::c_void>(),
+                        gate_up_dev + (slot * n_ff * 2 * std::mem::size_of::<f32>()) as u64,
+                        n_ff * std::mem::size_of::<f32>(),
+                        state.stream,
+                    )?;
+                    state.api.memcpy_dtoh_async(
+                        up[slot * n_ff..].as_mut_ptr().cast::<libc::c_void>(),
+                        gate_up_dev
+                            + ((slot * n_ff * 2 + n_ff) * std::mem::size_of::<f32>()) as u64,
+                        n_ff * std::mem::size_of::<f32>(),
+                        state.stream,
+                    )?;
+                }
+                state.api.memcpy_dtoh_async(
+                    rank_output.as_mut_ptr().cast::<libc::c_void>(),
+                    rank_output_dev,
+                    std::mem::size_of_val(rank_output.as_slice()),
+                    state.stream,
+                )?;
+                if let (Some((residual_dev, _)), Some(finalized_residual)) =
+                    (finalize_devs, finalized_residual.as_mut())
+                {
+                    state.api.memcpy_dtoh_async(
+                        finalized_residual.as_mut_ptr().cast::<libc::c_void>(),
+                        residual_dev,
+                        std::mem::size_of_val(finalized_residual.as_slice()),
+                        state.stream,
+                    )?;
+                }
+                state.api.stream_synchronize(state.stream)?;
+            }
+            state.release_gemma_mtp2_weight_pins_after_sync();
+            state.offload_non_pinned_resident_q4k()?;
+            for weights in [gate_up_weights, down_weights] {
+                let key = super::q4k_resident_key(weights);
+                if !state
+                    .resident_q4k
+                    .get(&key)
+                    .is_some_and(|entry| entry.pinned)
+                {
+                    return Err(
+                        "Gemma MTP2 stage released a model-lifetime resident weight pin"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(GemmaMtp2SelectedSparseTestResult {
+                output,
+                activation,
+                up,
+                rank_output,
+                finalized_residual,
+            })
+        }
+        Err(err) => Err(err),
+    };
+    unsafe {
+        state.api.mem_free(normalized_dev)?;
+        state.api.mem_free(expert_ids_dev)?;
+        state.api.mem_free(route_weights_dev)?;
+        if let Some((residual_dev, shared_raw_dev)) = finalize_devs {
+            state.api.mem_free(residual_dev)?;
+            state.api.mem_free(shared_raw_dev)?;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+pub struct GemmaProductFfnTestResult {
+    pub activation: Vec<f32>,
+    pub up: Vec<f32>,
+    pub output: Vec<f32>,
+}
+
+#[cfg(test)]
+pub fn gemma_product_ffn_for_test(
+    normalized: &[f32],
+    gate_up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    n_ff: usize,
+    hidden_dim: usize,
+) -> Result<GemmaProductFfnTestResult, String> {
+    if normalized.len() % hidden_dim != 0 {
+        return Err("Gemma product FFN test input shape mismatch".to_string());
+    }
+    let tokens = normalized.len() / hidden_dim;
+    let mut state = CudaState::open()?;
+    let normalized_dev = state.mem_alloc(std::mem::size_of_val(normalized))?;
+    let output_bytes = tokens * hidden_dim * std::mem::size_of::<f32>();
+    let output_dev = state.mem_alloc(output_bytes)?;
+    unsafe {
+        state.api.memcpy_htod_async(
+            normalized_dev,
+            normalized.as_ptr().cast::<libc::c_void>(),
+            std::mem::size_of_val(normalized),
+            state.stream,
+        )?;
+    }
+    let result = state.gemma4_moe_gelu_ffn_batch_dev_input_to_dev(
+        gate_up_weights,
+        down_weights,
+        down_quant,
+        n_ff,
+        hidden_dim,
+        tokens,
+        normalized_dev,
+        output_dev,
+    );
+    let output = match result {
+        Ok(()) => {
+            let activation_dev =
+                state.compute_mid_a_ptr(tokens * n_ff * std::mem::size_of::<f32>())?;
+            let up_dev = state.compute_mid_b_ptr(tokens * n_ff * std::mem::size_of::<f32>())?;
+            let mut activation = vec![0.0f32; tokens * n_ff];
+            let mut up = vec![0.0f32; tokens * n_ff];
+            let mut output = vec![0.0f32; tokens * hidden_dim];
+            unsafe {
+                state.api.memcpy_dtoh_async(
+                    activation.as_mut_ptr().cast::<libc::c_void>(),
+                    activation_dev,
+                    std::mem::size_of_val(activation.as_slice()),
+                    state.stream,
+                )?;
+                state.api.memcpy_dtoh_async(
+                    up.as_mut_ptr().cast::<libc::c_void>(),
+                    up_dev,
+                    std::mem::size_of_val(up.as_slice()),
+                    state.stream,
+                )?;
+                state.api.memcpy_dtoh_async(
+                    output.as_mut_ptr().cast::<libc::c_void>(),
+                    output_dev,
+                    std::mem::size_of_val(output.as_slice()),
+                    state.stream,
+                )?;
+                state.api.stream_synchronize(state.stream)?;
+            }
+            Ok(GemmaProductFfnTestResult {
+                activation,
+                up,
+                output,
+            })
+        }
+        Err(err) => Err(err),
+    };
+    unsafe {
+        state.api.mem_free(normalized_dev)?;
+        state.api.mem_free(output_dev)?;
+    }
+    output
+}

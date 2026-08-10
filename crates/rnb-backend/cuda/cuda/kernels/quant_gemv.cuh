@@ -1,3 +1,5 @@
+#include "q4k_block_dot.cuh"
+
 __device__ __forceinline__ int rnb_load_i32_aligned4(const void* ptr) {
     return *reinterpret_cast<const int*>(ptr);
 }
@@ -302,42 +304,6 @@ extern "C" __global__ void rnb_q4k_dequant_f32(
     }
 }
 
-static __device__ __forceinline__ float rnb_q4k_block_dot_f32_lane(
-    const unsigned char* __restrict__ block,
-    const float* __restrict__ input,
-    unsigned lane) {
-    const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
-    const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
-    const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
-    const float dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
-    float acc = 0.0f;
-#pragma unroll
-    for (unsigned group = 0; group < 4u; ++group) {
-        const unsigned j0 = group * 2u;
-        const unsigned j1 = j0 + 1u;
-        unsigned sc0;
-        unsigned mn0;
-        unsigned sc1;
-        unsigned mn1;
-        if (j0 < 4u) {
-            sc0 = block[4u + j0] & 63u;
-            mn0 = block[8u + j0] & 63u;
-            sc1 = block[4u + j1] & 63u;
-            mn1 = block[8u + j1] & 63u;
-        } else {
-            sc0 = (block[8u + j0] & 0x0fu) | ((block[j0] >> 6) << 4);
-            mn0 = (block[8u + j0] >> 4) | ((block[4u + j0] >> 6) << 4);
-            sc1 = (block[8u + j1] & 0x0fu) | ((block[j1] >> 6) << 4);
-            mn1 = (block[8u + j1] >> 4) | ((block[4u + j1] >> 6) << 4);
-        }
-        const unsigned q = block[16u + group * 32u + lane];
-        const float y0 = (d * (float)sc0) * (float)(q & 0x0fu) - dmin * (float)mn0;
-        const float y1 = (d * (float)sc1) * (float)(q >> 4) - dmin * (float)mn1;
-        acc += y0 * input[group * 64u + lane];
-        acc += y1 * input[group * 64u + lane + 32u];
-    }
-    return acc;
-}
 
 extern "C" __global__ void rnb_q4k_gemv_warp8(
     float* __restrict__ out,

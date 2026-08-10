@@ -1332,6 +1332,7 @@ impl CudaState {
                 ResidentQ4k {
                     ptr: slab + offset as u64,
                     bytes: weights.len(),
+                    source_identity: rnb_core::tensor::host_storage_identity(weights),
                     epoch,
                     owned_alloc: false,
                     slab_base: Some(slab),

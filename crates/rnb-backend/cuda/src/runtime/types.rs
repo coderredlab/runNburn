@@ -266,6 +266,25 @@ pub(super) struct PersistentDecodeReusable {
     pub(super) argmax_dev: u64,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct GemmaMtp2Reusable {
+    pub(super) normalized_qs: Option<u64>,
+    pub(super) normalized_qs_capacity: usize,
+    pub(super) normalized_ds: Option<u64>,
+    pub(super) normalized_ds_capacity: usize,
+    pub(super) gate_up: Option<u64>,
+    pub(super) gate_up_capacity: usize,
+    pub(super) rank_output: Option<u64>,
+    pub(super) rank_output_capacity: usize,
+    pub(super) output: Option<u64>,
+    pub(super) output_capacity: usize,
+    pub(super) shared_output: Option<u64>,
+    pub(super) shared_output_capacity: usize,
+    pub(super) sparse_input: Option<u64>,
+    pub(super) sparse_input_capacity: usize,
+    pub(super) pending_weight_pins: Vec<(usize, usize)>,
+}
+
 pub(super) struct DeviceTensorSlot {
     pub(super) ptr: u64,
     pub(super) capacity: usize,
@@ -619,6 +638,8 @@ pub(super) struct CudaState {
     pub(super) q4k_gemv_module: Option<usize>,
     pub(super) nemotron_selected_module: Option<usize>,
     pub(super) persistent_decode_module: Option<usize>,
+    pub(super) gemma_mtp2_module: Option<usize>,
+    pub(super) gemma_mtp2_ctx: GemmaMtp2Reusable,
     /// Per-CudaState reusable buffers for the persistent decode path.
     /// Allocated lazily on the first dispatch and grown when shapes change.
     pub(super) persistent_decode_ctx: Option<PersistentDecodeReusable>,
@@ -1268,6 +1289,7 @@ pub(super) struct ResidentQ4kAdmissionResult {
 pub(super) struct ResidentQ4k {
     pub(super) ptr: u64,
     pub(super) bytes: usize,
+    pub(super) source_identity: Option<rnb_core::tensor::HostStorageIdentity>,
     pub(super) epoch: u64,
     pub(super) owned_alloc: bool,
     pub(super) slab_base: Option<u64>,
