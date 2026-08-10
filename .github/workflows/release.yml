@@ -135,7 +135,7 @@ jobs:
           rustup default stable
 
       - name: Install CUDA compiler
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "13.2.0"
           method: network
@@ -223,7 +223,7 @@ jobs:
 
       - name: Install CUDA compiler
         if: matrix.backend == 'cuda-sm86'
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "13.2.0"
           method: network
