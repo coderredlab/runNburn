@@ -5556,8 +5556,8 @@ pub fn metal_prefill_gdn_f32_dual_proj_if_supported(
     })))
 }
 
-/// pm35 M2 + pm36: prefill GDN proj(in_proj/gate/ssm_out) single GEMM. weight Q4_K|Q5_K|Q6_K
-/// 만 GPU, 그 외 host fallback. RNB_METAL_PREFILL_GDN_INPROJ=1 opt-in. out[seq_len*n_out] 채우고
+/// pm35 M2 + pm36: prefill GDN proj(in_proj/gate/ssm_out) single GEMM. TensorOps가 지원하는
+/// Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0만 GPU, 그 외 host fallback.
 /// used=true. pm36: Q5_K 추가(27B ssm_out + 9B 전체 GDN projection).
 #[allow(clippy::too_many_arguments)]
 pub fn metal_prefill_gdn_proj_into_if_supported(
@@ -6908,22 +6908,18 @@ mod gdn_proj_wrapper_tests {
             4,
         );
         assert!(!r.unwrap(), "opt-out(=0)이면 Ok(false)");
-        // Q8_0(미지원 tensorops) → quant 가드 reject(device 도달 전). default ON 이라 env
-        // 미설정도 통과하지만 Q8_0 은 가드(_ => Ok(false))에서 device 전 reject.
+        // F32 → quant 가드 reject(device 도달 전).
         std::env::remove_var("RNB_METAL_PREFILL_GDN_INPROJ");
         let r = metal_prefill_gdn_proj_into_if_supported(
-            GGMLType::Q8_0,
-            &[0u8; 34],
+            GGMLType::F32,
+            &[0u8; 16],
             &[0f32; 4],
             &mut out,
             1,
             4,
             4,
         );
-        assert!(
-            !r.unwrap(),
-            "Q8_0 는 tensorops 커널 없어 가드에서 Ok(false)"
-        );
+        assert!(!r.unwrap(), "F32는 TensorOps 양자 커널이 없어 Ok(false)");
     }
 
     #[test]
@@ -7349,6 +7345,7 @@ mod atn_o_tail_policy_tests {
 #[cfg(test)]
 mod metal_qwen_moe_prefill_accum_policy_tests {
     use super::*;
+    use rnb_core::tensor::Tensor;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -7534,9 +7531,14 @@ mod metal_qwen_moe_prefill_accum_policy_tests {
             GGMLType::Q8_0 => FFN_DIM * (HIDDEN_DIM / 32) * Q8_0_BLOCK_BYTES,
             other => panic!("unsupported test quant {other:?}"),
         };
+        let registered_zeros = |len: usize| {
+            let tensor = Tensor::from_vec(vec![0u8; len], &[len]);
+            tensor.register_host_storage();
+            tensor
+        };
         let q4_matrix_bytes = matrix_bytes(GGMLType::Q4_K);
-        let gate_all = vec![0; q4_matrix_bytes];
-        let up_all = vec![0; q4_matrix_bytes];
+        let gate_all = registered_zeros(q4_matrix_bytes);
+        let up_all = registered_zeros(q4_matrix_bytes);
         let selected_experts = [0];
         let route_weights = [1.0];
         let shared_route_weights = [1.0];
@@ -7569,22 +7571,26 @@ mod metal_qwen_moe_prefill_accum_policy_tests {
             ),
         ] {
             let down_expert_bytes = matrix_bytes(down_quant);
-            let down_all = vec![0; down_expert_bytes];
-            let shared_gate = vec![0; matrix_bytes(shared_gate_quant)];
-            let shared_up = vec![0; matrix_bytes(shared_up_quant)];
-            let shared_down = vec![0; matrix_bytes(shared_down_quant)];
+            let down_all = registered_zeros(down_expert_bytes);
+            let shared_gate = registered_zeros(matrix_bytes(shared_gate_quant));
+            let shared_up = registered_zeros(matrix_bytes(shared_up_quant));
+            let shared_down = registered_zeros(matrix_bytes(shared_down_quant));
             let output = metal_qwen_moe_llama_id_prefill(MetalQwenMoeLlamaIdPrefillRequest {
-                gate_all: &gate_all,
-                up_all: &up_all,
-                down_all: &down_all,
+                gate_all: gate_all.as_bytes().expect("registered gate bytes"),
+                up_all: up_all.as_bytes().expect("registered up bytes"),
+                down_all: down_all.as_bytes().expect("registered down bytes"),
                 gate_expert_bytes: q4_matrix_bytes,
                 up_expert_bytes: q4_matrix_bytes,
                 down_expert_bytes,
                 selected_experts: &selected_experts,
                 route_weights: &route_weights,
-                shared_gate: &shared_gate,
-                shared_up: &shared_up,
-                shared_down: &shared_down,
+                shared_gate: shared_gate
+                    .as_bytes()
+                    .expect("registered shared gate bytes"),
+                shared_up: shared_up.as_bytes().expect("registered shared up bytes"),
+                shared_down: shared_down
+                    .as_bytes()
+                    .expect("registered shared down bytes"),
                 shared_route_weights: &shared_route_weights,
                 gate_quant: GGMLType::Q4_K,
                 up_quant: GGMLType::Q4_K,
