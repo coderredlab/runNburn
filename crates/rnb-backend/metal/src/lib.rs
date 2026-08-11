@@ -1823,8 +1823,12 @@ pub struct MetalBackend {
         RefCell<HashMap<ffn_chain::QwenMoeLlamaIdPlan, Vec<ffn_chain::QwenMoeLlamaIdCarrier>>>,
     qwen_prefill_chain_moe_carrier_pool:
         RefCell<HashMap<ffn_chain::QwenMoeLlamaIdPlan, Vec<ffn_chain::QwenMoeLlamaIdCarrier>>>,
-    gemma_moe_tensorops_carriers: RefCell<
-        HashMap<(ffn_chain::QwenMoeLlamaIdPlan, usize), ffn_chain::GemmaMoeTensoropsCarrier>,
+    /// The single active Gemma MoE shape. Its scratch is too large to retain per shape.
+    gemma_moe_tensorops_carrier: RefCell<
+        Option<(
+            (ffn_chain::QwenMoeLlamaIdPlan, usize),
+            ffn_chain::GemmaMoeTensoropsCarrier,
+        )>,
     >,
     /// (slots, hidden_dim, ffn_dim) → Qwen MoE id gate/up prefill scratch. Opt-in only.
     qwen_moe_prefill_id_gate_up_carriers:
@@ -2159,7 +2163,7 @@ impl MetalBackend {
                 qwen_moe_prefill_id_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_llama_id_carrier_pool: RefCell::new(HashMap::new()),
                 qwen_prefill_chain_moe_carrier_pool: RefCell::new(HashMap::new()),
-                gemma_moe_tensorops_carriers: RefCell::new(HashMap::new()),
+                gemma_moe_tensorops_carrier: RefCell::new(None),
                 qwen_moe_prefill_id_gate_up_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_prefill_id_gate_up_f16_carriers: RefCell::new(HashMap::new()),
                 qwen_moe_prefill_mulmmid_v3_carriers: RefCell::new(HashMap::new()),
@@ -2396,7 +2400,7 @@ impl MetalBackend {
             qwen_moe_prefill_id_carriers: RefCell::new(HashMap::new()),
             qwen_moe_llama_id_carrier_pool: RefCell::new(HashMap::new()),
             qwen_prefill_chain_moe_carrier_pool: RefCell::new(HashMap::new()),
-            gemma_moe_tensorops_carriers: RefCell::new(HashMap::new()),
+            gemma_moe_tensorops_carrier: RefCell::new(None),
             qwen_moe_prefill_id_gate_up_carriers: RefCell::new(HashMap::new()),
             qwen_moe_prefill_id_gate_up_f16_carriers: RefCell::new(HashMap::new()),
             qwen_moe_prefill_mulmmid_v3_carriers: RefCell::new(HashMap::new()),
@@ -6692,8 +6696,14 @@ impl MetalBackend {
         let (shared_down, shared_down_offset) = resident_weight(request.shared_down);
 
         let key = (plan, request.shared_ffn_dim);
-        let mut carriers = self.gemma_moe_tensorops_carriers.borrow_mut();
-        if !carriers.contains_key(&key) {
+        let mut carrier_slot = self.gemma_moe_tensorops_carrier.borrow_mut();
+        let requires_replacement = carrier_slot
+            .as_ref()
+            .map(|(cached_key, _)| cached_key != &key)
+            .unwrap_or(true);
+        if requires_replacement {
+            // Drop the previous shape before allocating ~200 MiB of replacement scratch.
+            *carrier_slot = None;
             let carrier = ffn_chain::GemmaMoeTensoropsCarrier::new(
                 ctx,
                 plan,
@@ -6702,11 +6712,12 @@ impl MetalBackend {
                 request.route_weights,
             )
             .map_err(qwen_moe_llama_id_error)?;
-            carriers.insert(key, carrier);
+            *carrier_slot = Some((key, carrier));
         }
-        let carrier = carriers
-            .get_mut(&key)
-            .ok_or_else(|| "Gemma TensorOps carrier cache insertion failed".to_string())?;
+        let carrier = &mut carrier_slot
+            .as_mut()
+            .ok_or_else(|| "Gemma TensorOps carrier slot initialization failed".to_string())?
+            .1;
         carrier
             .refresh_routes(request.selected_experts, request.route_weights)
             .map_err(qwen_moe_llama_id_error)?;
