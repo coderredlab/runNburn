@@ -832,6 +832,10 @@ impl Engine {
                         ))
                     })?;
             if _collect_output_logits {
+                super::models::muse_glimmer::scale_logits_inplace(
+                    &mut result.output_logits,
+                    self.metadata.logit_scale,
+                );
                 super::models::gemma::apply_logit_softcapping(
                     &mut result.output_logits,
                     self.metadata.final_logit_softcapping,

@@ -30,7 +30,7 @@ pub(super) fn apply_decode_attention_qkv_postprocess(
         }
     }
 
-    if layout.has_gated_attn {
+    if layout.packed_q_gate {
         for h in 0..layout.num_heads {
             let src_off = h * head_dim * 2;
             let dst_off = h * head_dim;
@@ -85,7 +85,7 @@ pub(super) fn apply_decode_attention_qkv_postprocess(
         && gemma4_should_apply_attn_rotation(architecture, w.k_weight.ggml_type, head_dim)
     {
         let nrot = gemma4_k_rot_size(head_dim);
-        let q_slice = if layout.has_gated_attn {
+        let q_slice = if layout.packed_q_gate {
             &mut scratch.q_split[..q_dim]
         } else {
             &mut scratch.q_buf[..q_dim]
@@ -96,7 +96,7 @@ pub(super) fn apply_decode_attention_qkv_postprocess(
         && gemma4_should_apply_attn_rotation(architecture, w.k_weight.ggml_type, head_dim)
     {
         let nrot = gemma4_k_rot_size(head_dim);
-        let q_slice = if layout.has_gated_attn {
+        let q_slice = if layout.packed_q_gate {
             &mut scratch.q_split[..q_dim]
         } else {
             &mut scratch.q_buf[..q_dim]

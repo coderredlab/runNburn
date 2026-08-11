@@ -1495,7 +1495,7 @@ pub(super) fn project_prefill_attention(
     }
 
     let q_out_dim = q_full.shape().last().copied().unwrap_or(0);
-    let (q, attn_gate) = if layout.has_gated_attn {
+    let (q, attn_gate) = if layout.packed_q_gate {
         let q_data = kernels::tensor_as_f32_slice(&q_full);
         let half_dim = q_out_dim / 2;
         let mut q_vec = vec![0.0f32; seq_len * half_dim];
@@ -1514,6 +1514,15 @@ pub(super) fn project_prefill_attention(
             Tensor::from_vec(q_vec, &[seq_len, half_dim]),
             Some(Tensor::from_vec(gate_vec, &[seq_len, half_dim])),
         )
+    } else if let Some(gate_weight) = &w.attn_gate_weight {
+        let gate = if let Some(tensor) =
+            atn_proj_metal("attn_gate", layer_idx, gate_weight, &normed, seq_len)?
+        {
+            tensor
+        } else {
+            gate_weight.gemv(&normed)?
+        };
+        (q_full, Some(gate))
     } else {
         (q_full, None)
     };

@@ -3,8 +3,19 @@ use crate::tokenizer::Tokenizer;
 use minijinja::{context, Environment, Error, ErrorKind};
 use serde::Serialize;
 use serde_json::Value;
+use std::borrow::Cow;
 
 const REQUEST_REJECTED_PREFIX: &str = "__RNB_CHAT_REQUEST_REJECTED__:";
+
+fn normalize_hf_jinja(source: &str) -> Cow<'_, str> {
+    const UNPARENTHESIZED: &str = "namespace(name=tcid if tcid else '')";
+    const PARENTHESIZED: &str = "namespace(name=(tcid if tcid else ''))";
+    if source.contains(UNPARENTHESIZED) {
+        Cow::Owned(source.replace(UNPARENTHESIZED, PARENTHESIZED))
+    } else {
+        Cow::Borrowed(source)
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ChatContent {
@@ -94,6 +105,7 @@ impl Tokenizer {
         let source = self.chat_template().ok_or_else(|| {
             LlmError::Tokenizer("GGUF does not contain tokenizer.chat_template".to_string())
         })?;
+        let source = normalize_hf_jinja(source);
 
         let mut environment = Environment::new();
         minijinja_contrib::add_to_environment(&mut environment);
@@ -109,7 +121,7 @@ impl Tokenizer {
             },
         );
         environment
-            .add_template("chat", source)
+            .add_template("chat", source.as_ref())
             .map_err(|error| LlmError::Tokenizer(format!("invalid GGUF chat template: {error}")))?;
 
         let bos_token = if self.should_add_bos() {
@@ -306,5 +318,24 @@ mod tests {
             rendered,
             "<|vision_start|><|image_pad|><|vision_end|>Describe the image."
         );
+    }
+
+    #[test]
+    fn parenthesizes_hf_conditional_namespace_arguments() {
+        let tokenizer = tokenizer(
+            true,
+            Some(
+                "{% set tcid = 'call_1' %}{% set rns = namespace(name=tcid if tcid else '') %}{{ rns.name }}",
+            ),
+        );
+
+        let rendered = tokenizer
+            .render_chat_prompt(
+                &[ChatMessage::new("user", "Hello")],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(rendered, "call_1");
     }
 }

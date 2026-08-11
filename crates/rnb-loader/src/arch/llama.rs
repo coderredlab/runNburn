@@ -184,6 +184,8 @@ mod tests {
             rope_sections: [0; 4],
             norm_eps: 1e-5,
             final_logit_softcapping: 0.0,
+            post_norm_eps: 1e-5,
+            logit_scale: 1.0,
             query_pre_attn_scalar: 16.0,
             sliding_window: 0,
             shared_kv_layers: 0,

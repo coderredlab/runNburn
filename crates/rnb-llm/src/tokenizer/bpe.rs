@@ -1,7 +1,7 @@
 use crate::tokenizer::vocab::Vocab;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 #[derive(Clone, Debug)]
 struct SpmMergeSymbol {
@@ -112,6 +112,7 @@ pub enum TokenizerMode {
     Gpt2Bpe {
         byte_to_unicode: [char; 256],
         unicode_to_byte: HashMap<char, u8>,
+        llama4_pretokenizer: bool,
     },
 }
 
@@ -264,8 +265,20 @@ impl Tokenizer {
         }
     }
 
-    /// GPT-2 byte-level BPE 모드 (Qwen, GPT 등)
+    /// GPT-2 byte-level BPE mode (Qwen, GPT, and related tokenizers).
     pub fn new_gpt2(vocab: Vocab, merges: Vec<(u32, u32)>) -> Self {
+        Self::new_gpt2_with_llama4_pretokenizer(vocab, merges, false)
+    }
+
+    pub fn new_gpt2_llama4(vocab: Vocab, merges: Vec<(u32, u32)>) -> Self {
+        Self::new_gpt2_with_llama4_pretokenizer(vocab, merges, true)
+    }
+
+    fn new_gpt2_with_llama4_pretokenizer(
+        vocab: Vocab,
+        merges: Vec<(u32, u32)>,
+        llama4_pretokenizer: bool,
+    ) -> Self {
         let merge_rank = merges
             .iter()
             .enumerate()
@@ -285,6 +298,7 @@ impl Tokenizer {
             mode: TokenizerMode::Gpt2Bpe {
                 byte_to_unicode,
                 unicode_to_byte,
+                llama4_pretokenizer,
             },
             sentencepiece_scores: vec![],
             add_bos_token: true,
@@ -347,8 +361,14 @@ impl Tokenizer {
             }
             TokenizerMode::Gemma4Bpe => self.initial_tokenize_gemma4_spm_with_specials(text),
             TokenizerMode::Gpt2Bpe {
-                byte_to_unicode, ..
-            } => self.initial_tokenize_gpt2_with_specials(text, byte_to_unicode),
+                byte_to_unicode,
+                llama4_pretokenizer,
+                ..
+            } => self.initial_tokenize_gpt2_with_specials(
+                text,
+                byte_to_unicode,
+                *llama4_pretokenizer,
+            ),
         }
     }
 
@@ -878,10 +898,11 @@ impl Tokenizer {
         &self,
         text: &str,
         byte_to_unicode: &[char; 256],
+        llama4_pretokenizer: bool,
     ) -> Vec<u32> {
         let special_tokens = self.special_control_tokens();
         if special_tokens.is_empty() {
-            return self.bpe_merge(self.initial_tokenize_gpt2(text, byte_to_unicode));
+            return self.initial_tokenize_gpt2_segment(text, byte_to_unicode, llama4_pretokenizer);
         }
 
         let mut out = Vec::new();
@@ -902,19 +923,61 @@ impl Tokenizer {
                 .min()
                 .unwrap_or(text.len());
             if next_special > cursor {
-                out.extend(self.bpe_merge(
-                    self.initial_tokenize_gpt2(&text[cursor..next_special], byte_to_unicode),
+                out.extend(self.initial_tokenize_gpt2_segment(
+                    &text[cursor..next_special],
+                    byte_to_unicode,
+                    llama4_pretokenizer,
                 ));
                 cursor = next_special;
             } else {
                 let ch = text[cursor..].chars().next().expect("valid utf-8 cursor");
-                out.extend(
-                    self.bpe_merge(self.initial_tokenize_gpt2(&ch.to_string(), byte_to_unicode)),
-                );
+                out.extend(self.initial_tokenize_gpt2_segment(
+                    &ch.to_string(),
+                    byte_to_unicode,
+                    llama4_pretokenizer,
+                ));
                 cursor += ch.len_utf8();
             }
         }
         out
+    }
+
+    fn initial_tokenize_gpt2_segment(
+        &self,
+        text: &str,
+        byte_to_unicode: &[char; 256],
+        llama4_pretokenizer: bool,
+    ) -> Vec<u32> {
+        if !llama4_pretokenizer {
+            return self.bpe_merge(self.initial_tokenize_gpt2(text, byte_to_unicode));
+        }
+
+        static LLAMA4_SPLIT: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+$|\s+",
+            )
+            .expect("Llama 4 pre-tokenizer regex must compile")
+        });
+        let regex = &*LLAMA4_SPLIT;
+        let mut tokens = Vec::new();
+        let mut cursor = 0usize;
+        for matched in regex.find_iter(text) {
+            if matched.start() > cursor {
+                tokens.extend(self.bpe_merge(
+                    self.initial_tokenize_gpt2(&text[cursor..matched.start()], byte_to_unicode),
+                ));
+            }
+            tokens.extend(
+                self.bpe_merge(self.initial_tokenize_gpt2(matched.as_str(), byte_to_unicode)),
+            );
+            cursor = matched.end();
+        }
+        if cursor < text.len() {
+            tokens.extend(
+                self.bpe_merge(self.initial_tokenize_gpt2(&text[cursor..], byte_to_unicode)),
+            );
+        }
+        tokens
     }
 
     fn decode_gpt2(&self, raw: &str, unicode_to_byte: &HashMap<char, u8>) -> String {
@@ -1108,6 +1171,28 @@ mod tests {
         let ids = tok.encode("he");
         assert_eq!(ids, vec![5]);
         assert!(!tok.should_add_bos());
+    }
+
+    #[test]
+    fn llama4_pretokenizer_prevents_merges_across_word_digit_boundaries() {
+        let tokens = vec![
+            "<unk>".to_string(),
+            "<s>".to_string(),
+            "</s>".to_string(),
+            "a".to_string(),
+            "1".to_string(),
+            "a1".to_string(),
+        ];
+        let special = SpecialTokens {
+            bos: 1,
+            eos: 2,
+            pad: None,
+        };
+        let plain = Tokenizer::new_gpt2(Vocab::new(tokens.clone(), special.clone()), vec![(3, 4)]);
+        let llama4 = Tokenizer::new_gpt2_llama4(Vocab::new(tokens, special), vec![(3, 4)]);
+
+        assert_eq!(plain.encode("a1"), vec![5]);
+        assert_eq!(llama4.encode("a1"), vec![3, 4]);
     }
 
     #[test]

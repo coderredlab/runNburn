@@ -8,6 +8,7 @@ pub(super) fn decode_ffn_layer(
     w: &AttentionLayerWeights,
     hidden_dim: usize,
     norm_eps: f32,
+    post_norm_eps: f32,
     layer_idx: usize,
     #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<()> {
@@ -48,6 +49,7 @@ pub(super) fn decode_ffn_layer(
             &w.ffn_gate_up_fused,
             hidden_dim,
             norm_eps,
+            post_norm_eps,
             layer_idx,
             #[cfg(feature = "vulkan")]
             gpu_runtime,

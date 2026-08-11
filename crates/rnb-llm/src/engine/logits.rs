@@ -11,6 +11,7 @@ use super::models::gemma::{
     prepare_gemma_per_layer_base, use_gemma_block_semantics,
 };
 use super::models::gemma::{gemma_disable_e2bit_local_defaults, gemma_ple_after_final_norm};
+use super::models::muse_glimmer::scale_logits_inplace;
 use super::norm::{apply_model_norm, apply_model_norm_unit_offset};
 use super::policy;
 #[cfg(feature = "cuda")]
@@ -137,6 +138,7 @@ impl super::Engine {
             }
             None => weights.output.gemv_vec(output_hidden)?,
         };
+        scale_logits_inplace(&mut logits, self.metadata.logit_scale);
         apply_logit_softcapping(&mut logits, self.metadata.final_logit_softcapping);
         let logits_len = logits.len();
         *logits.get_mut(excluded_token as usize).ok_or_else(|| {
@@ -232,6 +234,7 @@ pub(super) fn finalize_prefill_logits(
             logits
         }
     };
+    scale_logits_inplace(&mut logits, metadata.logit_scale);
     apply_logit_softcapping(&mut logits, metadata.final_logit_softcapping);
     emit_final_dump("prefill_logits", &logits);
     if profiling {
@@ -435,6 +438,7 @@ pub(super) fn finalize_prefill_all_logits(
         } else {
             weights.output.gemv_vec(normed_data)?
         };
+        scale_logits_inplace(&mut logits, metadata.logit_scale);
         apply_logit_softcapping(&mut logits, metadata.final_logit_softcapping);
         all_logits.push(logits);
     }
@@ -502,6 +506,7 @@ pub(super) fn finalize_prefill_argmax_tokens(
         } else {
             weights.output.gemv_vec(normed_data)?
         };
+        scale_logits_inplace(&mut logits, metadata.logit_scale);
         apply_logit_softcapping(&mut logits, metadata.final_logit_softcapping);
         if collect_output_logits {
             output_logits.extend_from_slice(&logits);

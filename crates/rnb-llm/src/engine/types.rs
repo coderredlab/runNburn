@@ -16,6 +16,8 @@ pub struct ModelMetadata {
     pub rope_sections: [usize; 4],
     pub norm_eps: f32,
     pub final_logit_softcapping: f32,
+    pub post_norm_eps: f32,
+    pub logit_scale: f32,
     pub query_pre_attn_scalar: f32,
     pub sliding_window: usize,
     pub shared_kv_layers: usize,

@@ -17,6 +17,8 @@ pub(super) struct AttentionLayerWeights {
     pub(super) k_weight: QuantizedWeight,
     pub(super) v_weight: QuantizedWeight,
     pub(super) o_weight: QuantizedWeight,
+    /// Separate attention-output gate projection. Packed Q+gate models leave this unset.
+    pub(super) attn_gate_weight: Option<QuantizedWeight>,
     pub(super) q_bias: Option<Tensor>, // Qwen2 등 bias 있는 모델용
     pub(super) k_bias: Option<Tensor>,
     pub(super) v_bias: Option<Tensor>,

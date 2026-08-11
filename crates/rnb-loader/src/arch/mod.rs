@@ -1,6 +1,7 @@
 pub mod deepseek4;
 pub mod gemma;
 pub mod llama;
+pub mod muse_glimmer;
 pub mod phi;
 
 use crate::error::LoaderError;
@@ -30,6 +31,7 @@ pub enum Architecture {
     Hy3,
     GlmDsa,
     DeepSeek4,
+    MuseGlimmer,
     DFlash,
 }
 
@@ -102,6 +104,10 @@ pub struct ModelMetadata {
     pub norm_eps: f32,
     pub final_logit_softcapping: f32,
     pub query_pre_attn_scalar: f32,
+    /// RMS epsilon for post-attention and post-FFN normalization.
+    pub post_norm_eps: f32,
+    /// Positive multiplier applied after the output projection and before softcapping.
+    pub logit_scale: f32,
     pub sliding_window: usize,
     pub shared_kv_layers: usize,
     pub sliding_window_pattern: Vec<bool>,
@@ -195,6 +201,7 @@ pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architect
         "hy_v3" => Ok(Architecture::Hy3),
         "glm-dsa" => Ok(Architecture::GlmDsa),
         "deepseek4" => Ok(Architecture::DeepSeek4),
+        "muse-glimmer" => Ok(Architecture::MuseGlimmer),
         "dflash" => Ok(Architecture::DFlash),
         other => Err(LoaderError::UnsupportedArchitecture(other.to_string())),
     }
@@ -277,6 +284,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         Architecture::Hy3 => "hy_v3",
         Architecture::GlmDsa => "glm-dsa",
         Architecture::DeepSeek4 => "deepseek4",
+        Architecture::MuseGlimmer => "muse-glimmer",
         Architecture::DFlash => "dflash",
     };
     let prefix = if get_u32(metadata, &format!("{arch_str}.embedding_length")).is_ok() {
@@ -503,6 +511,15 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     .unwrap_or(1e-5);
     let final_logit_softcapping =
         get_f32_opt(metadata, &format!("{prefix}.final_logit_softcapping"))?.unwrap_or(0.0);
+    let post_norm_eps = get_f32_opt(metadata, &format!("{prefix}.post_norm_epsilon"))?
+        .unwrap_or_else(|| {
+            if arch == Architecture::MuseGlimmer {
+                1e-8
+            } else {
+                norm_eps
+            }
+        });
+    let logit_scale = get_f32_opt(metadata, &format!("{prefix}.logit_scale"))?.unwrap_or(1.0);
 
     // head_dim: explicit key_length or hidden_size / num_heads
     let head_dim = get_u32_opt(metadata, &format!("{prefix}.attention.key_length"))?
@@ -729,6 +746,8 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         rope_sections,
         norm_eps,
         final_logit_softcapping,
+        post_norm_eps,
+        logit_scale,
         query_pre_attn_scalar,
         sliding_window,
         shared_kv_layers,
@@ -905,6 +924,7 @@ pub fn build_graph(meta: &ModelMetadata) -> Result<Graph, LoaderError> {
         // and are layered on top. Graph-level split will come if/when builder-level differences
         // demand it.
         Architecture::Gemma | Architecture::Gemma4 => Ok(gemma::build_gemma_graph(meta)),
+        Architecture::MuseGlimmer => Ok(muse_glimmer::build_muse_glimmer_graph(meta)),
         // Gemma4 assistant (drafter) GGUF lacks attn_k/attn_v tensors (KV-share with target)
         // and carries extra VQ codebooks. The generic Gemma graph builder cannot produce a
         // valid graph for it — drafter loading lives behind `rnb_mtp::Drafter::load_assistant`
@@ -948,6 +968,91 @@ mod tests {
                 GGUFValue::F32(1e-5),
             ),
         ]
+    }
+
+    #[test]
+    fn test_extract_metadata_muse_glimmer_contract() {
+        let sliding_pattern = (0..52)
+            .map(|layer| GGUFValue::Bool(layer % 4 != 3))
+            .collect();
+        let meta = vec![
+            (
+                "general.architecture".to_string(),
+                GGUFValue::String("muse-glimmer".to_string()),
+            ),
+            (
+                "muse-glimmer.embedding_length".to_string(),
+                GGUFValue::U32(6656),
+            ),
+            ("muse-glimmer.block_count".to_string(), GGUFValue::U32(52)),
+            (
+                "muse-glimmer.attention.head_count".to_string(),
+                GGUFValue::U32(32),
+            ),
+            (
+                "muse-glimmer.attention.head_count_kv".to_string(),
+                GGUFValue::U32(2),
+            ),
+            (
+                "muse-glimmer.attention.key_length".to_string(),
+                GGUFValue::U32(128),
+            ),
+            (
+                "muse-glimmer.attention.value_length".to_string(),
+                GGUFValue::U32(128),
+            ),
+            (
+                "muse-glimmer.feed_forward_length".to_string(),
+                GGUFValue::U32(19968),
+            ),
+            (
+                "muse-glimmer.context_length".to_string(),
+                GGUFValue::U32(131072),
+            ),
+            (
+                "muse-glimmer.rope.freq_base".to_string(),
+                GGUFValue::F32(500000.0),
+            ),
+            (
+                "muse-glimmer.attention.layer_norm_rms_epsilon".to_string(),
+                GGUFValue::F32(1e-5),
+            ),
+            (
+                "muse-glimmer.attention.sliding_window".to_string(),
+                GGUFValue::U32(2048),
+            ),
+            (
+                "muse-glimmer.attention.sliding_window_pattern".to_string(),
+                GGUFValue::Array(sliding_pattern),
+            ),
+            (
+                "muse-glimmer.final_logit_softcapping".to_string(),
+                GGUFValue::F32(20.0),
+            ),
+            (
+                "muse-glimmer.logit_scale".to_string(),
+                GGUFValue::F32(0.19611613),
+            ),
+        ];
+
+        let metadata = extract_metadata(&meta).unwrap();
+
+        assert_eq!(metadata.architecture, Architecture::MuseGlimmer);
+        assert_eq!(metadata.hidden_size, 6656);
+        assert_eq!(metadata.num_layers, 52);
+        assert_eq!(metadata.num_heads, 32);
+        assert_eq!(metadata.num_kv_heads, 2);
+        assert_eq!(metadata.head_dim, 128);
+        assert_eq!(metadata.intermediate_size, 19968);
+        assert_eq!(metadata.max_seq_len, 131072);
+        assert_eq!(metadata.rope_theta, 500000.0);
+        assert_eq!(metadata.sliding_window, 2048);
+        assert_eq!(metadata.sliding_window_pattern.len(), 52);
+        assert!(metadata.sliding_window_pattern[0]);
+        assert!(!metadata.sliding_window_pattern[3]);
+        assert_eq!(metadata.post_norm_eps, 1e-8);
+        assert_eq!(metadata.final_logit_softcapping, 20.0);
+        assert_eq!(metadata.logit_scale, 0.19611613);
     }
 
     #[test]
