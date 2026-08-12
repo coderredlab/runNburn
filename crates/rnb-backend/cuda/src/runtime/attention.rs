@@ -1407,14 +1407,28 @@ impl CudaState {
         let q_bytes = std::mem::size_of_val(q);
         let k_bytes = std::mem::size_of_val(k);
         let v_bytes = std::mem::size_of_val(v);
+        let ffn_scratch_bytes = seq_len
+            .checked_mul(n_ff)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse FFN scratch byte overflow".to_string())?;
+        let attention_gate_bytes = std::mem::size_of_val(attention_gate);
+        let hidden_scratch_bytes = seq_len
+            .checked_mul(n_embd)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse hidden scratch byte overflow".to_string())?;
+        let mid_a_bytes = k_bytes.max(attention_gate_bytes).max(ffn_scratch_bytes);
+        let mid_b_bytes = v_bytes.max(ffn_scratch_bytes);
         let output_bytes = seq_len
             .checked_mul(num_heads)
             .and_then(|len| len.checked_mul(128))
             .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| "CUDA Muse attention output byte overflow".to_string())?;
-        let q_dev = self.compute_input_ptr(q_bytes)?;
-        let k_dev = self.compute_mid_a_ptr(k_bytes)?;
-        let v_dev = self.compute_mid_b_ptr(v_bytes)?;
+        let q_dev = self.compute_input_ptr(q_bytes.max(hidden_scratch_bytes))?;
+        // Reserve these shared slabs at their largest use before any async
+        // launch. Attention K/V, the attention gate, and FFN gate/up then reuse
+        // them in stream order without reallocating live device pointers.
+        let k_dev = self.compute_mid_a_ptr(mid_a_bytes)?;
+        let v_dev = self.compute_mid_b_ptr(mid_b_bytes)?;
         let output_dev = self.compute_full_down_ptr(output_bytes)?;
         unsafe {
             self.api.memcpy_htod_async(
@@ -1498,7 +1512,6 @@ impl CudaState {
                 (256, 1, 1),
             )?;
         }
-
         self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             o_weights,
             gate_weights,

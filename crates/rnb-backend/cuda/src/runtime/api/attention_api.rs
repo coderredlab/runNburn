@@ -726,6 +726,46 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
 ) -> Result<(), String> {
     let expected_q = seq_len.saturating_mul(num_heads).saturating_mul(128);
     let expected_kv = kv_len.saturating_mul(num_kv_heads).saturating_mul(128);
+    let o_blocks = o_cols
+        .checked_div(256)
+        .filter(|_| o_cols.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse attention chain o_cols must be divisible by 256: {o_cols}")
+        })?;
+    let hidden_blocks = n_embd
+        .checked_div(256)
+        .filter(|_| n_embd.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse attention chain n_embd must be divisible by 256: {n_embd}")
+        })?;
+    let down_blocks = n_ff
+        .checked_div(256)
+        .filter(|_| n_ff.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse attention chain n_ff must be divisible by 256: {n_ff}")
+        })?;
+    let down_row_bytes = match down_quant {
+        12 => down_blocks.checked_mul(144),
+        13 => down_blocks.checked_mul(176),
+        14 => down_blocks.checked_mul(210),
+        other => {
+            return Err(format!(
+                "CUDA Muse attention chain unsupported down quant {other}"
+            ))
+        }
+    }
+    .ok_or_else(|| "CUDA Muse attention chain down row byte overflow".to_string())?;
+    let expected_o_bytes = n_embd
+        .checked_mul(o_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| "CUDA Muse attention chain O weight byte overflow".to_string())?;
+    let expected_gate_up_bytes = n_ff
+        .checked_mul(hidden_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| "CUDA Muse attention chain gate/up weight byte overflow".to_string())?;
+    let expected_down_bytes = n_embd
+        .checked_mul(down_row_bytes)
+        .ok_or_else(|| "CUDA Muse attention chain down weight byte overflow".to_string())?;
     if q.len() != expected_q
         || k.len() != expected_kv
         || v.len() != expected_kv
@@ -735,6 +775,10 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         || post_attn_norm_weight.len() != n_embd
         || ffn_norm_weight.len() != n_embd
         || post_ffn_norm_weight.len() != n_embd
+        || o_weights.len() != expected_o_bytes
+        || gate_weights.len() != expected_gate_up_bytes
+        || up_weights.len() != expected_gate_up_bytes
+        || down_weights.len() != expected_down_bytes
     {
         return Err(format!(
             "CUDA Muse attention chain shape mismatch: q={} expected_q={expected_q} k={} v={} expected_kv={expected_kv} gate={} hidden={} expected_hidden={} o_cols={o_cols} expected_o_cols={} post_attn_norm={} ffn_norm={} post_ffn_norm={} n_embd={n_embd}",

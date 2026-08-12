@@ -2440,6 +2440,18 @@ pub(in crate::engine) fn prefill_attention_hd128_muse_dense_chain_if_supported(
     if o.quant() != QuantFormat::Q4K
         || gate.quant() != QuantFormat::Q4K
         || up.quant() != QuantFormat::Q4K
+        || !matches!(
+            down.quant(),
+            QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K
+        )
+        || o.rows() != n_embd
+        || o.cols() != o_cols
+        || gate.rows() != n_ff
+        || gate.cols() != n_embd
+        || up.rows() != n_ff
+        || up.cols() != n_embd
+        || down.rows() != n_embd
+        || down.cols() != n_ff
     {
         return Ok(false);
     }
