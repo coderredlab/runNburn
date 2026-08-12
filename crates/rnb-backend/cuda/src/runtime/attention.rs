@@ -1368,7 +1368,7 @@ impl CudaState {
                 (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
             ],
             (seq_len as u32, num_heads as u32, 1),
-            (128, 1, 1),
+            (32, 1, 1),
         )?;
 
         let mut output = vec![0.0f32; output_len];
@@ -1475,7 +1475,7 @@ impl CudaState {
                     (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                 ],
                 (seq_len as u32, num_heads as u32, 1),
-                (128, 1, 1),
+                (32, 1, 1),
             )?;
         } else {
             let mut output_arg = output_dev;
@@ -1503,7 +1503,7 @@ impl CudaState {
                     (&mut window_arg as *mut u32).cast::<libc::c_void>(),
                 ],
                 (seq_len as u32, num_heads as u32, 1),
-                (128, 1, 1),
+                (32, 1, 1),
             )?;
         }
         self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
@@ -1760,7 +1760,7 @@ impl CudaState {
                     (&mut window_arg as *mut u32).cast::<libc::c_void>(),
                 ],
                 (seq_len as u32, num_heads as u32, 1),
-                (128, 1, 1),
+                (32, 1, 1),
             )?;
         } else {
             let mut output_arg = attn_out_dev;
@@ -1786,7 +1786,7 @@ impl CudaState {
                     (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                 ],
                 (seq_len as u32, num_heads as u32, 1),
-                (128, 1, 1),
+                (32, 1, 1),
             )?;
         }
         self.launch_sigmoid_mul_inplace(attn_out_dev, attention_gate_dev, q_len)?;
