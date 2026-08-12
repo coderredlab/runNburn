@@ -266,6 +266,32 @@ fn optional_metadata<T>(value: Result<T, LoaderError>) -> Result<Option<T>, Load
     }
 }
 
+fn muse_glimmer_sliding_window_pattern(
+    metadata: &[(String, GGUFValue)],
+    key: &str,
+    num_layers: usize,
+) -> Result<Vec<bool>, LoaderError> {
+    let value = metadata
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value)
+        .ok_or_else(|| LoaderError::MissingKey(key.to_string()))?;
+    if matches!(value, GGUFValue::Array(_)) {
+        return get_bool_array(metadata, key);
+    }
+
+    let period = get_u32(metadata, key)? as usize;
+    if period == 0 {
+        return Err(LoaderError::ParseError {
+            offset: 0,
+            msg: format!("{key} scalar period must be greater than zero"),
+        });
+    }
+    Ok((0..num_layers)
+        .map(|layer| layer % period < period - 1)
+        .collect())
+}
+
 pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadata, LoaderError> {
     let arch = detect_architecture(metadata)?;
 
@@ -554,17 +580,12 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     };
     let shared_kv_layers = get_u32_opt(metadata, &format!("{prefix}.attention.shared_kv_layers"))?
         .unwrap_or(0) as usize;
+    let sliding_window_pattern_key = format!("{prefix}.attention.sliding_window_pattern");
     let sliding_window_pattern = if arch == Architecture::MuseGlimmer {
-        get_bool_array(
-            metadata,
-            &format!("{prefix}.attention.sliding_window_pattern"),
-        )?
+        muse_glimmer_sliding_window_pattern(metadata, &sliding_window_pattern_key, num_layers)?
     } else {
-        optional_metadata(get_bool_array(
-            metadata,
-            &format!("{prefix}.attention.sliding_window_pattern"),
-        ))?
-        .unwrap_or_default()
+        optional_metadata(get_bool_array(metadata, &sliding_window_pattern_key))?
+            .unwrap_or_default()
     };
     if arch == Architecture::MuseGlimmer
         && (!norm_eps.is_finite()
@@ -1097,6 +1118,18 @@ mod tests {
         assert_eq!(metadata.post_norm_eps, 1e-8);
         assert_eq!(metadata.final_logit_softcapping, 20.0);
         assert_eq!(metadata.logit_scale, 0.19611613);
+
+        let mut scalar_pattern = meta.clone();
+        scalar_pattern
+            .iter_mut()
+            .find(|(key, _)| key == "muse-glimmer.attention.sliding_window_pattern")
+            .unwrap()
+            .1 = GGUFValue::U32(4);
+        let scalar_metadata = extract_metadata(&scalar_pattern).unwrap();
+        assert_eq!(
+            scalar_metadata.sliding_window_pattern,
+            metadata.sliding_window_pattern
+        );
 
         for required_key in [
             "muse-glimmer.final_logit_softcapping",
