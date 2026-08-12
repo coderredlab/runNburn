@@ -1039,6 +1039,73 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd128(
     out[i * num_heads * 128u + h * 128u + tid] = row_sum > 0.0f ? acc / row_sum : 0.0f;
 }
 
+extern "C" __global__ void rnb_attention_prefill_flash_hd128_window(
+    float* __restrict__ out,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    unsigned seq_len,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale,
+    unsigned window) {
+    const unsigned tid = threadIdx.x;
+    const unsigned i = blockIdx.x;
+    const unsigned h = blockIdx.y;
+    if (tid >= 128u || i >= seq_len || h >= num_heads || num_kv_heads == 0u || window == 0u) {
+        return;
+    }
+
+    __shared__ float partial[4];
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned global_pos = kv_len - seq_len + i;
+    const unsigned start = global_pos + 1u > window ? global_pos + 1u - window : 0u;
+    const float qv = q[i * num_heads * 128u + h * 128u + tid];
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc = 0.0f;
+
+    for (unsigned j = start; j <= global_pos; ++j) {
+        const float kv = k[j * num_kv_heads * 128u + kv_h * 128u + tid];
+        float dot = qv * kv;
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0u) {
+            partial[warp] = dot;
+        }
+        __syncthreads();
+        if (tid < 4u) {
+            float sum = partial[tid];
+            for (unsigned offset = 2u; offset > 0u; offset >>= 1u) {
+                sum += __shfl_down_sync(0x0000000fu, sum, offset);
+            }
+            if (tid == 0u) {
+                partial[0] = sum;
+            }
+        }
+        __syncthreads();
+        const float score = partial[0] * scale;
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float p = expf(score - new_max);
+        const float vv = v[j * num_kv_heads * 128u + kv_h * 128u + tid];
+        acc = acc * old_scale + p * vv;
+        row_sum = row_sum * old_scale + p;
+        row_max = new_max;
+        __syncthreads();
+    }
+
+    out[i * num_heads * 128u + h * 128u + tid] = row_sum > 0.0f ? acc / row_sum : 0.0f;
+}
+
 extern "C" __global__ void rnb_attention_decode_hd256(
     float* __restrict__ out,
     const float* __restrict__ q,

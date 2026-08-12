@@ -1486,13 +1486,10 @@ impl CudaState {
             let mut kv_len_arg = kv_len as u32;
             let mut heads_arg = num_heads as u32;
             let mut kv_heads_arg = num_kv_heads as u32;
-            let mut head_dim_arg = 128u32;
             let mut scale_arg = scale;
             let mut window_arg = sliding_window.unwrap_or(0) as u32;
-            let mut softcap_arg = 0.0f32;
-            let mut causal_arg = 1u32;
             self.launch_cached_gemv(
-                "rnb_attention_prefill_flash_hd256",
+                "rnb_attention_prefill_flash_hd128_window",
                 &[
                     (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                     (&mut q_arg as *mut u64).cast::<libc::c_void>(),
@@ -1502,14 +1499,11 @@ impl CudaState {
                     (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
                     (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
                     (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut head_dim_arg as *mut u32).cast::<libc::c_void>(),
                     (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                     (&mut window_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut softcap_arg as *mut f32).cast::<libc::c_void>(),
-                    (&mut causal_arg as *mut u32).cast::<libc::c_void>(),
                 ],
                 (seq_len as u32, num_heads as u32, 1),
-                (256, 1, 1),
+                (128, 1, 1),
             )?;
         }
         self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(

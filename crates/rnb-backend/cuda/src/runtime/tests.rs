@@ -9916,7 +9916,7 @@ fn attention_prefill_flash_hd128_matches_cpu_reference() {
 }
 
 #[test]
-fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
+fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
     let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
@@ -9931,6 +9931,7 @@ fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
     let n_embd = 256usize;
     let n_ff = 256usize;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let sliding_window = Some(2usize);
     let q_blocks = q_dim / 256;
     let hidden_blocks = n_embd / 256;
     let down_blocks = n_ff / 256;
@@ -9973,9 +9974,20 @@ fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
     let norm_eps = 1.0e-5;
     let post_norm_eps = 1.0e-6;
 
-    let mut expected =
-        attention_prefill_flash_hd128(&q, &k, &v, seq_len, kv_len, num_heads, num_kv_heads, scale)
-            .expect("separate CUDA hd128 attention");
+    let mut expected = attention_prefill_flash_f32(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        sliding_window,
+        None,
+    )
+    .expect("separate CUDA hd128 window attention");
     sigmoid_mul_f32_inplace(&mut expected, &attention_gate).expect("separate CUDA attention gate");
     let projected =
         q4k_gemv_batch(&o, n_embd, q_dim, &expected).expect("separate CUDA O projection");
@@ -10018,7 +10030,7 @@ fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
         num_heads,
         num_kv_heads,
         scale,
-        None,
+        sliding_window,
         &o,
         &gate,
         &up,
@@ -10034,10 +10046,10 @@ fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
         norm_eps,
         post_norm_eps,
     )
-    .expect("CUDA Muse hd128 attention dense chain");
+    .expect("CUDA Muse hd128 window attention dense chain");
 
     assert_close_rows_abs_rel(
-        "Muse hd128 attention dense chain",
+        "Muse hd128 window attention dense chain",
         &actual,
         &expected_hidden,
         1e-4,
