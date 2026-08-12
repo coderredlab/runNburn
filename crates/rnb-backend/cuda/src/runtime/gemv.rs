@@ -160,28 +160,55 @@ pub(in crate::runtime) fn quantize_q8_1_batch_by_32(
     seq_len: usize,
 ) -> (Vec<i8>, Vec<f32>) {
     let cols = blocks_per_row * 256;
+    let scales_per_row = blocks_per_row * 8;
     let mut qs = vec![0i8; seq_len * cols];
-    let mut ds = vec![0.0f32; seq_len * blocks_per_row * 8];
-    for seq in 0..seq_len {
-        let input_base = seq * cols;
-        let ds_base = seq * blocks_per_row * 8;
-        for b in 0..blocks_per_row {
-            for j in 0..8 {
-                let off = input_base + b * 256 + j * 32;
-                let chunk = &input[off..off + 32];
-                let max_abs = chunk.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
-                if max_abs == 0.0 {
-                    continue;
+    let mut ds = vec![0.0f32; seq_len * scales_per_row];
+    let threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(seq_len.max(1));
+    let rows_per = seq_len.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        let mut input_rest = input;
+        let mut qs_rest = qs.as_mut_slice();
+        let mut ds_rest = ds.as_mut_slice();
+        let mut row_start = 0usize;
+        while row_start < seq_len {
+            let chunk_rows = rows_per.min(seq_len - row_start);
+            let (input_chunk, input_next) = input_rest.split_at(chunk_rows * cols);
+            let (qs_chunk, qs_next) = qs_rest.split_at_mut(chunk_rows * cols);
+            let (ds_chunk, ds_next) = ds_rest.split_at_mut(chunk_rows * scales_per_row);
+            input_rest = input_next;
+            qs_rest = qs_next;
+            ds_rest = ds_next;
+            scope.spawn(move || {
+                for seq in 0..chunk_rows {
+                    let input_base = seq * cols;
+                    let ds_base = seq * scales_per_row;
+                    for b in 0..blocks_per_row {
+                        for j in 0..8 {
+                            let off = input_base + b * 256 + j * 32;
+                            let chunk = &input_chunk[off..off + 32];
+                            let max_abs = chunk
+                                .iter()
+                                .fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                            if max_abs == 0.0 {
+                                continue;
+                            }
+                            let d = max_abs / 127.0;
+                            let inv_d = 1.0 / d;
+                            ds_chunk[ds_base + b * 8 + j] = d;
+                            for (idx, &value) in chunk.iter().enumerate() {
+                                qs_chunk[off + idx] =
+                                    (value * inv_d).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                    }
                 }
-                let d = max_abs / 127.0;
-                let inv_d = 1.0 / d;
-                ds[ds_base + b * 8 + j] = d;
-                for (idx, &value) in chunk.iter().enumerate() {
-                    qs[off + idx] = (value * inv_d).round().clamp(-127.0, 127.0) as i8;
-                }
-            }
+            });
+            row_start += chunk_rows;
         }
-    }
+    });
     (qs, ds)
 }
 
@@ -4884,5 +4911,35 @@ impl CudaState {
         }
         self.stream_synchronize()?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_q8_1_quantization_matches_rowwise_reference() {
+        let blocks_per_row = 5usize;
+        let seq_len = 17usize;
+        let cols = blocks_per_row * 256;
+        let input = (0..seq_len * cols)
+            .map(|idx| {
+                let centered = (idx % 257) as f32 - 128.0;
+                centered * 0.0078125
+            })
+            .collect::<Vec<_>>();
+
+        let (actual_qs, actual_ds) = quantize_q8_1_batch_by_32(&input, blocks_per_row, seq_len);
+        let mut expected_qs = Vec::with_capacity(actual_qs.len());
+        let mut expected_ds = Vec::with_capacity(actual_ds.len());
+        for row in input.chunks_exact(cols) {
+            let (row_qs, row_ds) = quantize_q8_1_by_32(row, blocks_per_row);
+            expected_qs.extend(row_qs);
+            expected_ds.extend(row_ds);
+        }
+
+        assert_eq!(actual_qs, expected_qs);
+        assert_eq!(actual_ds, expected_ds);
     }
 }
