@@ -171,6 +171,74 @@ pub fn prefill_attention_hd256_if_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd128_muse_dense_chain_if_supported(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    has_softcap: bool,
+    o: &[u8],
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<bool> {
+    if !backend::tuning::prefill_flash_attention_enabled()
+        || has_softcap
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || head_dim != 128
+        || seq_len < backend::tuning::prefill_flash_attention_min_seq(head_dim)
+    {
+        return Ok(false);
+    }
+    backend::attention_prefill_flash_hd128_muse_dense_chain(
+        q,
+        k,
+        v,
+        attention_gate,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        scale,
+        sliding_window,
+        o,
+        gate,
+        up,
+        down,
+        down_quant as u32,
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        hidden,
+        norm_eps,
+        post_norm_eps,
+    )
+    .map(|()| true)
+    .map_err(|err| format!("CUDA Muse prefill attention dense chain failed: {err}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_non_causal_if_supported(
     q: &[f32],
     k: &[f32],

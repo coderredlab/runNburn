@@ -769,7 +769,7 @@ impl CudaState {
             )?;
         }
 
-        self.dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             o_weights,
             gate_weights,
             up_weights,
@@ -792,7 +792,10 @@ impl CudaState {
             output_dev,
             None,
             None,
+            None,
             norm_eps,
+            norm_eps,
+            true,
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
@@ -1005,35 +1008,37 @@ impl CudaState {
         // slabs can be reallocated or overwritten.
         self.stream_synchronize()?;
 
-        let output_id = self
-            .dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
-                o_weights,
-                gate_weights,
-                up_weights,
-                down_weights,
-                down_quant,
-                post_attn_norm_weight,
-                ffn_norm_weight,
-                post_ffn_norm_weight,
-                ple_gate_weights,
-                ple_proj_weights,
-                ple_post_norm_weight,
-                ple_input,
-                ple_dim,
-                o_cols,
-                n_ff,
-                n_embd,
-                seq_len,
-                hidden,
-                device.hidden_dev,
-                device.attn_out_scratch_dev,
-                device_output_desc,
-                layer_out_scale,
-                norm_eps,
-                unit_offset_post_attn_norm,
-                unit_offset_ffn_norm,
-                unit_offset_post_ffn_norm,
-            )?;
+        let output_id = self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            ple_gate_weights,
+            ple_proj_weights,
+            ple_post_norm_weight,
+            ple_input,
+            ple_dim,
+            o_cols,
+            n_ff,
+            n_embd,
+            seq_len,
+            hidden,
+            device.hidden_dev,
+            device.attn_out_scratch_dev,
+            None,
+            device_output_desc,
+            layer_out_scale,
+            norm_eps,
+            norm_eps,
+            true,
+            unit_offset_post_attn_norm,
+            unit_offset_ffn_norm,
+            unit_offset_post_ffn_norm,
+        )?;
         Ok(Some((
             k_bits,
             v_bits,
@@ -1171,7 +1176,7 @@ impl CudaState {
             )?;
         }
 
-        self.dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             o_weights,
             gate_weights,
             up_weights,
@@ -1194,7 +1199,10 @@ impl CudaState {
             output_dev,
             None,
             None,
+            None,
             norm_eps,
+            norm_eps,
+            true,
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
@@ -1366,6 +1374,163 @@ impl CudaState {
         let mut output = vec![0.0f32; output_len];
         self.dtoh_f32_via_pinned(output_dev, &mut output)?;
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_prefill_flash_hd128_muse_dense_chain(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        attention_gate: &[f32],
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+        o_weights: &[u8],
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        post_attn_norm_weight: &[f32],
+        ffn_norm_weight: &[f32],
+        post_ffn_norm_weight: &[f32],
+        o_cols: usize,
+        n_ff: usize,
+        n_embd: usize,
+        hidden: &mut [f32],
+        norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Result<(), String> {
+        let q_bytes = std::mem::size_of_val(q);
+        let k_bytes = std::mem::size_of_val(k);
+        let v_bytes = std::mem::size_of_val(v);
+        let output_bytes = seq_len
+            .checked_mul(num_heads)
+            .and_then(|len| len.checked_mul(128))
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse attention output byte overflow".to_string())?;
+        let q_dev = self.compute_input_ptr(q_bytes)?;
+        let k_dev = self.compute_mid_a_ptr(k_bytes)?;
+        let v_dev = self.compute_mid_b_ptr(v_bytes)?;
+        let output_dev = self.compute_full_down_ptr(output_bytes)?;
+        unsafe {
+            self.api.memcpy_htod_async(
+                q_dev,
+                q.as_ptr().cast::<libc::c_void>(),
+                q_bytes,
+                self.stream,
+            )?;
+            self.api.memcpy_htod_async(
+                k_dev,
+                k.as_ptr().cast::<libc::c_void>(),
+                k_bytes,
+                self.stream,
+            )?;
+            self.api.memcpy_htod_async(
+                v_dev,
+                v.as_ptr().cast::<libc::c_void>(),
+                v_bytes,
+                self.stream,
+            )?;
+        }
+
+        if sliding_window.is_none() {
+            let mut output_arg = output_dev;
+            let mut q_arg = q_dev;
+            let mut k_arg = k_dev;
+            let mut v_arg = v_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = kv_len as u32;
+            let mut heads_arg = num_heads as u32;
+            let mut kv_heads_arg = num_kv_heads as u32;
+            let mut scale_arg = scale;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (128, 1, 1),
+            )?;
+        } else {
+            let mut output_arg = output_dev;
+            let mut q_arg = q_dev;
+            let mut k_arg = k_dev;
+            let mut v_arg = v_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = kv_len as u32;
+            let mut heads_arg = num_heads as u32;
+            let mut kv_heads_arg = num_kv_heads as u32;
+            let mut head_dim_arg = 128u32;
+            let mut scale_arg = scale;
+            let mut window_arg = sliding_window.unwrap_or(0) as u32;
+            let mut softcap_arg = 0.0f32;
+            let mut causal_arg = 1u32;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd256",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut head_dim_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut window_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut softcap_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut causal_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (256, 1, 1),
+            )?;
+        }
+
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            Some(post_attn_norm_weight),
+            ffn_norm_weight,
+            Some(post_ffn_norm_weight),
+            None,
+            None,
+            None,
+            None,
+            0,
+            o_cols,
+            n_ff,
+            n_embd,
+            seq_len,
+            hidden,
+            None,
+            output_dev,
+            Some(attention_gate),
+            None,
+            None,
+            norm_eps,
+            post_norm_eps,
+            false,
+            false,
+            false,
+            false,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn attention_decode_hd256(

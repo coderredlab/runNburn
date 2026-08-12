@@ -8,7 +8,8 @@ mod qwen_moe;
 pub use attention::{
     decode_attention_hd256_if_supported, prefill_attention_f16kv_dense_chain_if_supported,
     prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
-    prefill_attention_f16kv_window_if_supported, prefill_attention_hd256_if_supported,
+    prefill_attention_f16kv_window_if_supported,
+    prefill_attention_hd128_muse_dense_chain_if_supported, prefill_attention_hd256_if_supported,
     prefill_attention_non_causal_if_supported, qwen35_gdn_decode_core_chain,
     qwen35_gdn_decode_core_chain_admitted, try_delta_step_if_supported, QwenGdnDecodeChainCall,
 };

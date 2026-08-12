@@ -697,6 +697,97 @@ pub fn attention_prefill_flash_hd128(
         .attention_prefill_flash_hd128(q, k, v, seq_len, kv_len, num_heads, num_kv_heads, scale)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_flash_hd128_muse_dense_chain(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<(), String> {
+    let expected_q = seq_len.saturating_mul(num_heads).saturating_mul(128);
+    let expected_kv = kv_len.saturating_mul(num_kv_heads).saturating_mul(128);
+    if q.len() != expected_q
+        || k.len() != expected_kv
+        || v.len() != expected_kv
+        || attention_gate.len() != expected_q
+        || hidden.len() != seq_len.saturating_mul(n_embd)
+        || o_cols != num_heads.saturating_mul(128)
+        || post_attn_norm_weight.len() != n_embd
+        || ffn_norm_weight.len() != n_embd
+        || post_ffn_norm_weight.len() != n_embd
+    {
+        return Err(format!(
+            "CUDA Muse attention chain shape mismatch: q={} expected_q={expected_q} k={} v={} expected_kv={expected_kv} gate={} hidden={} expected_hidden={} o_cols={o_cols} expected_o_cols={} post_attn_norm={} ffn_norm={} post_ffn_norm={} n_embd={n_embd}",
+            q.len(),
+            k.len(),
+            v.len(),
+            attention_gate.len(),
+            hidden.len(),
+            seq_len.saturating_mul(n_embd),
+            num_heads.saturating_mul(128),
+            post_attn_norm_weight.len(),
+            ffn_norm_weight.len(),
+            post_ffn_norm_weight.len(),
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .attention_prefill_flash_hd128_muse_dense_chain(
+            q,
+            k,
+            v,
+            attention_gate,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            scale,
+            sliding_window,
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+}
+
 // cu47 step 32: attention_decode_cached 의 device output variant.
 // caller (decode_attention_compute) 가 attn_out carrier ptr 제공.
 // internal attention compute 의 D2H + sync 안 함 → chain function 의 attn_out

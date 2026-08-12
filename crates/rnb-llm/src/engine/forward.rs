@@ -20,6 +20,7 @@ use attention_compute::compute_prefill_attention;
 use attention_output::apply_prefill_attention_output;
 use dense_chain::{
     try_prefill_attention_output_ffn_chain, try_prefill_f16kv_attention_output_ffn_chain,
+    try_prefill_muse_attention_output_ffn_chain,
 };
 use ffn::forward_prefill_ffn;
 pub(in crate::engine) use fused_qkv_chain::Gemma4PrefillPleFusion;
@@ -1298,6 +1299,40 @@ where
                 &q,
                 cached_k_f16,
                 cached_v_f16,
+                layout,
+                layer_idx,
+                seq_len,
+                kv_len,
+                norm_eps,
+                sliding_window,
+                has_softcap,
+            )? {
+                if kv_cache.layer_uses_kvarn(kv_cache_layer) {
+                    kv_cache
+                        .compact_layer(kv_cache_layer)
+                        .map_err(crate::error::LlmError::Forward)?;
+                }
+                prof("attention+o_proj+ffn_chain", t0);
+                return Ok(PrefillAttentionStep::FinalHidden(chained_hidden));
+            }
+        }
+    }
+
+    if !non_causal {
+        if let (Some(k), Some(v), Some(attention_gate)) = (
+            cached_k_tensor.as_ref(),
+            cached_v_tensor.as_ref(),
+            attn_gate.as_ref(),
+        ) {
+            if let Some(chained_hidden) = try_prefill_muse_attention_output_ffn_chain(
+                metadata,
+                architecture,
+                hidden,
+                w,
+                &q,
+                k,
+                v,
+                attention_gate,
                 layout,
                 layer_idx,
                 seq_len,

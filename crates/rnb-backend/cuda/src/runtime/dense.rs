@@ -2643,7 +2643,7 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
+    pub(super) fn dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
         &mut self,
         o_weights: &[u8],
         gate_weights: &[u8],
@@ -2665,9 +2665,12 @@ impl CudaState {
         hidden: &mut [f32],
         hidden_dev_override: Option<u64>,
         attn_out_dev: u64,
+        attention_gate: Option<&[f32]>,
         device_output_desc: Option<rnb_backend_api::DeviceTensorDesc>,
         layer_out_scale: Option<&[f32]>,
         norm_eps: f32,
+        post_norm_eps: f32,
+        ffn_uses_gelu: bool,
         unit_offset_post_attn_norm: bool,
         unit_offset_ffn_norm: bool,
         unit_offset_post_ffn_norm: bool,
@@ -2775,6 +2778,26 @@ impl CudaState {
                 )?;
             }
         }
+        if let Some(gate) = attention_gate {
+            let expected_gate_len = seq_len.saturating_mul(o_cols);
+            if gate.len() != expected_gate_len {
+                return Err(format!(
+                    "dense attention gate length mismatch: got {}, expected {expected_gate_len}",
+                    gate.len()
+                ));
+            }
+            let gate_bytes = std::mem::size_of_val(gate);
+            let gate_dev = self.compute_mid_a_ptr(gate_bytes)?;
+            unsafe {
+                self.api.memcpy_htod_async(
+                    gate_dev,
+                    gate.as_ptr().cast::<libc::c_void>(),
+                    gate_bytes,
+                    self.stream,
+                )?;
+            }
+            self.launch_sigmoid_mul_inplace(attn_out_dev, gate_dev, expected_gate_len)?;
+        }
         self.trace_dense_stage(
             trace_call,
             "cuda-attn-dense-batch-chain",
@@ -2855,7 +2878,10 @@ impl CudaState {
         let mut prequantized_q8 = None;
         if let Some(post_weight) = post_attn_norm_weight {
             let post_weight_dev = self.resident_f32_ptr(post_weight)?;
-            if dense_combined_norms_enabled(true) && dense_q8dot_gate_up_enabled(true) {
+            if post_norm_eps == norm_eps
+                && dense_combined_norms_enabled(true)
+                && dense_q8dot_gate_up_enabled(true)
+            {
                 let q8_qs_dev = self.compute_gate_ptrs_ptr(seq_len * n_embd)?;
                 let q8_ds_dev =
                     self.compute_up_ptrs_ptr(seq_len * (n_embd / 32) * std::mem::size_of::<f32>())?;
@@ -2880,7 +2906,7 @@ impl CudaState {
                     "post_attn_resid_norm+ffn_pre_norm+input_q8_quant",
                     &mut trace_stage,
                 )?;
-            } else {
+            } else if post_norm_eps == norm_eps {
                 self.launch_rms_norm_add_then_rms_norm_rows_f32(
                     proj_dev,
                     post_weight_dev,
@@ -2897,6 +2923,32 @@ impl CudaState {
                     trace_call,
                     "cuda-attn-dense-batch-chain",
                     "post_attn_resid_norm+ffn_pre_norm",
+                    &mut trace_stage,
+                )?;
+            } else {
+                self.launch_rms_norm_rows_f32(
+                    proj_dev,
+                    post_weight_dev,
+                    normed_dev,
+                    post_norm_eps,
+                    seq_len,
+                    n_embd,
+                    unit_offset_post_attn_norm,
+                )?;
+                self.launch_add_f32_inplace(hidden_dev, normed_dev, seq_len * n_embd)?;
+                self.launch_rms_norm_rows_f32(
+                    hidden_dev,
+                    ffn_norm_dev,
+                    normed_dev,
+                    norm_eps,
+                    seq_len,
+                    n_embd,
+                    unit_offset_ffn_norm,
+                )?;
+                self.trace_dense_stage(
+                    trace_call,
+                    "cuda-attn-dense-batch-chain",
+                    "post_attn_norm+resid+ffn_pre_norm",
                     &mut trace_stage,
                 )?;
             }
@@ -2919,20 +2971,37 @@ impl CudaState {
             )?;
         }
 
-        self.dense_q4k_gelu_ffn_batch_dev_input_to_dev(
-            gate_weights,
-            up_weights,
-            down_weights,
-            down_quant,
-            n_ff,
-            n_embd,
-            seq_len,
-            normed_dev,
-            proj_dev,
-            prequantized_q8,
-            trace_call,
-            &mut trace_stage,
-        )?;
+        if ffn_uses_gelu {
+            self.dense_q4k_gelu_ffn_batch_dev_input_to_dev(
+                gate_weights,
+                up_weights,
+                down_weights,
+                down_quant,
+                n_ff,
+                n_embd,
+                seq_len,
+                normed_dev,
+                proj_dev,
+                prequantized_q8,
+                trace_call,
+                &mut trace_stage,
+            )?;
+        } else {
+            self.dense_q4k_silu_ffn_batch_dev_input_to_dev(
+                gate_weights,
+                up_weights,
+                down_weights,
+                down_quant,
+                n_ff,
+                n_embd,
+                seq_len,
+                normed_dev,
+                proj_dev,
+                prequantized_q8,
+                trace_call,
+                &mut trace_stage,
+            )?;
+        }
         self.trace_dense_stage(
             trace_call,
             "cuda-attn-dense-batch-chain",
@@ -2946,7 +3015,7 @@ impl CudaState {
                 proj_dev,
                 weight_dev,
                 hidden_dev,
-                norm_eps,
+                post_norm_eps,
                 seq_len,
                 n_embd,
                 unit_offset_post_ffn_norm,

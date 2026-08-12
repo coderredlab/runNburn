@@ -9916,6 +9916,136 @@ fn attention_prefill_flash_hd128_matches_cpu_reference() {
 }
 
 #[test]
+fn cuda_prefill_hd128_muse_dense_chain_matches_separate_cuda_path() {
+    let _guard = runtime_test_lock();
+    let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
+    let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
+
+    let seq_len = 3usize;
+    let kv_len = 3usize;
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let q_dim = num_heads * head_dim;
+    let n_embd = 256usize;
+    let n_ff = 256usize;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let q_blocks = q_dim / 256;
+    let hidden_blocks = n_embd / 256;
+    let down_blocks = n_ff / 256;
+    let o = make_test_q4k_weights(1, n_embd, q_blocks, 601)
+        .pop()
+        .unwrap();
+    let gate = make_test_q4k_weights(1, n_ff, hidden_blocks, 607)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, hidden_blocks, 613)
+        .pop()
+        .unwrap();
+    let down = make_test_q4k_weights(1, n_embd, down_blocks, 617)
+        .pop()
+        .unwrap();
+    let q = (0..seq_len * q_dim)
+        .map(|i| ((i % 31) as f32 - 15.0) * 0.007)
+        .collect::<Vec<_>>();
+    let k = (0..kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 37) as f32 - 18.0) * 0.006)
+        .collect::<Vec<_>>();
+    let v = (0..kv_len * num_kv_heads * head_dim)
+        .map(|i| ((i % 41) as f32 - 20.0) * 0.005)
+        .collect::<Vec<_>>();
+    let attention_gate = (0..seq_len * q_dim)
+        .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+        .collect::<Vec<_>>();
+    let initial_hidden = (0..seq_len * n_embd)
+        .map(|i| ((i % 43) as f32 - 21.0) * 0.004)
+        .collect::<Vec<_>>();
+    let post_attn_norm = (0..n_embd)
+        .map(|i| 0.75 + (i % 17) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let ffn_norm = (0..n_embd)
+        .map(|i| 0.82 + (i % 19) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let post_ffn_norm = (0..n_embd)
+        .map(|i| 0.91 + (i % 23) as f32 * 0.0015)
+        .collect::<Vec<_>>();
+    let norm_eps = 1.0e-5;
+    let post_norm_eps = 1.0e-6;
+
+    let mut expected =
+        attention_prefill_flash_hd128(&q, &k, &v, seq_len, kv_len, num_heads, num_kv_heads, scale)
+            .expect("separate CUDA hd128 attention");
+    sigmoid_mul_f32_inplace(&mut expected, &attention_gate).expect("separate CUDA attention gate");
+    let projected =
+        q4k_gemv_batch(&o, n_embd, q_dim, &expected).expect("separate CUDA O projection");
+    let mut post_attn = vec![0.0f32; projected.len()];
+    rms_norm_rows_f32(
+        &projected,
+        &post_attn_norm,
+        &mut post_attn,
+        post_norm_eps,
+        false,
+    )
+    .expect("separate CUDA post-attention norm");
+    let mut expected_hidden = initial_hidden.clone();
+    add_f32_inplace(&mut expected_hidden, &post_attn).expect("separate CUDA attention residual");
+    let mut ffn_input = vec![0.0f32; expected_hidden.len()];
+    rms_norm_rows_f32(&expected_hidden, &ffn_norm, &mut ffn_input, norm_eps, false)
+        .expect("separate CUDA FFN norm");
+    let down_out =
+        dense_q4k_silu_ffn_batch(&gate, &up, &down, 12, n_ff, n_embd, seq_len, &ffn_input)
+            .expect("separate CUDA SiLU FFN");
+    let mut post_ffn = vec![0.0f32; down_out.len()];
+    rms_norm_rows_f32(
+        &down_out,
+        &post_ffn_norm,
+        &mut post_ffn,
+        post_norm_eps,
+        false,
+    )
+    .expect("separate CUDA post-FFN norm");
+    add_f32_inplace(&mut expected_hidden, &post_ffn).expect("separate CUDA FFN residual");
+
+    let mut actual = initial_hidden;
+    attention_prefill_flash_hd128_muse_dense_chain(
+        &q,
+        &k,
+        &v,
+        &attention_gate,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        scale,
+        None,
+        &o,
+        &gate,
+        &up,
+        &down,
+        12,
+        &post_attn_norm,
+        &ffn_norm,
+        &post_ffn_norm,
+        q_dim,
+        n_ff,
+        n_embd,
+        &mut actual,
+        norm_eps,
+        post_norm_eps,
+    )
+    .expect("CUDA Muse hd128 attention dense chain");
+
+    assert_close_rows_abs_rel(
+        "Muse hd128 attention dense chain",
+        &actual,
+        &expected_hidden,
+        1e-4,
+        1e-5,
+    );
+}
+
+#[test]
 fn attention_decode_hd128_matches_cpu_reference() {
     let kv_len = 5usize;
     let num_heads = 2usize;
@@ -14840,7 +14970,7 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_norm_residual_matches_cpu_refe
     let output_desc =
         DeviceTensorDesc::new(seq_len, n_embd, ScalarType::F32, DeviceTensorRole::Hidden);
     let output_id = state
-        .dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
+        .dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             &o,
             &gate,
             &up,
@@ -14861,9 +14991,12 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_norm_residual_matches_cpu_refe
             &mut device_hidden_input,
             None,
             attn_out_dev,
+            None,
             Some(output_desc),
             None,
             eps,
+            eps,
+            true,
             true,
             true,
             true,
@@ -16035,7 +16168,7 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_f32_ple_device_output_matches_
     let output_desc =
         DeviceTensorDesc::new(seq_len, n_embd, ScalarType::F32, DeviceTensorRole::Hidden);
     let output_id = state
-        .dense_q4k_attention_output_gelu_ffn_batch_norm_residual_from_attn_dev(
+        .dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             &o,
             &gate,
             &up,
@@ -16056,9 +16189,12 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_f32_ple_device_output_matches_
             &mut hidden,
             None,
             attn_out_dev,
+            None,
             Some(output_desc),
             None,
             eps,
+            eps,
+            true,
             true,
             true,
             true,

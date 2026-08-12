@@ -2399,6 +2399,88 @@ pub(in crate::engine) fn dense_q4k_attention_output_gelu_ffn_batch_norm_residual
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn prefill_attention_hd128_muse_dense_chain_if_supported(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    has_softcap: bool,
+    o_weight: &QuantizedWeight,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<bool> {
+    if seq_len <= 1 {
+        return Ok(false);
+    }
+    let (Some(o), Some(gate), Some(up), Some(down)) = (
+        o_weight.backend_view(),
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    ) else {
+        return Ok(false);
+    };
+    if o.quant() != QuantFormat::Q4K
+        || gate.quant() != QuantFormat::Q4K
+        || up.quant() != QuantFormat::Q4K
+    {
+        return Ok(false);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::prefill_attention_hd128_muse_dense_chain_if_supported(
+            q,
+            k,
+            v,
+            attention_gate,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            has_softcap,
+            o.raw(),
+            gate.raw(),
+            up.raw(),
+            down.raw(),
+            backend_ggml_type(down.quant()),
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn gemma4_ple_q4k_batch_norm_residual_if_supported(
     gate_weight: &QuantizedWeight,
     proj_weight: &QuantizedWeight,
