@@ -161,11 +161,16 @@ pub(in crate::engine) fn forward_prefill_ffn(
             kernels::tensor_as_f32_slice(&down),
         );
     }
-    let down = if use_gemma_block_semantics(architecture) {
+    let down = if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
         if let Some(post_ffw_norm) = &w.post_ffw_norm {
-            if use_gemma_block_semantics(architecture)
-                && policy::gemma_unit_offset_ffn_post_norm_enabled()
-            {
+            apply_model_norm(&down, post_ffw_norm, metadata.post_norm_eps, architecture)
+                .map_err(fwd)?
+        } else {
+            down
+        }
+    } else if use_gemma_block_semantics(architecture) {
+        if let Some(post_ffw_norm) = &w.post_ffw_norm {
+            if policy::gemma_unit_offset_ffn_post_norm_enabled() {
                 apply_model_norm_unit_offset(&down, post_ffw_norm, norm_eps).map_err(fwd)?
             } else {
                 apply_model_norm(&down, post_ffw_norm, norm_eps, architecture).map_err(fwd)?

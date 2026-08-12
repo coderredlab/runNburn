@@ -225,7 +225,12 @@ pub(super) fn stream_response(
             json!({
                 "type": "response.output_item.done",
                 "output_index": output_index,
-                "item": message_item(&item_id, status, text)
+                "item": message_item(
+                    &item_id,
+                    status,
+                    text,
+                    result.output.reasoning_content.as_deref(),
+                )
             }),
         ) {
             return Ok(());
@@ -332,7 +337,7 @@ fn capture_sequence_state(
     let prompt_alignment =
         if result.output.tool_calls.is_empty() && !result.output.content.is_empty() {
             match prepared.generation.response_history_context.as_ref() {
-                Some(context) => match context.prompt_alignment(engine, &result.output.content) {
+                Some(context) => match context.prompt_alignment(engine, &result.output) {
                     Ok(alignment) => Some(alignment),
                     Err(error) => {
                         eprintln!("[WARN] response KV snapshot skipped: {error}");
@@ -447,11 +452,22 @@ fn output_items(
     let mut items = Vec::new();
     if !output.content.is_empty() || output.tool_calls.is_empty() {
         let item_id = identity.message_id(items.len());
-        items.push(message_item(&item_id, status, &output.content));
+        items.push(message_item(
+            &item_id,
+            status,
+            &output.content,
+            output.reasoning_content.as_deref(),
+        ));
     }
     for call in &output.tool_calls {
         let index = items.len();
-        items.push(function_item(identity, index, call, status));
+        items.push(function_item(
+            identity,
+            index,
+            call,
+            status,
+            output.reasoning_content.as_deref(),
+        ));
     }
     items
 }
@@ -556,13 +572,16 @@ fn message_started_item(id: &str) -> Value {
     })
 }
 
-fn message_item(id: &str, status: &str, text: &str) -> Value {
+fn message_item(id: &str, status: &str, text: &str, reasoning_content: Option<&str>) -> Value {
     json!({
         "id": id,
         "type": "message",
         "status": status,
         "role": "assistant",
-        "content": [output_text_part(text)]
+        "content": [output_text_part(text)],
+        "reasoning_content": reasoning_content,
+        "recipient": "user",
+        "end_turn": true
     })
 }
 
@@ -575,6 +594,7 @@ fn function_item(
     index: usize,
     call: &ParsedToolCall,
     status: &str,
+    reasoning_content: Option<&str>,
 ) -> Value {
     json!({
         "id": identity.function_id(index),
@@ -582,7 +602,8 @@ fn function_item(
         "status": status,
         "call_id": identity.call_id(index),
         "name": call.name,
-        "arguments": call.arguments
+        "arguments": call.arguments,
+        "reasoning_content": reasoning_content
     })
 }
 

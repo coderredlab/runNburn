@@ -20,6 +20,11 @@ pub(super) fn load_attention_layer(
     let q_bias = load_optional_f32_weight(model, &format!("blk.{i}.attn_q.bias"));
     let k_bias = load_optional_f32_weight(model, &format!("blk.{i}.attn_k.bias"));
     let v_bias = load_optional_f32_weight(model, &format!("blk.{i}.attn_v.bias"));
+    let attn_gate_name = format!("blk.{i}.attn_gate.weight");
+    let attn_gate_weight = model
+        .weights
+        .contains_key(&attn_gate_name)
+        .then(|| load_quantized_weight(model, &attn_gate_name));
 
     // Q/K norm (Qwen3.5 attention layers)
     let q_norm = load_optional_f32_weight(model, &format!("blk.{i}.attn_q_norm.weight"));
@@ -60,6 +65,7 @@ pub(super) fn load_attention_layer(
             load_quantized_weight(model, v_load_name)
         },
         o_weight: load_quantized_weight(model, &format!("blk.{i}.attn_output.weight")),
+        attn_gate_weight,
         q_bias,
         k_bias,
         v_bias,

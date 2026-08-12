@@ -3,7 +3,7 @@ use super::image_input::decode_data_image;
 use super::structured::{prepare_generation_constraint, prepare_tools};
 use rnb_llm::{
     ChatContent, ChatContentPart, ChatMessage, ChatTemplateOptions, Engine, GenerateParams,
-    RgbImage,
+    ParsedAssistantOutput, RgbImage,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -46,6 +46,9 @@ pub(super) struct ApiMessage {
     function_call: Option<Value>,
     tool_call_id: Option<String>,
     name: Option<String>,
+    reasoning_content: Option<String>,
+    recipient: Option<String>,
+    end_turn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +91,7 @@ pub(super) struct PreparedGenerationRequest {
     pub include_usage: bool,
     pub tool_names: Vec<String>,
     pub parallel_tool_calls: bool,
+    pub muse_protocol: bool,
     pub response_history_context: Option<ResponseHistoryContext>,
     pub image: Option<RgbImage>,
 }
@@ -101,12 +105,15 @@ impl ResponseHistoryContext {
     pub fn prompt_alignment(
         &self,
         engine: &Engine,
-        assistant_content: &str,
+        assistant_output: &ParsedAssistantOutput,
     ) -> Result<(String, String), String> {
-        crate::chat_alignment::render_chat_resume_alignment(
+        crate::chat_alignment::render_chat_resume_alignment_message(
             &engine.tokenizer,
             &self.messages,
-            assistant_content,
+            ChatMessage::assistant(
+                &assistant_output.content,
+                assistant_output.reasoning_content.clone(),
+            ),
             ChatTemplateOptions {
                 add_generation_prompt: false,
                 enable_thinking: false,
@@ -398,6 +405,7 @@ impl GenerationRequest {
             include_usage: self.include_usage,
             tool_names: tools.names,
             parallel_tool_calls,
+            muse_protocol: engine.tool_call_format() == rnb_llm::ToolCallFormat::Muse,
             response_history_context,
             image: self.image,
         })
@@ -485,6 +493,9 @@ impl ApiMessage {
                 tool_calls,
                 tool_call_id,
                 name: self.name,
+                reasoning_content: self.reasoning_content,
+                recipient: self.recipient,
+                end_turn: self.end_turn,
             },
             image,
         ))

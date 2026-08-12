@@ -5,6 +5,9 @@ pub(in crate::engine) fn apply_embedding_scale(
     metadata: &ModelMetadata,
     architecture: ModelArchitecture,
 ) -> Tensor {
+    if super::super::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+        return super::super::muse_glimmer::normalize_token_embeddings(hidden, metadata);
+    }
     if env_flag("RNB_DISABLE_GEMMA_EMB_SCALE") {
         return hidden;
     }
@@ -23,6 +26,10 @@ pub(in crate::engine) fn apply_embedding_scale_inplace(
     metadata: &ModelMetadata,
     architecture: ModelArchitecture,
 ) {
+    if super::super::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+        super::super::muse_glimmer::normalize_token_embeddings_inplace(hidden, metadata);
+        return;
+    }
     if env_flag("RNB_DISABLE_GEMMA_EMB_SCALE") {
         return;
     }
@@ -151,6 +158,7 @@ pub(in crate::engine) fn emit_decode_layer_target_trace(
     } else {
         weights.output.gemv_vec(normed_data)?
     };
+    super::super::muse_glimmer::scale_logits_inplace(&mut logits, metadata.logit_scale);
     apply_logit_softcapping(&mut logits, metadata.final_logit_softcapping);
 
     let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();

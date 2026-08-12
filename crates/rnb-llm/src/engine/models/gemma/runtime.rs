@@ -55,15 +55,30 @@ pub(in crate::engine) fn is_gemma_sliding_window_layer(
         .copied()
         .unwrap_or(false)
 }
+pub(in crate::engine) fn is_sliding_window_layer(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    layer_idx: usize,
+) -> bool {
+    if matches!(architecture, ModelArchitecture::MuseGlimmer) {
+        return metadata
+            .sliding_window_pattern
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(false);
+    }
+    is_gemma_sliding_window_layer(metadata, layer_idx)
+}
 
 pub(in crate::engine) fn active_sliding_window(
     metadata: &ModelMetadata,
     architecture: ModelArchitecture,
     layer_idx: usize,
 ) -> Option<usize> {
-    if use_gemma_block_semantics(architecture)
+    if (use_gemma_block_semantics(architecture)
+        || matches!(architecture, ModelArchitecture::MuseGlimmer))
         && metadata.sliding_window > 0
-        && is_gemma_sliding_window_layer(metadata, layer_idx)
+        && is_sliding_window_layer(metadata, architecture, layer_idx)
     {
         Some(metadata.sliding_window)
     } else {
@@ -139,15 +154,31 @@ pub(in crate::engine) fn gemma4_prefill_uses_f16_cache(architecture: ModelArchit
     matches!(architecture, ModelArchitecture::Gemma4)
 }
 
+fn uses_dedicated_ffn_pre_norm(architecture: ModelArchitecture) -> bool {
+    use_gemma_block_semantics(architecture)
+        || matches!(architecture, ModelArchitecture::MuseGlimmer)
+}
+
 pub(in crate::engine) fn select_ffn_pre_norm_weight<'a>(
     w: &'a AttentionLayerWeights,
     architecture: ModelArchitecture,
 ) -> &'a Tensor {
-    if use_gemma_block_semantics(architecture) {
+    if uses_dedicated_ffn_pre_norm(architecture) {
         &w.ffn_norm
     } else if let Some(ref pan) = w.post_attn_norm {
         pan
     } else {
         &w.ffn_norm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn muse_glimmer_uses_dedicated_ffn_pre_norm() {
+        assert!(uses_dedicated_ffn_pre_norm(ModelArchitecture::MuseGlimmer));
+        assert!(!uses_dedicated_ffn_pre_norm(ModelArchitecture::Qwen2));
     }
 }

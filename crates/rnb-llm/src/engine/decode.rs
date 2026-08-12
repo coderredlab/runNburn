@@ -85,6 +85,11 @@ pub(super) fn decode_attention_layer(
     .ple_fused)
 }
 
+fn plain_metal_o_chain_supports(architecture: ModelArchitecture) -> bool {
+    !use_gemma_block_semantics(architecture)
+        && !super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+}
+
 fn attn_chain_core_eligible(
     w: &AttentionLayerWeights,
     has_gated_attn: bool,
@@ -228,6 +233,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     let kv_dim = layout.kv_dim;
     let q_dim = layout.q_dim;
     let has_gated_attn = layout.has_gated_attn;
+    let packed_q_gate = layout.packed_q_gate;
     let num_heads_layout = layout.num_heads;
     let num_kv_heads_layout = layout.num_kv_heads;
     let norm_eps = metadata.norm_eps;
@@ -398,7 +404,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
                 rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
             )
         };
-        supports_device_input(&w.q_weight)
+        w.attn_gate_weight.is_none()
+            && supports_device_input(&w.q_weight)
             && (gemma4_reuse_q_only
                 || (supports_device_input(&w.k_weight) && supports_device_input(&w.v_weight)))
     };
@@ -657,6 +664,23 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             |label, t| prof!(label, t),
         )?;
     }
+    if !qkv_precomputed {
+        if let Some(gate_weight) = &w.attn_gate_weight {
+            let gate_ok = gpu_gemv_into_if_supported(
+                gate_weight,
+                &scratch.norm_buf[..hidden_dim],
+                &mut scratch.gate_split[..q_dim],
+                "attention gate",
+                false,
+            )?;
+            if !gate_ok {
+                gate_weight.gemv_into(
+                    &scratch.norm_buf[..hidden_dim],
+                    &mut scratch.gate_split[..q_dim],
+                )?;
+            }
+        }
+    }
     emit_mtp_finite_trace(
         "decode-attn",
         layer_idx,
@@ -679,7 +703,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             gemma4_reuse_q_only,
         );
     }
-    let q_after_post = if has_gated_attn {
+    let q_after_post = if packed_q_gate {
         &scratch.q_split[..q_dim]
     } else {
         &scratch.q_buf[..q_dim]
@@ -694,7 +718,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // 3. RoPE — fused path 또는 device QKV path 에서 GPU RoPE 가 이미 적용된 상태라 skip.
     let t0 = std::time::Instant::now();
     if !used_fused_hd128 && !used_device_qkv {
-        let q_slice = if has_gated_attn {
+        let q_slice = if packed_q_gate {
             &mut scratch.q_split[..q_dim]
         } else {
             &mut scratch.q_buf[..q_dim]
@@ -714,7 +738,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             &mut scratch.k_buf[..kv_dim],
         );
     }
-    let q_after_rope = if has_gated_attn {
+    let q_after_rope = if packed_q_gate {
         &scratch.q_split[..q_dim]
     } else {
         &scratch.q_buf[..q_dim]
@@ -737,7 +761,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
 
     // 6. Attention decode
     let t0 = std::time::Instant::now();
-    let q_slice = if has_gated_attn {
+    let q_slice = if packed_q_gate {
         &scratch.q_split[..q_dim]
     } else {
         &scratch.q_buf[..q_dim]
@@ -1166,7 +1190,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // Metal attention O chain (RNB_METAL_O_CHAIN=1) — o_proj + residual 단일 command
     // buffer. non-gemma(qwen) 한정(gemma post-attn-norm 제외). 성공 시 두 함수 skip.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let o_chain_done = if !use_gemma_block_semantics(architecture) {
+    let o_chain_done = if plain_metal_o_chain_supports(architecture) {
         backend_runtime::metal_attention_o_chain_into_if_supported(
             &scratch.attn_out[..q_dim],
             &w.o_weight,
@@ -1203,6 +1227,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             w,
             hidden_dim,
             norm_eps,
+            metadata.post_norm_eps,
             layer_idx,
             source_hidden,
             prev_layer_hidden,
@@ -1233,6 +1258,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         w,
         hidden_dim,
         norm_eps,
+        metadata.post_norm_eps,
         layer_idx,
         #[cfg(feature = "vulkan")]
         vulkan_backend.as_mut().map(|v| &mut **v),
@@ -1246,4 +1272,17 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     prof!("ffn_total", t0);
 
     Ok(DecodeAttentionLayerReport::default())
+}
+
+#[cfg(test)]
+mod muse_metal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn plain_metal_o_chain_rejects_muse_post_norm_contract() {
+        assert!(!plain_metal_o_chain_supports(
+            ModelArchitecture::MuseGlimmer
+        ));
+        assert!(plain_metal_o_chain_supports(ModelArchitecture::Qwen2));
+    }
 }

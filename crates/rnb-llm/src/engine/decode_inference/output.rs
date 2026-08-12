@@ -70,6 +70,10 @@ pub(super) fn finalize_decode_logits(
         }
     }
     if !scratch.backend_argmax_only {
+        super::super::models::muse_glimmer::scale_logits_inplace(
+            &mut scratch.logits,
+            metadata.logit_scale,
+        );
         apply_logit_softcapping(&mut scratch.logits, metadata.final_logit_softcapping);
         emit_final_dump("decode_logits", &scratch.logits);
         if crate::engine::policy::env_string("RNB_CUDA_EAGER_LOGITS_RANGE").as_deref() == Some("1")

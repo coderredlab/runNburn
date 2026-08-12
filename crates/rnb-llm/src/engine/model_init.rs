@@ -154,8 +154,20 @@ pub(super) fn build_tokenizer(tok_data: &TokenizerData) -> Result<(Tokenizer, us
     );
     let mut tokenizer = match kind {
         TokenizerKind::Gpt2 => {
-            eprintln!("[INFO] Tokenizer: GPT-2 BPE");
-            let mut tokenizer = crate::tokenizer::bpe::Tokenizer::new_gpt2(vocab, merges);
+            let llama4 = tok_data.pre.as_deref() == Some("llama4");
+            eprintln!(
+                "[INFO] Tokenizer: GPT-2 BPE{}",
+                if llama4 {
+                    " + Llama 4 pre-tokenizer"
+                } else {
+                    ""
+                }
+            );
+            let mut tokenizer = if llama4 {
+                crate::tokenizer::bpe::Tokenizer::new_gpt2_llama4(vocab, merges)
+            } else {
+                crate::tokenizer::bpe::Tokenizer::new_gpt2(vocab, merges)
+            };
             tokenizer.set_add_bos_token(tok_data.add_bos_token);
             tokenizer
         }
@@ -224,6 +236,8 @@ pub(super) fn build_model_metadata(model: &LoadedModel, vocab_size: usize) -> Mo
         rope_sections: model.metadata.rope_sections,
         norm_eps: model.metadata.norm_eps,
         final_logit_softcapping: model.metadata.final_logit_softcapping,
+        post_norm_eps: model.metadata.post_norm_eps,
+        logit_scale: model.metadata.logit_scale,
         query_pre_attn_scalar: model.metadata.query_pre_attn_scalar,
         sliding_window: model.metadata.sliding_window,
         shared_kv_layers: model.metadata.shared_kv_layers,

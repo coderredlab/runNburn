@@ -688,6 +688,19 @@ fn stream_chat_completion(
         return Ok(());
     }
 
+    if let Some(reasoning) = result.output.reasoning_content.as_deref() {
+        let reasoning_chunk = stream_chunk(
+            &id,
+            created,
+            model_name,
+            json!({"reasoning_content": reasoning}),
+            Value::Null,
+        );
+        if write_sse_json(stream, &reasoning_chunk).is_err() {
+            return Ok(());
+        }
+    }
+
     let finish_reason = finish_reason(result.output_tokens, result.max_tokens, result.matched_stop);
     let final_chunk = stream_chunk(&id, created, model_name, json!({}), json!(finish_reason));
     if write_sse_json(stream, &final_chunk).is_err() {
@@ -731,6 +744,19 @@ fn stream_tool_completion(
             return Ok(());
         }
     };
+
+    if let Some(reasoning) = result.output.reasoning_content.as_deref() {
+        let chunk = stream_chunk(
+            id,
+            created,
+            model_name,
+            json!({"reasoning_content": reasoning}),
+            Value::Null,
+        );
+        if write_sse_json(stream, &chunk).is_err() {
+            return Ok(());
+        }
+    }
 
     if !result.output.content.is_empty() {
         let chunk = stream_chunk(
@@ -813,7 +839,8 @@ fn assistant_message(completion_id: &str, output: &ParsedAssistantOutput) -> Val
     if output.tool_calls.is_empty() {
         return json!({
             "role": "assistant",
-            "content": output.content
+            "content": output.content,
+            "reasoning_content": output.reasoning_content
         });
     }
     let content = if output.content.is_empty() {
@@ -830,6 +857,7 @@ fn assistant_message(completion_id: &str, output: &ParsedAssistantOutput) -> Val
     json!({
         "role": "assistant",
         "content": content,
+        "reasoning_content": output.reasoning_content,
         "tool_calls": tool_calls
     })
 }
@@ -1038,6 +1066,7 @@ mod tests {
     fn builds_openai_tool_call_message() {
         let output = ParsedAssistantOutput {
             content: String::new(),
+            reasoning_content: None,
             tool_calls: vec![ParsedToolCall {
                 name: "get_weather".to_string(),
                 arguments: r#"{"city":"Seoul"}"#.to_string(),

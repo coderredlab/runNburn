@@ -2002,6 +2002,7 @@ fn mtp_argmax(
         }
     }
     let mut logits = head.gemv_vec(&normed)?;
+    super::models::muse_glimmer::scale_logits_inplace(&mut logits, runtime.metadata.logit_scale);
     apply_logit_softcapping(&mut logits, runtime.metadata.final_logit_softcapping);
     // pm117 계측: `RNB_MTP_TRACE=1` 이면 draft top-1 softmax prob / logit margin
     // 을 출력 — verify 의 `[MTP_TRACE] round= accepted=` 와 조인해 draft 확신도와
@@ -2090,6 +2091,8 @@ mod tests {
             rope_sections: [11, 11, 10, 0],
             norm_eps: 1.0e-6,
             final_logit_softcapping: 0.0,
+            post_norm_eps: 1.0e-6,
+            logit_scale: 1.0,
             query_pre_attn_scalar: 0.0,
             sliding_window: 0,
             shared_kv_layers: 0,

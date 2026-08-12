@@ -4,6 +4,10 @@ use super::*;
 
 /// FFN sub-block for decode path. Reads from scratch.norm_buf, writes result via add_inplace to scratch.hidden.
 /// Called by both decode_attention_layer and decode_gdn_layer.
+fn shared_epsilon_metal_ffn_chain_supports(architecture: ModelArchitecture) -> bool {
+    !super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+}
+
 #[allow(unused_variables)]
 pub(super) fn decode_ffn(
     scratch: &mut ScratchBuffers,
@@ -16,6 +20,7 @@ pub(super) fn decode_ffn(
     ffn_gate_up_fused: &Option<QuantizedWeight>,
     hidden_dim: usize,
     norm_eps: f32,
+    post_norm_eps: f32,
     layer_idx: usize,
     #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<()> {
@@ -37,8 +42,9 @@ pub(super) fn decode_ffn(
 
     #[cfg(feature = "vulkan")]
     let mut gpu_runtime = gpu_runtime;
-    let gemma_needs_post_ffw_norm =
-        use_gemma_block_semantics(architecture) && post_ffw_norm_weight.is_some();
+    let needs_post_ffw_norm = post_ffw_norm_weight.is_some()
+        && (use_gemma_block_semantics(architecture)
+            || super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture));
 
     #[cfg(feature = "cuda")]
     if use_gemma_block_semantics(architecture) {
@@ -105,7 +111,10 @@ pub(super) fn decode_ffn(
             && (super::policy::gemma_unit_offset_attn_ffn_norm_enabled()
                 || super::policy::gemma_unit_offset_norm_enabled()
                 || super::policy::gemma_unit_offset_main_norm_enabled());
-        if ffn_gate_up_fused.is_none() && !unit_offset_norm {
+        if shared_epsilon_metal_ffn_chain_supports(architecture)
+            && ffn_gate_up_fused.is_none()
+            && !unit_offset_norm
+        {
             let norm_w = kernels::tensor_as_f32_slice(ffn_norm_weight);
             let post_norm_w = post_ffw_norm_weight
                 .as_ref()
@@ -131,7 +140,7 @@ pub(super) fn decode_ffn(
         }
     }
 
-    if !gemma_needs_post_ffw_norm {
+    if !needs_post_ffw_norm {
         let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
         let gpu_chain_ok = backend_runtime::try_decode_ffn_chain_if_supported(
             #[cfg(feature = "vulkan")]
@@ -189,7 +198,7 @@ pub(super) fn decode_ffn(
         gpu_down_done = true;
     }
 
-    if !gpu_ffn_ok && !gemma_needs_post_ffw_norm {
+    if !gpu_ffn_ok && !needs_post_ffw_norm {
         let gate_rows = ffn_gate_weight.rows;
         let gpu_gate_dispatched = backend_runtime::try_decode_ffn_gate_async_if_supported(
             #[cfg(feature = "vulkan")]
@@ -317,9 +326,18 @@ pub(super) fn decode_ffn(
     }
     prof!("down_gemv", t_down);
 
-    if use_gemma_block_semantics(architecture) {
-        if let Some(post_ffw_norm) = post_ffw_norm_weight {
-            let post_ffw_norm_data = kernels::tensor_as_f32_slice(post_ffw_norm);
+    if let Some(post_ffw_norm) = post_ffw_norm_weight {
+        let post_ffw_norm_data = kernels::tensor_as_f32_slice(post_ffw_norm);
+        if super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+            apply_model_norm_into(
+                &scratch.ffn_down[..hidden_dim],
+                post_ffw_norm_data,
+                post_norm_eps,
+                &mut scratch.norm_buf2[..hidden_dim],
+                architecture,
+            );
+            scratch.ffn_down[..hidden_dim].copy_from_slice(&scratch.norm_buf2[..hidden_dim]);
+        } else if use_gemma_block_semantics(architecture) {
             apply_model_norm_into(
                 &scratch.ffn_down[..hidden_dim],
                 post_ffw_norm_data,
@@ -341,4 +359,19 @@ pub(super) fn decode_ffn(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod muse_metal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn shared_epsilon_metal_ffn_chain_rejects_muse_post_norm_contract() {
+        assert!(!shared_epsilon_metal_ffn_chain_supports(
+            ModelArchitecture::MuseGlimmer
+        ));
+        assert!(shared_epsilon_metal_ffn_chain_supports(
+            ModelArchitecture::Qwen2
+        ));
+    }
 }

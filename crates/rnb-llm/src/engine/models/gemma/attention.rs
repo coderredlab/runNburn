@@ -203,6 +203,7 @@ mod tests {
     #[test]
     fn qwen2_uses_neox_rope_layout() {
         assert!(uses_neox_rope(ModelArchitecture::Qwen2));
+        assert!(!uses_neox_rope(ModelArchitecture::MuseGlimmer));
         assert!(!uses_neox_rope(ModelArchitecture::LLaMA));
     }
 }

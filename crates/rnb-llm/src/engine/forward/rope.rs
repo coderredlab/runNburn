@@ -84,6 +84,11 @@ pub(super) fn apply_prefill_rope(
     if matches!(architecture, ModelArchitecture::NemotronHMoE) {
         return Ok((q, k.cloned()));
     }
+    if matches!(architecture, ModelArchitecture::MuseGlimmer)
+        && !is_sliding_window_layer(metadata, architecture, layer_idx)
+    {
+        return Ok((q, k.cloned()));
+    }
 
     let fwd = |e: rnb_core::error::RnbError| crate::error::LlmError::Forward(e.to_string());
     let (rope_dim, rope_theta, proportional_rope) =

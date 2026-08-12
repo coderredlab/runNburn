@@ -61,7 +61,20 @@ pub(in crate::engine) fn finish_prefill_attention_projection(
             &proj_data[(seq_len - 1) * metadata.hidden_dim..seq_len * metadata.hidden_dim];
         emit_vec_trace("prefill-l34", layer_idx, "attn_proj", proj_last);
     }
-    let attn_proj = if use_gemma_block_semantics(architecture) {
+    let attn_proj = if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+    {
+        if let Some(post_attn_norm) = &w.post_attn_norm {
+            apply_model_norm(
+                &attn_proj,
+                post_attn_norm,
+                metadata.post_norm_eps,
+                architecture,
+            )
+            .map_err(fwd)?
+        } else {
+            attn_proj
+        }
+    } else if use_gemma_block_semantics(architecture) {
         if let Some(post_attn_norm) = &w.post_attn_norm {
             if gemma_skip_post_attn_enabled(layer_idx)
                 || gemma_effective_skip_post_attn_prefill_enabled(

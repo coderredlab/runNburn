@@ -9,6 +9,7 @@ pub(super) fn apply_decode_attention_residual<F>(
     w: &AttentionLayerWeights,
     hidden_dim: usize,
     norm_eps: f32,
+    post_norm_eps: f32,
     layer_idx: usize,
     source_hidden: Option<&[f32]>,
     prev_layer_hidden: Option<&[f32]>,
@@ -19,7 +20,18 @@ pub(super) fn apply_decode_attention_residual<F>(
 ) where
     F: FnMut(&str, std::time::Instant),
 {
-    if use_gemma_block_semantics(architecture) {
+    if super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+        if let Some(post_attn_norm) = &w.post_attn_norm {
+            apply_model_norm_into(
+                &scratch.proj_buf[..hidden_dim],
+                kernels::tensor_as_f32_slice(post_attn_norm),
+                post_norm_eps,
+                &mut scratch.norm_buf2[..hidden_dim],
+                architecture,
+            );
+            scratch.proj_buf[..hidden_dim].copy_from_slice(&scratch.norm_buf2[..hidden_dim]);
+        }
+    } else if use_gemma_block_semantics(architecture) {
         if let Some(post_attn_norm) = &w.post_attn_norm {
             if !(gemma_skip_post_attn_enabled(layer_idx)
                 || gemma_skip_post_attn_decode_enabled(layer_idx))

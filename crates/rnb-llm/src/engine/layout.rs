@@ -9,6 +9,7 @@ pub(super) struct AttentionLayout {
     pub(super) head_dim: usize,
     pub(super) q_dim: usize,
     pub(super) kv_dim: usize,
+    pub(super) packed_q_gate: bool,
     pub(super) has_gated_attn: bool,
 }
 
@@ -44,8 +45,9 @@ pub(super) fn resolve_attention_layout(
         })
         .unwrap_or(metadata.head_dim);
 
-    let has_gated_attn = q_out_dim == num_heads * inferred_head_dim * 2;
-    let q_dim = if has_gated_attn {
+    let packed_q_gate = q_out_dim == num_heads * inferred_head_dim * 2;
+    let has_gated_attn = packed_q_gate || w.attn_gate_weight.is_some();
+    let q_dim = if packed_q_gate {
         q_out_dim / 2
     } else {
         q_out_dim
@@ -98,6 +100,15 @@ pub(super) fn resolve_attention_layout(
             k_out_dim, v_out_dim
         )));
     }
+    if let Some(gate) = &w.attn_gate_weight {
+        let expected = num_heads * inferred_head_dim;
+        if gate.rows != expected {
+            return Err(crate::error::LlmError::Forward(format!(
+                "attention gate rows {} != expected {}",
+                gate.rows, expected
+            )));
+        }
+    }
 
     Ok(AttentionLayout {
         num_heads,
@@ -106,6 +117,7 @@ pub(super) fn resolve_attention_layout(
         q_dim,
         kv_dim,
         has_gated_attn,
+        packed_q_gate,
     })
 }
 
@@ -128,8 +140,9 @@ pub(super) fn resolve_attention_layout_gemma4_reuse(
         })
         .unwrap_or(metadata.head_dim);
 
-    let has_gated_attn = q_out_dim == num_heads * inferred_head_dim * 2;
-    let q_dim = if has_gated_attn {
+    let packed_q_gate = q_out_dim == num_heads * inferred_head_dim * 2;
+    let has_gated_attn = packed_q_gate || w.attn_gate_weight.is_some();
+    let q_dim = if packed_q_gate {
         q_out_dim / 2
     } else {
         q_out_dim
@@ -154,5 +167,6 @@ pub(super) fn resolve_attention_layout_gemma4_reuse(
         q_dim,
         kv_dim,
         has_gated_attn,
+        packed_q_gate,
     })
 }

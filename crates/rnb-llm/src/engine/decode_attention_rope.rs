@@ -19,6 +19,11 @@ pub(in crate::engine) fn apply_decode_rope(
     if matches!(architecture, ModelArchitecture::NemotronHMoE) {
         return;
     }
+    if matches!(architecture, ModelArchitecture::MuseGlimmer)
+        && !is_sliding_window_layer(metadata, architecture, layer_idx)
+    {
+        return;
+    }
 
     let (rope_dim, rope_theta, proportional_rope) =
         resolve_rope_params(metadata, architecture, layer_idx, head_dim);

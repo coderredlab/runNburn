@@ -618,6 +618,7 @@ mod tests {
             q_dim: 1,
             kv_dim: 1,
             has_gated_attn: false,
+            packed_q_gate: false,
         };
         let q = Tensor::from_vec(vec![0.0, 0.0], &[2, 1]);
         let k = Tensor::from_vec(vec![1.0, 3.0], &[2, 1]);

@@ -47,13 +47,14 @@ pub(super) fn normalize_input(
                 return Err(invalid("input", "input must not be empty"));
             }
             let mut pending_calls = Vec::new();
+            let mut pending_reasoning = None;
             for (index, item) in items.into_iter().enumerate() {
                 let object = item
                     .as_object()
                     .ok_or_else(|| invalid("input", format!("input[{index}] must be an object")))?;
                 let kind = object.get("type").and_then(Value::as_str);
                 if kind.is_none() || kind == Some("message") {
-                    flush_function_calls(&mut messages, &mut pending_calls);
+                    flush_function_calls(&mut messages, &mut pending_calls, &mut pending_reasoning);
                     let (message, message_image) = normalize_message(object, index)?;
                     if let Some(message_image) = message_image {
                         if image.replace(message_image).is_some() {
@@ -65,9 +66,16 @@ pub(super) fn normalize_input(
                     }
                     messages.push(message);
                 } else if kind == Some("function_call") {
+                    if let Some(reasoning) = object
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .filter(|reasoning| !reasoning.is_empty())
+                    {
+                        pending_reasoning = Some(reasoning.to_string());
+                    }
                     pending_calls.push(normalize_function_call(object, index)?);
                 } else if kind == Some("function_call_output") {
-                    flush_function_calls(&mut messages, &mut pending_calls);
+                    flush_function_calls(&mut messages, &mut pending_calls, &mut pending_reasoning);
                     messages.push(normalize_function_output(object, index)?);
                 } else {
                     return Err(unsupported(
@@ -79,7 +87,7 @@ pub(super) fn normalize_input(
                     ));
                 }
             }
-            flush_function_calls(&mut messages, &mut pending_calls);
+            flush_function_calls(&mut messages, &mut pending_calls, &mut pending_reasoning);
         }
     }
     Ok(NormalizedResponseInput { messages, image })
@@ -110,6 +118,15 @@ fn normalize_message(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: object
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            recipient: object
+                .get("recipient")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            end_turn: object.get("end_turn").and_then(Value::as_bool),
         },
         image,
     ))
@@ -229,10 +246,17 @@ fn normalize_function_output(
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),
         name: None,
+        reasoning_content: None,
+        recipient: None,
+        end_turn: None,
     })
 }
 
-fn flush_function_calls(messages: &mut Vec<ChatMessage>, calls: &mut Vec<Value>) {
+fn flush_function_calls(
+    messages: &mut Vec<ChatMessage>,
+    calls: &mut Vec<Value>,
+    reasoning_content: &mut Option<String>,
+) {
     if calls.is_empty() {
         return;
     }
@@ -242,6 +266,9 @@ fn flush_function_calls(messages: &mut Vec<ChatMessage>, calls: &mut Vec<Value>)
         tool_calls: Some(Value::Array(std::mem::take(calls))),
         tool_call_id: None,
         name: None,
+        reasoning_content: reasoning_content.take(),
+        recipient: None,
+        end_turn: None,
     });
 }
 

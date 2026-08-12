@@ -1,7 +1,8 @@
 use rnb_llm::{
-    generate_stream_multimodal, generate_stream_multimodal_resuming, ChatMessage,
+    generate_stream_multimodal, generate_stream_multimodal_resuming,
+    parse_assistant_output_with_format, AssistantTurnStreamFilter, ChatMessage,
     ChatTemplateOptions, Engine, EngineLoadConfig, EngineSequenceState, GenerateParams,
-    GenerateResult, RgbImage,
+    GenerateResult, RgbImage, ToolCallFormat,
 };
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -70,6 +71,10 @@ impl ChatHistory {
 
     fn push(&mut self, role: &str, content: String) {
         self.messages.push(ChatMessage::new(role, content));
+    }
+
+    fn push_message(&mut self, message: ChatMessage) {
+        self.messages.push(message);
     }
 
     fn push_user(&mut self, content: String, attach_image: bool) {
@@ -206,11 +211,15 @@ fn run_session(
                     )
                     .map_err(|error| format!("failed to render chat prompt: {error}"))?;
 
+                let muse_protocol = engine.tool_call_format() == ToolCallFormat::Muse;
+                let mut turn_filter = AssistantTurnStreamFilter::new(muse_protocol);
                 let mut on_piece = |piece: &str| {
-                    if write!(output, "{piece}").is_err() || output.flush().is_err() {
-                        return false;
-                    }
-                    true
+                    turn_filter.push(piece, |visible| {
+                        if write!(output, "{visible}").is_err() || output.flush().is_err() {
+                            return false;
+                        }
+                        true
+                    })
                 };
                 let result = match (image, sequence_state.as_ref()) {
                     (Some(image), Some(state)) => generate_stream_multimodal_resuming(
@@ -239,15 +248,29 @@ fn run_session(
                     }
                 }
                 .map_err(|error| format!("generation failed: {error}"))?;
+                turn_filter.finish(|visible| {
+                    if write!(output, "{visible}").is_err() || output.flush().is_err() {
+                        return false;
+                    }
+                    true
+                });
                 writeln!(output).map_err(|error| error.to_string())?;
+                let parsed = parse_assistant_output_with_format(
+                    &result.text,
+                    &[],
+                    engine.tool_call_format(),
+                )
+                .map_err(|error| format!("failed to parse assistant output: {error}"))?;
+                let assistant = ChatMessage::assistant(parsed.content, parsed.reasoning_content);
                 sequence_state = capture_chat_sequence_state(
                     engine,
                     &history.messages,
                     &rendered,
                     &result,
+                    assistant.clone(),
                     config.enable_thinking,
                 )?;
-                history.push("assistant", result.text);
+                history.push_message(assistant);
             }
         }
     }
@@ -258,15 +281,16 @@ fn capture_chat_sequence_state(
     messages_before_assistant: &[ChatMessage],
     rendered_prompt: &str,
     result: &GenerateResult,
+    assistant_message: ChatMessage,
     enable_thinking: bool,
 ) -> Result<Option<EngineSequenceState>, String> {
     if !engine.durable_sequence_state_supported() {
         return Ok(None);
     }
-    let (prompt_prefix, append_text) = crate::chat_alignment::render_chat_resume_alignment(
+    let (prompt_prefix, append_text) = crate::chat_alignment::render_chat_resume_alignment_message(
         &engine.tokenizer,
         messages_before_assistant,
-        &result.text,
+        assistant_message,
         ChatTemplateOptions {
             add_generation_prompt: false,
             enable_thinking,
@@ -570,6 +594,8 @@ mod tests {
                 rope_dim_swa: 0,
                 rope_sections: [0; 4],
                 norm_eps: 1e-5,
+                post_norm_eps: 1e-5,
+                logit_scale: 1.0,
                 final_logit_softcapping: 0.0,
                 query_pre_attn_scalar: 256.0,
                 sliding_window: 0,
@@ -718,10 +744,17 @@ mod tests {
             .generate_stream(&first_prompt, &params, |_| true)
             .unwrap();
         engine.kv_cache.append(0, 0, &[0.0, 0.0], &[0.0, 0.0]);
-        let state =
-            capture_chat_sequence_state(&mut engine, &first_messages, &first_prompt, &first, false)
-                .unwrap()
-                .unwrap();
+        let first_assistant = ChatMessage::assistant(first.text.clone(), None);
+        let state = capture_chat_sequence_state(
+            &mut engine,
+            &first_messages,
+            &first_prompt,
+            &first,
+            first_assistant,
+            false,
+        )
+        .unwrap()
+        .unwrap();
 
         let second_messages = vec![
             ChatMessage::new("user", "first"),

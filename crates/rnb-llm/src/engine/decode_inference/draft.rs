@@ -219,6 +219,10 @@ impl Engine {
         weights
             .output
             .gemv_into(&scratch.norm_buf[..hidden_dim], &mut scratch.logits)?;
+        super::super::models::muse_glimmer::scale_logits_inplace(
+            &mut scratch.logits,
+            metadata.logit_scale,
+        );
         apply_logit_softcapping(&mut scratch.logits, metadata.final_logit_softcapping);
 
         // 4. KV cache update
