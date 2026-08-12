@@ -2086,6 +2086,46 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_batch_if_supported(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn dense_q4k_silu_ffn_batch_if_supported(
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    input: &[f32],
+    seq_len: usize,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    if seq_len <= 1 {
+        return Ok(None);
+    }
+    let (Some(gate), Some(up), Some(down)) = (
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    ) else {
+        return Ok(None);
+    };
+    if gate.quant() != QuantFormat::Q4K || up.quant() != QuantFormat::Q4K {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::dense_q4k_silu_ffn_batch(
+            gate.raw(),
+            up.raw(),
+            down.raw(),
+            backend_ggml_type(down.quant()),
+            gate.rows(),
+            gate.cols(),
+            seq_len,
+            input,
+        )
+        .map(Some)
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn gemma4_moe_gelu_selected_if_supported(

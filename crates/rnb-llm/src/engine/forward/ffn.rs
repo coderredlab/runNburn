@@ -59,22 +59,27 @@ pub(in crate::engine) fn forward_prefill_ffn(
     }
     let normed_data = kernels::tensor_as_f32_slice(&normed);
     #[cfg(feature = "cuda")]
-    let cuda_down = if use_gemma_block_semantics(architecture) {
-        if dump_bin_dir().is_none() {
-            if let Some(down) = backend_runtime::dense_q4k_gelu_ffn_batch_if_supported(
+    let cuda_down = if dump_bin_dir().is_none() {
+        let down = if use_gemma_block_semantics(architecture) {
+            backend_runtime::dense_q4k_gelu_ffn_batch_if_supported(
                 &w.ffn_gate_weight,
                 &w.ffn_up_weight,
                 &w.ffn_down_weight,
                 normed_data,
                 seq_len,
-            )? {
-                Some(Tensor::from_vec(down, &[seq_len, metadata.hidden_dim]))
-            } else {
-                None
-            }
+            )?
+        } else if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+            backend_runtime::dense_q4k_silu_ffn_batch_if_supported(
+                &w.ffn_gate_weight,
+                &w.ffn_up_weight,
+                &w.ffn_down_weight,
+                normed_data,
+                seq_len,
+            )?
         } else {
             None
-        }
+        };
+        down.map(|down| Tensor::from_vec(down, &[seq_len, metadata.hidden_dim]))
     } else {
         None
     };
