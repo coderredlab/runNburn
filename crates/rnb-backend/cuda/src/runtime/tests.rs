@@ -12678,10 +12678,10 @@ fn cuda_q4k_gemv_batch_seq4_matches_cpu_reference() {
 fn cuda_q4k_gemv_batch_seq4_matches_warp8_bits() {
     let _guard = runtime_test_lock();
     let _q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
-    let rows = 1024usize;
+    let rows = 256usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
-    let seq_len = 5usize;
+    let seq_len = 65usize;
     let weights = make_test_q4k_weights(1, rows, blocks_per_row, 94)
         .pop()
         .unwrap();
@@ -12692,10 +12692,7 @@ fn cuda_q4k_gemv_batch_seq4_matches_warp8_bits() {
         let _seq4 = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", "0");
         q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K warp8 batch GEMV")
     };
-    let seq4 = {
-        let _seq4 = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", "1");
-        q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K raw seq4 batch GEMV")
-    };
+    let seq4 = q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K raw seq4 batch GEMV");
     assert_eq!(warp8.len(), seq4.len());
     for (idx, (a, b)) in warp8.iter().zip(seq4.iter()).enumerate() {
         assert_eq!(

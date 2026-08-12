@@ -122,7 +122,12 @@ pub fn q4k_gemv_batch_warp8_enabled() -> bool {
 }
 
 pub fn q4k_batch_raw_seq4_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
-    let default = seq_len >= 8 && rows >= 1024 && blocks_per_row >= 4;
+    // cu262: seq4 keeps each token's raw-F32 accumulation order while sharing
+    // one weight decode across four tokens. Keep the original wide-row gate,
+    // and admit narrow projections only when at least a 64-token slab supplies
+    // enough independent row/sequence CTAs to offset the 4x smaller grid.
+    let enough_parallel_work = rows >= 1024 || (rows >= 64 && seq_len >= 64);
+    let default = seq_len >= 8 && enough_parallel_work && blocks_per_row >= 4;
     env_bool("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", default)
 }
 
@@ -2410,8 +2415,10 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_BATCH_RAW_SEQ4");
         }
         assert!(q4k_batch_raw_seq4_enabled(1115, 2560, 10));
+        assert!(q4k_batch_raw_seq4_enabled(1115, 256, 26));
+        assert!(!q4k_batch_raw_seq4_enabled(63, 256, 26));
         assert!(!q4k_batch_raw_seq4_enabled(4, 2560, 10));
-        assert!(!q4k_batch_raw_seq4_enabled(1115, 512, 10));
+        assert!(!q4k_batch_raw_seq4_enabled(1115, 32, 10));
 
         unsafe {
             std::env::set_var("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", "0");
