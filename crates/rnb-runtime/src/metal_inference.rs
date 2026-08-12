@@ -3785,8 +3785,8 @@ pub fn metal_ffn_chain_into_if_supported(
 }
 
 /// Prefill FFN batch GEMM chain. `metal_ffn_chain_into_if_supported`의 M>1 아날로그.
-/// norm은 caller가 적용하고 residual도 caller가 처리한다. `use_gelu`는 Gemma GeGLU,
-/// false는 기존 SwiGLU 산술을 선택한다.
+/// norm은 caller가 적용하고 residual도 caller가 처리한다. 선택적 post-norm은
+/// down readback 전에 같은 command buffer에서 적용한다.
 fn metal_prefill_ffn_quant_mode(
     gate_ggml: GGMLType,
     up_ggml: GGMLType,
@@ -3822,6 +3822,8 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
     hidden_dim: usize,
     ffn_dim: usize,
     use_gelu: bool,
+    post_norm_weight: Option<&[f32]>,
+    post_norm_eps: f32,
 ) -> Result<bool> {
     // pm37: default ON(metal prefill GPU 승격, 27B token-identical 검증). opt-out=RNB_METAL_PREFILL_FFN=0.
     if std::env::var("RNB_METAL_PREFILL_FFN").as_deref() == Ok("0") {
@@ -3848,6 +3850,8 @@ pub fn metal_prefill_ffn_chain_into_if_supported(
             hidden_dim,
             ffn_dim,
             use_gelu,
+            post_norm_weight,
+            post_norm_eps,
         )
     });
     out.copy_from_slice(&r);
@@ -4119,6 +4123,8 @@ pub fn metal_qwen_moe_expert_ffn_into_if_supported(
             hidden_dim,
             ffn_dim,
             false,
+            None,
+            0.0,
         )
     });
     out.copy_from_slice(&r);

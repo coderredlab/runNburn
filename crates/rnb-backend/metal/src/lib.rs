@@ -6305,9 +6305,9 @@ impl MetalBackend {
     }
 
     /// Prefill FFN chain(M>1). normed[seq_len*hidden] + gate/up/down(Q8_0), or
-    /// gate/up(Q4_K) + down(Q4_K|Q6_K), → down result[seq_len*hidden](before residual).
-    /// `use_gelu` selects Gemma GeGLU; false selects SwiGLU. Weights retain source
-    /// storage leases in the resident cache and carriers are reused by shape.
+    /// gate/up(Q4_K) + down(Q4_K|Q6_K), → down result[seq_len*hidden].
+    /// Optional post-norm is encoded before the single result readback. Weights
+    /// retain source storage leases in the resident cache and carriers are reused by shape.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_ffn_chain(
         &self,
@@ -6321,6 +6321,8 @@ impl MetalBackend {
         hidden_dim: usize,
         ffn_dim: usize,
         use_gelu: bool,
+        post_norm_weight: Option<&[f32]>,
+        post_norm_eps: f32,
     ) -> Vec<f32> {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
         let wrap = |raw: &[u8]| {
@@ -6333,6 +6335,8 @@ impl MetalBackend {
         let (gate_wb, gate_off) = wrap(gate_w);
         let (up_wb, up_off) = wrap(up_w);
         let (down_wb, down_off) = wrap(down_w);
+        let post_norm_w_buf = post_norm_weight.map(|weight| ffn_chain::shared_f32_buf(ctx, weight));
+        let post_norm_eps_buf = post_norm_weight.map(|_| ffn_chain::f32_buf(ctx, post_norm_eps));
         let mut carriers = self.prefill_ffn_carriers.borrow_mut();
         let carrier = carriers
             .entry((hidden_dim, ffn_dim, seq_len))
@@ -6360,6 +6364,8 @@ impl MetalBackend {
                 &down_off_buf,
                 down_is_q6k,
                 use_gelu,
+                post_norm_w_buf.as_deref(),
+                post_norm_eps_buf.as_deref(),
                 seq_len,
             )
         }
@@ -15326,7 +15332,7 @@ mod tests {
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m); // [m, hid]
 
         let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false,
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false, None, 0.0,
         );
         assert_eq!(gpu.len(), m * hid);
         // pm34 M7: M5 default = tensorops(half staging) → global rel(half GEMM 표준). 비-M5 는
@@ -15342,6 +15348,53 @@ mod tests {
         assert!(
             global_rel < 1e-2,
             "prefill_ffn_chain mismatch: global_rel={global_rel}"
+        );
+
+        let post_norm_weight = det_vals(hid, 0.7);
+        let post_norm_eps = 1.0e-6;
+        let gpu_post_norm = backend.prefill_ffn_chain(
+            &normed,
+            gate_raw,
+            up_raw,
+            down_raw,
+            true,
+            false,
+            m,
+            hid,
+            ffn,
+            false,
+            Some(&post_norm_weight),
+            post_norm_eps,
+        );
+        let mut cpu_post_norm = vec![0.0f32; m * hid];
+        for row in 0..m {
+            let base = row * hid;
+            let mean_sq = gpu[base..base + hid]
+                .iter()
+                .map(|value| (*value as f64) * (*value as f64))
+                .sum::<f64>()
+                / hid as f64;
+            let rms = ((mean_sq + post_norm_eps as f64).sqrt()) as f32;
+            for col in 0..hid {
+                cpu_post_norm[base + col] = (gpu[base + col] / rms) * post_norm_weight[col];
+            }
+        }
+        let max_abs = gpu_post_norm
+            .iter()
+            .zip(&cpu_post_norm)
+            .map(|(&candidate, &reference)| (candidate - reference).abs())
+            .fold(0.0f32, f32::max);
+        let max_w = cpu_post_norm
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max);
+        let global_rel = max_abs / max_w.max(1e-3);
+        eprintln!(
+            "[pm233] prefill_ffn_chain post-norm max_abs={max_abs:.2e} global_rel={global_rel:.2e}"
+        );
+        assert!(
+            global_rel < 2e-5,
+            "prefill FFN post-norm mismatch: max_abs={max_abs}, global_rel={global_rel}"
         );
     }
 
@@ -15374,7 +15427,7 @@ mod tests {
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m);
         let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false,
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, false, None, 0.0,
         );
         std::env::remove_var("RNB_METAL_PREFILL_FFN_KERNEL");
         assert_eq!(gpu.len(), m * hid);
@@ -15420,7 +15473,7 @@ mod tests {
             .collect();
         let cpu = cpu_q6k_gemm_reference(&down_w, hid, ffn, &act, m);
         let gpu = backend.prefill_ffn_chain(
-            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, true,
+            &normed, gate_raw, up_raw, down_raw, true, false, m, hid, ffn, true, None, 0.0,
         );
         let mut max_abs = 0f32;
         let mut max_w = 0f32;
@@ -15472,7 +15525,7 @@ mod tests {
                 .collect();
             let cpu = cpu_q8_0_gemm_reference(&down_w, hid, ffn, &act, m);
             let gpu = backend.prefill_ffn_chain(
-                &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true,
+                &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, true, None, 0.0,
             );
             let mut max_abs = 0f32;
             let mut max_w = 0f32;
@@ -15525,6 +15578,7 @@ mod tests {
                     let _off = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "0");
                     backend.prefill_ffn_chain(
                         &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, use_gelu,
+                        None, 0.0,
                     )
                 };
                 assert!(
@@ -15536,6 +15590,7 @@ mod tests {
                     let _on = EnvGuard::set("RNB_TEST_METAL_PREFILL_FFN_Q8_SMALL_M", "1");
                     backend.prefill_ffn_chain(
                         &normed, gate_raw, up_raw, down_raw, false, true, m, hid, ffn, use_gelu,
+                        None, 0.0,
                     )
                 };
                 let pipeline = ctx
@@ -19934,6 +19989,7 @@ kernel void q4k_ro_vec4(
         }
         let ffn_down = backend.prefill_ffn_chain(
             &normed, gate_raw, up_raw, down_raw, false, false, seq, hidden_dim, ffn_dim, false,
+            None, 0.0,
         );
         let mut expected = hidden_plus;
         for i in 0..expected.len() {

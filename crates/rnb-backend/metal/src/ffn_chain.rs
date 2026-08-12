@@ -12274,6 +12274,8 @@ pub(crate) fn prefill_ffn_chain_dispatch(
     down_off_buf: &ProtocolObject<dyn MTLBuffer>,
     down_is_q6k: bool,
     use_gelu: bool,
+    post_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    post_norm_eps_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
     m: usize,
 ) -> Vec<f32> {
     let hidden_dim = carrier.hidden_dim;
@@ -12596,6 +12598,24 @@ pub(crate) fn prefill_ffn_chain_dispatch(
         );
     }
 
+    let output = match (post_norm_w_buf, post_norm_eps_buf) {
+        (Some(weight), Some(eps)) => {
+            crate::compute::encode_rms_norm_batch(
+                ctx,
+                &enc,
+                &carrier.down_dev,
+                weight,
+                &carrier.normed_dev,
+                &carrier.hdim_buf,
+                eps,
+                m,
+            );
+            &carrier.normed_dev
+        }
+        (None, None) => &carrier.down_dev,
+        _ => unreachable!("post-FFN norm weight and epsilon must be provided together"),
+    };
+
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
@@ -12616,7 +12636,7 @@ pub(crate) fn prefill_ffn_chain_dispatch(
         });
     }
 
-    readback(&carrier.down_dev, m * hidden_dim)
+    readback(output, m * hidden_dim)
 }
 
 thread_local! {

@@ -212,6 +212,8 @@ pub(in crate::engine) fn metal_prefill_ffn_chain_into_if_supported(
     seq_len: usize,
     hidden_dim: usize,
     use_gelu: bool,
+    post_norm_weight: Option<&[f32]>,
+    post_norm_eps: f32,
 ) -> crate::error::Result<bool> {
     let (Some(gate_v), Some(up_v), Some(down_v)) = (
         gate_weight.backend_view(),
@@ -237,12 +239,22 @@ pub(in crate::engine) fn metal_prefill_ffn_chain_into_if_supported(
             hidden_dim,
             ffn_dim,
             use_gelu,
+            post_norm_weight,
+            post_norm_eps,
         )
         .map_err(|e| crate::error::LlmError::Forward(e));
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
-        let _ = (gate_v, up_v, down_v, ffn_dim, use_gelu);
+        let _ = (
+            gate_v,
+            up_v,
+            down_v,
+            ffn_dim,
+            use_gelu,
+            post_norm_weight,
+            post_norm_eps,
+        );
         Ok(false)
     }
 }

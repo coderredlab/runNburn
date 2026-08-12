@@ -82,30 +82,43 @@ pub(in crate::engine) fn forward_prefill_ffn(
     let cuda_down: Option<Tensor> = None;
 
     // Metal prefill FFN batch GEMM chain. Dense gate/up/down only; the backend selects
-    // SwiGLU for non-Gemma blocks and GeGLU for Gemma blocks.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let metal_down: Option<Tensor> = if w.ffn_gate_up_fused.is_none() && dump_bin_dir().is_none() {
-        let mut out = vec![0f32; seq_len * metadata.hidden_dim];
-        let used = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
-            &w.ffn_gate_weight,
-            &w.ffn_up_weight,
-            &w.ffn_down_weight,
-            normed_data,
-            &mut out,
-            seq_len,
-            metadata.hidden_dim,
-            use_gemma_block_semantics(architecture),
-        )?;
-        if used {
-            Some(Tensor::from_vec(out, &[seq_len, metadata.hidden_dim]))
+    // SwiGLU for non-Gemma blocks and GeGLU for Gemma blocks. Muse post-FFW norm stays
+    // device-resident through the down projection and is read back once.
+    let muse_post_ffw_norm =
+        if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
+            w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice)
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let (metal_down, metal_post_norm_done): (Option<Tensor>, bool) =
+        if w.ffn_gate_up_fused.is_none() && dump_bin_dir().is_none() {
+            let mut out = vec![0f32; seq_len * metadata.hidden_dim];
+            let used = backend_runtime::metal_prefill_ffn_chain_into_if_supported(
+                &w.ffn_gate_weight,
+                &w.ffn_up_weight,
+                &w.ffn_down_weight,
+                normed_data,
+                &mut out,
+                seq_len,
+                metadata.hidden_dim,
+                use_gemma_block_semantics(architecture),
+                muse_post_ffw_norm,
+                metadata.post_norm_eps,
+            )?;
+            if used {
+                (
+                    Some(Tensor::from_vec(out, &[seq_len, metadata.hidden_dim])),
+                    muse_post_ffw_norm.is_some(),
+                )
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
-    let metal_down: Option<Tensor> = None;
+    let (metal_down, metal_post_norm_done): (Option<Tensor>, bool) = (None, false);
 
     #[cfg(feature = "mediatek")]
     let mediatek_down: Option<Tensor> = if super::super::mediatek_ffn::prefill_enabled()
@@ -131,6 +144,7 @@ pub(in crate::engine) fn forward_prefill_ffn(
     #[cfg(not(feature = "mediatek"))]
     let mediatek_down: Option<Tensor> = None;
 
+    let used_metal_down = metal_down.is_some();
     let down = if let Some(down) = cuda_down.or(metal_down).or(mediatek_down) {
         down
     } else {
@@ -162,7 +176,9 @@ pub(in crate::engine) fn forward_prefill_ffn(
         );
     }
     let down = if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture) {
-        if let Some(post_ffw_norm) = &w.post_ffw_norm {
+        if used_metal_down && metal_post_norm_done {
+            down
+        } else if let Some(post_ffw_norm) = &w.post_ffw_norm {
             apply_model_norm(&down, post_ffw_norm, metadata.post_norm_eps, architecture)
                 .map_err(fwd)?
         } else {

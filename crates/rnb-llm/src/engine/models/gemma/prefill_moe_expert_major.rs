@@ -199,6 +199,8 @@ fn compute_shared_output(
         seq_len,
         hidden_dim,
         true,
+        None,
+        0.0,
     )?;
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     let used_metal = false;
