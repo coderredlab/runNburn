@@ -3484,6 +3484,115 @@ extern "C" __global__ void rnb_q6k_gemv_batch_seq2_warp8(
     }
 }
 
+extern "C" __global__ void rnb_q6k_gemv_batch_seq4_warp8(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const float* __restrict__ input,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * 8u + warp;
+    const unsigned seq_base = blockIdx.y * 4u;
+    const bool row_valid = row < rows;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    __shared__ float input_tile[4][256];
+
+    for (unsigned b = 0; b < blocks_per_row; ++b) {
+        const unsigned input_offset = b * 256u + threadIdx.x;
+        if (seq_base + 0u < seq_len) {
+            input_tile[0][threadIdx.x] =
+                input[(seq_base + 0u) * blocks_per_row * 256u + input_offset];
+        }
+        if (seq_base + 1u < seq_len) {
+            input_tile[1][threadIdx.x] =
+                input[(seq_base + 1u) * blocks_per_row * 256u + input_offset];
+        }
+        if (seq_base + 2u < seq_len) {
+            input_tile[2][threadIdx.x] =
+                input[(seq_base + 2u) * blocks_per_row * 256u + input_offset];
+        }
+        if (seq_base + 3u < seq_len) {
+            input_tile[3][threadIdx.x] =
+                input[(seq_base + 3u) * blocks_per_row * 256u + input_offset];
+        }
+        __syncthreads();
+        if (row_valid) {
+            const unsigned char* block = row_ptr + b * 210u;
+            const unsigned raw_d = (unsigned)block[208] | ((unsigned)block[209] << 8);
+            const float d = __half2float(__ushort_as_half((unsigned short)raw_d));
+            for (unsigned tid = lane; tid < 256u; tid += 32u) {
+                const unsigned n = tid >> 7;
+                const unsigned rem = tid & 127u;
+                const unsigned l = rem & 31u;
+                const unsigned is = l >> 4;
+                const unsigned ql_base = n * 64u;
+                const unsigned qh_base = 128u + n * 32u;
+                const unsigned sc_base = 192u + n * 8u;
+
+                unsigned q;
+                int sc;
+                const unsigned qh = block[qh_base + l];
+                if (rem < 32u) {
+                    q = (block[ql_base + l] & 0x0fu) | (((qh >> 0) & 3u) << 4);
+                    sc = (int)((signed char)block[sc_base + is]);
+                } else if (rem < 64u) {
+                    q = (block[ql_base + l + 32u] & 0x0fu) | (((qh >> 2) & 3u) << 4);
+                    sc = (int)((signed char)block[sc_base + is + 2u]);
+                } else if (rem < 96u) {
+                    q = (block[ql_base + l] >> 4) | (((qh >> 4) & 3u) << 4);
+                    sc = (int)((signed char)block[sc_base + is + 4u]);
+                } else {
+                    q = (block[ql_base + l + 32u] >> 4) | (((qh >> 6) & 3u) << 4);
+                    sc = (int)((signed char)block[sc_base + is + 6u]);
+                }
+                const float y = d * (float)sc * (float)((int)q - 32);
+                if (seq_base + 0u < seq_len) {
+                    acc0 += y * input_tile[0][tid];
+                }
+                if (seq_base + 1u < seq_len) {
+                    acc1 += y * input_tile[1][tid];
+                }
+                if (seq_base + 2u < seq_len) {
+                    acc2 += y * input_tile[2][tid];
+                }
+                if (seq_base + 3u < seq_len) {
+                    acc3 += y * input_tile[3][tid];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, offset);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, offset);
+        acc2 += __shfl_down_sync(0xffffffffu, acc2, offset);
+        acc3 += __shfl_down_sync(0xffffffffu, acc3, offset);
+    }
+    if (row_valid && lane == 0u) {
+        if (seq_base + 0u < seq_len) {
+            out[(seq_base + 0u) * rows + row] = acc0;
+        }
+        if (seq_base + 1u < seq_len) {
+            out[(seq_base + 1u) * rows + row] = acc1;
+        }
+        if (seq_base + 2u < seq_len) {
+            out[(seq_base + 2u) * rows + row] = acc2;
+        }
+        if (seq_base + 3u < seq_len) {
+            out[(seq_base + 3u) * rows + row] = acc3;
+        }
+    }
+}
+
 extern "C" __global__ void rnb_q5k_gemv_batch(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,

@@ -14224,6 +14224,34 @@ fn cuda_q6k_gemv_batch_seq2_warp8_matches_cpu_reference() {
 }
 
 #[test]
+fn cuda_q6k_gemv_batch_seq4_warp8_matches_warp8_bits() {
+    let _guard = runtime_test_lock();
+    let rows = 256usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 65usize;
+    let weights = make_test_q6k_weights(1, rows, blocks_per_row, 104)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 41.0) - 20.0) * 0.0078125)
+        .collect::<Vec<_>>();
+    let warp8 = {
+        let _seq4 = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", "0");
+        q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K warp8 batch GEMV")
+    };
+    let seq4 = q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K seq4 batch GEMV");
+    assert_eq!(warp8.len(), seq4.len());
+    for (idx, (a, b)) in warp8.iter().zip(seq4.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "Q6_K raw seq4 bit mismatch at index {idx}: warp8={a} seq4={b}"
+        );
+    }
+}
+
+#[test]
 fn cuda_dense_q4k_gelu_ffn_batch_matches_cpu_reference() {
     let _guard = runtime_test_lock();
     let prev = std::env::var("RNB_CUDA_DENSE_Q8DOT_GATE_UP").ok();

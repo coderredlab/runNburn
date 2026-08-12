@@ -1182,6 +1182,16 @@ impl CudaState {
                 output_dev,
             );
         }
+        if tuning::q6k_gemv_batch_seq4_warp8_enabled(seq_len, rows, blocks_per_row) {
+            return self.launch_q6k_gemv_batch_seq4_warp8_to_dev(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_dev,
+                output_dev,
+            );
+        }
         if seq_len == 2 && tuning::q6k_gemv_batch_seq2_warp8_enabled() {
             return self.launch_q6k_gemv_batch_seq2_warp8_to_dev(
                 weights,

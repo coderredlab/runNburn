@@ -348,6 +348,15 @@ pub fn q6k_gemv_batch_seq2_warp8_enabled() -> bool {
     env_bool("RNB_CUDA_Q6K_GEMV_BATCH_SEQ2_WARP8", true)
 }
 
+pub fn q6k_gemv_batch_seq4_warp8_enabled(
+    seq_len: usize,
+    rows: usize,
+    blocks_per_row: usize,
+) -> bool {
+    let default = seq_len >= 64 && rows >= 64 && blocks_per_row >= 4;
+    env_bool("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", default)
+}
+
 pub fn resident_q4k_touch_hits_enabled() -> bool {
     env_bool("RNB_CUDA_RESIDENT_Q4K_TOUCH_HITS", false)
 }
@@ -2956,6 +2965,31 @@ mod tests {
 
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_GEMV_BATCH_WARP8");
+        }
+    }
+
+    #[test]
+    fn q6k_gemv_batch_seq4_defaults_on_for_long_narrow_prefill_and_allows_overrides() {
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8");
+        }
+        assert!(q6k_gemv_batch_seq4_warp8_enabled(1144, 256, 26));
+        assert!(!q6k_gemv_batch_seq4_warp8_enabled(63, 256, 26));
+        assert!(!q6k_gemv_batch_seq4_warp8_enabled(1144, 32, 26));
+        assert!(!q6k_gemv_batch_seq4_warp8_enabled(1144, 256, 3));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", "0");
+        }
+        assert!(!q6k_gemv_batch_seq4_warp8_enabled(1144, 256, 26));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", "1");
+        }
+        assert!(q6k_gemv_batch_seq4_warp8_enabled(4, 32, 1));
+
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8");
         }
     }
 

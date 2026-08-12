@@ -5130,6 +5130,37 @@ impl CudaState {
         )
     }
 
+    pub(in crate::runtime) fn launch_q6k_gemv_batch_seq4_warp8_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_arg = input_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        self.launch_cached_gemv(
+            "rnb_q6k_gemv_batch_seq4_warp8",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(8) as u32, seq_len.div_ceil(4) as u32, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_q6k_packed_q8dot_to_dev(
         &mut self,
         packed_qs_dev: u64,
