@@ -40,6 +40,12 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_turn: Option<bool>,
 }
 
 impl ChatMessage {
@@ -50,6 +56,22 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            recipient: None,
+            end_turn: None,
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>, reasoning_content: Option<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: Some(ChatContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content,
+            recipient: Some("user".to_string()),
+            end_turn: Some(true),
         }
     }
 
@@ -63,6 +85,9 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
+            recipient: None,
+            end_turn: None,
         }
     }
 }
@@ -143,6 +168,7 @@ impl Tokenizer {
                 tools => tools,
                 add_generation_prompt => options.add_generation_prompt,
                 enable_thinking => options.enable_thinking,
+                reasoning_strength => if options.enable_thinking { "high" } else { "low" },
                 bos_token => bos_token,
                 eos_token => eos_token,
             });
@@ -273,6 +299,9 @@ mod tests {
                 }])),
                 tool_call_id: None,
                 name: None,
+                reasoning_content: None,
+                recipient: None,
+                end_turn: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -280,6 +309,9 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
                 name: None,
+                reasoning_content: None,
+                recipient: None,
+                end_turn: None,
             },
         ];
         let tools = serde_json::json!([{
@@ -296,6 +328,54 @@ mod tests {
             .unwrap();
 
         assert_eq!(rendered, "weather|weather|call_1");
+    }
+    #[test]
+    fn renders_muse_reasoning_and_final_assistant_turns() {
+        let tokenizer = tokenizer(
+            true,
+            Some(
+                "{% if messages[0].reasoning_content %}self={{ messages[0].reasoning_content }}|{% endif %}to={{ messages[0].recipient }}|end={{ messages[0].end_turn }}|{{ messages[0].content }}",
+            ),
+        );
+
+        let rendered = tokenizer
+            .render_chat_prompt(
+                &[ChatMessage::assistant(
+                    "Final answer.",
+                    Some("Private reasoning.".to_string()),
+                )],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            "self=Private reasoning.|to=user|end=true|Final answer."
+        );
+    }
+
+    #[test]
+    fn passes_explicit_reasoning_strength_to_templates() {
+        let tokenizer = tokenizer(true, Some("{{ reasoning_strength }}"));
+
+        let low = tokenizer
+            .render_chat_prompt(
+                &[ChatMessage::new("user", "Hello")],
+                ChatTemplateOptions::default(),
+            )
+            .unwrap();
+        let high = tokenizer
+            .render_chat_prompt(
+                &[ChatMessage::new("user", "Hello")],
+                ChatTemplateOptions {
+                    add_generation_prompt: true,
+                    enable_thinking: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(low, "low");
+        assert_eq!(high, "high");
     }
 
     #[test]

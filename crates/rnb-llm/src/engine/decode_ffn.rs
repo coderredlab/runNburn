@@ -4,6 +4,10 @@ use super::*;
 
 /// FFN sub-block for decode path. Reads from scratch.norm_buf, writes result via add_inplace to scratch.hidden.
 /// Called by both decode_attention_layer and decode_gdn_layer.
+fn shared_epsilon_metal_ffn_chain_supports(architecture: ModelArchitecture) -> bool {
+    !super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+}
+
 #[allow(unused_variables)]
 pub(super) fn decode_ffn(
     scratch: &mut ScratchBuffers,
@@ -107,7 +111,10 @@ pub(super) fn decode_ffn(
             && (super::policy::gemma_unit_offset_attn_ffn_norm_enabled()
                 || super::policy::gemma_unit_offset_norm_enabled()
                 || super::policy::gemma_unit_offset_main_norm_enabled());
-        if ffn_gate_up_fused.is_none() && !unit_offset_norm {
+        if shared_epsilon_metal_ffn_chain_supports(architecture)
+            && ffn_gate_up_fused.is_none()
+            && !unit_offset_norm
+        {
             let norm_w = kernels::tensor_as_f32_slice(ffn_norm_weight);
             let post_norm_w = post_ffw_norm_weight
                 .as_ref()
@@ -352,4 +359,19 @@ pub(super) fn decode_ffn(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod muse_metal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn shared_epsilon_metal_ffn_chain_rejects_muse_post_norm_contract() {
+        assert!(!shared_epsilon_metal_ffn_chain_supports(
+            ModelArchitecture::MuseGlimmer
+        ));
+        assert!(shared_epsilon_metal_ffn_chain_supports(
+            ModelArchitecture::Qwen2
+        ));
+    }
 }

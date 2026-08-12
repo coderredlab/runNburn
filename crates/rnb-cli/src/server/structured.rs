@@ -158,6 +158,9 @@ pub(super) fn prepare_generation_constraint(
     if tools.definitions.is_empty() {
         return Ok(response_schema.map(GenerationConstraint::JsonSchema));
     }
+    if tool_format == ToolCallFormat::Muse {
+        return Ok(None);
+    }
 
     let selected = match &tools.choice {
         ToolChoice::Function(name) => tools
@@ -310,6 +313,7 @@ fn build_tool_grammar(
             grammar.push_str(match format {
                 ToolCallFormat::Gemma => "no_call: NO_GEMMA_CALL\n",
                 ToolCallFormat::Json => "no_call: NO_JSON_CALL\n",
+                ToolCallFormat::Muse => unreachable!("Muse tools use native ATEM generation"),
             });
         }
     }
@@ -366,6 +370,7 @@ fn build_tool_grammar(
                 compact(&json!({"anyOf": choices}))
             ));
         }
+        ToolCallFormat::Muse => unreachable!("Muse tools use native ATEM generation"),
     }
 
     if !required && response_schema.is_none() {
@@ -376,6 +381,7 @@ fn build_tool_grammar(
             ToolCallFormat::Json => {
                 grammar.push_str("NO_JSON_CALL: /(?s:.*)/ & ~/(?s:.*)<tool_call>(?s:.*)/\n")
             }
+            ToolCallFormat::Muse => unreachable!("Muse tools use native ATEM generation"),
         }
     }
     grammar
@@ -477,6 +483,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.choice, ToolChoice::Function("get_weather".into()));
+    }
+
+    #[test]
+    fn muse_tools_use_native_atem_generation() {
+        let definitions = tools();
+        let prepared = prepare_tools(Some(&definitions), None).unwrap();
+
+        let constraint =
+            prepare_generation_constraint(None, &prepared, false, ToolCallFormat::Muse).unwrap();
+
+        assert!(constraint.is_none());
     }
 
     #[test]

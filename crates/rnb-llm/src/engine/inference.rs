@@ -66,6 +66,7 @@ impl Engine {
             rnb_loader::Architecture::Gemma4 | rnb_loader::Architecture::Gemma4Assistant => {
                 crate::tool_call::ToolCallFormat::Gemma
             }
+            rnb_loader::Architecture::MuseGlimmer => crate::tool_call::ToolCallFormat::Muse,
             _ => crate::tool_call::ToolCallFormat::Json,
         }
     }

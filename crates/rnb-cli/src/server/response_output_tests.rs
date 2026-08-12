@@ -12,6 +12,7 @@ fn identity() -> ResponseIdentity {
 fn builds_text_and_parallel_function_output_items() {
     let output = ParsedAssistantOutput {
         content: "checking".to_string(),
+        reasoning_content: None,
         tool_calls: vec![
             ParsedToolCall {
                 name: "weather".to_string(),
@@ -32,9 +33,26 @@ fn builds_text_and_parallel_function_output_items() {
 }
 
 #[test]
+fn function_output_item_preserves_reasoning_for_history_replay() {
+    let output = ParsedAssistantOutput {
+        content: String::new(),
+        reasoning_content: Some("choose weather".to_string()),
+        tool_calls: vec![ParsedToolCall {
+            name: "weather".to_string(),
+            arguments: r#"{"city":"Seoul"}"#.to_string(),
+        }],
+    };
+
+    let items = output_items(&identity(), &output, "completed");
+
+    assert_eq!(items[0]["reasoning_content"], "choose weather");
+}
+
+#[test]
 fn text_stream_opens_message_before_content_part() {
     let output = ParsedAssistantOutput {
         content: "4".to_string(),
+        reasoning_content: None,
         tool_calls: Vec::new(),
     };
     let events = buffered_output_events(&identity(), &output, "completed");
@@ -46,9 +64,25 @@ fn text_stream_opens_message_before_content_part() {
 }
 
 #[test]
+fn response_message_preserves_reasoning_for_history_replay() {
+    let output = ParsedAssistantOutput {
+        content: "4".to_string(),
+        reasoning_content: Some("add two and two".to_string()),
+        tool_calls: Vec::new(),
+    };
+
+    let items = output_items(&identity(), &output, "completed");
+
+    assert_eq!(items[0]["reasoning_content"], "add two and two");
+    assert_eq!(items[0]["recipient"], "user");
+    assert_eq!(items[0]["end_turn"], true);
+}
+
+#[test]
 fn function_stream_events_have_open_delta_done_and_item_done_order() {
     let output = ParsedAssistantOutput {
         content: String::new(),
+        reasoning_content: None,
         tool_calls: vec![ParsedToolCall {
             name: "weather".to_string(),
             arguments: r#"{"city":"Seoul"}"#.to_string(),

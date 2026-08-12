@@ -7,9 +7,123 @@ const JSON_CALL_OPEN: &str = "<tool_call>";
 const JSON_CALL_CLOSE: &str = "</tool_call>";
 const GEMMA_QUOTE: &str = "<|\"|>";
 
+const MUSE_END_MESSAGE: &str = "<|eom|>";
+const MUSE_END_TURN: &str = "<|eot|>";
+const MUSE_MESSAGE: &str = "<|message|>";
+const MUSE_NEXT_ASSISTANT: &str = "<|eom|><|start|>assistant";
+const MUSE_NEXT_USER: &str = "<|eom|><|start|>assistant to=user<|message|>";
+const ATEM_CALLS_OPEN: &str = "<atem:function_calls>";
+const ATEM_CALLS_CLOSE: &str = "</atem:function_calls>";
+const ATEM_INVOKE_OPEN: &str = "<atem:invoke name=\"";
+const ATEM_INVOKE_CLOSE: &str = "</atem:invoke>";
+const ATEM_PARAMETER_OPEN: &str = "<atem:parameter name=\"";
+const ATEM_PARAMETER_CLOSE: &str = "</atem:parameter>";
+
+#[derive(Debug, Default)]
+pub struct AssistantTurnStreamFilter {
+    muse_protocol: bool,
+    state: AssistantTurnStreamState,
+    pending: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum AssistantTurnStreamState {
+    #[default]
+    Detecting,
+    MuseProtocol,
+    Passthrough,
+}
+
+impl AssistantTurnStreamFilter {
+    pub fn new(muse_protocol: bool) -> Self {
+        Self {
+            muse_protocol,
+            ..Self::default()
+        }
+    }
+
+    pub fn push<F>(&mut self, text: &str, mut emit: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        if !self.muse_protocol {
+            return emit(text);
+        }
+        match self.state {
+            AssistantTurnStreamState::Detecting => {
+                self.pending.push_str(text);
+                let candidate = self.pending.trim_start();
+                if "to=".starts_with(candidate) {
+                    return true;
+                }
+                if !candidate.starts_with("to=") {
+                    self.state = AssistantTurnStreamState::Passthrough;
+                    let pending = std::mem::take(&mut self.pending);
+                    return emit(&pending);
+                }
+                let Some(message_start) = candidate.find(MUSE_MESSAGE) else {
+                    return true;
+                };
+                let recipient = candidate[3..message_start].trim();
+                if recipient == "user" {
+                    let body = candidate[message_start + MUSE_MESSAGE.len()..].to_string();
+                    self.pending.clear();
+                    self.state = AssistantTurnStreamState::Passthrough;
+                    return body.is_empty() || emit(&body);
+                }
+                self.state = AssistantTurnStreamState::MuseProtocol;
+                self.emit_muse_user_turn(emit)
+            }
+            AssistantTurnStreamState::MuseProtocol => {
+                self.pending.push_str(text);
+                self.emit_muse_user_turn(emit)
+            }
+            AssistantTurnStreamState::Passthrough => emit(text),
+        }
+    }
+
+    pub fn finish<F>(&mut self, mut emit: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        match self.state {
+            AssistantTurnStreamState::Detecting => {
+                let pending = std::mem::take(&mut self.pending);
+                self.state = AssistantTurnStreamState::Passthrough;
+                let candidate = pending.trim_start();
+                if candidate.starts_with("to=") && candidate != "to=" {
+                    true
+                } else {
+                    pending.is_empty() || emit(&pending)
+                }
+            }
+            AssistantTurnStreamState::MuseProtocol => {
+                self.pending.clear();
+                true
+            }
+            AssistantTurnStreamState::Passthrough => true,
+        }
+    }
+
+    fn emit_muse_user_turn<F>(&mut self, mut emit: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let Some(user_start) = self.pending.find(MUSE_NEXT_USER) else {
+            return true;
+        };
+        let body_start = user_start + MUSE_NEXT_USER.len();
+        let body = self.pending[body_start..].to_string();
+        self.pending.clear();
+        self.state = AssistantTurnStreamState::Passthrough;
+        body.is_empty() || emit(&body)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallFormat {
     Gemma,
+    Muse,
     Json,
 }
 
@@ -22,6 +136,7 @@ pub struct ParsedToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAssistantOutput {
     pub content: String,
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ParsedToolCall>,
 }
 
@@ -29,9 +144,26 @@ pub fn parse_assistant_output(
     text: &str,
     allowed_tools: &[String],
 ) -> Result<ParsedAssistantOutput, String> {
-    let text = strip_reasoning(text);
+    parse_assistant_output_with_format(text, allowed_tools, ToolCallFormat::Json)
+}
+
+pub fn parse_assistant_output_with_format(
+    text: &str,
+    allowed_tools: &[String],
+    format: ToolCallFormat,
+) -> Result<ParsedAssistantOutput, String> {
+    let muse_output = if format == ToolCallFormat::Muse {
+        parse_muse_output(text, allowed_tools)?
+    } else {
+        None
+    };
+    let is_muse = muse_output.is_some();
+    let (reasoning_content, visible_text, mut tool_calls) = match muse_output {
+        Some(output) => (output.reasoning_content, output.content, output.tool_calls),
+        None => (None, text.to_string(), Vec::new()),
+    };
+    let text = strip_reasoning(&visible_text);
     let mut content = String::new();
-    let mut tool_calls = Vec::new();
     let mut remaining = text.as_str();
 
     loop {
@@ -74,8 +206,14 @@ pub fn parse_assistant_output(
         remaining = &remaining[body_end + close.len()..];
     }
 
+    let content = if is_muse || !allowed_tools.is_empty() {
+        content.trim().to_string()
+    } else {
+        content
+    };
     Ok(ParsedAssistantOutput {
-        content: content.trim().to_string(),
+        content,
+        reasoning_content,
         tool_calls,
     })
 }
@@ -150,6 +288,163 @@ fn validate_name(name: &str) -> Result<(), String> {
         return Err(format!("invalid tool name '{name}'"));
     }
     Ok(())
+}
+
+struct MuseOutput {
+    reasoning_content: Option<String>,
+    content: String,
+    tool_calls: Vec<ParsedToolCall>,
+}
+
+fn parse_muse_output(text: &str, allowed_tools: &[String]) -> Result<Option<MuseOutput>, String> {
+    let mut remaining = text.trim_start();
+    if !remaining.starts_with("to=") || remaining == "to=" {
+        return Ok(None);
+    }
+
+    let mut reasoning = Vec::new();
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    loop {
+        let Some(message_start) = remaining.find(MUSE_MESSAGE) else {
+            return Ok(Some(MuseOutput {
+                reasoning_content: if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning.join("\n\n"))
+                },
+                content,
+                tool_calls,
+            }));
+        };
+        let recipient = remaining[3..message_start].trim();
+        if recipient.is_empty() {
+            return Ok(None);
+        }
+        let body_and_rest = &remaining[message_start + MUSE_MESSAGE.len()..];
+        let (body, next) = match body_and_rest.find(MUSE_NEXT_ASSISTANT) {
+            Some(next_start) => (
+                &body_and_rest[..next_start],
+                Some(&body_and_rest[next_start + MUSE_NEXT_ASSISTANT.len()..]),
+            ),
+            None => (body_and_rest, None),
+        };
+        let body = body
+            .strip_suffix(MUSE_END_TURN)
+            .or_else(|| body.strip_suffix(MUSE_END_MESSAGE))
+            .unwrap_or(body);
+
+        match recipient {
+            "self" => {
+                let body = body.trim();
+                if !body.is_empty() {
+                    reasoning.push(body.to_string());
+                }
+            }
+            "user" => content.push_str(body),
+            tool_name => {
+                if !allowed_tools.iter().any(|name| name == tool_name) {
+                    return Err(format!("model requested undeclared tool '{tool_name}'"));
+                }
+                tool_calls.extend(parse_atem_calls(body, tool_name, allowed_tools)?);
+            }
+        }
+
+        let Some(next) = next else {
+            break;
+        };
+        remaining = next.trim_start();
+        if !remaining.starts_with("to=") {
+            return Err("Muse assistant turn is missing a recipient".to_string());
+        }
+    }
+
+    Ok(Some(MuseOutput {
+        reasoning_content: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning.join("\n\n"))
+        },
+        content,
+        tool_calls,
+    }))
+}
+
+fn parse_atem_calls(
+    text: &str,
+    recipient: &str,
+    allowed_tools: &[String],
+) -> Result<Vec<ParsedToolCall>, String> {
+    let calls_start = text
+        .find(ATEM_CALLS_OPEN)
+        .ok_or_else(|| format!("Muse tool turn '{recipient}' is missing ATEM calls"))?;
+    let calls_body = &text[calls_start + ATEM_CALLS_OPEN.len()..];
+    let calls_end = calls_body
+        .find(ATEM_CALLS_CLOSE)
+        .ok_or_else(|| "Muse ATEM calls are not terminated".to_string())?;
+    let mut remaining = &calls_body[..calls_end];
+    let mut calls = Vec::new();
+
+    while let Some(invoke_start) = remaining.find(ATEM_INVOKE_OPEN) {
+        let invoke = &remaining[invoke_start + ATEM_INVOKE_OPEN.len()..];
+        let name_end = invoke
+            .find("\">")
+            .ok_or_else(|| "Muse ATEM invoke is missing a name terminator".to_string())?;
+        let name = &invoke[..name_end];
+        if name != recipient {
+            return Err(format!(
+                "Muse tool recipient '{recipient}' does not match invoke '{name}'"
+            ));
+        }
+        if !allowed_tools.iter().any(|allowed| allowed == name) {
+            return Err(format!("model requested undeclared tool '{name}'"));
+        }
+        let invoke_body = &invoke[name_end + 2..];
+        let invoke_end = invoke_body
+            .find(ATEM_INVOKE_CLOSE)
+            .ok_or_else(|| "Muse ATEM invoke is not terminated".to_string())?;
+        let mut parameters = &invoke_body[..invoke_end];
+        let mut arguments = Map::new();
+
+        while let Some(parameter_start) = parameters.find(ATEM_PARAMETER_OPEN) {
+            let parameter = &parameters[parameter_start + ATEM_PARAMETER_OPEN.len()..];
+            let name_end = parameter
+                .find("\">")
+                .ok_or_else(|| "Muse ATEM parameter is missing a name terminator".to_string())?;
+            let parameter_name = &parameter[..name_end];
+            validate_name(parameter_name)?;
+            let value_and_rest = &parameter[name_end + 2..];
+            let value_end = value_and_rest
+                .find(ATEM_PARAMETER_CLOSE)
+                .ok_or_else(|| "Muse ATEM parameter is not terminated".to_string())?;
+            let raw_value = &value_and_rest[..value_end];
+            let value = serde_json::from_str(raw_value)
+                .unwrap_or_else(|_| Value::String(raw_value.to_string()));
+            if arguments
+                .insert(parameter_name.to_string(), value)
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate Muse ATEM tool argument '{parameter_name}'"
+                ));
+            }
+            parameters = &value_and_rest[value_end + ATEM_PARAMETER_CLOSE.len()..];
+        }
+
+        let mut arguments = Value::Object(arguments);
+        sort_object_keys(&mut arguments);
+        calls.push(ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(&arguments)
+                .map_err(|error| format!("serialize Muse ATEM arguments: {error}"))?,
+        });
+        remaining = &invoke_body[invoke_end + ATEM_INVOKE_CLOSE.len()..];
+    }
+
+    if calls.is_empty() {
+        return Err("Muse ATEM block contains no invokes".to_string());
+    }
+    Ok(calls)
 }
 
 fn strip_reasoning(text: &str) -> String {
@@ -329,6 +624,10 @@ mod tests {
         vec!["get_weather".to_string(), "set_config".to_string()]
     }
 
+    fn parse_muse(text: &str, allowed_tools: &[String]) -> Result<ParsedAssistantOutput, String> {
+        parse_assistant_output_with_format(text, allowed_tools, ToolCallFormat::Muse)
+    }
+
     #[test]
     fn parses_gemma_tool_calls_and_converts_arguments_to_json() {
         let parsed = parse_assistant_output(
@@ -382,6 +681,190 @@ mod tests {
 
         assert_eq!(parsed.content, "");
         assert_eq!(parsed.tool_calls[0].arguments, r#"{"city":"Seoul"}"#);
+    }
+
+    #[test]
+    fn separates_muse_reasoning_from_user_facing_content() {
+        let parsed = parse_muse(
+            r#" to=self<|message|>Think privately.<|eom|><|start|>assistant to=user<|message|>Final answer."#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("Think privately.")
+        );
+        assert_eq!(parsed.content, "Final answer.");
+    }
+
+    #[test]
+    fn parses_muse_direct_user_turn_without_reasoning() {
+        let parsed = parse_muse(r#" to=user<|message|>Direct answer.<|eot|>"#, &[]).unwrap();
+
+        assert_eq!(parsed.reasoning_content, None);
+        assert_eq!(parsed.content, "Direct answer.");
+    }
+
+    #[test]
+    fn accumulates_multiple_muse_self_turns() {
+        let parsed = parse_muse(
+            r#"to=self<|message|>first<|eom|><|start|>assistant to=self<|message|>second<|eom|><|start|>assistant to=user<|message|>answer"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(parsed.content, "answer");
+    }
+
+    #[test]
+    fn parses_muse_atem_tool_call() {
+        let parsed = parse_muse(
+            r#"to=self<|message|>use weather<|eom|><|start|>assistant to=get_weather<|message|><atem:function_calls>
+<atem:invoke name="get_weather">
+<atem:parameter name="city">Seoul</atem:parameter>
+<atem:parameter name="days">[1,2]</atem:parameter>
+</atem:invoke>
+</atem:function_calls><|eot|>"#,
+            &tools(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("use weather"));
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            r#"{"city":"Seoul","days":[1,2]}"#
+        );
+    }
+
+    #[test]
+    fn partial_muse_header_is_not_exposed_as_content() {
+        let parsed = parse_muse("to=self<|mess", &[]).unwrap();
+
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.reasoning_content, None);
+    }
+
+    #[test]
+    fn preserves_outer_whitespace_for_plain_output() {
+        let parsed = parse_assistant_output(" answer ", &[]).unwrap();
+
+        assert_eq!(parsed.content, " answer ");
+    }
+
+    #[test]
+    fn preserves_plain_outputs_that_are_muse_prefixes() {
+        for text in ["t", "to", "to=", "to=foo"] {
+            let parsed = parse_assistant_output(text, &[]).unwrap();
+            assert_eq!(parsed.content, text);
+        }
+    }
+
+    #[test]
+    fn muse_stream_filter_hides_reasoning_across_chunk_boundaries() {
+        let mut filter = AssistantTurnStreamFilter::new(true);
+        let mut visible = String::new();
+        for chunk in [
+            " to=se",
+            r#"lf<|message|>private"#,
+            r#"<|eom|><|start|>assis"#,
+            r#"tant to=user<|message|>public"#,
+        ] {
+            assert!(filter.push(chunk, |text| {
+                visible.push_str(text);
+                true
+            }));
+        }
+        assert!(filter.finish(|text| {
+            visible.push_str(text);
+            true
+        }));
+
+        assert_eq!(visible, "public");
+    }
+
+    #[test]
+    fn muse_stream_filter_handles_direct_user_turn() {
+        let mut filter = AssistantTurnStreamFilter::new(true);
+        let mut visible = String::new();
+        for chunk in [r#" to=user<|mes"#, r#"sage|>direct"#] {
+            assert!(filter.push(chunk, |text| {
+                visible.push_str(text);
+                true
+            }));
+        }
+
+        assert_eq!(visible, "direct");
+    }
+
+    #[test]
+    fn muse_stream_filter_hides_multiple_self_turns() {
+        let mut filter = AssistantTurnStreamFilter::new(true);
+        let mut visible = String::new();
+        for chunk in [
+            r#"to=self<|message|>one<|eom|><|start|>assistant "#,
+            r#"to=self<|message|>two<|eom|><|start|>assistant to=user"#,
+            r#"<|message|>answer"#,
+        ] {
+            assert!(filter.push(chunk, |text| {
+                visible.push_str(text);
+                true
+            }));
+        }
+
+        assert_eq!(visible, "answer");
+    }
+
+    #[test]
+    fn partial_muse_stream_header_is_not_emitted_on_finish() {
+        let mut filter = AssistantTurnStreamFilter::new(true);
+        let mut visible = String::new();
+        assert!(filter.push("to=self<|mess", |text| {
+            visible.push_str(text);
+            true
+        }));
+        assert!(filter.finish(|text| {
+            visible.push_str(text);
+            true
+        }));
+
+        assert_eq!(visible, "");
+    }
+
+    #[test]
+    fn stream_filter_preserves_non_muse_text() {
+        let mut filter = AssistantTurnStreamFilter::default();
+        let mut visible = String::new();
+        assert!(filter.push(" normal", |text| {
+            visible.push_str(text);
+            true
+        }));
+        assert!(filter.push(" output", |text| {
+            visible.push_str(text);
+            true
+        }));
+        assert_eq!(visible, " normal output");
+    }
+
+    #[test]
+    fn stream_filter_preserves_plain_muse_prefixes_on_finish() {
+        for text in ["t", "to", "to=", "to=foo"] {
+            let mut filter = AssistantTurnStreamFilter::default();
+            let mut visible = String::new();
+            assert!(filter.push(text, |piece| {
+                visible.push_str(piece);
+                true
+            }));
+            assert!(filter.finish(|piece| {
+                visible.push_str(piece);
+                true
+            }));
+            assert_eq!(visible, text);
+        }
     }
 
     #[test]

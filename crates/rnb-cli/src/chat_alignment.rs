@@ -1,10 +1,10 @@
 use rnb_llm::{ChatMessage, ChatTemplateOptions, Tokenizer};
 use serde_json::Value;
 
-pub(crate) fn render_chat_resume_alignment(
+pub(crate) fn render_chat_resume_alignment_message(
     tokenizer: &Tokenizer,
     messages_before_assistant: &[ChatMessage],
-    assistant_content: &str,
+    assistant_message: ChatMessage,
     options: ChatTemplateOptions,
     tool_definitions: &[Value],
 ) -> Result<(String, String), String> {
@@ -17,17 +17,20 @@ pub(crate) fn render_chat_resume_alignment(
         .map_err(|error| error.to_string())?;
     let mut assistant_sentinel = "__RNB_CHAT_ASSISTANT_CONTENT_7F43A9C2__".to_string();
     let mut user_sentinel = "__RNB_CHAT_NEXT_USER_CONTENT_51D8E604__".to_string();
+    let assistant_debug = format!("{assistant_message:?}");
     while existing.contains(&assistant_sentinel)
         || existing.contains(&user_sentinel)
-        || assistant_content.contains(&assistant_sentinel)
-        || assistant_content.contains(&user_sentinel)
+        || assistant_debug.contains(&assistant_sentinel)
+        || assistant_debug.contains(&user_sentinel)
     {
         assistant_sentinel.push('_');
         user_sentinel.push('_');
     }
 
+    let mut probe_assistant = assistant_message.clone();
+    probe_assistant.content = Some(rnb_llm::ChatContent::Text(assistant_sentinel.clone()));
     let mut probe_messages = messages_before_assistant.to_vec();
-    probe_messages.push(ChatMessage::new("assistant", assistant_sentinel.clone()));
+    probe_messages.push(probe_assistant);
     probe_messages.push(ChatMessage::new("user", user_sentinel.clone()));
     let probe = tokenizer
         .render_chat_prompt_with_tools(&probe_messages, options, tool_definitions)
@@ -40,7 +43,7 @@ pub(crate) fn render_chat_resume_alignment(
         .ok_or_else(|| "chat template omitted the next user content".to_string())?;
 
     let mut completed_messages = messages_before_assistant.to_vec();
-    completed_messages.push(ChatMessage::new("assistant", assistant_content));
+    completed_messages.push(assistant_message);
     completed_messages.push(ChatMessage::new("user", user_sentinel.clone()));
     let completed = tokenizer
         .render_chat_prompt_with_tools(&completed_messages, options, tool_definitions)
@@ -78,10 +81,10 @@ mod tests {
     #[test]
     fn alignment_uses_template_normalized_assistant_content() {
         let tokenizer = tokenizer();
-        let (prompt_prefix, append_text) = render_chat_resume_alignment(
+        let (prompt_prefix, append_text) = render_chat_resume_alignment_message(
             &tokenizer,
             &[ChatMessage::new("user", "Name the colors")],
-            " Green Pink ",
+            ChatMessage::new("assistant", " Green Pink "),
             ChatTemplateOptions::default(),
             &[],
         )

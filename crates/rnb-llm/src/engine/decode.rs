@@ -85,6 +85,11 @@ pub(super) fn decode_attention_layer(
     .ple_fused)
 }
 
+fn plain_metal_o_chain_supports(architecture: ModelArchitecture) -> bool {
+    !use_gemma_block_semantics(architecture)
+        && !super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+}
+
 fn attn_chain_core_eligible(
     w: &AttentionLayerWeights,
     has_gated_attn: bool,
@@ -1185,7 +1190,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // Metal attention O chain (RNB_METAL_O_CHAIN=1) — o_proj + residual 단일 command
     // buffer. non-gemma(qwen) 한정(gemma post-attn-norm 제외). 성공 시 두 함수 skip.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let o_chain_done = if !use_gemma_block_semantics(architecture) {
+    let o_chain_done = if plain_metal_o_chain_supports(architecture) {
         backend_runtime::metal_attention_o_chain_into_if_supported(
             &scratch.attn_out[..q_dim],
             &w.o_weight,
@@ -1267,4 +1272,17 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     prof!("ffn_total", t0);
 
     Ok(DecodeAttentionLayerReport::default())
+}
+
+#[cfg(test)]
+mod muse_metal_contract_tests {
+    use super::*;
+
+    #[test]
+    fn plain_metal_o_chain_rejects_muse_post_norm_contract() {
+        assert!(!plain_metal_o_chain_supports(
+            ModelArchitecture::MuseGlimmer
+        ));
+        assert!(plain_metal_o_chain_supports(ModelArchitecture::Qwen2));
+    }
 }

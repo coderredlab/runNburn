@@ -3,8 +3,8 @@ use super::types::PreparedGenerationRequest;
 use rnb_llm::{
     generate_stream_multimodal, generate_stream_multimodal_cancellable,
     generate_stream_multimodal_resuming, generate_stream_multimodal_resuming_cancellable,
-    parse_assistant_output, Engine, EngineSequenceState, GenerationCancellation,
-    ParsedAssistantOutput, TextStopFilter,
+    parse_assistant_output_with_format, AssistantTurnStreamFilter, Engine, EngineSequenceState,
+    GenerationCancellation, ParsedAssistantOutput, TextStopFilter, ToolCallFormat,
 };
 
 pub(super) struct GeneratedCompletion {
@@ -38,18 +38,24 @@ pub(super) fn run_generation(
     let stop_on_tool_call = tool_mode && !prepared.parallel_tool_calls;
     let mut content = String::new();
     let mut filter = TextStopFilter::new(prepared.stop_sequences.clone());
+    let mut turn_filter = AssistantTurnStreamFilter::new(prepared.muse_protocol);
     let mut callback_stopped = false;
     let mut callback = |piece: &str| {
         filter.push(piece, |text| {
             let should_continue = append_generated_text(&mut content, text, stop_on_tool_call);
-            if !tool_mode
-                && !text.is_empty()
-                && on_text
-                    .as_deref_mut()
-                    .is_some_and(|callback| !callback(text))
-            {
-                callback_stopped = true;
-                return false;
+            if !tool_mode && !text.is_empty() {
+                let callback_continue = turn_filter.push(text, |visible| {
+                    if on_text
+                        .as_deref_mut()
+                        .is_some_and(|callback| !callback(visible))
+                    {
+                        callback_stopped = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                return should_continue && callback_continue;
             }
             should_continue
         })
@@ -122,20 +128,42 @@ pub(super) fn run_generation(
     if !callback_stopped {
         filter.finish(|text| {
             let should_continue = append_generated_text(&mut content, text, stop_on_tool_call);
-            if !tool_mode
-                && !text.is_empty()
-                && on_text
-                    .as_deref_mut()
-                    .is_some_and(|callback| !callback(text))
-            {
-                callback_stopped = true;
-                return false;
+            if !tool_mode && !text.is_empty() {
+                let callback_continue = turn_filter.push(text, |visible| {
+                    if on_text
+                        .as_deref_mut()
+                        .is_some_and(|callback| !callback(visible))
+                    {
+                        callback_stopped = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                return should_continue && callback_continue;
             }
             should_continue
         });
+        if !callback_stopped && !tool_mode {
+            turn_filter.finish(|visible| {
+                if on_text
+                    .as_deref_mut()
+                    .is_some_and(|callback| !callback(visible))
+                {
+                    callback_stopped = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
-    let output =
-        parse_generated_output(&content, &prepared.tool_names, prepared.parallel_tool_calls)?;
+    let output = parse_generated_output(
+        &content,
+        &prepared.tool_names,
+        prepared.parallel_tool_calls,
+        prepared.muse_protocol,
+    )?;
 
     Ok(GeneratedCompletion {
         output,
@@ -178,15 +206,15 @@ pub(super) fn parse_generated_output(
     content: &str,
     tool_names: &[String],
     parallel_tool_calls: bool,
+    muse_protocol: bool,
 ) -> Result<ParsedAssistantOutput, ApiError> {
-    if tool_names.is_empty() {
-        return Ok(ParsedAssistantOutput {
-            content: content.to_string(),
-            tool_calls: Vec::new(),
-        });
-    }
-    let parsed = parse_assistant_output(content, tool_names)
-        .map_err(|error| ApiError::internal(format!("invalid tool call generated: {error}")))?;
+    let format = if muse_protocol {
+        ToolCallFormat::Muse
+    } else {
+        ToolCallFormat::Json
+    };
+    let parsed = parse_assistant_output_with_format(content, tool_names, format)
+        .map_err(|error| ApiError::internal(format!("invalid assistant output: {error}")))?;
     if !parallel_tool_calls && parsed.tool_calls.len() > 1 {
         return Err(ApiError::internal(
             "model generated parallel tool calls when parallel_tool_calls is false",

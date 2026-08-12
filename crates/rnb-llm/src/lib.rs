@@ -34,7 +34,8 @@ pub use multimodal::{CompiledPrompt, PromptSpan};
 pub use sampler::SamplerChain;
 pub use tokenizer::Tokenizer;
 pub use tool_call::{
-    parse_assistant_output, ParsedAssistantOutput, ParsedToolCall, ToolCallFormat,
+    parse_assistant_output, parse_assistant_output_with_format, AssistantTurnStreamFilter,
+    ParsedAssistantOutput, ParsedToolCall, ToolCallFormat,
 };
 
 // SharedKvStates / SharedKvLayer 는 rnb-mtp 에 정의된다.
