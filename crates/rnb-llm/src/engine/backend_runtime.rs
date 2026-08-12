@@ -83,9 +83,9 @@ pub(super) use cuda_basic::{
     prefill_attention_q4k_f16_qkv_if_supported,
     prefill_attention_q4k_f16_qkv_postprocess_hd256_if_supported,
     prefill_attention_q4k_f16_qkv_postprocess_hd256_window_dense_chain_if_supported,
-    prewarm_dense_q4_packed_gate_up_weights, prewarm_dense_q6_packed_down_weights,
-    prewarm_prefill_q4_f32_projection_weights, try_delta_restore_step_if_supported,
-    try_delta_step_if_supported, upload_gemma_ple_base,
+    prefill_q4k_muse_hd128_dense_chain_if_supported, prewarm_dense_q4_packed_gate_up_weights,
+    prewarm_dense_q6_packed_down_weights, prewarm_prefill_q4_f32_projection_weights,
+    try_delta_restore_step_if_supported, try_delta_step_if_supported, upload_gemma_ple_base,
 };
 #[cfg(all(feature = "cuda", test))]
 pub(super) use cuda_basic::{cuda_relu_sqr_f32_inplace, cuda_sigmoid_f32_inplace};

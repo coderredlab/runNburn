@@ -832,6 +832,202 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         )
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn q4k_muse_prefill_hd128_dense_chain(
+    q_weights: &[u8],
+    k_weights: &[u8],
+    v_weights: &[u8],
+    v_quant: u32,
+    attention_gate_weights: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    hidden_input: &[f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<Option<(Vec<u16>, Vec<u16>)>, String> {
+    if cols == 0 || !cols.is_multiple_of(256) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain cols must be non-zero and divisible by 256: {cols}"
+        ));
+    }
+    let blocks_per_row = cols / 256;
+    let row_bytes = blocks_per_row
+        .checked_mul(144)
+        .ok_or_else(|| "CUDA Muse QKV row byte overflow".to_string())?;
+    let expected_q = q_rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "CUDA Muse Q weight byte overflow".to_string())?;
+    let expected_k = kv_rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "CUDA Muse K weight byte overflow".to_string())?;
+    let v_row_bytes = match v_quant {
+        12 => blocks_per_row.checked_mul(144),
+        14 => blocks_per_row.checked_mul(210),
+        other => return Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+    }
+    .ok_or_else(|| "CUDA Muse V row byte overflow".to_string())?;
+    let expected_v = kv_rows
+        .checked_mul(v_row_bytes)
+        .ok_or_else(|| "CUDA Muse V weight byte overflow".to_string())?;
+    let expected_gate = num_heads
+        .checked_mul(128)
+        .and_then(|rows| rows.checked_mul(row_bytes))
+        .ok_or_else(|| "CUDA Muse attention gate weight byte overflow".to_string())?;
+    let o_blocks = o_cols
+        .checked_div(256)
+        .filter(|_| o_cols.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse QKV dense chain o_cols must be divisible by 256: {o_cols}")
+        })?;
+    let hidden_blocks = n_embd
+        .checked_div(256)
+        .filter(|_| n_embd.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse QKV dense chain n_embd must be divisible by 256: {n_embd}")
+        })?;
+    let down_blocks = n_ff
+        .checked_div(256)
+        .filter(|_| n_ff.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse QKV dense chain n_ff must be divisible by 256: {n_ff}")
+        })?;
+    let down_row_bytes = match down_quant {
+        12 => down_blocks.checked_mul(144),
+        13 => down_blocks.checked_mul(176),
+        14 => down_blocks.checked_mul(210),
+        other => {
+            return Err(format!(
+                "CUDA Muse QKV dense chain unsupported down quant {other}"
+            ))
+        }
+    }
+    .ok_or_else(|| "CUDA Muse QKV dense chain down row byte overflow".to_string())?;
+    let expected_o_bytes = n_embd
+        .checked_mul(o_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| "CUDA Muse QKV dense chain O weight byte overflow".to_string())?;
+    let expected_gate_up_bytes = n_ff
+        .checked_mul(hidden_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| "CUDA Muse QKV dense chain gate/up weight byte overflow".to_string())?;
+    let expected_down_bytes = n_embd
+        .checked_mul(down_row_bytes)
+        .ok_or_else(|| "CUDA Muse QKV dense chain down weight byte overflow".to_string())?;
+    let expected_hidden = hidden_input
+        .len()
+        .checked_div(cols)
+        .and_then(|seq_len| seq_len.checked_mul(n_embd))
+        .ok_or_else(|| "CUDA Muse QKV dense chain hidden length overflow".to_string())?;
+    if q_weights.len() != expected_q
+        || k_weights.len() != expected_k
+        || v_weights.len() != expected_v
+        || attention_gate_weights.len() != expected_gate
+        || hidden_input.len() != expected_hidden
+        || hidden.len() != expected_hidden
+        || attn_norm_weight.len() != n_embd
+        || q_norm.len() != 128
+        || k_norm.len() != 128
+        || o_cols != num_heads.saturating_mul(128)
+        || post_attn_norm_weight.len() != n_embd
+        || ffn_norm_weight.len() != n_embd
+        || post_ffn_norm_weight.len() != n_embd
+        || o_weights.len() != expected_o_bytes
+        || gate_weights.len() != expected_gate_up_bytes
+        || up_weights.len() != expected_gate_up_bytes
+        || down_weights.len() != expected_down_bytes
+    {
+        return Err(format!(
+            "CUDA Muse QKV dense chain shape mismatch: q={} expected_q={expected_q} k={} expected_k={expected_k} v={} expected_v={expected_v} attn_gate={} expected_attn_gate={expected_gate} hidden_input={} hidden={} expected_hidden={expected_hidden} attn_norm={} q_norm={} k_norm={} o_cols={o_cols} expected_o_cols={} post_attn_norm={} ffn_norm={} post_ffn_norm={} n_embd={n_embd} o_bytes={} expected_o_bytes={expected_o_bytes} gate_bytes={} up_bytes={} expected_gate_up_bytes={expected_gate_up_bytes} down_bytes={} expected_down_bytes={expected_down_bytes}",
+            q_weights.len(),
+            k_weights.len(),
+            v_weights.len(),
+            attention_gate_weights.len(),
+            hidden_input.len(),
+            hidden.len(),
+            attn_norm_weight.len(),
+            q_norm.len(),
+            k_norm.len(),
+            num_heads.saturating_mul(128),
+            post_attn_norm_weight.len(),
+            ffn_norm_weight.len(),
+            post_ffn_norm_weight.len(),
+            o_weights.len(),
+            gate_weights.len(),
+            up_weights.len(),
+            down_weights.len(),
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .q4k_muse_prefill_hd128_dense_chain(
+            q_weights,
+            k_weights,
+            v_weights,
+            v_quant,
+            attention_gate_weights,
+            q_rows,
+            kv_rows,
+            blocks_per_row,
+            hidden_input.len() / cols,
+            hidden_input,
+            attn_norm_weight,
+            q_norm,
+            k_norm,
+            num_heads,
+            num_kv_heads,
+            scale,
+            rope_theta,
+            pos_start,
+            apply_rope,
+            sliding_window,
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+}
+
 // cu47 step 32: attention_decode_cached 의 device output variant.
 // caller (decode_attention_compute) 가 attn_out carrier ptr 제공.
 // internal attention compute 의 D2H + sync 안 함 → chain function 의 attn_out

@@ -10058,6 +10058,215 @@ fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
 }
 
 #[test]
+fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
+    let _guard = runtime_test_lock();
+    let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
+    let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
+
+    let seq_len = 3usize;
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let q_dim = num_heads * head_dim;
+    let q_rows = q_dim;
+    let kv_rows = num_kv_heads * head_dim;
+    let n_embd = 256usize;
+    let n_ff = 256usize;
+    let blocks_per_row = n_embd / 256;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let rope_theta = 10000.0f32;
+    let sliding_window = Some(2usize);
+    let q_weights = make_test_q4k_weights(1, q_rows, blocks_per_row, 631)
+        .pop()
+        .unwrap();
+    let k_weights = make_test_q4k_weights(1, kv_rows, blocks_per_row, 641)
+        .pop()
+        .unwrap();
+    let v_weights = make_test_q6k_weights(1, kv_rows, blocks_per_row, 643)
+        .pop()
+        .unwrap();
+    let attention_gate_weights = make_test_q4k_weights(1, q_dim, blocks_per_row, 645)
+        .pop()
+        .unwrap();
+    let o = make_test_q4k_weights(1, n_embd, q_dim / 256, 647)
+        .pop()
+        .unwrap();
+    let gate = make_test_q4k_weights(1, n_ff, blocks_per_row, 653)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, blocks_per_row, 659)
+        .pop()
+        .unwrap();
+    let down = make_test_q4k_weights(1, n_embd, n_ff / 256, 661)
+        .pop()
+        .unwrap();
+    let initial_hidden = (0..seq_len * n_embd)
+        .map(|i| ((i % 43) as f32 - 21.0) * 0.004)
+        .collect::<Vec<_>>();
+    let attn_norm = (0..n_embd)
+        .map(|i| 0.77 + (i % 13) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let q_norm = (0..head_dim)
+        .map(|i| 0.81 + (i % 11) as f32 * 0.004)
+        .collect::<Vec<_>>();
+    let k_norm = (0..head_dim)
+        .map(|i| 0.79 + (i % 17) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let post_attn_norm = (0..n_embd)
+        .map(|i| 0.75 + (i % 17) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let ffn_norm = (0..n_embd)
+        .map(|i| 0.82 + (i % 19) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let post_ffn_norm = (0..n_embd)
+        .map(|i| 0.91 + (i % 23) as f32 * 0.0015)
+        .collect::<Vec<_>>();
+    let norm_eps = 1.0e-5;
+    let post_norm_eps = 1.0e-6;
+
+    let mut normed_hidden = vec![0.0f32; initial_hidden.len()];
+    rms_norm_rows_f32(
+        &initial_hidden,
+        &attn_norm,
+        &mut normed_hidden,
+        norm_eps,
+        false,
+    )
+    .expect("separate CUDA attention norm");
+    let q_full = q4k_gemv_batch(&q_weights, q_rows, n_embd, &normed_hidden)
+        .expect("separate CUDA Q projection");
+    let mut k = q4k_gemv_batch(&k_weights, kv_rows, n_embd, &normed_hidden)
+        .expect("separate CUDA K projection");
+    let v = q6k_gemv_batch(&v_weights, kv_rows, n_embd, &normed_hidden)
+        .expect("separate CUDA V projection");
+    let attention_gate = q4k_gemv_batch(&attention_gate_weights, q_dim, n_embd, &normed_hidden)
+        .expect("separate CUDA attention gate projection");
+    let mut q = q_full;
+    let q_before_norm = q.clone();
+    rms_norm_rows_f32(&q_before_norm, &q_norm, &mut q, norm_eps, false)
+        .expect("separate CUDA Q norm");
+    let k_before_norm = k.clone();
+    rms_norm_rows_f32(&k_before_norm, &k_norm, &mut k, norm_eps, false)
+        .expect("separate CUDA K norm");
+    rope_f32_inplace(&mut q, q_dim, head_dim, head_dim, 0, rope_theta, 0, None)
+        .expect("separate CUDA Q RoPE");
+    rope_f32_inplace(&mut k, kv_rows, head_dim, head_dim, 0, rope_theta, 0, None)
+        .expect("separate CUDA K RoPE");
+    let expected_k_bits = k
+        .iter()
+        .map(|value| half::f16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    let expected_v_bits = v
+        .iter()
+        .map(|value| half::f16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    let mut attention_out = attention_prefill_flash_f32(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        sliding_window,
+        None,
+    )
+    .expect("separate CUDA Muse attention");
+    sigmoid_mul_f32_inplace(&mut attention_out, &attention_gate).expect("separate CUDA Muse gate");
+    let projected =
+        q4k_gemv_batch(&o, n_embd, q_dim, &attention_out).expect("separate CUDA O projection");
+    let mut post_attn = vec![0.0f32; projected.len()];
+    rms_norm_rows_f32(
+        &projected,
+        &post_attn_norm,
+        &mut post_attn,
+        post_norm_eps,
+        false,
+    )
+    .expect("separate CUDA post-attention norm");
+    let mut expected_hidden = initial_hidden.clone();
+    add_f32_inplace(&mut expected_hidden, &post_attn).expect("separate CUDA attention residual");
+    let mut ffn_input = vec![0.0f32; expected_hidden.len()];
+    rms_norm_rows_f32(&expected_hidden, &ffn_norm, &mut ffn_input, norm_eps, false)
+        .expect("separate CUDA FFN norm");
+    let down_out =
+        dense_q4k_silu_ffn_batch(&gate, &up, &down, 12, n_ff, n_embd, seq_len, &ffn_input)
+            .expect("separate CUDA SiLU FFN");
+    let mut post_ffn = vec![0.0f32; down_out.len()];
+    rms_norm_rows_f32(
+        &down_out,
+        &post_ffn_norm,
+        &mut post_ffn,
+        post_norm_eps,
+        false,
+    )
+    .expect("separate CUDA post-FFN norm");
+    add_f32_inplace(&mut expected_hidden, &post_ffn).expect("separate CUDA FFN residual");
+
+    let mut actual = initial_hidden;
+    let (actual_k_bits, actual_v_bits) = q4k_muse_prefill_hd128_dense_chain(
+        &q_weights,
+        &k_weights,
+        &v_weights,
+        14,
+        &attention_gate_weights,
+        q_rows,
+        kv_rows,
+        n_embd,
+        &actual.clone(),
+        &attn_norm,
+        &q_norm,
+        &k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        0,
+        true,
+        sliding_window,
+        &o,
+        &gate,
+        &up,
+        &down,
+        12,
+        &post_attn_norm,
+        &ffn_norm,
+        &post_ffn_norm,
+        q_dim,
+        n_ff,
+        n_embd,
+        &mut actual,
+        norm_eps,
+        post_norm_eps,
+    )
+    .expect("CUDA Muse fused QKV dense chain")
+    .expect("CUDA Muse fused QKV path");
+
+    assert_f16_bits_close(
+        "Muse fused QKV K cache",
+        &actual_k_bits,
+        &expected_k_bits,
+        1e-3,
+    );
+    assert_f16_bits_close(
+        "Muse fused QKV V cache",
+        &actual_v_bits,
+        &expected_v_bits,
+        1e-3,
+    );
+    assert_close_rows_abs_rel(
+        "Muse fused QKV hd128 dense chain",
+        &actual,
+        &expected_hidden,
+        2e-4,
+        2e-5,
+    );
+}
+
+#[test]
 fn attention_decode_hd128_matches_cpu_reference() {
     let kv_len = 5usize;
     let num_heads = 2usize;

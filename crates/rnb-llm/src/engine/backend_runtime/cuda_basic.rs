@@ -2491,6 +2491,131 @@ pub(in crate::engine) fn prefill_attention_hd128_muse_dense_chain_if_supported(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn prefill_q4k_muse_hd128_dense_chain_if_supported(
+    q_weight: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    attention_gate_weight: &QuantizedWeight,
+    hidden_input: &[f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o_weight: &QuantizedWeight,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<Option<(Vec<u16>, Vec<u16>)>> {
+    let (
+        Some(q),
+        Some(k),
+        Some(v),
+        Some(attention_gate),
+        Some(o),
+        Some(gate),
+        Some(up),
+        Some(down),
+    ) = (
+        q_weight.backend_view(),
+        k_weight.backend_view(),
+        v_weight.backend_view(),
+        attention_gate_weight.backend_view(),
+        o_weight.backend_view(),
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    )
+    else {
+        return Ok(None);
+    };
+    if q.quant() != QuantFormat::Q4K
+        || k.quant() != QuantFormat::Q4K
+        || !matches!(v.quant(), QuantFormat::Q4K | QuantFormat::Q6K)
+        || attention_gate.quant() != QuantFormat::Q4K
+        || o.quant() != QuantFormat::Q4K
+        || gate.quant() != QuantFormat::Q4K
+        || up.quant() != QuantFormat::Q4K
+        || !matches!(
+            down.quant(),
+            QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K
+        )
+        || q.cols() != n_embd
+        || k.cols() != n_embd
+        || v.cols() != n_embd
+        || attention_gate.rows() != num_heads.saturating_mul(128)
+        || attention_gate.cols() != n_embd
+        || k.rows() != v.rows()
+        || o.rows() != n_embd
+        || o.cols() != o_cols
+        || gate.rows() != n_ff
+        || gate.cols() != n_embd
+        || up.rows() != n_ff
+        || up.cols() != n_embd
+        || down.rows() != n_embd
+        || down.cols() != n_ff
+    {
+        return Ok(None);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::prefill_q4k_muse_hd128_dense_chain_if_supported(
+            q.raw(),
+            k.raw(),
+            v.raw(),
+            backend_ggml_type(v.quant()),
+            attention_gate.raw(),
+            q.rows(),
+            k.rows(),
+            q.cols(),
+            hidden_input,
+            attn_norm_weight,
+            q_norm,
+            k_norm,
+            num_heads,
+            num_kv_heads,
+            scale,
+            rope_theta,
+            pos_start,
+            apply_rope,
+            sliding_window,
+            o.raw(),
+            gate.raw(),
+            up.raw(),
+            down.raw(),
+            backend_ggml_type(down.quant()),
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn gemma4_ple_q4k_batch_norm_residual_if_supported(

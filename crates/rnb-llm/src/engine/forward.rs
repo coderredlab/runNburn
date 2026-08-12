@@ -27,7 +27,7 @@ pub(in crate::engine) use fused_qkv_chain::Gemma4PrefillPleFusion;
 use fused_qkv_chain::{
     try_prefill_q4k_f16_qkv_hd256_window_dense_chain, try_prefill_q4k_f16_qkv_hd512_dense_chain,
     try_prefill_q4k_f16_reuse_q_hd256_window_dense_chain,
-    try_prefill_q4k_f16_reuse_q_hd512_dense_chain,
+    try_prefill_q4k_f16_reuse_q_hd512_dense_chain, try_prefill_q4k_muse_hd128_dense_chain,
 };
 #[cfg(feature = "cuda")]
 pub(in crate::engine) use fused_qkv_chain::{
@@ -431,6 +431,38 @@ fn forward_attention_layer_impl(
                 gemma4_output_scale_fused: fused.gemma4_output_scale_fused,
                 #[cfg(feature = "cuda")]
                 device_output: fused.device_output,
+            });
+        }
+    }
+
+    if !non_causal && positions_aligned && owns_kv {
+        if let Some(fused) = try_prefill_q4k_muse_hd128_dense_chain(
+            metadata,
+            architecture,
+            &hidden,
+            w,
+            layout,
+            layer_idx,
+            seq_len,
+            pos_start,
+            norm_eps,
+        )? {
+            kv_cache
+                .replace_layer_f16_range_compacted(
+                    kv_cache_layer,
+                    pos_start,
+                    seq_len,
+                    &fused.k_bits,
+                    &fused.v_bits,
+                )
+                .map_err(crate::error::LlmError::Forward)?;
+            prof("muse_qkv+rope+attn+ffn_cuda", fused_t0);
+            return Ok(PrefillAttentionLayerOutput {
+                hidden: fused.hidden,
+                gemma4_ple_fused: false,
+                gemma4_output_scale_fused: false,
+                #[cfg(feature = "cuda")]
+                device_output: None,
             });
         }
     }

@@ -238,6 +238,92 @@ pub fn prefill_attention_hd128_muse_dense_chain_if_supported(
     .map_err(|err| format!("CUDA Muse prefill attention dense chain failed: {err}"))
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
+    q: &[u8],
+    k: &[u8],
+    v: &[u8],
+    v_quant: GGMLType,
+    attention_gate: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    hidden_input: &[f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o: &[u8],
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<Option<(Vec<u16>, Vec<u16>)>> {
+    let seq_len = hidden_input.len().checked_div(cols).unwrap_or(0);
+    if !backend::tuning::prefill_flash_attention_enabled()
+        || q_rows != num_heads.saturating_mul(128)
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || kv_rows != num_kv_heads.saturating_mul(128)
+        || q_norm.len() != 128
+        || k_norm.len() != 128
+        || seq_len < backend::tuning::prefill_flash_attention_min_seq(128)
+    {
+        return Ok(None);
+    }
+    backend::q4k_muse_prefill_hd128_dense_chain(
+        q,
+        k,
+        v,
+        v_quant as u32,
+        attention_gate,
+        q_rows,
+        kv_rows,
+        cols,
+        hidden_input,
+        attn_norm_weight,
+        q_norm,
+        k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        apply_rope,
+        sliding_window,
+        o,
+        gate,
+        up,
+        down,
+        down_quant as u32,
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        hidden,
+        norm_eps,
+        post_norm_eps,
+    )
+    .map_err(|err| format!("CUDA Muse QKV prefill dense chain failed: {err}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_non_causal_if_supported(
     q: &[f32],

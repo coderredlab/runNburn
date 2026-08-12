@@ -1540,6 +1540,309 @@ impl CudaState {
         .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(super) fn q4k_muse_prefill_hd128_dense_chain(
+        &mut self,
+        q_weights: &[u8],
+        k_weights: &[u8],
+        v_weights: &[u8],
+        v_quant: u32,
+        attention_gate_weights: &[u8],
+        q_rows: usize,
+        kv_rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        hidden_input: &[f32],
+        attn_norm_weight: &[f32],
+        q_norm: &[f32],
+        k_norm: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+        rope_theta: f32,
+        pos_start: usize,
+        apply_rope: bool,
+        sliding_window: Option<usize>,
+        o_weights: &[u8],
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        post_attn_norm_weight: &[f32],
+        ffn_norm_weight: &[f32],
+        post_ffn_norm_weight: &[f32],
+        o_cols: usize,
+        n_ff: usize,
+        n_embd: usize,
+        hidden: &mut [f32],
+        norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Result<Option<(Vec<u16>, Vec<u16>)>, String> {
+        const HEAD_DIM: usize = 128;
+        let q_dim = num_heads.saturating_mul(HEAD_DIM);
+        let expected_hidden = seq_len.saturating_mul(n_embd);
+        if q_rows != q_dim
+            || kv_rows != num_kv_heads.saturating_mul(HEAD_DIM)
+            || o_cols != q_dim
+            || hidden_input.len() != expected_hidden
+            || hidden.len() != expected_hidden
+            || attn_norm_weight.len() != n_embd
+            || q_norm.len() != HEAD_DIM
+            || k_norm.len() != HEAD_DIM
+        {
+            return Ok(None);
+        }
+
+        let hidden_bytes = expected_hidden
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA Muse QKV hidden byte overflow".to_string())?;
+        let q_len = seq_len
+            .checked_mul(q_dim)
+            .ok_or_else(|| "CUDA Muse QKV Q length overflow".to_string())?;
+        let q_bytes = q_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA Muse QKV Q byte overflow".to_string())?;
+        let q_storage_bytes = q_bytes.max(hidden_bytes);
+        let kv_len = seq_len
+            .checked_mul(kv_rows)
+            .ok_or_else(|| "CUDA Muse QKV KV length overflow".to_string())?;
+        let kv_f32_bytes = kv_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA Muse QKV KV f32 byte overflow".to_string())?;
+        let kv_f16_bytes = kv_len
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| "CUDA Muse QKV KV f16 byte overflow".to_string())?;
+        let ffn_scratch_bytes = seq_len
+            .checked_mul(n_ff)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse QKV FFN scratch byte overflow".to_string())?;
+
+        // Reserve every shared slab at its largest use before the first async
+        // launch. QKV postprocessing consumes these values before the dense
+        // tail reuses the same slabs in stream order.
+        let hidden_dev = self.compute_full_gate_ptr(hidden_bytes)?;
+        let normed_dev = self.compute_full_up_ptr(hidden_bytes)?;
+        let q_full_dev = self.compute_temp_slab_ptr(q_storage_bytes)?;
+        let k_dev = self.compute_mid_a_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
+        let v_dev = self.compute_mid_b_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
+        self.compute_input_ptr(hidden_bytes)?;
+        let attention_gate_dev = self.compute_aux_output_ptr(q_storage_bytes)?;
+        let q_post_dev = self.compute_q_rope_out_ptr(q_bytes)?;
+        let k_bits_dev = self.compute_k_bits_out_ptr(kv_f16_bytes)?;
+        let v_bits_dev = self.compute_v_bits_out_ptr(kv_f16_bytes)?;
+        let attn_out_dev = self.compute_full_down_ptr(q_bytes)?;
+        self.compute_output_ptr(hidden_bytes)?;
+
+        unsafe {
+            self.api.memcpy_htod_async(
+                hidden_dev,
+                hidden_input.as_ptr().cast::<libc::c_void>(),
+                hidden_bytes,
+                self.stream,
+            )?;
+        }
+        let attn_norm_dev = self.resident_f32_ptr(attn_norm_weight)?;
+        self.launch_rms_norm_rows_f32(
+            hidden_dev,
+            attn_norm_dev,
+            normed_dev,
+            norm_eps,
+            seq_len,
+            n_embd,
+            false,
+        )?;
+        self.q4k_batch_dev_input_to_dev(
+            q_weights,
+            q_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            q_full_dev,
+        )?;
+        self.q4k_batch_dev_input_to_dev(
+            k_weights,
+            kv_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            k_dev,
+        )?;
+        match v_quant {
+            12 => self.q4k_batch_dev_input_to_dev(
+                v_weights,
+                kv_rows,
+                blocks_per_row,
+                seq_len,
+                normed_dev,
+                v_dev,
+            )?,
+            14 => self.q6k_batch_dev_input_to_dev(
+                v_weights,
+                kv_rows,
+                blocks_per_row,
+                seq_len,
+                normed_dev,
+                v_dev,
+            )?,
+            other => return Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+        }
+        self.q4k_batch_dev_input_to_dev(
+            attention_gate_weights,
+            q_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            attention_gate_dev,
+        )?;
+
+        let q_norm_dev = self.resident_f32_ptr(q_norm)?;
+        let k_norm_dev = self.resident_f32_ptr(k_norm)?;
+        self.launch_rms_norm_rows_f32(
+            q_full_dev,
+            q_norm_dev,
+            q_post_dev,
+            norm_eps,
+            seq_len.saturating_mul(num_heads),
+            HEAD_DIM,
+            false,
+        )?;
+        self.launch_rms_norm_rows_f32(
+            k_dev,
+            k_norm_dev,
+            k_dev,
+            norm_eps,
+            seq_len.saturating_mul(num_kv_heads),
+            HEAD_DIM,
+            false,
+        )?;
+        if apply_rope {
+            let q_pairs = seq_len
+                .checked_mul(num_heads)
+                .and_then(|heads| heads.checked_mul(HEAD_DIM / 2))
+                .ok_or_else(|| "CUDA Muse Q RoPE pair count overflow".to_string())?;
+            let k_pairs = seq_len
+                .checked_mul(num_kv_heads)
+                .and_then(|heads| heads.checked_mul(HEAD_DIM / 2))
+                .ok_or_else(|| "CUDA Muse K RoPE pair count overflow".to_string())?;
+            self.launch_rope_f32_inplace(
+                q_post_dev, 0, q_pairs, q_dim, HEAD_DIM, HEAD_DIM, pos_start, rope_theta, 0,
+            )?;
+            self.launch_rope_f32_inplace(
+                k_dev, 0, k_pairs, kv_rows, HEAD_DIM, HEAD_DIM, pos_start, rope_theta, 0,
+            )?;
+        }
+        self.launch_f32_to_f16_pack(k_dev, k_bits_dev, kv_len)?;
+        self.launch_f32_to_f16_pack(v_dev, v_bits_dev, kv_len)?;
+
+        if let Some(window) = sliding_window {
+            let mut output_arg = attn_out_dev;
+            let mut q_arg = q_post_dev;
+            let mut k_arg = k_dev;
+            let mut v_arg = v_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = seq_len as u32;
+            let mut heads_arg = num_heads as u32;
+            let mut kv_heads_arg = num_kv_heads as u32;
+            let mut scale_arg = scale;
+            let mut window_arg = window as u32;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128_window",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut window_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (128, 1, 1),
+            )?;
+        } else {
+            let mut output_arg = attn_out_dev;
+            let mut q_arg = q_post_dev;
+            let mut k_arg = k_dev;
+            let mut v_arg = v_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = seq_len as u32;
+            let mut heads_arg = num_heads as u32;
+            let mut kv_heads_arg = num_kv_heads as u32;
+            let mut scale_arg = scale;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (128, 1, 1),
+            )?;
+        }
+        self.launch_sigmoid_mul_inplace(attn_out_dev, attention_gate_dev, q_len)?;
+
+        let mut k_bits = vec![0u16; kv_len];
+        let mut v_bits = vec![0u16; kv_len];
+        unsafe {
+            self.api.memcpy_dtoh_async(
+                k_bits.as_mut_ptr().cast::<libc::c_void>(),
+                k_bits_dev,
+                kv_f16_bytes,
+                self.stream,
+            )?;
+            self.api.memcpy_dtoh_async(
+                v_bits.as_mut_ptr().cast::<libc::c_void>(),
+                v_bits_dev,
+                kv_f16_bytes,
+                self.stream,
+            )?;
+        }
+        self.stream_synchronize()?;
+
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            Some(post_attn_norm_weight),
+            ffn_norm_weight,
+            Some(post_ffn_norm_weight),
+            None,
+            None,
+            None,
+            None,
+            0,
+            o_cols,
+            n_ff,
+            n_embd,
+            seq_len,
+            hidden,
+            Some(hidden_dev),
+            attn_out_dev,
+            None,
+            None,
+            None,
+            norm_eps,
+            post_norm_eps,
+            false,
+            false,
+            false,
+            false,
+        )?;
+        Ok(Some((k_bits, v_bits)))
+    }
+
     pub(super) fn attention_decode_hd256(
         &mut self,
         q: &[f32],
