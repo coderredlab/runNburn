@@ -121,6 +121,7 @@ mod prefill_attn_chain;
 mod prefill_gemma_attn_chain;
 #[cfg(target_os = "macos")]
 pub use compute::GlmMlaLayerFusedOut;
+#[cfg(target_os = "macos")]
 pub use gdn_proj_chain::{PrefillProjTrace, TensoropsQuant};
 
 #[cfg(target_os = "macos")]
@@ -173,6 +174,7 @@ pub struct GlmMoeQuantSelect {
 }
 
 /// pm116 M2: pread 준비물 — plan/staging/handles. run 은 `glm_direct_run_preads`.
+#[cfg(target_os = "macos")]
 struct GlmDirectPreadPrep {
     plan: Vec<((usize, usize), usize, u64, usize)>,
     handles: [Option<std::sync::Arc<std::fs::File>>; 3],
@@ -180,6 +182,7 @@ struct GlmDirectPreadPrep {
     contents: usize,
 }
 
+#[cfg(target_os = "macos")]
 impl GlmDirectPreadPrep {
     #[allow(clippy::type_complexity)]
     fn to_map(
@@ -197,6 +200,7 @@ impl GlmDirectPreadPrep {
 
 /// pm116 M2: prep 의 plan 을 병렬 pread 로 실행. Retained buffer 를 스레드로
 /// 넘기지 않도록 contents 주소만 받는다 (구간은 plan 에서 서로 배타 배정).
+#[cfg(target_os = "macos")]
 fn glm_direct_run_preads(
     plan: &[((usize, usize), usize, u64, usize)],
     handles: &[Option<std::sync::Arc<std::fs::File>>; 3],
