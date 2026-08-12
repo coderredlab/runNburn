@@ -16,8 +16,9 @@ use crate::compute::{
     encode_silu_mul_to_f16, MetalContext,
 };
 use crate::ffn_chain::{
-    empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, readback,
-    shared_f32_buf, u32_buf, QwenMoeLlamaIdStage, QwenMoeLlamaIdStageSampler,
+    empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, private_f16_buf,
+    private_f32_buf, readback, shared_f32_buf, u32_buf, QwenMoeLlamaIdStage,
+    QwenMoeLlamaIdStageSampler,
 };
 use crate::{PrefillAtnOTailBackendSpecRef, TensoropsQuant};
 
@@ -81,6 +82,35 @@ pub(crate) struct PrefillAtnFullLayerCarrier {
     q_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+pub(crate) struct MusePrefillOTailFfnCarrier {
+    pub seq_len: usize,
+    pub q_dim: usize,
+    pub hidden_dim: usize,
+    pub ffn_dim: usize,
+    attn_out_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    o_in_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    o_proj_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_attn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_ffn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_normed_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_normed_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_up_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_act_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_down_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    seq_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ffn_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    norm_eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_norm_eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 pub(crate) struct PrefillAtnOTailCarrier {
@@ -309,6 +339,68 @@ impl PrefillAtnFullLayerCarrier {
     }
 }
 
+impl MusePrefillOTailFfnCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        q_dim: usize,
+        hidden_dim: usize,
+        ffn_dim: usize,
+        norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Self {
+        Self {
+            seq_len,
+            q_dim,
+            hidden_dim,
+            ffn_dim,
+            attn_out_dev: empty_f32_buf(ctx, seq_len * q_dim),
+            hidden_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
+            o_in_f16_dev: private_f16_buf(ctx, seq_len * q_dim),
+            o_proj_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            post_attn_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
+            ffn_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
+            post_ffn_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
+            ffn_normed_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            ffn_normed_f16_dev: private_f16_buf(ctx, seq_len * hidden_dim),
+            ffn_gate_dev: private_f32_buf(ctx, seq_len * ffn_dim),
+            ffn_up_dev: private_f32_buf(ctx, seq_len * ffn_dim),
+            ffn_act_f16_dev: private_f16_buf(ctx, seq_len * ffn_dim),
+            ffn_down_dev: private_f32_buf(ctx, seq_len * hidden_dim),
+            q_dim_buf: u32_buf(ctx, q_dim as u32),
+            hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            ffn_dim_buf: u32_buf(ctx, ffn_dim as u32),
+            seq_buf: u32_buf(ctx, seq_len as u32),
+            q_elems_buf: u32_buf(ctx, (seq_len * q_dim) as u32),
+            hidden_elems_buf: u32_buf(ctx, (seq_len * hidden_dim) as u32),
+            ffn_elems_buf: u32_buf(ctx, (seq_len * ffn_dim) as u32),
+            norm_eps_buf: f32_buf(ctx, norm_eps),
+            post_norm_eps_buf: f32_buf(ctx, post_norm_eps),
+        }
+    }
+
+    fn upload(
+        &self,
+        attn_out: &[f32],
+        hidden: &[f32],
+        post_attn_norm_w: &[f32],
+        ffn_norm_w: &[f32],
+        post_ffn_norm_w: &[f32],
+    ) {
+        debug_assert_eq!(attn_out.len(), self.seq_len * self.q_dim);
+        debug_assert_eq!(hidden.len(), self.seq_len * self.hidden_dim);
+        debug_assert_eq!(post_attn_norm_w.len(), self.hidden_dim);
+        debug_assert_eq!(ffn_norm_w.len(), self.hidden_dim);
+        debug_assert_eq!(post_ffn_norm_w.len(), self.hidden_dim);
+        copy_f32(attn_out, &self.attn_out_dev);
+        copy_f32(hidden, &self.hidden_dev);
+        copy_f32(post_attn_norm_w, &self.post_attn_norm_w_dev);
+        copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
+        copy_f32(post_ffn_norm_w, &self.post_ffn_norm_w_dev);
+    }
+}
+
 impl PrefillAtnOTailCarrier {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -438,6 +530,27 @@ pub(crate) struct PrefillAtnFullLayerDispatchRequest<'a> {
     pub o_w_off: u32,
     pub o_quant: TensoropsQuant,
     pub ffn_norm_w: &'a [f32],
+    pub ffn_gate_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_gate_w_off: u32,
+    pub ffn_gate_quant: TensoropsQuant,
+    pub ffn_up_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_up_w_off: u32,
+    pub ffn_up_quant: TensoropsQuant,
+    pub ffn_down_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub ffn_down_w_off: u32,
+    pub ffn_down_quant: TensoropsQuant,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct MusePrefillOTailFfnDispatchRequest<'a> {
+    pub attn_out: &'a [f32],
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub o_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub o_w_off: u32,
+    pub o_quant: TensoropsQuant,
     pub ffn_gate_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub ffn_gate_w_off: u32,
     pub ffn_gate_quant: TensoropsQuant,
@@ -1105,6 +1218,165 @@ pub(crate) fn prefill_atn_o_tail_dispatch(
     Ok((hidden, k_bits, v_bits))
 }
 
+pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
+    ctx: &MetalContext,
+    carrier: &MusePrefillOTailFfnCarrier,
+    req: MusePrefillOTailFfnDispatchRequest<'_>,
+) -> Result<Vec<f32>, String> {
+    carrier.upload(
+        req.attn_out,
+        req.hidden,
+        req.post_attn_norm_w,
+        req.ffn_norm_w,
+        req.post_ffn_norm_w,
+    );
+
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal Muse prefill O+FFN: command buffer creation failed".to_string())?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Muse prefill O+FFN: compute encoder creation failed".to_string())?;
+
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &carrier.attn_out_dev,
+        &carrier.o_in_f16_dev,
+        &carrier.q_elems_buf,
+        carrier.seq_len * carrier.q_dim,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.o_quant,
+        req.o_w_buf,
+        req.o_w_off,
+        &carrier.o_in_f16_dev,
+        &carrier.o_proj_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.q_dim_buf,
+        &carrier.seq_buf,
+        carrier.hidden_dim,
+        carrier.seq_len,
+    );
+    encode_rms_norm_batch(
+        ctx,
+        &enc,
+        &carrier.o_proj_dev,
+        &carrier.post_attn_norm_w_dev,
+        &carrier.ffn_normed_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.post_norm_eps_buf,
+        carrier.seq_len,
+    );
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &enc,
+        &carrier.hidden_dev,
+        &carrier.ffn_normed_dev,
+        &carrier.hidden_elems_buf,
+        carrier.seq_len * carrier.hidden_dim,
+    );
+    encode_rms_norm_batch(
+        ctx,
+        &enc,
+        &carrier.hidden_dev,
+        &carrier.ffn_norm_w_dev,
+        &carrier.ffn_normed_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.norm_eps_buf,
+        carrier.seq_len,
+    );
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &carrier.ffn_normed_dev,
+        &carrier.ffn_normed_f16_dev,
+        &carrier.hidden_elems_buf,
+        carrier.seq_len * carrier.hidden_dim,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.ffn_gate_quant,
+        req.ffn_gate_w_buf,
+        req.ffn_gate_w_off,
+        &carrier.ffn_normed_f16_dev,
+        &carrier.ffn_gate_dev,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        &carrier.seq_buf,
+        carrier.ffn_dim,
+        carrier.seq_len,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.ffn_up_quant,
+        req.ffn_up_w_buf,
+        req.ffn_up_w_off,
+        &carrier.ffn_normed_f16_dev,
+        &carrier.ffn_up_dev,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        &carrier.seq_buf,
+        carrier.ffn_dim,
+        carrier.seq_len,
+    );
+    encode_silu_mul_to_f16(
+        ctx,
+        &enc,
+        &carrier.ffn_gate_dev,
+        &carrier.ffn_up_dev,
+        &carrier.ffn_act_f16_dev,
+        &carrier.ffn_elems_buf,
+        carrier.seq_len * carrier.ffn_dim,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.ffn_down_quant,
+        req.ffn_down_w_buf,
+        req.ffn_down_w_off,
+        &carrier.ffn_act_f16_dev,
+        &carrier.ffn_down_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.ffn_dim_buf,
+        &carrier.seq_buf,
+        carrier.hidden_dim,
+        carrier.seq_len,
+    );
+    encode_rms_norm_batch(
+        ctx,
+        &enc,
+        &carrier.ffn_down_dev,
+        &carrier.post_ffn_norm_w_dev,
+        &carrier.ffn_normed_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.post_norm_eps_buf,
+        carrier.seq_len,
+    );
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &enc,
+        &carrier.hidden_dev,
+        &carrier.ffn_normed_dev,
+        &carrier.hidden_elems_buf,
+        carrier.seq_len * carrier.hidden_dim,
+    );
+
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    ensure_command_completed(&cmd)?;
+    Ok(readback(
+        &carrier.hidden_dev,
+        carrier.seq_len * carrier.hidden_dim,
+    ))
+}
+
 pub(crate) fn prefill_atn_full_layer_dispatch(
     ctx: &MetalContext,
     carrier: &PrefillAtnFullLayerCarrier,
@@ -1271,10 +1543,71 @@ pub(crate) fn prefill_atn_full_layer_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::{MTLDevice, MTLResourceOptions};
     use rnb_cpu::kernels::{
         norm::rms_norm_into,
         rope::{rope_imrope_inplace, rope_partial_inplace},
     };
+
+    fn rms_norm_f64(input: &[f32], weight: &[f32], eps: f32, rows: usize) -> Vec<f32> {
+        let cols = weight.len();
+        assert_eq!(input.len(), rows * cols);
+        let mut output = Vec::with_capacity(input.len());
+        for row in input.chunks_exact(cols) {
+            let mean_sq = row
+                .iter()
+                .map(|&value| {
+                    let value = f64::from(value);
+                    value * value
+                })
+                .sum::<f64>()
+                / cols as f64;
+            let inverse_rms = 1.0 / (mean_sq + f64::from(eps)).sqrt();
+            output.extend(row.iter().zip(weight).map(|(&value, &scale)| {
+                (f64::from(value) * inverse_rms * f64::from(scale)) as f32
+            }));
+        }
+        output
+    }
+
+    fn metal_rms_norm(
+        ctx: &MetalContext,
+        input: &[f32],
+        weight: &[f32],
+        eps: f32,
+        rows: usize,
+    ) -> Vec<f32> {
+        let input_dev = shared_f32_buf(ctx, input);
+        let weight_dev = shared_f32_buf(ctx, weight);
+        let output_dev = empty_f32_buf(ctx, input.len());
+        let cols_dev = u32_buf(ctx, weight.len() as u32);
+        let eps_dev = f32_buf(ctx, eps);
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        encode_rms_norm_batch(
+            ctx,
+            &enc,
+            &input_dev,
+            &weight_dev,
+            &output_dev,
+            &cols_dev,
+            &eps_dev,
+            rows,
+        );
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        ensure_command_completed(&cmd).expect("command completed");
+        readback(&output_dev, input.len())
+    }
+
+    fn max_abs_diff(actual: &[f32], expected: &[f32]) -> f32 {
+        actual
+            .iter()
+            .zip(expected)
+            .map(|(&actual, &expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max)
+    }
 
     fn assert_f32_bits(label: &str, got: &[f32], expected: &[f32]) {
         assert_eq!(got.len(), expected.len(), "{label} length");
@@ -1439,5 +1772,185 @@ mod tests {
         ensure_command_completed(&cmd).expect("command completed");
 
         assert_f32_close("IMRoPE", &readback(&output_dev, len), &expected);
+    }
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn muse_prefill_o_tail_ffn_norms_match_f64_cpu() {
+        const SEQ_LEN: usize = 2;
+        const Q_DIM: usize = 256;
+        const HIDDEN_DIM: usize = 256;
+        const FFN_DIM: usize = 256;
+        const NORM_EPS: f32 = 1.0e-6;
+        const POST_NORM_EPS: f32 = 1.0e-5;
+
+        let ctx = compute::build_metal_context().expect("Metal context");
+        let hidden = (0..SEQ_LEN * HIDDEN_DIM)
+            .map(|index| ((index * 29 % 251) as f32 - 125.0) * 0.001)
+            .collect::<Vec<_>>();
+        let attn_out = (0..SEQ_LEN * Q_DIM)
+            .map(|index| ((index * 17 % 239) as f32 - 119.0) * 0.0015)
+            .collect::<Vec<_>>();
+        let post_attn_norm_w = (0..HIDDEN_DIM)
+            .map(|index| 0.8 + (index % 13) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let ffn_norm_w = (0..HIDDEN_DIM)
+            .map(|index| 0.7 + (index % 11) as f32 * 0.0125)
+            .collect::<Vec<_>>();
+        let post_ffn_norm_w = (0..HIDDEN_DIM)
+            .map(|index| 0.9 + (index % 7) as f32 * 0.015)
+            .collect::<Vec<_>>();
+        let mut block = crate::tests_fixture::q4k_block_fixed();
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(0.005).to_le_bytes());
+        let q4_weight = |rows: usize, cols: usize| {
+            block
+                .iter()
+                .cycle()
+                .take(rows * (cols / 256) * 144)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let o_weight = q4_weight(HIDDEN_DIM, Q_DIM);
+        let gate_weight = q4_weight(FFN_DIM, HIDDEN_DIM);
+        let up_weight = q4_weight(FFN_DIM, HIDDEN_DIM);
+        let down_weight = q4_weight(HIDDEN_DIM, FFN_DIM);
+        let round_f16 = |values: &[f32]| {
+            values
+                .iter()
+                .map(|&value| half::f16::from_f32(value).to_f32())
+                .collect::<Vec<_>>()
+        };
+
+        let o_proj = crate::tests_fixture::q4k_gemm_reference(
+            &o_weight,
+            HIDDEN_DIM,
+            Q_DIM,
+            &round_f16(&attn_out),
+            SEQ_LEN,
+        );
+        let post_attn = rms_norm_f64(&o_proj, &post_attn_norm_w, POST_NORM_EPS, SEQ_LEN);
+        let residual_1 = hidden
+            .iter()
+            .zip(&post_attn)
+            .map(|(&hidden, &residual)| hidden + residual)
+            .collect::<Vec<_>>();
+        let pre_ffn = rms_norm_f64(&residual_1, &ffn_norm_w, NORM_EPS, SEQ_LEN);
+        let pre_ffn_f16 = round_f16(&pre_ffn);
+        let gate = crate::tests_fixture::q4k_gemm_reference(
+            &gate_weight,
+            FFN_DIM,
+            HIDDEN_DIM,
+            &pre_ffn_f16,
+            SEQ_LEN,
+        );
+        let up = crate::tests_fixture::q4k_gemm_reference(
+            &up_weight,
+            FFN_DIM,
+            HIDDEN_DIM,
+            &pre_ffn_f16,
+            SEQ_LEN,
+        );
+        let activation = gate
+            .iter()
+            .zip(&up)
+            .map(|(&gate, &up)| half::f16::from_f32((gate / (1.0 + (-gate).exp())) * up).to_f32())
+            .collect::<Vec<_>>();
+        let down = crate::tests_fixture::q4k_gemm_reference(
+            &down_weight,
+            HIDDEN_DIM,
+            FFN_DIM,
+            &activation,
+            SEQ_LEN,
+        );
+        let post_ffn = rms_norm_f64(&down, &post_ffn_norm_w, POST_NORM_EPS, SEQ_LEN);
+        let expected = residual_1
+            .iter()
+            .zip(&post_ffn)
+            .map(|(&hidden, &residual)| hidden + residual)
+            .collect::<Vec<_>>();
+
+        let post_attn_norm_error = max_abs_diff(
+            &metal_rms_norm(&ctx, &o_proj, &post_attn_norm_w, POST_NORM_EPS, SEQ_LEN),
+            &post_attn,
+        );
+        let pre_ffn_norm_error = max_abs_diff(
+            &metal_rms_norm(&ctx, &residual_1, &ffn_norm_w, NORM_EPS, SEQ_LEN),
+            &pre_ffn,
+        );
+        let post_ffn_norm_error = max_abs_diff(
+            &metal_rms_norm(&ctx, &down, &post_ffn_norm_w, POST_NORM_EPS, SEQ_LEN),
+            &post_ffn,
+        );
+        assert!(
+            post_attn_norm_error < 2.0e-6,
+            "post-attention norm max_abs={post_attn_norm_error}"
+        );
+        assert!(
+            pre_ffn_norm_error < 2.0e-6,
+            "pre-FFN norm max_abs={pre_ffn_norm_error}"
+        );
+        assert!(
+            post_ffn_norm_error < 2.0e-6,
+            "post-FFN norm max_abs={post_ffn_norm_error}"
+        );
+
+        let shared_bytes = |data: &[u8]| unsafe {
+            let ptr = std::ptr::NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
+                .expect("weight pointer");
+            ctx.device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    data.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("weight buffer")
+        };
+        let o_weight_dev = shared_bytes(&o_weight);
+        let gate_weight_dev = shared_bytes(&gate_weight);
+        let up_weight_dev = shared_bytes(&up_weight);
+        let down_weight_dev = shared_bytes(&down_weight);
+        let carrier = MusePrefillOTailFfnCarrier::new(
+            &ctx,
+            SEQ_LEN,
+            Q_DIM,
+            HIDDEN_DIM,
+            FFN_DIM,
+            NORM_EPS,
+            POST_NORM_EPS,
+        );
+        let actual = prefill_muse_o_tail_ffn_dispatch(
+            &ctx,
+            &carrier,
+            MusePrefillOTailFfnDispatchRequest {
+                attn_out: &attn_out,
+                hidden: &hidden,
+                post_attn_norm_w: &post_attn_norm_w,
+                ffn_norm_w: &ffn_norm_w,
+                post_ffn_norm_w: &post_ffn_norm_w,
+                o_w_buf: &o_weight_dev,
+                o_w_off: 0,
+                o_quant: TensoropsQuant::Q4K,
+                ffn_gate_w_buf: &gate_weight_dev,
+                ffn_gate_w_off: 0,
+                ffn_gate_quant: TensoropsQuant::Q4K,
+                ffn_up_w_buf: &up_weight_dev,
+                ffn_up_w_off: 0,
+                ffn_up_quant: TensoropsQuant::Q4K,
+                ffn_down_w_buf: &down_weight_dev,
+                ffn_down_w_off: 0,
+                ffn_down_quant: TensoropsQuant::Q4K,
+            },
+        )
+        .expect("Muse O+FFN dispatch");
+        let full_chain_error = max_abs_diff(&actual, &expected);
+        assert!(
+            full_chain_error < 5.0e-3,
+            "full chain max_abs={full_chain_error}"
+        );
+        eprintln!(
+            "Muse O+FFN oracle: post_attn={post_attn_norm_error:.9e} \
+             pre_ffn={pre_ffn_norm_error:.9e} post_ffn={post_ffn_norm_error:.9e} \
+             full={full_chain_error:.9e}"
+        );
     }
 }

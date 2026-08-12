@@ -1438,6 +1438,21 @@ struct GemmaPrefillFullLayerCarrierKey {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MusePrefillOTailFfnCarrierKey {
+    seq_len: usize,
+    q_dim: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    norm_eps_bits: u32,
+    post_norm_eps_bits: u32,
+    o_quant: TensoropsQuant,
+    ffn_gate_quant: TensoropsQuant,
+    ffn_up_quant: TensoropsQuant,
+    ffn_down_quant: TensoropsQuant,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillAtnCoreWeightView<'a> {
     pub raw: &'a [u8],
@@ -1497,6 +1512,26 @@ pub struct GemmaPrefillFullLayerBackendRequest<'a> {
     pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
     pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
     pub ffn_dim: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct MusePrefillOTailFfnBackendRequest<'a> {
+    pub attn_out: &'a [f32],
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub o_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
+    pub seq_len: usize,
+    pub q_dim: usize,
+    pub hidden_dim: usize,
+    pub ffn_dim: usize,
+    pub norm_eps: f32,
+    pub post_norm_eps: f32,
 }
 
 #[cfg(target_os = "macos")]
@@ -1955,6 +1990,10 @@ pub struct MetalBackend {
             prefill_gemma_attn_chain::GemmaPrefillFullLayerCarrier,
         >,
     >,
+    /// Muse attention output→post norms/residual→SwiGLU FFN carrier.
+    muse_prefill_o_ffn_carriers: RefCell<
+        HashMap<MusePrefillOTailFfnCarrierKey, prefill_atn_core_chain::MusePrefillOTailFfnCarrier>,
+    >,
     qwen_prefill_gdn_carriers:
         RefCell<HashMap<QwenGdnPrefillCarrierKey, gdn_chain::QwenGdnPrefillCarrier>>,
     qwen_prefill_atn_o_tail_carriers:
@@ -2194,6 +2233,7 @@ impl MetalBackend {
                 gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
+                muse_prefill_o_ffn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 qkv_carriers: RefCell::new(HashMap::new()),
@@ -2431,6 +2471,7 @@ impl MetalBackend {
             gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
+            muse_prefill_o_ffn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             qkv_carriers: RefCell::new(HashMap::new()),
@@ -4506,6 +4547,125 @@ impl MetalBackend {
                 owns_kv: req.owns_kv,
                 pos_start: req.pos_start,
                 kv_len: req.kv_len,
+            },
+        )?;
+        Ok(Some(output))
+    }
+
+    /// Muse dense layer tail: O projection, both residual branches, and SwiGLU FFN.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_muse_o_tail_ffn_if_supported(
+        &self,
+        req: MusePrefillOTailFfnBackendRequest<'_>,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.o_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_gate_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_up_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_down_weight.quant)
+        {
+            return Ok(None);
+        }
+        if req.seq_len == 0 || req.q_dim == 0 || req.hidden_dim == 0 || req.ffn_dim == 0 {
+            return Err(
+                "Metal Muse prefill O+FFN: dimensions and sequence length must be > 0".to_string(),
+            );
+        }
+        if !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+            || !req.post_norm_eps.is_finite()
+            || req.post_norm_eps <= 0.0
+        {
+            return Err("Metal Muse prefill O+FFN: invalid epsilon".to_string());
+        }
+        let expected_attn = Self::atn_core_checked_mul(req.seq_len, req.q_dim, "attention len")?;
+        let expected_hidden =
+            Self::atn_core_checked_mul(req.seq_len, req.hidden_dim, "hidden len")?;
+        Self::atn_core_require_eq("attention len", req.attn_out.len(), expected_attn)?;
+        Self::atn_core_require_eq("hidden len", req.hidden.len(), expected_hidden)?;
+        for (role, norm) in [
+            ("post_attn_norm", req.post_attn_norm_w),
+            ("ffn_norm", req.ffn_norm_w),
+            ("post_ffn_norm", req.post_ffn_norm_w),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} len"), norm.len(), req.hidden_dim)?;
+        }
+        for (role, weight, rows, cols) in [
+            ("o", req.o_weight, req.hidden_dim, req.q_dim),
+            ("ffn gate", req.ffn_gate_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn up", req.ffn_up_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn down", req.ffn_down_weight, req.hidden_dim, req.ffn_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} weight rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} weight cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+
+        let (o_w_buf, o_w_off, gate_w_buf, gate_w_off, up_w_buf, up_w_off, down_w_buf, down_w_off) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (o_w_buf, o_w_off) = wrap(req.o_weight.raw);
+            let (gate_w_buf, gate_w_off) = wrap(req.ffn_gate_weight.raw);
+            let (up_w_buf, up_w_off) = wrap(req.ffn_up_weight.raw);
+            let (down_w_buf, down_w_off) = wrap(req.ffn_down_weight.raw);
+            (
+                o_w_buf, o_w_off, gate_w_buf, gate_w_off, up_w_buf, up_w_off, down_w_buf,
+                down_w_off,
+            )
+        };
+        let key = MusePrefillOTailFfnCarrierKey {
+            seq_len: req.seq_len,
+            q_dim: req.q_dim,
+            hidden_dim: req.hidden_dim,
+            ffn_dim: req.ffn_dim,
+            norm_eps_bits: req.norm_eps.to_bits(),
+            post_norm_eps_bits: req.post_norm_eps.to_bits(),
+            o_quant: req.o_weight.quant,
+            ffn_gate_quant: req.ffn_gate_weight.quant,
+            ffn_up_quant: req.ffn_up_weight.quant,
+            ffn_down_quant: req.ffn_down_weight.quant,
+        };
+        let mut carriers = self.muse_prefill_o_ffn_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_atn_core_chain::MusePrefillOTailFfnCarrier::new(
+                ctx,
+                req.seq_len,
+                req.q_dim,
+                req.hidden_dim,
+                req.ffn_dim,
+                req.norm_eps,
+                req.post_norm_eps,
+            )
+        });
+        let output = prefill_atn_core_chain::prefill_muse_o_tail_ffn_dispatch(
+            ctx,
+            carrier,
+            prefill_atn_core_chain::MusePrefillOTailFfnDispatchRequest {
+                attn_out: req.attn_out,
+                hidden: req.hidden,
+                post_attn_norm_w: req.post_attn_norm_w,
+                ffn_norm_w: req.ffn_norm_w,
+                post_ffn_norm_w: req.post_ffn_norm_w,
+                o_w_buf: &o_w_buf,
+                o_w_off,
+                o_quant: req.o_weight.quant,
+                ffn_gate_w_buf: &gate_w_buf,
+                ffn_gate_w_off: gate_w_off,
+                ffn_gate_quant: req.ffn_gate_weight.quant,
+                ffn_up_w_buf: &up_w_buf,
+                ffn_up_w_off: up_w_off,
+                ffn_up_quant: req.ffn_up_weight.quant,
+                ffn_down_w_buf: &down_w_buf,
+                ffn_down_w_off: down_w_off,
+                ffn_down_quant: req.ffn_down_weight.quant,
             },
         )?;
         Ok(Some(output))

@@ -104,6 +104,40 @@ pub struct MetalPrefillAtnFullLayerOut {
     pub v_bits: Vec<u16>,
 }
 
+pub struct MetalMusePrefillOTailFfnRequest<'a> {
+    pub attn_out: &'a [f32],
+    pub hidden: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub o_weight_ggml: GGMLType,
+    pub o_weight_raw: &'a [u8],
+    pub o_weight_rows: usize,
+    pub o_weight_cols: usize,
+    pub ffn_gate_weight_ggml: GGMLType,
+    pub ffn_gate_weight_raw: &'a [u8],
+    pub ffn_gate_weight_rows: usize,
+    pub ffn_gate_weight_cols: usize,
+    pub ffn_up_weight_ggml: GGMLType,
+    pub ffn_up_weight_raw: &'a [u8],
+    pub ffn_up_weight_rows: usize,
+    pub ffn_up_weight_cols: usize,
+    pub ffn_down_weight_ggml: GGMLType,
+    pub ffn_down_weight_raw: &'a [u8],
+    pub ffn_down_weight_rows: usize,
+    pub ffn_down_weight_cols: usize,
+    pub seq_len: usize,
+    pub q_dim: usize,
+    pub hidden_dim: usize,
+    pub ffn_dim: usize,
+    pub norm_eps: f32,
+    pub post_norm_eps: f32,
+}
+
+pub struct MetalMusePrefillOTailFfnOut {
+    pub hidden: Vec<f32>,
+}
+
 pub struct MetalPrefillAtnOTailRequest<'a> {
     pub core: MetalPrefillAtnCoreRequest<'a>,
     pub o_weight_ggml: GGMLType,
@@ -5825,6 +5859,75 @@ pub fn metal_gemma_prefill_qkv_o_resident_if_supported(
                     v_bits,
                 })
             })
+    })
+}
+
+pub fn metal_muse_prefill_o_tail_ffn_if_supported(
+    req: MetalMusePrefillOTailFfnRequest<'_>,
+) -> Result<Option<MetalMusePrefillOTailFfnOut>> {
+    if env_falsey("RNB_METAL_MUSE_PREFILL_O_FFN_CHAIN") {
+        return Ok(None);
+    }
+    let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_gate_quant) = tensorops_quant_from_ggml(req.ffn_gate_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_up_quant) = tensorops_quant_from_ggml(req.ffn_up_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight_ggml) else {
+        return Ok(None);
+    };
+    let view = |raw, quant, rows, cols| rnb_backend_metal::PrefillAtnCoreWeightView {
+        raw,
+        quant,
+        rows,
+        cols,
+    };
+    METAL.with(|backend| {
+        backend
+            .prefill_muse_o_tail_ffn_if_supported(
+                rnb_backend_metal::MusePrefillOTailFfnBackendRequest {
+                    attn_out: req.attn_out,
+                    hidden: req.hidden,
+                    post_attn_norm_w: req.post_attn_norm_w,
+                    ffn_norm_w: req.ffn_norm_w,
+                    post_ffn_norm_w: req.post_ffn_norm_w,
+                    o_weight: view(
+                        req.o_weight_raw,
+                        o_quant,
+                        req.o_weight_rows,
+                        req.o_weight_cols,
+                    ),
+                    ffn_gate_weight: view(
+                        req.ffn_gate_weight_raw,
+                        ffn_gate_quant,
+                        req.ffn_gate_weight_rows,
+                        req.ffn_gate_weight_cols,
+                    ),
+                    ffn_up_weight: view(
+                        req.ffn_up_weight_raw,
+                        ffn_up_quant,
+                        req.ffn_up_weight_rows,
+                        req.ffn_up_weight_cols,
+                    ),
+                    ffn_down_weight: view(
+                        req.ffn_down_weight_raw,
+                        ffn_down_quant,
+                        req.ffn_down_weight_rows,
+                        req.ffn_down_weight_cols,
+                    ),
+                    seq_len: req.seq_len,
+                    q_dim: req.q_dim,
+                    hidden_dim: req.hidden_dim,
+                    ffn_dim: req.ffn_dim,
+                    norm_eps: req.norm_eps,
+                    post_norm_eps: req.post_norm_eps,
+                },
+            )
+            .map(|result| result.map(|hidden| MetalMusePrefillOTailFfnOut { hidden }))
     })
 }
 

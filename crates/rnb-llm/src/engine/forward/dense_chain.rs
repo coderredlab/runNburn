@@ -1,4 +1,4 @@
-//! Prefill dense attention-output + FFN CUDA chain.
+//! Prefill dense attention-output + FFN backend chains.
 
 use super::super::*;
 
@@ -23,6 +23,40 @@ pub(super) fn try_prefill_attention_output_ffn_chain(
     seq_len: usize,
     norm_eps: f32,
 ) -> crate::error::Result<Option<Tensor>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+        && w.moe.is_none()
+        && w.shared_expert_moe.is_none()
+        && w.ffn_gate_up_fused.is_none()
+        && dump_bin_dir().is_none()
+        && !attn_trace_enabled()
+        && !targeted_attn_trace_enabled(layer_idx)
+    {
+        if let (Some(post_attn_norm), Some(post_ffn_norm)) = (&w.post_attn_norm, &w.post_ffw_norm) {
+            let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+            if let Some(hidden_out) = backend_runtime::metal_muse_prefill_o_tail_ffn_if_supported(
+                kernels::tensor_as_f32_slice(hidden),
+                kernels::tensor_as_f32_slice(attn_out),
+                kernels::tensor_as_f32_slice(post_attn_norm),
+                kernels::tensor_as_f32_slice(ffn_norm),
+                kernels::tensor_as_f32_slice(post_ffn_norm),
+                &w.o_weight,
+                &w.ffn_gate_weight,
+                &w.ffn_up_weight,
+                &w.ffn_down_weight,
+                seq_len,
+                metadata.hidden_dim,
+                norm_eps,
+                metadata.post_norm_eps,
+            )? {
+                return Ok(Some(Tensor::from_vec(
+                    hidden_out,
+                    &[seq_len, metadata.hidden_dim],
+                )));
+            }
+        }
+    }
+
     if !prefill_dense_chain_enabled()
         || !use_gemma_block_semantics(architecture)
         || w.moe.is_some()

@@ -934,3 +934,63 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
         Ok(None)
     }
 }
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_muse_prefill_o_tail_ffn_if_supported(
+    hidden: &[f32],
+    attn_out: &[f32],
+    post_attn_norm_w: &[f32],
+    ffn_norm_w: &[f32],
+    post_ffn_norm_w: &[f32],
+    o_weight: &QuantizedWeight,
+    ffn_gate_weight: &QuantizedWeight,
+    ffn_up_weight: &QuantizedWeight,
+    ffn_down_weight: &QuantizedWeight,
+    seq_len: usize,
+    hidden_dim: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    let (Some(o_view), Some(ffn_gate_view), Some(ffn_up_view), Some(ffn_down_view)) = (
+        o_weight.backend_view(),
+        ffn_gate_weight.backend_view(),
+        ffn_up_weight.backend_view(),
+        ffn_down_weight.backend_view(),
+    ) else {
+        return Ok(None);
+    };
+    metal_runtime::metal_muse_prefill_o_tail_ffn_if_supported(
+        metal_runtime::MetalMusePrefillOTailFfnRequest {
+            attn_out,
+            hidden,
+            post_attn_norm_w,
+            ffn_norm_w,
+            post_ffn_norm_w,
+            o_weight_ggml: backend_ggml_type(o_view.quant()),
+            o_weight_raw: o_view.raw(),
+            o_weight_rows: o_view.rows(),
+            o_weight_cols: o_view.cols(),
+            ffn_gate_weight_ggml: backend_ggml_type(ffn_gate_view.quant()),
+            ffn_gate_weight_raw: ffn_gate_view.raw(),
+            ffn_gate_weight_rows: ffn_gate_view.rows(),
+            ffn_gate_weight_cols: ffn_gate_view.cols(),
+            ffn_up_weight_ggml: backend_ggml_type(ffn_up_view.quant()),
+            ffn_up_weight_raw: ffn_up_view.raw(),
+            ffn_up_weight_rows: ffn_up_view.rows(),
+            ffn_up_weight_cols: ffn_up_view.cols(),
+            ffn_down_weight_ggml: backend_ggml_type(ffn_down_view.quant()),
+            ffn_down_weight_raw: ffn_down_view.raw(),
+            ffn_down_weight_rows: ffn_down_view.rows(),
+            ffn_down_weight_cols: ffn_down_view.cols(),
+            seq_len,
+            q_dim: o_view.cols(),
+            hidden_dim,
+            ffn_dim: ffn_gate_view.rows(),
+            norm_eps,
+            post_norm_eps,
+        },
+    )
+    .map(|result| result.map(|output| output.hidden))
+    .map_err(crate::error::LlmError::Forward)
+}
