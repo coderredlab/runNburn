@@ -548,6 +548,10 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
         __pipeline_commit();
         __pipeline_wait_prior(0);
         __syncthreads();
+        unsigned packed_qs_pair = 0u;
+        unsigned packed_scales0 = 0u;
+        unsigned packed_scales1 = 0u;
+        unsigned packed_scales2 = 0u;
 
         for (unsigned sub = 0; sub < 8u; ++sub) {
             const unsigned load_row = tid >> 3;
@@ -567,24 +571,35 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                         __half2float(__ushort_as_half(static_cast<unsigned short>(raw_dmin)));
                 }
                 if (load_off == 0u) {
+                    if (sub == 0u) {
+                        packed_scales0 = *reinterpret_cast<const unsigned*>(packed + 4u);
+                        packed_scales1 = *reinterpret_cast<const unsigned*>(packed + 8u);
+                        packed_scales2 = *reinterpret_cast<const unsigned*>(packed + 12u);
+                    }
                     unsigned scale;
                     unsigned minimum;
                     if (sub < 4u) {
-                        scale = packed[4u + sub] & 63u;
-                        minimum = packed[8u + sub] & 63u;
+                        scale = (packed_scales0 >> (sub * 8u)) & 63u;
+                        minimum = (packed_scales1 >> (sub * 8u)) & 63u;
                     } else {
-                        scale = (packed[8u + sub] & 0x0fu)
-                            | ((packed[sub] >> 6) << 4);
-                        minimum = (packed[8u + sub] >> 4)
-                            | ((packed[4u + sub] >> 6) << 4);
+                        const unsigned shift = (sub - 4u) * 8u;
+                        const unsigned tail = (packed_scales2 >> shift) & 0xffu;
+                        scale = (tail & 0x0fu)
+                            | (((packed_scales0 >> shift) & 0xffu) >> 6 << 4);
+                        minimum = (tail >> 4)
+                            | (((packed_scales1 >> shift) & 0xffu) >> 6 << 4);
                     }
                     x_sc[load_row] = static_cast<unsigned char>(scale);
                     x_mn[load_row] = static_cast<unsigned char>(minimum);
                 }
                 const unsigned nibble_base = 16u + (sub >> 1) * 32u;
-                const unsigned packed_qs = *reinterpret_cast<const unsigned*>(packed + nibble_base + load_off);
-                const unsigned unpacked = ((sub & 1u) == 0u) ? (packed_qs & 0x0f0f0f0fu)
-                                                               : ((packed_qs >> 4) & 0x0f0f0f0fu);
+                if ((sub & 1u) == 0u) {
+                    packed_qs_pair = *reinterpret_cast<const unsigned*>(
+                        packed + nibble_base + load_off);
+                }
+                const unsigned unpacked = ((sub & 1u) == 0u)
+                    ? (packed_qs_pair & 0x0f0f0f0fu)
+                    : ((packed_qs_pair >> 4) & 0x0f0f0f0fu);
                 *reinterpret_cast<unsigned*>(a_dst) = unpacked;
             } else {
                 *reinterpret_cast<unsigned*>(a_dst) = 0u;
