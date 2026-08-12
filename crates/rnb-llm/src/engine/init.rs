@@ -84,6 +84,18 @@ fn default_kv_cache_format(
     }
 }
 
+fn f16_kv_cache_fits_host_budget(
+    f16_kv_bytes: u64,
+    host_budget_bytes: Option<u64>,
+    mapped_weight_bytes: u64,
+) -> bool {
+    f16_kv_bytes > 0
+        && host_budget_bytes.is_some_and(|budget| {
+            let remaining = budget.saturating_sub(mapped_weight_bytes);
+            f16_kv_bytes.saturating_mul(2) <= remaining
+        })
+}
+
 fn apply_host_memory_plan(
     weights: &mut super::layer_weights::ModelWeights,
     sparse_moe_cuda_enabled: bool,
@@ -470,12 +482,12 @@ impl Engine {
                 .transpose()
                 .map_err(crate::error::LlmError::ModelLoad)?
                 .unwrap_or_else(|| {
-                    // pm124: 압축 KVarn decode 는 매 토큰 전체 context re-dequant 가
-                    // compute floor (측정 Metal: KVarn ~42 vs F16 67 t/s, +55%). 메모리
-                    // 여유가 충분하면 F16(fast, memory-bound coalesced read)을, 부족하면
-                    // KVarn(압축, offloading·장문)을 고르는 적응형 정책. F16 KV 가 가중치
-                    // 로드 후 남는 예산의 절반 이하(2x headroom)일 때만 F16 — 낮은 RAM /
-                    // 장문에서는 자동으로 KVarn 로 후퇴. Metal 한정(CUDA 기본은 불변).
+                    // 압축 KVarn decode 는 매 토큰 전체 context를 dequantize한다.
+                    // 반면 F16은 더 크지만 coalesced read만 필요하다. F16 최대
+                    // capacity가 가중치 뒤 host budget의 절반 이하일 때만 F16을
+                    // 선택해 2x headroom을 남기고, 낮은 RAM·장문·offload 모델은
+                    // 자동으로 KVarn으로 후퇴한다. 전용 decode path가 있는
+                    // CUDA/Metal에서만 적용한다.
                     let f16_kv_bytes: u64 = weights
                         .layers
                         .iter()
@@ -491,14 +503,15 @@ impl Engine {
                                 * 2 // f16 bytes
                         })
                         .sum();
-                    let f16_fits = cfg!(all(feature = "metal", not(feature = "cuda")))
-                        && f16_kv_bytes > 0
-                        && host_memory_plan.ram_budget().is_some_and(|budget| {
-                            let remaining = budget
-                                .available_bytes()
-                                .saturating_sub(mapped_weight_bytes as u64);
-                            f16_kv_bytes.saturating_mul(2) <= remaining
-                        });
+                    let f16_accelerated = cfg!(any(feature = "cuda", feature = "metal"));
+                    let f16_fits = f16_accelerated
+                        && f16_kv_cache_fits_host_budget(
+                            f16_kv_bytes,
+                            host_memory_plan
+                                .ram_budget()
+                                .map(|budget| budget.available_bytes()),
+                            mapped_weight_bytes as u64,
+                        );
                     if f16_fits {
                         KvCacheFormat::F16
                     } else {
@@ -1245,6 +1258,23 @@ mod kv_cache_default_tests {
     #[test]
     fn unaccelerated_gpu_backends_keep_f16_default() {
         assert_eq!(default_kv_cache_format(false, true), KvCacheFormat::F16);
+    }
+
+    #[test]
+    fn f16_kv_cache_requires_double_capacity_headroom() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert!(f16_kv_cache_fits_host_budget(
+            6 * GIB,
+            Some(32 * GIB),
+            16 * GIB
+        ));
+        assert!(!f16_kv_cache_fits_host_budget(
+            9 * GIB,
+            Some(32 * GIB),
+            16 * GIB
+        ));
+        assert!(!f16_kv_cache_fits_host_budget(6 * GIB, None, 16 * GIB));
+        assert!(!f16_kv_cache_fits_host_budget(0, Some(32 * GIB), 16 * GIB));
     }
 
     #[cfg(feature = "cuda")]
