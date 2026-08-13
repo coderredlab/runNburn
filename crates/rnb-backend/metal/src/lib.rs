@@ -1518,8 +1518,29 @@ pub struct GemmaPrefillFullLayerBackendRequest<'a> {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
+pub enum MusePrefillOTailInput<'a> {
+    Attention(&'a [f32]),
+    TargetAttention {
+        query: &'a [f32],
+        cached_k_f16: &'a [u16],
+        cached_v_f16: &'a [u16],
+        sequence_epoch: u64,
+        cache_layer: usize,
+        pos_start: usize,
+        kv_len: usize,
+        attention_gate: &'a [f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
 pub struct MusePrefillOTailFfnBackendRequest<'a> {
-    pub attn_out: &'a [f32],
+    pub input: MusePrefillOTailInput<'a>,
     pub hidden: &'a [f32],
     pub post_attn_norm_w: &'a [f32],
     pub ffn_norm_w: &'a [f32],
@@ -1966,6 +1987,9 @@ pub struct MetalBackend {
     dflash_attention_carriers: RefCell<
         HashMap<(usize, usize, usize, usize, usize), dflash_attention::DflashAttentionCarrier>,
     >,
+    /// Muse target continuation attention scratch, keyed by tiny verify shape.
+    muse_target_attention_carriers:
+        RefCell<HashMap<(usize, usize, usize), dflash_attention::MuseTargetAttentionCarrier>>,
     /// pm50 M1: prefill dense gated ATN core(q/k/v→flash→gate) carrier.
     prefill_atn_core_carriers:
         RefCell<HashMap<AtnCoreKey, prefill_atn_core_chain::PrefillAtnCoreCarrier>>,
@@ -2238,6 +2262,7 @@ impl MetalBackend {
                 prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
                 prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
                 dflash_attention_carriers: RefCell::new(HashMap::new()),
+                muse_target_attention_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_core_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -2477,6 +2502,7 @@ impl MetalBackend {
             prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
             prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
             dflash_attention_carriers: RefCell::new(HashMap::new()),
+            muse_target_attention_carriers: RefCell::new(HashMap::new()),
             prefill_atn_core_carriers: RefCell::new(HashMap::new()),
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
             prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -4644,7 +4670,47 @@ impl MetalBackend {
         let expected_attn = Self::atn_core_checked_mul(req.seq_len, req.q_dim, "attention len")?;
         let expected_hidden =
             Self::atn_core_checked_mul(req.seq_len, req.hidden_dim, "hidden len")?;
-        Self::atn_core_require_eq("attention len", req.attn_out.len(), expected_attn)?;
+        match req.input {
+            MusePrefillOTailInput::Attention(attn_out) => {
+                Self::atn_core_require_eq("attention len", attn_out.len(), expected_attn)?;
+            }
+            MusePrefillOTailInput::TargetAttention {
+                query,
+                cached_k_f16,
+                cached_v_f16,
+                pos_start,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                ..
+            } => {
+                Self::atn_core_require_eq("target query len", query.len(), expected_attn)?;
+                let expected_kv = Self::atn_core_checked_mul(
+                    Self::atn_core_checked_mul(kv_len, num_kv_heads, "target KV heads")?,
+                    head_dim,
+                    "target KV len",
+                )?;
+                Self::atn_core_require_eq("target key cache len", cached_k_f16.len(), expected_kv)?;
+                Self::atn_core_require_eq(
+                    "target value cache len",
+                    cached_v_f16.len(),
+                    expected_kv,
+                )?;
+                if !(2..=4).contains(&req.seq_len)
+                    || pos_start == 0
+                    || kv_len != pos_start.saturating_add(req.seq_len)
+                    || head_dim != 128
+                    || num_kv_heads == 0
+                    || num_heads % num_kv_heads != 0
+                    || req.q_dim != num_heads * head_dim
+                    || !scale.is_finite()
+                {
+                    return Err("Metal Muse target attention+O+FFN contract mismatch".to_string());
+                }
+            }
+        }
         Self::atn_core_require_eq("hidden len", req.hidden.len(), expected_hidden)?;
         for (role, norm) in [
             ("post_attn_norm", req.post_attn_norm_w),
@@ -4716,29 +4782,109 @@ impl MetalBackend {
             .as_ref()
             .ok_or_else(|| "Muse prefill O+FFN carrier slot initialization failed".to_string())?
             .1;
-        let output = prefill_atn_core_chain::prefill_muse_o_tail_ffn_dispatch(
-            ctx,
-            carrier,
-            prefill_atn_core_chain::MusePrefillOTailFfnDispatchRequest {
-                attn_out: req.attn_out,
-                hidden: req.hidden,
-                post_attn_norm_w: req.post_attn_norm_w,
-                ffn_norm_w: req.ffn_norm_w,
-                post_ffn_norm_w: req.post_ffn_norm_w,
-                o_w_buf: &o_w_buf,
-                o_w_off,
-                o_quant: req.o_weight.quant,
-                ffn_gate_w_buf: &gate_w_buf,
-                ffn_gate_w_off: gate_w_off,
-                ffn_gate_quant: req.ffn_gate_weight.quant,
-                ffn_up_w_buf: &up_w_buf,
-                ffn_up_w_off: up_w_off,
-                ffn_up_quant: req.ffn_up_weight.quant,
-                ffn_down_w_buf: &down_w_buf,
-                ffn_down_w_off: down_w_off,
-                ffn_down_quant: req.ffn_down_weight.quant,
-            },
-        )?;
+        let ops = prefill_atn_core_chain::MuseOTailFfnOpsRequest {
+            hidden: req.hidden,
+            post_attn_norm_w: req.post_attn_norm_w,
+            ffn_norm_w: req.ffn_norm_w,
+            post_ffn_norm_w: req.post_ffn_norm_w,
+            o_w_buf: &o_w_buf,
+            o_w_off,
+            o_quant: req.o_weight.quant,
+            ffn_gate_w_buf: &gate_w_buf,
+            ffn_gate_w_off: gate_w_off,
+            ffn_gate_quant: req.ffn_gate_weight.quant,
+            ffn_up_w_buf: &up_w_buf,
+            ffn_up_w_off: up_w_off,
+            ffn_up_quant: req.ffn_up_weight.quant,
+            ffn_down_w_buf: &down_w_buf,
+            ffn_down_w_off: down_w_off,
+            ffn_down_quant: req.ffn_down_weight.quant,
+        };
+        let output = match req.input {
+            MusePrefillOTailInput::Attention(attn_out) => {
+                prefill_atn_core_chain::prefill_muse_o_tail_ffn_dispatch(
+                    ctx,
+                    carrier,
+                    prefill_atn_core_chain::MusePrefillOTailFfnDispatchRequest { attn_out, ops },
+                )?
+            }
+            MusePrefillOTailInput::TargetAttention {
+                query,
+                cached_k_f16,
+                cached_v_f16,
+                sequence_epoch,
+                cache_layer,
+                pos_start,
+                kv_len,
+                attention_gate,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                sliding_window,
+            } => {
+                let capacity = kv_len.next_multiple_of(64);
+                {
+                    let mut cache = self.gemma_prefill_f16kv_residents.borrow_mut();
+                    let recreate = cache.get(&cache_layer).is_none_or(|entry| {
+                        entry.sequence_epoch != sequence_epoch
+                            || entry.kv.kv_int8
+                            || entry.kv.num_kv_heads != num_kv_heads
+                            || entry.kv.head_dim != head_dim
+                            || entry.kv.capacity < capacity
+                    });
+                    if recreate {
+                        cache.insert(
+                            cache_layer,
+                            GemmaPrefillF16KvResident {
+                                sequence_epoch,
+                                kv: compute::KvResident::new_f16_zeroed(
+                                    ctx,
+                                    num_kv_heads,
+                                    head_dim,
+                                    capacity,
+                                ),
+                            },
+                        );
+                    }
+                    cache
+                        .get_mut(&cache_layer)
+                        .expect("Metal Muse target resident initialized")
+                        .kv
+                        .sync_f16_range(cached_k_f16, cached_v_f16, pos_start, kv_len);
+                }
+                let cache = self.gemma_prefill_f16kv_residents.borrow();
+                let resident = &cache
+                    .get(&cache_layer)
+                    .expect("Metal Muse target resident retained")
+                    .kv;
+                let target_key = (req.seq_len, num_heads, num_kv_heads);
+                let mut target_carriers = self.muse_target_attention_carriers.borrow_mut();
+                let target = target_carriers.entry(target_key).or_insert_with(|| {
+                    dflash_attention::MuseTargetAttentionCarrier::new(
+                        ctx,
+                        req.seq_len,
+                        num_heads,
+                        num_kv_heads,
+                    )
+                });
+                prefill_atn_core_chain::prefill_muse_target_attention_o_tail_ffn_dispatch(
+                    ctx,
+                    target,
+                    carrier,
+                    prefill_atn_core_chain::MuseTargetAttentionOTailFfnDispatchRequest {
+                        query,
+                        key: &resident.k_buf,
+                        value: &resident.v_buf,
+                        kv_len,
+                        sliding_window,
+                        scale,
+                        attention_gate,
+                        ops,
+                    },
+                )?
+            }
+        };
         Ok(Some(output))
     }
 
@@ -15053,7 +15199,7 @@ mod tests {
         for seq_len in [1usize, 2, 1] {
             let output = backend
                 .prefill_muse_o_tail_ffn_if_supported(MusePrefillOTailFfnBackendRequest {
-                    attn_out: &det_vals(seq_len * DIM, 0.01),
+                    input: MusePrefillOTailInput::Attention(&det_vals(seq_len * DIM, 0.01)),
                     hidden: &det_vals(seq_len * DIM, 0.02),
                     post_attn_norm_w: &norm,
                     ffn_norm_w: &norm,

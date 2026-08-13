@@ -21,6 +21,7 @@ use attention_output::apply_prefill_attention_output;
 use dense_chain::{
     try_prefill_attention_output_ffn_chain, try_prefill_f16kv_attention_output_ffn_chain,
     try_prefill_f16kv_muse_attention_output_ffn_chain, try_prefill_muse_attention_output_ffn_chain,
+    try_prefill_muse_target_attention_output_ffn_chain,
 };
 use ffn::forward_prefill_ffn;
 pub(in crate::engine) use fused_qkv_chain::Gemma4PrefillPleFusion;
@@ -1322,6 +1323,37 @@ where
     let has_softcap = resolve_attention_softcap(architecture).is_some();
     if !non_causal {
         if let Some((cached_k_f16, cached_v_f16)) = cached_kv_f16 {
+            if let (Some((sequence_epoch, cache_layer, _)), Some(attention_gate)) =
+                (metal_f16_kv_resident, attn_gate.as_ref())
+            {
+                if let Some(chained_hidden) = try_prefill_muse_target_attention_output_ffn_chain(
+                    metadata,
+                    architecture,
+                    &hidden,
+                    w,
+                    &q,
+                    cached_k_f16,
+                    cached_v_f16,
+                    sequence_epoch,
+                    cache_layer,
+                    attention_gate,
+                    layout,
+                    layer_idx,
+                    seq_len,
+                    pos_start,
+                    kv_len,
+                    norm_eps,
+                    sliding_window,
+                )? {
+                    if kv_cache.layer_uses_kvarn(kv_cache_layer) {
+                        kv_cache
+                            .compact_layer(kv_cache_layer)
+                            .map_err(crate::error::LlmError::Forward)?;
+                    }
+                    prof("attention+o_proj+ffn_chain", t0);
+                    return Ok(PrefillAttentionStep::FinalHidden(chained_hidden));
+                }
+            }
             if let Some(attention_gate) = attn_gate.as_ref() {
                 if let Some(chained_hidden) = try_prefill_f16kv_muse_attention_output_ffn_chain(
                     metadata,

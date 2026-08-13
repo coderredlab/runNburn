@@ -212,7 +212,8 @@ pub(super) use metal_prefill::{
 pub(super) use metal_prefill::{
     metal_gemma_prefill_full_layer_if_supported, metal_gemma_prefill_layer_range_if_supported,
     metal_gemma_prefill_qkv_o_resident_if_supported, metal_gemma_prefill_qkv_o_tail_if_supported,
-    metal_muse_prefill_o_tail_ffn_if_supported, metal_prefill_atn_core_if_supported,
+    metal_muse_prefill_o_tail_ffn_if_supported,
+    metal_muse_target_attention_o_tail_ffn_if_supported, metal_prefill_atn_core_if_supported,
     metal_prefill_atn_full_layer_if_supported, metal_prefill_atn_o_tail_if_supported,
     metal_prefill_atn_o_tail_record_adapter_reject, GemmaPrefillLayerRangeSpec,
     MetalPrefillAtnCoreShape,

@@ -7,7 +7,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder,
 };
 
 use crate::compute::{
@@ -89,6 +90,8 @@ pub(crate) struct MusePrefillOTailFfnCarrier {
     pub q_dim: usize,
     pub hidden_dim: usize,
     pub ffn_dim: usize,
+    attention_gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    attention_gated_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     attn_out_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     o_in_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -355,6 +358,8 @@ impl MusePrefillOTailFfnCarrier {
             q_dim,
             hidden_dim,
             ffn_dim,
+            attention_gate_dev: empty_f32_buf(ctx, seq_len * q_dim),
+            attention_gated_dev: private_f32_buf(ctx, seq_len * q_dim),
             attn_out_dev: empty_f32_buf(ctx, seq_len * q_dim),
             hidden_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
             o_in_f16_dev: private_f16_buf(ctx, seq_len * q_dim),
@@ -380,24 +385,24 @@ impl MusePrefillOTailFfnCarrier {
         }
     }
 
-    fn upload(
-        &self,
-        attn_out: &[f32],
-        hidden: &[f32],
-        post_attn_norm_w: &[f32],
-        ffn_norm_w: &[f32],
-        post_ffn_norm_w: &[f32],
-    ) {
+    fn upload_attention(&self, attn_out: &[f32]) {
         debug_assert_eq!(attn_out.len(), self.seq_len * self.q_dim);
-        debug_assert_eq!(hidden.len(), self.seq_len * self.hidden_dim);
-        debug_assert_eq!(post_attn_norm_w.len(), self.hidden_dim);
-        debug_assert_eq!(ffn_norm_w.len(), self.hidden_dim);
-        debug_assert_eq!(post_ffn_norm_w.len(), self.hidden_dim);
         copy_f32(attn_out, &self.attn_out_dev);
-        copy_f32(hidden, &self.hidden_dev);
-        copy_f32(post_attn_norm_w, &self.post_attn_norm_w_dev);
-        copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
-        copy_f32(post_ffn_norm_w, &self.post_ffn_norm_w_dev);
+    }
+
+    fn upload_ops(&self, attention_gate: Option<&[f32]>, req: MuseOTailFfnOpsRequest<'_>) {
+        debug_assert_eq!(req.hidden.len(), self.seq_len * self.hidden_dim);
+        debug_assert_eq!(req.post_attn_norm_w.len(), self.hidden_dim);
+        debug_assert_eq!(req.ffn_norm_w.len(), self.hidden_dim);
+        debug_assert_eq!(req.post_ffn_norm_w.len(), self.hidden_dim);
+        if let Some(gate) = attention_gate {
+            debug_assert_eq!(gate.len(), self.seq_len * self.q_dim);
+            copy_f32(gate, &self.attention_gate_dev);
+        }
+        copy_f32(req.hidden, &self.hidden_dev);
+        copy_f32(req.post_attn_norm_w, &self.post_attn_norm_w_dev);
+        copy_f32(req.ffn_norm_w, &self.ffn_norm_w_dev);
+        copy_f32(req.post_ffn_norm_w, &self.post_ffn_norm_w_dev);
     }
 }
 
@@ -541,9 +546,8 @@ pub(crate) struct PrefillAtnFullLayerDispatchRequest<'a> {
     pub ffn_down_quant: TensoropsQuant,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) struct MusePrefillOTailFfnDispatchRequest<'a> {
-    pub attn_out: &'a [f32],
+#[derive(Clone, Copy)]
+pub(crate) struct MuseOTailFfnOpsRequest<'a> {
     pub hidden: &'a [f32],
     pub post_attn_norm_w: &'a [f32],
     pub ffn_norm_w: &'a [f32],
@@ -560,6 +564,24 @@ pub(crate) struct MusePrefillOTailFfnDispatchRequest<'a> {
     pub ffn_down_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub ffn_down_w_off: u32,
     pub ffn_down_quant: TensoropsQuant,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct MusePrefillOTailFfnDispatchRequest<'a> {
+    pub attn_out: &'a [f32],
+    pub ops: MuseOTailFfnOpsRequest<'a>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct MuseTargetAttentionOTailFfnDispatchRequest<'a> {
+    pub query: &'a [f32],
+    pub key: &'a ProtocolObject<dyn MTLBuffer>,
+    pub value: &'a ProtocolObject<dyn MTLBuffer>,
+    pub kv_len: usize,
+    pub sliding_window: Option<usize>,
+    pub scale: f32,
+    pub attention_gate: &'a [f32],
+    pub ops: MuseOTailFfnOpsRequest<'a>,
 }
 
 pub(crate) struct PrefillAtnOTailDispatchRequest<'a> {
@@ -1218,38 +1240,24 @@ pub(crate) fn prefill_atn_o_tail_dispatch(
     Ok((hidden, k_bits, v_bits))
 }
 
-pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
+fn encode_muse_o_tail_ffn_ops(
     ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &MusePrefillOTailFfnCarrier,
-    req: MusePrefillOTailFfnDispatchRequest<'_>,
-) -> Result<Vec<f32>, String> {
-    carrier.upload(
-        req.attn_out,
-        req.hidden,
-        req.post_attn_norm_w,
-        req.ffn_norm_w,
-        req.post_ffn_norm_w,
-    );
-
-    let cmd = ctx
-        .queue
-        .commandBuffer()
-        .ok_or_else(|| "Metal Muse prefill O+FFN: command buffer creation failed".to_string())?;
-    let enc = cmd
-        .computeCommandEncoder()
-        .ok_or_else(|| "Metal Muse prefill O+FFN: compute encoder creation failed".to_string())?;
-
+    attn_out: &ProtocolObject<dyn MTLBuffer>,
+    req: MuseOTailFfnOpsRequest<'_>,
+) {
     encode_cast_f32_to_f16(
         ctx,
-        &enc,
-        &carrier.attn_out_dev,
+        enc,
+        attn_out,
         &carrier.o_in_f16_dev,
         &carrier.q_elems_buf,
         carrier.seq_len * carrier.q_dim,
     );
     encode_quant_gemm_v2(
         ctx,
-        &enc,
+        enc,
         req.o_quant,
         req.o_w_buf,
         req.o_w_off,
@@ -1263,7 +1271,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_rms_norm_batch(
         ctx,
-        &enc,
+        enc,
         &carrier.o_proj_dev,
         &carrier.post_attn_norm_w_dev,
         &carrier.ffn_normed_dev,
@@ -1273,7 +1281,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     crate::ffn_chain::encode_residual_add(
         ctx,
-        &enc,
+        enc,
         &carrier.hidden_dev,
         &carrier.ffn_normed_dev,
         &carrier.hidden_elems_buf,
@@ -1281,7 +1289,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_rms_norm_batch(
         ctx,
-        &enc,
+        enc,
         &carrier.hidden_dev,
         &carrier.ffn_norm_w_dev,
         &carrier.ffn_normed_dev,
@@ -1291,7 +1299,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_cast_f32_to_f16(
         ctx,
-        &enc,
+        enc,
         &carrier.ffn_normed_dev,
         &carrier.ffn_normed_f16_dev,
         &carrier.hidden_elems_buf,
@@ -1299,7 +1307,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_quant_gemm_v2(
         ctx,
-        &enc,
+        enc,
         req.ffn_gate_quant,
         req.ffn_gate_w_buf,
         req.ffn_gate_w_off,
@@ -1313,7 +1321,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_quant_gemm_v2(
         ctx,
-        &enc,
+        enc,
         req.ffn_up_quant,
         req.ffn_up_w_buf,
         req.ffn_up_w_off,
@@ -1327,7 +1335,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_silu_mul_to_f16(
         ctx,
-        &enc,
+        enc,
         &carrier.ffn_gate_dev,
         &carrier.ffn_up_dev,
         &carrier.ffn_act_f16_dev,
@@ -1336,7 +1344,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_quant_gemm_v2(
         ctx,
-        &enc,
+        enc,
         req.ffn_down_quant,
         req.ffn_down_w_buf,
         req.ffn_down_w_off,
@@ -1350,7 +1358,7 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     encode_rms_norm_batch(
         ctx,
-        &enc,
+        enc,
         &carrier.ffn_down_dev,
         &carrier.post_ffn_norm_w_dev,
         &carrier.ffn_normed_dev,
@@ -1360,13 +1368,73 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     );
     crate::ffn_chain::encode_residual_add(
         ctx,
-        &enc,
+        enc,
         &carrier.hidden_dev,
         &carrier.ffn_normed_dev,
         &carrier.hidden_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
     );
+}
 
+pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
+    ctx: &MetalContext,
+    carrier: &MusePrefillOTailFfnCarrier,
+    req: MusePrefillOTailFfnDispatchRequest<'_>,
+) -> Result<Vec<f32>, String> {
+    carrier.upload_attention(req.attn_out);
+    carrier.upload_ops(None, req.ops);
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal Muse prefill O+FFN: command buffer creation failed".to_string())?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Muse prefill O+FFN: compute encoder creation failed".to_string())?;
+    encode_muse_o_tail_ffn_ops(ctx, &enc, carrier, &carrier.attn_out_dev, req.ops);
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    ensure_command_completed(&cmd)?;
+    Ok(readback(
+        &carrier.hidden_dev,
+        carrier.seq_len * carrier.hidden_dim,
+    ))
+}
+
+pub(crate) fn prefill_muse_target_attention_o_tail_ffn_dispatch(
+    ctx: &MetalContext,
+    target: &crate::dflash_attention::MuseTargetAttentionCarrier,
+    carrier: &MusePrefillOTailFfnCarrier,
+    req: MuseTargetAttentionOTailFfnDispatchRequest<'_>,
+) -> Result<Vec<f32>, String> {
+    target.upload_query(req.query)?;
+    carrier.upload_ops(Some(req.attention_gate), req.ops);
+    let cmd = ctx.queue.commandBuffer().ok_or_else(|| {
+        "Metal Muse target attention+O+FFN: command buffer creation failed".to_string()
+    })?;
+    let enc = cmd.computeCommandEncoder().ok_or_else(|| {
+        "Metal Muse target attention+O+FFN: compute encoder creation failed".to_string()
+    })?;
+    target.encode(
+        ctx,
+        &enc,
+        req.key,
+        req.value,
+        req.kv_len,
+        req.sliding_window,
+        req.scale,
+    )?;
+    enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+    encode_prefill_gate_apply(
+        ctx,
+        &enc,
+        target.output_buffer(),
+        &carrier.attention_gate_dev,
+        &carrier.attention_gated_dev,
+        &carrier.q_elems_buf,
+        carrier.seq_len * carrier.q_dim,
+    );
+    encode_muse_o_tail_ffn_ops(ctx, &enc, carrier, &carrier.attention_gated_dev, req.ops);
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
@@ -1923,22 +1991,24 @@ mod tests {
             &carrier,
             MusePrefillOTailFfnDispatchRequest {
                 attn_out: &attn_out,
-                hidden: &hidden,
-                post_attn_norm_w: &post_attn_norm_w,
-                ffn_norm_w: &ffn_norm_w,
-                post_ffn_norm_w: &post_ffn_norm_w,
-                o_w_buf: &o_weight_dev,
-                o_w_off: 0,
-                o_quant: TensoropsQuant::Q4K,
-                ffn_gate_w_buf: &gate_weight_dev,
-                ffn_gate_w_off: 0,
-                ffn_gate_quant: TensoropsQuant::Q4K,
-                ffn_up_w_buf: &up_weight_dev,
-                ffn_up_w_off: 0,
-                ffn_up_quant: TensoropsQuant::Q4K,
-                ffn_down_w_buf: &down_weight_dev,
-                ffn_down_w_off: 0,
-                ffn_down_quant: TensoropsQuant::Q4K,
+                ops: MuseOTailFfnOpsRequest {
+                    hidden: &hidden,
+                    post_attn_norm_w: &post_attn_norm_w,
+                    ffn_norm_w: &ffn_norm_w,
+                    post_ffn_norm_w: &post_ffn_norm_w,
+                    o_w_buf: &o_weight_dev,
+                    o_w_off: 0,
+                    o_quant: TensoropsQuant::Q4K,
+                    ffn_gate_w_buf: &gate_weight_dev,
+                    ffn_gate_w_off: 0,
+                    ffn_gate_quant: TensoropsQuant::Q4K,
+                    ffn_up_w_buf: &up_weight_dev,
+                    ffn_up_w_off: 0,
+                    ffn_up_quant: TensoropsQuant::Q4K,
+                    ffn_down_w_buf: &down_weight_dev,
+                    ffn_down_w_off: 0,
+                    ffn_down_quant: TensoropsQuant::Q4K,
+                },
             },
         )
         .expect("Muse O+FFN dispatch");

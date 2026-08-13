@@ -104,8 +104,28 @@ pub struct MetalPrefillAtnFullLayerOut {
     pub v_bits: Vec<u16>,
 }
 
+#[derive(Clone, Copy)]
+pub enum MetalMusePrefillOTailInput<'a> {
+    Attention(&'a [f32]),
+    TargetAttention {
+        query: &'a [f32],
+        cached_k_f16: &'a [u16],
+        cached_v_f16: &'a [u16],
+        sequence_epoch: u64,
+        cache_layer: usize,
+        pos_start: usize,
+        kv_len: usize,
+        num_heads: usize,
+        attention_gate: &'a [f32],
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+    },
+}
+
 pub struct MetalMusePrefillOTailFfnRequest<'a> {
-    pub attn_out: &'a [f32],
+    pub input: MetalMusePrefillOTailInput<'a>,
     pub hidden: &'a [f32],
     pub post_attn_norm_w: &'a [f32],
     pub ffn_norm_w: &'a [f32],
@@ -5862,12 +5882,95 @@ pub fn metal_gemma_prefill_qkv_o_resident_if_supported(
     })
 }
 
+pub fn metal_muse_target_attention_requested() -> bool {
+    std::env::var("RNB_METAL_MUSE_TARGET_ATTN").as_deref() == Ok("1")
+}
+#[cfg(test)]
+mod muse_target_attention_policy_tests {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn target_attention_is_explicit_only() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("RNB_METAL_MUSE_TARGET_ATTN");
+        unsafe {
+            std::env::remove_var("RNB_METAL_MUSE_TARGET_ATTN");
+        }
+        assert!(!super::metal_muse_target_attention_requested());
+        unsafe {
+            std::env::set_var("RNB_METAL_MUSE_TARGET_ATTN", "1");
+        }
+        assert!(super::metal_muse_target_attention_requested());
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("RNB_METAL_MUSE_TARGET_ATTN", value);
+            } else {
+                std::env::remove_var("RNB_METAL_MUSE_TARGET_ATTN");
+            }
+        }
+    }
+}
+
 pub fn metal_muse_prefill_o_tail_ffn_if_supported(
     req: MetalMusePrefillOTailFfnRequest<'_>,
 ) -> Result<Option<MetalMusePrefillOTailFfnOut>> {
     if env_falsey("RNB_METAL_MUSE_PREFILL_O_FFN_CHAIN") {
         return Ok(None);
     }
+    let input = match req.input {
+        MetalMusePrefillOTailInput::Attention(attn_out) => {
+            rnb_backend_metal::MusePrefillOTailInput::Attention(attn_out)
+        }
+        MetalMusePrefillOTailInput::TargetAttention {
+            query,
+            cached_k_f16,
+            cached_v_f16,
+            sequence_epoch,
+            cache_layer,
+            pos_start,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            attention_gate,
+            head_dim,
+            scale,
+            sliding_window,
+        } => {
+            if !metal_muse_target_attention_requested()
+                || !(2..=4).contains(&req.seq_len)
+                || pos_start == 0
+                || kv_len != pos_start.saturating_add(req.seq_len)
+                || head_dim != 128
+                || num_kv_heads == 0
+                || num_heads % num_kv_heads != 0
+            {
+                return Ok(None);
+            }
+            GEMMA_PREFILL_F16KV_RESIDENT_USED.with(|used| {
+                if !used.replace(true) {
+                    GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            });
+            rnb_backend_metal::MusePrefillOTailInput::TargetAttention {
+                query,
+                cached_k_f16,
+                cached_v_f16,
+                sequence_epoch,
+                cache_layer,
+                pos_start,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                attention_gate,
+                scale,
+                sliding_window,
+            }
+        }
+    };
     let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
         return Ok(None);
     };
@@ -5890,7 +5993,7 @@ pub fn metal_muse_prefill_o_tail_ffn_if_supported(
         backend
             .prefill_muse_o_tail_ffn_if_supported(
                 rnb_backend_metal::MusePrefillOTailFfnBackendRequest {
-                    attn_out: req.attn_out,
+                    input,
                     hidden: req.hidden,
                     post_attn_norm_w: req.post_attn_norm_w,
                     ffn_norm_w: req.ffn_norm_w,

@@ -835,6 +835,9 @@ pub struct MetalContext {
     /// Muse DFlash non-causal sliding-window attention. HD=128, one SIMD-group per row/head.
     pub(crate) dflash_attention_hd128_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Muse target causal F16 attention matching the CPU mixed-precision contract.
+    pub(crate) muse_target_attention_f16_hd128_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm48 ② prefill qk_norm→rope fused 커널(device-resident attention chain 부품).
     /// per-head RMSNorm → text M-RoPE(partial n_rot) 를 device q/k 에 in-chain 적용. 항상 build.
     pub(crate) prefill_rope_qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2086,6 +2089,11 @@ pub fn build_metal_context_with_opts(
     };
     let dflash_attention_hd128_pipeline =
         build_pipeline(&device, DFLASH_ATTENTION_SRC, "dflash_attention_hd128");
+    let muse_target_attention_f16_hd128_pipeline = build_pipeline_safe_math(
+        &device,
+        DFLASH_ATTENTION_SRC,
+        "muse_target_attention_f16_hd128",
+    );
     let q4k_pipeline = build_pipeline(&device, GEMV_Q4K_SRC, "gemv_q4k");
     let q4k_simd_pipeline = build_pipeline(&device, GEMV_Q4K_SIMD_SRC, "gemv_q4k_simd");
     let q4k_coalesced_pipeline =
@@ -2662,6 +2670,7 @@ pub fn build_metal_context_with_opts(
         flash_attn_prefill_tg_pipeline,
         flash_attn_prefill_hd512_gemma_pipeline,
         dflash_attention_hd128_pipeline,
+        muse_target_attention_f16_hd128_pipeline,
         prefill_rope_qk_norm_pipeline,
         prefill_neox_qk_norm_pipeline,
         prefill_neox_qk_norm_table_pipeline,

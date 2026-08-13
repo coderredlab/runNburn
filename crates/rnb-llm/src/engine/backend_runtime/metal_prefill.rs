@@ -1002,6 +1002,100 @@ pub(in crate::engine) fn metal_muse_prefill_o_tail_ffn_if_supported(
     norm_eps: f32,
     post_norm_eps: f32,
 ) -> crate::error::Result<Option<Vec<f32>>> {
+    metal_muse_prefill_o_tail_ffn_input_if_supported(
+        metal_runtime::MetalMusePrefillOTailInput::Attention(attn_out),
+        hidden,
+        post_attn_norm_w,
+        ffn_norm_w,
+        post_ffn_norm_w,
+        o_weight,
+        ffn_gate_weight,
+        ffn_up_weight,
+        ffn_down_weight,
+        seq_len,
+        hidden_dim,
+        norm_eps,
+        post_norm_eps,
+    )
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_muse_target_attention_o_tail_ffn_if_supported(
+    query: &[f32],
+    cached_k_f16: &[u16],
+    attention_gate: &[f32],
+    cached_v_f16: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    pos_start: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    hidden: &[f32],
+    post_attn_norm_w: &[f32],
+    ffn_norm_w: &[f32],
+    post_ffn_norm_w: &[f32],
+    o_weight: &QuantizedWeight,
+    ffn_gate_weight: &QuantizedWeight,
+    ffn_up_weight: &QuantizedWeight,
+    ffn_down_weight: &QuantizedWeight,
+    seq_len: usize,
+    hidden_dim: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    metal_muse_prefill_o_tail_ffn_input_if_supported(
+        metal_runtime::MetalMusePrefillOTailInput::TargetAttention {
+            query,
+            cached_k_f16,
+            cached_v_f16,
+            sequence_epoch,
+            cache_layer,
+            pos_start,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            attention_gate,
+            head_dim,
+            scale,
+            sliding_window,
+        },
+        hidden,
+        post_attn_norm_w,
+        ffn_norm_w,
+        post_ffn_norm_w,
+        o_weight,
+        ffn_gate_weight,
+        ffn_up_weight,
+        ffn_down_weight,
+        seq_len,
+        hidden_dim,
+        norm_eps,
+        post_norm_eps,
+    )
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+fn metal_muse_prefill_o_tail_ffn_input_if_supported(
+    input: metal_runtime::MetalMusePrefillOTailInput<'_>,
+    hidden: &[f32],
+    post_attn_norm_w: &[f32],
+    ffn_norm_w: &[f32],
+    post_ffn_norm_w: &[f32],
+    o_weight: &QuantizedWeight,
+    ffn_gate_weight: &QuantizedWeight,
+    ffn_up_weight: &QuantizedWeight,
+    ffn_down_weight: &QuantizedWeight,
+    seq_len: usize,
+    hidden_dim: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<Option<Vec<f32>>> {
     let (Some(o_view), Some(ffn_gate_view), Some(ffn_up_view), Some(ffn_down_view)) = (
         o_weight.backend_view(),
         ffn_gate_weight.backend_view(),
@@ -1012,7 +1106,7 @@ pub(in crate::engine) fn metal_muse_prefill_o_tail_ffn_if_supported(
     };
     metal_runtime::metal_muse_prefill_o_tail_ffn_if_supported(
         metal_runtime::MetalMusePrefillOTailFfnRequest {
-            attn_out,
+            input,
             hidden,
             post_attn_norm_w,
             ffn_norm_w,

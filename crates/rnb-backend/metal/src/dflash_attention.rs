@@ -167,6 +167,136 @@ impl DflashAttentionCarrier {
     }
 }
 
+pub(crate) struct MuseTargetAttentionCarrier {
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    query: Retained<ProtocolObject<dyn MTLBuffer>>,
+    output: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+impl MuseTargetAttentionCarrier {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+    ) -> Self {
+        let elements = seq_len * num_heads * 128;
+        Self {
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            query: empty_f32_buf(ctx, elements),
+            output: empty_f32_buf(ctx, elements),
+        }
+    }
+
+    pub(crate) fn upload_query(&self, query: &[f32]) -> Result<(), String> {
+        if self.seq_len == 0
+            || self.num_heads == 0
+            || self.num_kv_heads == 0
+            || self.num_heads % self.num_kv_heads != 0
+            || query.len() != self.seq_len * self.num_heads * 128
+        {
+            return Err("Metal Muse target attention query contract mismatch".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                query.as_ptr(),
+                self.query.contents().as_ptr().cast::<f32>(),
+                query.len(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn output_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.output
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode(
+        &self,
+        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        key: &ProtocolObject<dyn MTLBuffer>,
+        value: &ProtocolObject<dyn MTLBuffer>,
+        kv_len: usize,
+        sliding_window: Option<usize>,
+        scale: f32,
+    ) -> Result<(), String> {
+        if kv_len < self.seq_len || !scale.is_finite() {
+            return Err("Metal Muse target attention cache contract mismatch".to_string());
+        }
+        encoder.setComputePipelineState(&ctx.muse_target_attention_f16_hd128_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&self.query), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(key), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(value), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&self.output), 0, 3);
+        }
+        set_u32(encoder, kv_len, 4)?;
+        set_u32(encoder, self.seq_len, 5)?;
+        set_u32(encoder, self.num_heads, 6)?;
+        set_u32(encoder, self.num_kv_heads, 7)?;
+        set_u32(encoder, sliding_window.unwrap_or(0), 8)?;
+        set_f32(encoder, scale, 9);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: self.seq_len * self.num_heads,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch(
+        &self,
+        ctx: &MetalContext,
+        query: &[f32],
+        key: &ProtocolObject<dyn MTLBuffer>,
+        value: &ProtocolObject<dyn MTLBuffer>,
+        kv_len: usize,
+        sliding_window: Option<usize>,
+        scale: f32,
+    ) -> Result<Vec<f32>, String> {
+        self.upload_query(query)?;
+        let command = ctx
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| "Metal Muse target command buffer unavailable".to_string())?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| "Metal Muse target compute encoder unavailable".to_string())?;
+        self.encode(ctx, &encoder, key, value, kv_len, sliding_window, scale)?;
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if command.status() != MTLCommandBufferStatus::Completed {
+            let error = command
+                .error()
+                .map(|value| value.localizedDescription().to_string())
+                .unwrap_or_else(|| "no NSError attached".to_string());
+            return Err(format!(
+                "Metal Muse target attention failed status={:?}: {error}",
+                command.status()
+            ));
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(self.output.contents().as_ptr().cast::<f32>(), query.len())
+                .to_vec()
+        })
+    }
+}
+
 fn set_u32(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     value: usize,
@@ -206,6 +336,7 @@ mod tests {
         let context_len = 5;
         let position = 5;
         let num_heads = 4;
+
         let num_kv_heads = 2;
         let head_dim = 128;
         let sliding_window = 6;
@@ -312,5 +443,85 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 2.0e-5, "max_abs={max_abs:e}");
+    }
+
+    #[test]
+    fn metal_target_matches_cpu_f16_attention_contract() {
+        let _guard = crate::METAL_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ctx =
+            crate::compute::build_metal_context_with_kv_int8(false).expect("Metal test device");
+        let seq_len = 3;
+        let kv_len = 67;
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let kv_dim = num_kv_heads * 128;
+        let values = |len: usize, mul: usize, offset: usize| {
+            (0..len)
+                .map(|index| (((index * mul + offset) % 101) as f32 - 50.0) / 96.0)
+                .collect::<Vec<_>>()
+        };
+        let query = values(seq_len * num_heads * 128, 17, 3);
+        let key: Vec<u16> = values(kv_len * kv_dim, 13, 5)
+            .into_iter()
+            .map(|value| f16::from_f32(value).to_bits())
+            .collect();
+        let value: Vec<u16> = values(kv_len * kv_dim, 19, 7)
+            .into_iter()
+            .map(|value| f16::from_f32(value).to_bits())
+            .collect();
+        let key_buf = empty_f16_buf(&ctx, key.len());
+        let value_buf = empty_f16_buf(&ctx, value.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                key.as_ptr(),
+                key_buf.contents().as_ptr().cast::<u16>(),
+                key.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                value_buf.contents().as_ptr().cast::<u16>(),
+                value.len(),
+            );
+        }
+        let carrier = MuseTargetAttentionCarrier::new(&ctx, seq_len, num_heads, num_kv_heads);
+        let actual = carrier
+            .dispatch(
+                &ctx,
+                &query,
+                &key_buf,
+                &value_buf,
+                kv_len,
+                Some(48),
+                (128.0f32).sqrt().recip(),
+            )
+            .expect("Metal Muse target attention");
+        let expected = rnb_cpu::kernels::attention::attention_batch_f16(
+            &query,
+            &key,
+            &value,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            128,
+            (128.0f32).sqrt().recip(),
+            Some(48),
+            None,
+        );
+        let (max_index, max_abs) = actual
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+            .map(|(index, (left, right))| (index, (left - right).abs()))
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .expect("non-empty attention output");
+        assert!(
+            max_abs <= 2.0e-5,
+            "max_abs={max_abs:e} index={max_index} actual={} expected={}",
+            actual[max_index],
+            expected[max_index]
+        );
     }
 }

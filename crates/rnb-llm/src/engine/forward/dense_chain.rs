@@ -204,6 +204,7 @@ pub(super) fn try_prefill_f16kv_muse_attention_output_ffn_chain(
     q: &Tensor,
     cached_k_f16: &[u16],
     cached_v_f16: &[u16],
+
     attention_gate: &Tensor,
     layout: AttentionLayout,
     layer_idx: usize,
@@ -266,6 +267,97 @@ pub(super) fn try_prefill_f16kv_muse_attention_output_ffn_chain(
     } else {
         Ok(None)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_prefill_muse_target_attention_output_ffn_chain(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    hidden: &Tensor,
+    w: &AttentionLayerWeights,
+    q: &Tensor,
+    cached_k_f16: &[u16],
+    cached_v_f16: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    attention_gate: &Tensor,
+    layout: AttentionLayout,
+    layer_idx: usize,
+    seq_len: usize,
+    pos_start: usize,
+    kv_len: usize,
+    norm_eps: f32,
+    sliding_window: Option<usize>,
+) -> crate::error::Result<Option<Tensor>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if prefill_dense_chain_enabled()
+        && super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+        && w.moe.is_none()
+        && w.shared_expert_moe.is_none()
+        && w.ffn_gate_up_fused.is_none()
+        && dump_bin_dir().is_none()
+        && !attn_trace_enabled()
+        && !targeted_attn_trace_enabled(layer_idx)
+        && layout.head_dim == 128
+    {
+        if let (Some(post_attn_norm), Some(post_ffn_norm)) = (&w.post_attn_norm, &w.post_ffw_norm) {
+            let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+            if let Some(hidden_out) =
+                backend_runtime::metal_muse_target_attention_o_tail_ffn_if_supported(
+                    kernels::tensor_as_f32_slice(q),
+                    cached_k_f16,
+                    kernels::tensor_as_f32_slice(attention_gate),
+                    cached_v_f16,
+                    sequence_epoch,
+                    cache_layer,
+                    pos_start,
+                    kv_len,
+                    layout.num_heads,
+                    layout.num_kv_heads,
+                    layout.head_dim,
+                    resolve_attention_scale(metadata, architecture),
+                    sliding_window,
+                    kernels::tensor_as_f32_slice(hidden),
+                    kernels::tensor_as_f32_slice(post_attn_norm),
+                    kernels::tensor_as_f32_slice(ffn_norm),
+                    kernels::tensor_as_f32_slice(post_ffn_norm),
+                    &w.o_weight,
+                    &w.ffn_gate_weight,
+                    &w.ffn_up_weight,
+                    &w.ffn_down_weight,
+                    seq_len,
+                    metadata.hidden_dim,
+                    norm_eps,
+                    metadata.post_norm_eps,
+                )?
+            {
+                return Ok(Some(Tensor::from_vec(
+                    hidden_out,
+                    &[seq_len, metadata.hidden_dim],
+                )));
+            }
+        }
+    }
+    let _ = (
+        metadata,
+        architecture,
+        hidden,
+        w,
+        q,
+        cached_k_f16,
+        cached_v_f16,
+        sequence_epoch,
+        cache_layer,
+        attention_gate,
+        layout,
+        layer_idx,
+        seq_len,
+        pos_start,
+        kv_len,
+        norm_eps,
+        sliding_window,
+    );
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
