@@ -724,6 +724,26 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
     norm_eps: f32,
     post_norm_eps: f32,
 ) -> Result<(), String> {
+    if seq_len == 0
+        || kv_len < seq_len
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+    {
+        return Err(format!(
+            "CUDA Muse attention chain invalid attention geometry: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads}"
+        ));
+    }
+    if seq_len > u32::MAX as usize
+        || kv_len > u32::MAX as usize
+        || num_heads > u32::MAX as usize
+        || num_kv_heads > u32::MAX as usize
+        || sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+    {
+        return Err(format!(
+            "CUDA Muse attention chain kernel argument out of range: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads} sliding_window={sliding_window:?}"
+        ));
+    }
     let expected_q = seq_len.saturating_mul(num_heads).saturating_mul(128);
     let expected_kv = kv_len.saturating_mul(num_kv_heads).saturating_mul(128);
     let o_blocks = o_cols

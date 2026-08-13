@@ -10058,6 +10058,44 @@ fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
 }
 
 #[test]
+fn cuda_prefill_hd128_muse_dense_chain_rejects_invalid_attention_geometry() {
+    for (seq_len, kv_len, num_heads, num_kv_heads) in [(0, 0, 2, 1), (2, 1, 2, 1), (1, 1, 3, 2)] {
+        let mut hidden = Vec::new();
+        let err = attention_prefill_flash_hd128_muse_dense_chain(
+            &[],
+            &[],
+            &[],
+            &[],
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            1.0,
+            Some(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut hidden,
+            1.0e-5,
+            1.0e-6,
+        )
+        .expect_err("invalid Muse attention geometry must fail before CUDA launch");
+        assert!(
+            err.contains("invalid attention geometry"),
+            "unexpected error for seq={seq_len} kv={kv_len} heads={num_heads}/{num_kv_heads}: {err}"
+        );
+    }
+}
+
+#[test]
 fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
@@ -14229,6 +14267,7 @@ fn cuda_q6k_gemv_batch_seq2_warp8_matches_cpu_reference() {
 #[test]
 fn cuda_q6k_gemv_batch_seq4_warp8_matches_warp8_bits() {
     let _guard = runtime_test_lock();
+    let _dev_dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
     let rows = 256usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
