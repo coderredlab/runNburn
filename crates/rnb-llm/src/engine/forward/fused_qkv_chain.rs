@@ -109,6 +109,12 @@ pub(super) fn try_prefill_q4k_muse_hd128_dense_chain(
     let Some((k_bits, v_bits)) = fused else {
         return Ok(None);
     };
+    #[cfg(feature = "cuda")]
+    let device_output = Some(backend_runtime::upload_hidden_device_output_f32(
+        &hidden_out,
+        seq_len,
+        metadata.hidden_dim,
+    )?);
     Ok(Some(PrefillFusedQkvDenseChain {
         hidden: Tensor::from_vec(hidden_out, &[seq_len, metadata.hidden_dim]),
         k_bits,
@@ -116,8 +122,113 @@ pub(super) fn try_prefill_q4k_muse_hd128_dense_chain(
         gemma4_ple_fused: false,
         gemma4_output_scale_fused: false,
         #[cfg(feature = "cuda")]
-        device_output: None,
+        device_output,
     }))
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn try_prefill_q4k_muse_hd128_dense_chain_from_device(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    device_hidden: &crate::engine::prefill::hidden_carrier::DevicePrefillHidden,
+    w: &AttentionLayerWeights,
+    layout: AttentionLayout,
+    layer_idx: usize,
+    seq_len: usize,
+    pos_start: usize,
+    norm_eps: f32,
+) -> crate::error::Result<Option<PrefillFusedQkvDenseChain>> {
+    if !super::dense_chain::prefill_dense_chain_enabled()
+        || !super::super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+        || pos_start != 0
+        || w.v_proj_missing
+        || w.moe.is_some()
+        || w.shared_expert_moe.is_some()
+        || w.ffn_gate_up_fused.is_some()
+        || layout.packed_q_gate
+        || layout.head_dim != 128
+        || resolve_attention_softcap(architecture).is_some()
+        || dump_bin_dir().is_some()
+        || layer_trace_enabled()
+        || attn_trace_enabled()
+        || targeted_attn_trace_enabled(layer_idx)
+        || w.q_bias.is_some()
+        || w.k_bias.is_some()
+        || w.v_bias.is_some()
+    {
+        return Ok(None);
+    }
+    let (
+        Some(attention_gate),
+        Some(q_norm),
+        Some(k_norm),
+        Some(post_attn_norm),
+        Some(post_ffn_norm),
+    ) = (
+        &w.attn_gate_weight,
+        &w.q_norm,
+        &w.k_norm,
+        &w.post_attn_norm,
+        &w.post_ffw_norm,
+    )
+    else {
+        return Ok(None);
+    };
+    let (rope_dim, rope_theta, proportional_rope) =
+        resolve_rope_params(metadata, architecture, layer_idx, layout.head_dim);
+    if proportional_rope || !matches!(rope_dim, 0 | 128) || uses_neox_rope(architecture) {
+        return Ok(None);
+    }
+    let input_desc = device_hidden.output.output_desc;
+    if input_desc.rows() != seq_len
+        || input_desc.cols() != metadata.hidden_dim
+        || input_desc.dtype() != crate::engine::cuda_runtime::ScalarType::F32
+    {
+        return Ok(None);
+    }
+    let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
+    let apply_rope = sliding_window.is_some();
+    let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+    let output = backend_runtime::prefill_q4k_muse_hd128_dense_chain_from_device_if_supported(
+        &device_hidden.output,
+        &w.q_weight,
+        &w.k_weight,
+        &w.v_weight,
+        attention_gate,
+        kernels::tensor_as_f32_slice(&w.attn_norm),
+        kernels::tensor_as_f32_slice(q_norm),
+        kernels::tensor_as_f32_slice(k_norm),
+        layout.num_heads,
+        layout.num_kv_heads,
+        resolve_attention_scale(metadata, architecture),
+        rope_theta,
+        pos_start,
+        apply_rope,
+        sliding_window,
+        &w.o_weight,
+        &w.ffn_gate_weight,
+        &w.ffn_up_weight,
+        &w.ffn_down_weight,
+        kernels::tensor_as_f32_slice(post_attn_norm),
+        kernels::tensor_as_f32_slice(ffn_norm),
+        kernels::tensor_as_f32_slice(post_ffn_norm),
+        w.o_weight.cols,
+        w.ffn_gate_weight.rows,
+        metadata.hidden_dim,
+        norm_eps,
+        metadata.post_norm_eps,
+    )?;
+    Ok(output.map(
+        |(k_bits, v_bits, device_output)| PrefillFusedQkvDenseChain {
+            hidden: Tensor::from_vec(Vec::<f32>::new(), &[0]),
+            k_bits,
+            v_bits,
+            gemma4_ple_fused: false,
+            gemma4_output_scale_fused: false,
+            device_output: Some(device_output),
+        },
+    ))
 }
 
 #[cfg(feature = "cuda")]

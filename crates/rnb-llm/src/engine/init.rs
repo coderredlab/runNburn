@@ -685,12 +685,20 @@ impl Engine {
         let backend_runtime = load_stage!("backend_runtime_init", {
             init_engine_backend_runtime(&metadata, &weights, ffn_inner_dim)
         });
+        #[cfg(feature = "cuda")]
+        let muse_low_vram = matches!(model.metadata.architecture, ModelArchitecture::MuseGlimmer)
+            && detected_cuda_memory_bytes()
+                .is_some_and(|(_, total)| total <= 12 * 1024 * 1024 * 1024);
+        #[cfg(not(feature = "cuda"))]
+        let muse_low_vram = false;
         load_stage!("backend_prewarm_q4_gate_up", {
-            super::backend_runtime::prewarm_dense_q4_packed_gate_up_weights(&weights)
+            super::backend_runtime::prewarm_dense_q4_packed_gate_up_weights(&weights, muse_low_vram)
         })?;
-        load_stage!("backend_prewarm_q6_down", {
-            super::backend_runtime::prewarm_dense_q6_packed_down_weights(&weights)
-        })?;
+        if !muse_low_vram {
+            load_stage!("backend_prewarm_q6_down", {
+                super::backend_runtime::prewarm_dense_q6_packed_down_weights(&weights)
+            })?;
+        }
         load_stage!("backend_prewarm_q4_prefill", {
             super::backend_runtime::prewarm_prefill_q4_f32_projection_weights(&weights)
         })?;

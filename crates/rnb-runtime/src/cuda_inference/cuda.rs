@@ -12,9 +12,10 @@ pub use attention::{
     prefill_attention_f16kv_window_if_supported,
     prefill_attention_hd128_f16kv_muse_dense_chain_if_supported,
     prefill_attention_hd128_muse_dense_chain_if_supported, prefill_attention_hd256_if_supported,
-    prefill_attention_non_causal_if_supported, prefill_q4k_muse_hd128_dense_chain_if_supported,
-    qwen35_gdn_decode_core_chain, qwen35_gdn_decode_core_chain_admitted,
-    try_delta_step_if_supported, QwenGdnDecodeChainCall,
+    prefill_attention_non_causal_if_supported,
+    prefill_q4k_muse_hd128_dense_chain_device_input_if_supported,
+    prefill_q4k_muse_hd128_dense_chain_if_supported, qwen35_gdn_decode_core_chain,
+    qwen35_gdn_decode_core_chain_admitted, try_delta_step_if_supported, QwenGdnDecodeChainCall,
 };
 pub use gdn::{
     begin_nemotron_prefill_workspace, end_nemotron_prefill_workspace,
@@ -958,6 +959,10 @@ pub fn prewarm_q4k_weight_slices(weights: &[&[u8]]) -> Result<usize> {
 
 pub fn prewarm_q4k_weight_slices_pinned(weights: &[&[u8]]) -> Result<usize> {
     backend::prewarm_q4k_weights_pinned(weights)
+}
+
+pub fn prewarm_q4k_weight_slices_pinned_prefix(weights: &[&[u8]]) -> Result<usize> {
+    backend::prewarm_q4k_weights_pinned_prefix(weights)
 }
 
 pub fn prewarm_quant_resident_q4k_weights(weights: &[&[u8]]) -> Result<usize> {

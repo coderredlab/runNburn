@@ -2688,12 +2688,21 @@ impl CudaState {
         let trace_call = dense_chain_trace_call();
         let trace_total = trace_call.map(|_| std::time::Instant::now());
         let mut trace_stage = std::time::Instant::now();
-        let hidden_bytes = std::mem::size_of_val(hidden);
+        let hidden_bytes = seq_len
+            .checked_mul(n_embd)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "dense attention+FFN hidden byte overflow".to_string())?;
         let hidden_dev = if let Some(hidden_dev) = hidden_dev_override {
             hidden_dev
         } else {
             self.compute_full_gate_ptr(hidden_bytes)?
         };
+        if device_output_desc.is_none() && std::mem::size_of_val(hidden) != hidden_bytes {
+            return Err(format!(
+                "dense attention+FFN host output bytes mismatch: got={} expected={hidden_bytes}",
+                std::mem::size_of_val(hidden)
+            ));
+        }
         let normed_dev = self.compute_full_up_ptr(hidden_bytes)?;
         let proj_dev = self.compute_output_ptr(hidden_bytes)?;
         let ple_weight_kind = if ple_gate_weights.is_some()

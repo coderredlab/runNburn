@@ -1052,6 +1052,39 @@ pub fn prewarm_q4k_weights_pinned(weights: &[&[u8]]) -> Result<usize, String> {
     Ok(warmed)
 }
 
+pub fn prewarm_q4k_weights_pinned_prefix(weights: &[&[u8]]) -> Result<usize, String> {
+    if weights.is_empty() {
+        return Ok(0);
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    let state = guard.as_mut().expect("cuda compute state initialized");
+    if std::env::var("RNB_CUDA_Q4K_CACHE_MB").is_err() {
+        let (free_bytes, total_bytes) = unsafe { state.api.mem_get_info() }?;
+        let mib = 1024 * 1024;
+        let total_mib = total_bytes / mib;
+        let free_mib = free_bytes / mib;
+        let reserve_mib = super::super::state::quant_resident_reserve_mib(total_mib);
+        let target_bytes = free_mib.saturating_sub(reserve_mib).saturating_mul(mib);
+        state.resident_q4k_limit = state.resident_q4k_limit.max(target_bytes);
+    }
+    let mut warmed = 0usize;
+    for weight in weights {
+        match state.resident_q4k_weights_ptr_pinned_with_lease(weight) {
+            Ok(_) => warmed += 1,
+            Err(err) if err.contains("pinned resident Q4_K admission failed") => break,
+            Err(err) => return Err(err),
+        }
+    }
+    state.stream_synchronize()?;
+    Ok(warmed)
+}
+
 pub fn prewarm_q4k_packed_gate_up_weights(
     weights: &[(&[u8], &[u8], usize, usize)],
 ) -> Result<usize, String> {

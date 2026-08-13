@@ -1333,7 +1333,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     if guard.is_none() {
         *guard = Some(CudaState::open()?);
     }
-    guard
+    let output = guard
         .as_mut()
         .expect("cuda compute state initialized")
         .q4k_muse_prefill_hd128_dense_chain(
@@ -1346,7 +1346,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
             kv_rows,
             blocks_per_row,
             hidden_input.len() / cols,
-            hidden_input,
+            Some(hidden_input),
             attn_norm_weight,
             q_norm,
             k_norm,
@@ -1369,9 +1369,205 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
             n_ff,
             n_embd,
             hidden,
+            None,
+            None,
             norm_eps,
             post_norm_eps,
+        )?;
+    Ok(output.map(|(k_bits, v_bits, _)| (k_bits, v_bits)))
+}
+
+#[derive(Debug)]
+pub struct MuseQ4kPrefillDeviceOutput {
+    pub k_bits: Vec<u16>,
+    pub v_bits: Vec<u16>,
+    pub output_id: rnb_backend_api::DeviceTensorId,
+    pub output_desc: rnb_backend_api::DeviceTensorDesc,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn q4k_muse_prefill_hd128_dense_chain_device_input(
+    input_id: rnb_backend_api::DeviceTensorId,
+    input_desc: rnb_backend_api::DeviceTensorDesc,
+    q_weights: &[u8],
+    k_weights: &[u8],
+    v_weights: &[u8],
+    v_quant: u32,
+    attention_gate_weights: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<Option<MuseQ4kPrefillDeviceOutput>, String> {
+    let seq_len = input_desc.rows();
+    if input_desc.cols() != cols
+        || input_desc.dtype() != rnb_backend_api::ScalarType::F32
+        || !matches!(
+            input_desc.role(),
+            rnb_backend_api::DeviceTensorRole::Hidden
+                | rnb_backend_api::DeviceTensorRole::MoeOutput
         )
+    {
+        return Err(format!(
+            "CUDA Muse QKV device input desc mismatch: got {input_desc:?}, expected rows={seq_len} cols={cols} dtype=F32 role=Hidden|MoeOutput"
+        ));
+    }
+    if sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || num_heads > MUSE_HD128_MAX_GRID_Y
+        || num_kv_heads > u32::MAX as usize
+        || num_heads.checked_mul(128) != Some(q_rows)
+        || num_kv_heads.checked_mul(128) != Some(kv_rows)
+        || cols == 0
+        || !cols.is_multiple_of(256)
+        || seq_len == 0
+        || n_ff == 0
+        || n_embd == 0
+        || !muse_hd128_rope_positions_fit_u32(apply_rope, pos_start, seq_len)
+        || !muse_hd128_kernel_extents_fit_u32(seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd)
+    {
+        return Err("CUDA Muse QKV device input dimensions are invalid".to_string());
+    }
+    let blocks_per_row = cols / 256;
+    let q4_row_bytes = blocks_per_row
+        .checked_mul(144)
+        .ok_or_else(|| "CUDA Muse QKV row byte overflow".to_string())?;
+    let v_row_bytes = match v_quant {
+        12 => blocks_per_row.checked_mul(144),
+        14 => blocks_per_row.checked_mul(210),
+        other => return Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+    }
+    .ok_or_else(|| "CUDA Muse V row byte overflow".to_string())?;
+    let o_blocks = o_cols
+        .checked_div(256)
+        .filter(|_| o_cols.is_multiple_of(256))
+        .ok_or_else(|| "CUDA Muse O cols must be divisible by 256".to_string())?;
+    let hidden_blocks = n_embd
+        .checked_div(256)
+        .filter(|_| n_embd.is_multiple_of(256))
+        .ok_or_else(|| "CUDA Muse hidden dim must be divisible by 256".to_string())?;
+    let down_blocks = n_ff
+        .checked_div(256)
+        .filter(|_| n_ff.is_multiple_of(256))
+        .ok_or_else(|| "CUDA Muse FFN dim must be divisible by 256".to_string())?;
+    let down_row_bytes = match down_quant {
+        12 => down_blocks.checked_mul(144),
+        13 => down_blocks.checked_mul(176),
+        14 => down_blocks.checked_mul(210),
+        other => return Err(format!("CUDA Muse unsupported down quant {other}")),
+    }
+    .ok_or_else(|| "CUDA Muse down row byte overflow".to_string())?;
+    let expected_q = q_rows.saturating_mul(q4_row_bytes);
+    let expected_k = kv_rows.saturating_mul(q4_row_bytes);
+    let expected_v = kv_rows.saturating_mul(v_row_bytes);
+    let expected_gate = q_rows.saturating_mul(q4_row_bytes);
+    let expected_o = n_embd.saturating_mul(o_blocks).saturating_mul(144);
+    let expected_gate_up = n_ff.saturating_mul(hidden_blocks).saturating_mul(144);
+    let expected_down = n_embd.saturating_mul(down_row_bytes);
+    if q_weights.len() != expected_q
+        || k_weights.len() != expected_k
+        || v_weights.len() != expected_v
+        || attention_gate_weights.len() != expected_gate
+        || o_weights.len() != expected_o
+        || gate_weights.len() != expected_gate_up
+        || up_weights.len() != expected_gate_up
+        || down_weights.len() != expected_down
+        || attn_norm_weight.len() != n_embd
+        || q_norm.len() != 128
+        || k_norm.len() != 128
+        || post_attn_norm_weight.len() != n_embd
+        || ffn_norm_weight.len() != n_embd
+        || post_ffn_norm_weight.len() != n_embd
+        || o_cols != q_rows
+    {
+        return Err("CUDA Muse QKV device input weight shape mismatch".to_string());
+    }
+    let output_desc = rnb_backend_api::DeviceTensorDesc::new(
+        seq_len,
+        n_embd,
+        rnb_backend_api::ScalarType::F32,
+        rnb_backend_api::DeviceTensorRole::Hidden,
+    );
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    let state = guard.as_mut().expect("cuda compute state initialized");
+    let input_dev = state.device_tensor_ptr(input_id, input_desc)?;
+    let output = state.q4k_muse_prefill_hd128_dense_chain(
+        q_weights,
+        k_weights,
+        v_weights,
+        v_quant,
+        attention_gate_weights,
+        q_rows,
+        kv_rows,
+        blocks_per_row,
+        seq_len,
+        None,
+        attn_norm_weight,
+        q_norm,
+        k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        apply_rope,
+        sliding_window,
+        o_weights,
+        gate_weights,
+        up_weights,
+        down_weights,
+        down_quant,
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        &mut [],
+        Some(input_dev),
+        Some(output_desc),
+        norm_eps,
+        post_norm_eps,
+    )?;
+    let Some((k_bits, v_bits, Some(output_id))) = output else {
+        return Ok(None);
+    };
+    Ok(Some(MuseQ4kPrefillDeviceOutput {
+        k_bits,
+        v_bits,
+        output_id,
+        output_desc,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]

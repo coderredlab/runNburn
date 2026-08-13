@@ -1705,7 +1705,7 @@ impl CudaState {
         kv_rows: usize,
         blocks_per_row: usize,
         seq_len: usize,
-        hidden_input: &[f32],
+        hidden_input: Option<&[f32]>,
         attn_norm_weight: &[f32],
         q_norm: &[f32],
         k_norm: &[f32],
@@ -1728,17 +1728,20 @@ impl CudaState {
         n_ff: usize,
         n_embd: usize,
         hidden: &mut [f32],
+        hidden_dev_override: Option<u64>,
+        device_output_desc: Option<rnb_backend_api::DeviceTensorDesc>,
         norm_eps: f32,
         post_norm_eps: f32,
-    ) -> Result<Option<(Vec<u16>, Vec<u16>)>, String> {
+    ) -> Result<Option<(Vec<u16>, Vec<u16>, Option<rnb_backend_api::DeviceTensorId>)>, String> {
         const HEAD_DIM: usize = 128;
         let q_dim = num_heads.saturating_mul(HEAD_DIM);
         let expected_hidden = seq_len.saturating_mul(n_embd);
         if q_rows != q_dim
             || kv_rows != num_kv_heads.saturating_mul(HEAD_DIM)
             || o_cols != q_dim
-            || hidden_input.len() != expected_hidden
-            || hidden.len() != expected_hidden
+            || hidden_input.is_some_and(|hidden_input| hidden_input.len() != expected_hidden)
+            || hidden_dev_override.is_none() && hidden_input.is_none()
+            || device_output_desc.is_none() && hidden.len() != expected_hidden
             || attn_norm_weight.len() != n_embd
             || q_norm.len() != HEAD_DIM
             || k_norm.len() != HEAD_DIM
@@ -1773,7 +1776,10 @@ impl CudaState {
         // Reserve every shared slab at its largest use before the first async
         // launch. QKV postprocessing consumes these values before the dense
         // tail reuses the same slabs in stream order.
-        let hidden_dev = self.compute_full_gate_ptr(hidden_bytes)?;
+        let hidden_dev = match hidden_dev_override {
+            Some(hidden_dev) => hidden_dev,
+            None => self.compute_full_gate_ptr(hidden_bytes)?,
+        };
         let normed_dev = self.compute_full_up_ptr(hidden_bytes)?;
         let q_full_dev = self.compute_temp_slab_ptr(q_storage_bytes)?;
         let k_dev = self.compute_mid_a_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
@@ -1786,13 +1792,15 @@ impl CudaState {
         let attn_out_dev = self.compute_full_down_ptr(q_bytes)?;
         self.compute_output_ptr(hidden_bytes)?;
 
-        unsafe {
-            self.api.memcpy_htod_async(
-                hidden_dev,
-                hidden_input.as_ptr().cast::<libc::c_void>(),
-                hidden_bytes,
-                self.stream,
-            )?;
+        if let Some(hidden_input) = hidden_input {
+            unsafe {
+                self.api.memcpy_htod_async(
+                    hidden_dev,
+                    hidden_input.as_ptr().cast::<libc::c_void>(),
+                    hidden_bytes,
+                    self.stream,
+                )?;
+            }
         }
         let attn_norm_dev = self.resident_f32_ptr(attn_norm_weight)?;
         self.launch_rms_norm_rows_f32(
@@ -1962,7 +1970,7 @@ impl CudaState {
         }
         self.stream_synchronize()?;
 
-        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+        let device_output = self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             o_weights,
             gate_weights,
             up_weights,
@@ -1984,7 +1992,7 @@ impl CudaState {
             Some(hidden_dev),
             attn_out_dev,
             None,
-            None,
+            device_output_desc,
             None,
             norm_eps,
             post_norm_eps,
@@ -1993,7 +2001,7 @@ impl CudaState {
             false,
             false,
         )?;
-        Ok(Some((k_bits, v_bits)))
+        Ok(Some((k_bits, v_bits, device_output)))
     }
 
     #[allow(clippy::too_many_arguments)]

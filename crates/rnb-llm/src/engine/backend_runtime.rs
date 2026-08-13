@@ -58,6 +58,8 @@ pub(super) use accelerator_basic::{
 };
 
 #[cfg(feature = "cuda")]
+pub(super) use cuda_basic::prefill_q4k_muse_hd128_dense_chain_from_device_if_supported;
+#[cfg(feature = "cuda")]
 pub(super) use cuda_basic::{
     cuda_activation_mul_inplace, cuda_add_f32_inplace, cuda_add_rows_f32_inplace,
     cuda_axpby_f32_inplace, cuda_cache_snapshot, cuda_gdn_prepare_delta_gate_beta_f32,

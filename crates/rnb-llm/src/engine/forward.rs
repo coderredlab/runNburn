@@ -36,6 +36,7 @@ pub(in crate::engine) use fused_qkv_chain::{
     try_prefill_q4k_f16_qkv_hd512_dense_chain_from_device,
     try_prefill_q4k_f16_reuse_q_hd256_window_dense_chain_from_device,
     try_prefill_q4k_f16_reuse_q_hd512_dense_chain_from_device,
+    try_prefill_q4k_muse_hd128_dense_chain_from_device,
 };
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(in crate::engine) use projection::build_prefill_gemma_layer_range_spec;
@@ -463,7 +464,7 @@ fn forward_attention_layer_impl(
                 gemma4_ple_fused: false,
                 gemma4_output_scale_fused: false,
                 #[cfg(feature = "cuda")]
-                device_output: None,
+                device_output: fused.device_output,
             });
         }
     }

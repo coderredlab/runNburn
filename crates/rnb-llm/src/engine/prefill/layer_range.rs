@@ -430,6 +430,8 @@ fn device_carrier_accepts_layer_kind(
 ) -> bool {
     (architecture == ModelArchitecture::NemotronHMoE
         && matches!(layer_kind, Some("nemotron_moe" | "nemotron_mamba2")))
+        || (architecture == ModelArchitecture::MuseGlimmer
+            && matches!(layer_kind, Some("attention")))
         || (architecture == ModelArchitecture::Qwen35MoE
             && qwen_gdn_moe_output_device_enabled()
             && matches!(layer_kind, Some("gated_delta_net" | "attention")))
@@ -2701,6 +2703,91 @@ fn run_prefill_layers_cpu_range_impl(
                     let reason = device_hidden_materialize_reason(current_layer_kind);
                     hidden = hidden
                         .into_host_for_layer(Some(layer_idx), reason)
+                        .map(hidden_carrier::PrefillHidden::Host)?;
+                }
+            } else if architecture == ModelArchitecture::MuseGlimmer {
+                let device_hidden = hidden.take_device().ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "expected CUDA Muse device hidden carrier".to_string(),
+                    )
+                })?;
+                if let Some(LayerType::Attention(w)) = weights.layers.get(layer_idx) {
+                    let layer_kv_override = metadata
+                        .head_count_kv_per_layer
+                        .as_ref()
+                        .and_then(|v| v.get(layer_idx).copied());
+                    let layout = resolve_attention_layout(metadata, w, layer_kv_override)?;
+                    match try_prefill_q4k_muse_hd128_dense_chain_from_device(
+                        metadata,
+                        architecture,
+                        &device_hidden,
+                        w,
+                        layout,
+                        layer_idx,
+                        seq_len,
+                        pos_start,
+                        norm_eps,
+                    ) {
+                        Ok(Some(output)) => {
+                            kv_cache
+                                .replace_layer_f16_range_compacted(
+                                    layer_idx,
+                                    pos_start,
+                                    seq_len,
+                                    &output.k_bits,
+                                    &output.v_bits,
+                                )
+                                .map_err(crate::error::LlmError::Forward)?;
+                            let Some(device_output) = output.device_output else {
+                                let cleanup = device_hidden.output.release();
+                                return Err(crate::error::LlmError::Forward(format!(
+                                    "CUDA Muse device chain returned no device output; input cleanup={cleanup:?}"
+                                )));
+                            };
+                            match device_hidden.output.release() {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let _ = device_output.release();
+                                    return Err(crate::error::LlmError::Forward(
+                                        "CUDA Muse device hidden tensor was already missing"
+                                            .to_string(),
+                                    ));
+                                }
+                                Err(err) => {
+                                    let _ = device_output.release();
+                                    return Err(err);
+                                }
+                            }
+                            hidden = hidden_carrier::PrefillHidden::Device(
+                                hidden_carrier::DevicePrefillHidden {
+                                    output: device_output,
+                                    producer_layer_idx: layer_idx,
+                                },
+                            );
+                            layer_idx += 1;
+                            continue;
+                        }
+                        Ok(None) => {
+                            hidden = hidden_carrier::PrefillHidden::Device(device_hidden)
+                                .into_host_for_layer(Some(layer_idx), "feature_disabled")
+                                .map(hidden_carrier::PrefillHidden::Host)?;
+                        }
+                        Err(err) => {
+                            let cleanup = device_hidden.output.release();
+                            return Err(match cleanup {
+                                Ok(true) => err,
+                                Ok(false) => crate::error::LlmError::Forward(format!(
+                                    "{err}; CUDA Muse input cleanup failed: tensor was already missing"
+                                )),
+                                Err(cleanup_err) => crate::error::LlmError::Forward(format!(
+                                    "{err}; CUDA Muse input cleanup failed: {cleanup_err}"
+                                )),
+                            });
+                        }
+                    }
+                } else {
+                    hidden = hidden_carrier::PrefillHidden::Device(device_hidden)
+                        .into_host_for_layer(Some(layer_idx), "unsupported_layer")
                         .map(hidden_carrier::PrefillHidden::Host)?;
                 }
             } else if architecture == ModelArchitecture::Gemma4 {

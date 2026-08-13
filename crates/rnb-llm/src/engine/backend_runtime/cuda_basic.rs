@@ -2913,6 +2913,107 @@ pub(in crate::engine) fn prefill_q4k_muse_hd128_dense_chain_if_supported(
     Ok(None)
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn prefill_q4k_muse_hd128_dense_chain_from_device_if_supported(
+    input: &NemotronDeviceLayerOutput,
+    q_weight: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    attention_gate_weight: &QuantizedWeight,
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o_weight: &QuantizedWeight,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<Option<(Vec<u16>, Vec<u16>, NemotronDeviceLayerOutput)>> {
+    let (
+        Some(q),
+        Some(k),
+        Some(v),
+        Some(attention_gate),
+        Some(o),
+        Some(gate),
+        Some(up),
+        Some(down),
+    ) = (
+        q_weight.backend_view(),
+        k_weight.backend_view(),
+        v_weight.backend_view(),
+        attention_gate_weight.backend_view(),
+        o_weight.backend_view(),
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    )
+    else {
+        return Ok(None);
+    };
+    let output = cuda_runtime::prefill_q4k_muse_hd128_dense_chain_device_input_if_supported(
+        input.output_id,
+        input.output_desc,
+        q.raw(),
+        k.raw(),
+        v.raw(),
+        backend_ggml_type(v.quant()),
+        attention_gate.raw(),
+        q.rows(),
+        k.rows(),
+        q.cols(),
+        attn_norm_weight,
+        q_norm,
+        k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        apply_rope,
+        sliding_window,
+        o.raw(),
+        gate.raw(),
+        up.raw(),
+        down.raw(),
+        backend_ggml_type(down.quant()),
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        norm_eps,
+        post_norm_eps,
+    )
+    .map_err(cuda_error)?;
+    Ok(output.map(|output| {
+        (
+            output.k_bits,
+            output.v_bits,
+            NemotronDeviceLayerOutput {
+                output_id: output.output_id,
+                output_desc: output.output_desc,
+            },
+        )
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn gemma4_ple_q4k_batch_norm_residual_if_supported(
@@ -4786,11 +4887,16 @@ pub(in crate::engine) fn cuda_cache_snapshot() -> cuda_runtime::CudaCacheSnapsho
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn prewarm_dense_q4_packed_gate_up_weights(
     weights: &ModelWeights,
+    muse_low_vram: bool,
 ) -> crate::error::Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let requests = collect_cuda_product_prewarm_requests(weights);
-        execute_cuda_product_prewarm_requests(&requests, CudaProductPrewarmSelection::Q4Dense)?;
+        let requests = collect_cuda_product_prewarm_requests(weights, muse_low_vram);
+        execute_cuda_product_prewarm_requests(
+            &requests,
+            CudaProductPrewarmSelection::Q4Dense,
+            muse_low_vram,
+        )?;
     }
     Ok(())
 }
@@ -4808,8 +4914,12 @@ pub(in crate::engine) fn prewarm_dense_q6_packed_down_weights(
 ) -> crate::error::Result<()> {
     #[cfg(feature = "cuda")]
     {
-        let requests = collect_cuda_product_prewarm_requests(weights);
-        execute_cuda_product_prewarm_requests(&requests, CudaProductPrewarmSelection::Q6Dense)?;
+        let requests = collect_cuda_product_prewarm_requests(weights, false);
+        execute_cuda_product_prewarm_requests(
+            &requests,
+            CudaProductPrewarmSelection::Q6Dense,
+            false,
+        )?;
     }
     Ok(())
 }
@@ -4831,6 +4941,24 @@ fn push_q4_raw_candidate<'a>(
         return;
     }
     if seen.insert((raw.as_ptr() as usize, raw.len())) {
+        requests.q4_raw.push(raw);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn push_raw_quant_candidate<'a>(
+    requests: &mut CudaProductPrewarmRequests<'a>,
+    seen: &mut std::collections::HashSet<(usize, usize)>,
+    weight: &'a QuantizedWeight,
+) {
+    let Some(view) = weight.backend_view() else {
+        return;
+    };
+    if !matches!(view.quant(), QuantFormat::Q4K | QuantFormat::Q6K) {
+        return;
+    }
+    let raw = view.raw();
+    if !raw.is_empty() && seen.insert((raw.as_ptr() as usize, raw.len())) {
         requests.q4_raw.push(raw);
     }
 }
@@ -4869,7 +4997,10 @@ fn push_dense_product_packed_candidates<'a>(
 }
 
 #[cfg(feature = "cuda")]
-fn collect_cuda_product_prewarm_requests(weights: &ModelWeights) -> CudaProductPrewarmRequests<'_> {
+fn collect_cuda_product_prewarm_requests(
+    weights: &ModelWeights,
+    muse_low_vram: bool,
+) -> CudaProductPrewarmRequests<'_> {
     let mut requests = CudaProductPrewarmRequests::default();
     let mut seen_q4_raw = std::collections::HashSet::new();
     for layer in &weights.layers {
@@ -4877,6 +5008,27 @@ fn collect_cuda_product_prewarm_requests(weights: &ModelWeights) -> CudaProductP
             LayerType::Attention(layer)
                 if layer.moe.is_none() && layer.shared_expert_moe.is_none() =>
             {
+                if muse_low_vram {
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.q_weight);
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.k_weight);
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.v_weight);
+                    if let Some(attention_gate) = &layer.attn_gate_weight {
+                        push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, attention_gate);
+                    }
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.o_weight);
+                    push_raw_quant_candidate(
+                        &mut requests,
+                        &mut seen_q4_raw,
+                        &layer.ffn_gate_weight,
+                    );
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_up_weight);
+                    push_raw_quant_candidate(
+                        &mut requests,
+                        &mut seen_q4_raw,
+                        &layer.ffn_down_weight,
+                    );
+                    continue;
+                }
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.o_weight);
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_gate_weight);
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_up_weight);
@@ -4912,16 +5064,31 @@ fn collect_cuda_product_prewarm_requests(weights: &ModelWeights) -> CudaProductP
 fn execute_cuda_product_prewarm_requests(
     requests: &CudaProductPrewarmRequests<'_>,
     selection: CudaProductPrewarmSelection,
+    muse_low_vram: bool,
 ) -> crate::error::Result<()> {
     match selection {
         CudaProductPrewarmSelection::Q4Dense => {
-            cuda_runtime::prewarm_q4k_packed_gate_up_weights(&requests.q4_gate_up)
-                .map_err(cuda_error)?;
-            cuda_runtime::prewarm_q4k_packed_weights(&requests.q4_single).map_err(cuda_error)?;
-            let raw_warmed = cuda_runtime::prewarm_quant_resident_q4k_weights(&requests.q4_raw)
-                .map_err(cuda_error)?;
-            if raw_warmed > 0 {
-                eprintln!("[INFO] CUDA Q4_K raw quant resident weights prewarmed: {raw_warmed}");
+            if muse_low_vram {
+                let raw_warmed =
+                    cuda_runtime::prewarm_q4k_weight_slices_pinned_prefix(&requests.q4_raw)
+                        .map_err(cuda_error)?;
+                if raw_warmed > 0 {
+                    eprintln!(
+                        "[INFO] CUDA Muse low-VRAM pinned raw quant weights prewarmed: {raw_warmed}"
+                    );
+                }
+            } else {
+                cuda_runtime::prewarm_q4k_packed_gate_up_weights(&requests.q4_gate_up)
+                    .map_err(cuda_error)?;
+                cuda_runtime::prewarm_q4k_packed_weights(&requests.q4_single)
+                    .map_err(cuda_error)?;
+                let raw_warmed = cuda_runtime::prewarm_quant_resident_q4k_weights(&requests.q4_raw)
+                    .map_err(cuda_error)?;
+                if raw_warmed > 0 {
+                    eprintln!(
+                        "[INFO] CUDA Q4_K raw quant resident weights prewarmed: {raw_warmed}"
+                    );
+                }
             }
         }
         CudaProductPrewarmSelection::Q6Dense => {
@@ -4956,7 +5123,7 @@ impl From<CudaProductPrewarmRequestKind> for CudaProductPrewarmRequestKindForTes
 pub(in crate::engine) fn cuda_product_prewarm_request_kinds_for_test(
     weights: &ModelWeights,
 ) -> Vec<CudaProductPrewarmRequestKindForTest> {
-    collect_cuda_product_prewarm_requests(weights)
+    collect_cuda_product_prewarm_requests(weights, false)
         .kinds()
         .into_iter()
         .map(Into::into)
@@ -4967,7 +5134,9 @@ pub(in crate::engine) fn cuda_product_prewarm_request_kinds_for_test(
 pub(in crate::engine) fn cuda_product_prewarm_q4_raw_count_for_test(
     weights: &ModelWeights,
 ) -> usize {
-    collect_cuda_product_prewarm_requests(weights).q4_raw.len()
+    collect_cuda_product_prewarm_requests(weights, false)
+        .q4_raw
+        .len()
 }
 
 #[cfg(all(test, feature = "cuda"))]

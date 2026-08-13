@@ -560,6 +560,101 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn prefill_q4k_muse_hd128_dense_chain_device_input_if_supported(
+    input_id: rnb_backend_api::DeviceTensorId,
+    input_desc: rnb_backend_api::DeviceTensorDesc,
+    q: &[u8],
+    k: &[u8],
+    v: &[u8],
+    v_quant: GGMLType,
+    attention_gate: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    o: &[u8],
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<Option<backend::MuseQ4kPrefillDeviceOutput>> {
+    let seq_len = input_desc.rows();
+    if !backend::tuning::prefill_flash_attention_enabled()
+        || muse_hd128_head_geometry_is_invalid(q_rows, kv_rows, num_heads, num_kv_heads)
+        || cols == 0
+        || seq_len == 0
+        || n_ff == 0
+        || n_embd == 0
+        || muse_hd128_kernel_extents_are_invalid(
+            seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd,
+        )
+        || muse_hd128_qkv_weight_extents_are_invalid(
+            q_rows, kv_rows, cols, v_quant, o_cols, n_ff, n_embd, down_quant,
+        )
+        || q_norm.len() != 128
+        || k_norm.len() != 128
+        || muse_hd128_window_is_invalid(sliding_window)
+        || muse_hd128_rope_positions_are_invalid(apply_rope, pos_start, seq_len)
+        || seq_len < backend::tuning::prefill_flash_attention_min_seq(128)
+    {
+        return Ok(None);
+    }
+    backend::q4k_muse_prefill_hd128_dense_chain_device_input(
+        input_id,
+        input_desc,
+        q,
+        k,
+        v,
+        v_quant as u32,
+        attention_gate,
+        q_rows,
+        kv_rows,
+        cols,
+        attn_norm_weight,
+        q_norm,
+        k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        apply_rope,
+        sliding_window,
+        o,
+        gate,
+        up,
+        down,
+        down_quant as u32,
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        norm_eps,
+        post_norm_eps,
+    )
+    .map_err(|err| format!("CUDA Muse QKV prefill device input failed: {err}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn dflash_q4k_layer_chain(
     q_weights: &[u8],
     k_weights: &[u8],
