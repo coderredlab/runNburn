@@ -1764,9 +1764,7 @@ pub(crate) fn prefill_muse_layer_range_submit(
         .queue
         .commandBuffer()
         .ok_or_else(|| "Metal Muse prefill range command buffer creation failed".to_string())?;
-    let encoder = command
-        .computeCommandEncoder()
-        .ok_or_else(|| "Metal Muse prefill range encoder creation failed".to_string())?;
+    let encoder = compute::chain_compute_encoder(ctx, &command);
     encode_muse_full_layer_ops(ctx, &encoder, carrier, &state.hidden_dev, &req)?;
     encoder.endEncoding();
     command.commit();
