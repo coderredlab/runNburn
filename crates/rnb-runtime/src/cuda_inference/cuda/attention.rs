@@ -255,6 +255,28 @@ fn muse_hd128_head_geometry_is_invalid(
         || num_kv_heads.checked_mul(128) != Some(kv_rows)
 }
 
+fn muse_hd128_kernel_extents_are_invalid(
+    seq_len: usize,
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+) -> bool {
+    let max = u32::MAX as usize;
+    [seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
+        .into_iter()
+        .any(|value| value > max)
+        || [q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
+            .into_iter()
+            .any(|width| {
+                seq_len
+                    .checked_mul(width)
+                    .is_none_or(|elements| elements > max)
+            })
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
     q: &[u8],
@@ -294,6 +316,11 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
     let seq_len = hidden_input.len().checked_div(cols).unwrap_or(0);
     if !backend::tuning::prefill_flash_attention_enabled()
         || muse_hd128_head_geometry_is_invalid(q_rows, kv_rows, num_heads, num_kv_heads)
+        || cols == 0
+        || !hidden_input.len().is_multiple_of(cols)
+        || muse_hd128_kernel_extents_are_invalid(
+            seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd,
+        )
         || q_norm.len() != 128
         || k_norm.len() != 128
         || muse_hd128_window_is_invalid(sliding_window)
@@ -725,7 +752,10 @@ pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{muse_hd128_head_geometry_is_invalid, muse_hd128_window_is_invalid};
+    use super::{
+        muse_hd128_head_geometry_is_invalid, muse_hd128_kernel_extents_are_invalid,
+        muse_hd128_window_is_invalid,
+    };
 
     #[test]
     fn muse_hd128_window_rejects_zero_and_kernel_overflow() {
@@ -745,5 +775,30 @@ mod tests {
         assert!(muse_hd128_head_geometry_is_invalid(256, 0, 2, 0));
         assert!(muse_hd128_head_geometry_is_invalid(512, 384, 4, 3));
         assert!(muse_hd128_head_geometry_is_invalid(128, 128, 2, 1));
+    }
+
+    #[test]
+    fn muse_hd128_kernel_extents_reject_derived_u32_overflow() {
+        assert!(!muse_hd128_kernel_extents_are_invalid(
+            64, 256, 128, 256, 256, 1024, 256
+        ));
+        assert!(muse_hd128_kernel_extents_are_invalid(
+            2,
+            1usize << 31,
+            128,
+            256,
+            256,
+            1024,
+            256,
+        ));
+        assert!(muse_hd128_kernel_extents_are_invalid(
+            1usize << 24,
+            256,
+            128,
+            256,
+            256,
+            1024,
+            256,
+        ));
     }
 }

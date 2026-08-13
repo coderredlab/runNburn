@@ -852,6 +852,28 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         )
 }
 
+fn muse_hd128_kernel_extents_fit_u32(
+    seq_len: usize,
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+) -> bool {
+    let max = u32::MAX as usize;
+    [seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
+        .into_iter()
+        .all(|value| value <= max)
+        && [q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
+            .into_iter()
+            .all(|width| {
+                seq_len
+                    .checked_mul(width)
+                    .is_some_and(|elements| elements <= max)
+            })
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn q4k_muse_prefill_hd128_dense_chain(
     q_weights: &[u8],
@@ -910,6 +932,18 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     if cols == 0 || !cols.is_multiple_of(256) {
         return Err(format!(
             "CUDA Muse QKV dense chain cols must be non-zero and divisible by 256: {cols}"
+        ));
+    }
+    if !hidden_input.len().is_multiple_of(cols) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain hidden input length {} is not divisible by cols {cols}",
+            hidden_input.len()
+        ));
+    }
+    let seq_len = hidden_input.len() / cols;
+    if !muse_hd128_kernel_extents_fit_u32(seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain kernel extent out of u32 range: seq_len={seq_len} q_rows={q_rows} kv_rows={kv_rows} cols={cols} o_cols={o_cols} n_ff={n_ff} n_embd={n_embd}"
         ));
     }
     let blocks_per_row = cols / 256;
@@ -975,10 +1009,8 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     let expected_down_bytes = n_embd
         .checked_mul(down_row_bytes)
         .ok_or_else(|| "CUDA Muse QKV dense chain down weight byte overflow".to_string())?;
-    let expected_hidden = hidden_input
-        .len()
-        .checked_div(cols)
-        .and_then(|seq_len| seq_len.checked_mul(n_embd))
+    let expected_hidden = seq_len
+        .checked_mul(n_embd)
         .ok_or_else(|| "CUDA Muse QKV dense chain hidden length overflow".to_string())?;
     if q_weights.len() != expected_q
         || k_weights.len() != expected_k
@@ -1739,5 +1771,40 @@ impl CudaState {
         }
         self.stream_synchronize()?;
         Ok(Some(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::muse_hd128_kernel_extents_fit_u32;
+
+    #[test]
+    fn muse_hd128_kernel_extents_reject_derived_u32_overflow() {
+        assert!(muse_hd128_kernel_extents_fit_u32(
+            64, 256, 128, 256, 256, 1024, 256
+        ));
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert!(!muse_hd128_kernel_extents_fit_u32(
+                1, too_large, 128, 256, 256, 1024, 256,
+            ));
+        }
+        assert!(!muse_hd128_kernel_extents_fit_u32(
+            2,
+            1usize << 31,
+            128,
+            256,
+            256,
+            1024,
+            256,
+        ));
+        assert!(!muse_hd128_kernel_extents_fit_u32(
+            1usize << 24,
+            256,
+            128,
+            256,
+            256,
+            1024,
+            256,
+        ));
     }
 }
