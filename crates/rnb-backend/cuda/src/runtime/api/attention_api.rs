@@ -697,6 +697,8 @@ pub fn attention_prefill_flash_hd128(
         .attention_prefill_flash_hd128(q, k, v, seq_len, kv_len, num_heads, num_kv_heads, scale)
 }
 
+const MUSE_HD128_MAX_GRID_Y: usize = 65_535;
+
 #[allow(clippy::too_many_arguments)]
 pub fn attention_prefill_flash_hd128_muse_dense_chain(
     q: &[f32],
@@ -729,6 +731,8 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         || num_heads == 0
         || num_kv_heads == 0
         || num_heads % num_kv_heads != 0
+        || n_ff == 0
+        || n_embd == 0
     {
         return Err(format!(
             "CUDA Muse attention chain invalid attention geometry: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads}"
@@ -736,7 +740,7 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
     }
     if seq_len > u32::MAX as usize
         || kv_len > u32::MAX as usize
-        || num_heads > u32::MAX as usize
+        || num_heads > MUSE_HD128_MAX_GRID_Y
         || num_kv_heads > u32::MAX as usize
         || sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
     {
@@ -744,8 +748,24 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
             "CUDA Muse attention chain kernel argument out of range: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads} sliding_window={sliding_window:?}"
         ));
     }
-    let expected_q = seq_len.saturating_mul(num_heads).saturating_mul(128);
-    let expected_kv = kv_len.saturating_mul(num_kv_heads).saturating_mul(128);
+    let q_rows = num_heads
+        .checked_mul(128)
+        .ok_or_else(|| "CUDA Muse attention chain Q row overflow".to_string())?;
+    let kv_rows = num_kv_heads
+        .checked_mul(128)
+        .ok_or_else(|| "CUDA Muse attention chain KV row overflow".to_string())?;
+    if !muse_hd128_attention_extents_fit_u32(seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd)
+    {
+        return Err(format!(
+            "CUDA Muse attention chain kernel extent out of u32 range: seq_len={seq_len} kv_len={kv_len} q_rows={q_rows} kv_rows={kv_rows} o_cols={o_cols} n_ff={n_ff} n_embd={n_embd}"
+        ));
+    }
+    let expected_q = seq_len
+        .checked_mul(q_rows)
+        .ok_or_else(|| "CUDA Muse attention chain Q length overflow".to_string())?;
+    let expected_kv = kv_len
+        .checked_mul(kv_rows)
+        .ok_or_else(|| "CUDA Muse attention chain KV length overflow".to_string())?;
     let o_blocks = o_cols
         .checked_div(256)
         .filter(|_| o_cols.is_multiple_of(256))
@@ -786,12 +806,24 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
     let expected_down_bytes = n_embd
         .checked_mul(down_row_bytes)
         .ok_or_else(|| "CUDA Muse attention chain down weight byte overflow".to_string())?;
+    if !muse_hd128_weight_extents_fit_u32(&[
+        expected_o_bytes,
+        expected_gate_up_bytes,
+        expected_down_bytes,
+    ]) {
+        return Err(format!(
+            "CUDA Muse attention chain weight extent out of u32 range: o={expected_o_bytes} gate_up={expected_gate_up_bytes} down={expected_down_bytes}"
+        ));
+    }
+    let expected_hidden = seq_len
+        .checked_mul(n_embd)
+        .ok_or_else(|| "CUDA Muse attention chain hidden length overflow".to_string())?;
     if q.len() != expected_q
         || k.len() != expected_kv
         || v.len() != expected_kv
         || attention_gate.len() != expected_q
-        || hidden.len() != seq_len.saturating_mul(n_embd)
-        || o_cols != num_heads.saturating_mul(128)
+        || hidden.len() != expected_hidden
+        || o_cols != q_rows
         || post_attn_norm_weight.len() != n_embd
         || ffn_norm_weight.len() != n_embd
         || post_ffn_norm_weight.len() != n_embd
@@ -807,8 +839,8 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
             v.len(),
             attention_gate.len(),
             hidden.len(),
-            seq_len.saturating_mul(n_embd),
-            num_heads.saturating_mul(128),
+            expected_hidden,
+            q_rows,
             post_attn_norm_weight.len(),
             ffn_norm_weight.len(),
             post_ffn_norm_weight.len(),
@@ -852,6 +884,46 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         )
 }
 
+fn muse_hd128_attention_extents_fit_u32(
+    seq_len: usize,
+    kv_len: usize,
+    q_rows: usize,
+    kv_rows: usize,
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+) -> bool {
+    let max = u32::MAX as usize;
+    seq_len <= MUSE_HD128_MAX_GRID_Y
+        && [seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd]
+            .into_iter()
+            .all(|value| value <= max)
+        && [
+            (seq_len, q_rows),
+            (kv_len, kv_rows),
+            (seq_len, o_cols),
+            (seq_len, n_ff),
+            (seq_len, n_embd),
+        ]
+        .into_iter()
+        .all(|(rows, width)| {
+            rows.checked_mul(width)
+                .is_some_and(|elements| elements <= max)
+        })
+}
+
+fn muse_hd128_weight_extents_fit_u32(extents: &[usize]) -> bool {
+    extents.iter().all(|&bytes| bytes <= u32::MAX as usize)
+}
+
+fn muse_hd128_rope_positions_fit_u32(apply_rope: bool, pos_start: usize, seq_len: usize) -> bool {
+    !apply_rope
+        || (seq_len > 0
+            && pos_start
+                .checked_add(seq_len - 1)
+                .is_some_and(|last_pos| last_pos <= u32::MAX as usize))
+}
+
 fn muse_hd128_kernel_extents_fit_u32(
     seq_len: usize,
     q_rows: usize,
@@ -861,17 +933,11 @@ fn muse_hd128_kernel_extents_fit_u32(
     n_ff: usize,
     n_embd: usize,
 ) -> bool {
-    let max = u32::MAX as usize;
-    [seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
-        .into_iter()
-        .all(|value| value <= max)
-        && [q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
-            .into_iter()
-            .all(|width| {
-                seq_len
-                    .checked_mul(width)
-                    .is_some_and(|elements| elements <= max)
-            })
+    muse_hd128_attention_extents_fit_u32(seq_len, seq_len, q_rows, kv_rows, o_cols, n_ff, n_embd)
+        && cols <= u32::MAX as usize
+        && seq_len
+            .checked_mul(cols)
+            .is_some_and(|elements| elements <= u32::MAX as usize)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -920,7 +986,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     if num_heads == 0
         || num_kv_heads == 0
         || num_heads % num_kv_heads != 0
-        || num_heads > u32::MAX as usize
+        || num_heads > MUSE_HD128_MAX_GRID_Y
         || num_kv_heads > u32::MAX as usize
         || expected_q_rows != Some(q_rows)
         || expected_kv_rows != Some(kv_rows)
@@ -941,6 +1007,16 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
         ));
     }
     let seq_len = hidden_input.len() / cols;
+    if seq_len == 0 || n_ff == 0 || n_embd == 0 {
+        return Err(format!(
+            "CUDA Muse QKV dense chain dimensions must be non-zero: seq_len={seq_len} n_ff={n_ff} n_embd={n_embd}"
+        ));
+    }
+    if !muse_hd128_rope_positions_fit_u32(apply_rope, pos_start, seq_len) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain RoPE position out of u32 range: pos_start={pos_start} seq_len={seq_len}"
+        ));
+    }
     if !muse_hd128_kernel_extents_fit_u32(seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd) {
         return Err(format!(
             "CUDA Muse QKV dense chain kernel extent out of u32 range: seq_len={seq_len} q_rows={q_rows} kv_rows={kv_rows} cols={cols} o_cols={o_cols} n_ff={n_ff} n_embd={n_embd}"
@@ -1009,6 +1085,19 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     let expected_down_bytes = n_embd
         .checked_mul(down_row_bytes)
         .ok_or_else(|| "CUDA Muse QKV dense chain down weight byte overflow".to_string())?;
+    if !muse_hd128_weight_extents_fit_u32(&[
+        expected_q,
+        expected_k,
+        expected_v,
+        expected_gate,
+        expected_o_bytes,
+        expected_gate_up_bytes,
+        expected_down_bytes,
+    ]) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain weight extent out of u32 range: q={expected_q} k={expected_k} v={expected_v} attention_gate={expected_gate} o={expected_o_bytes} gate_up={expected_gate_up_bytes} down={expected_down_bytes}"
+        ));
+    }
     let expected_hidden = seq_len
         .checked_mul(n_embd)
         .ok_or_else(|| "CUDA Muse QKV dense chain hidden length overflow".to_string())?;
@@ -1776,7 +1865,12 @@ impl CudaState {
 
 #[cfg(test)]
 mod tests {
-    use super::muse_hd128_kernel_extents_fit_u32;
+    use super::{
+        attention_prefill_flash_hd128_muse_dense_chain, muse_hd128_attention_extents_fit_u32,
+        muse_hd128_kernel_extents_fit_u32, muse_hd128_rope_positions_fit_u32,
+        muse_hd128_weight_extents_fit_u32, q4k_muse_prefill_hd128_dense_chain,
+        MUSE_HD128_MAX_GRID_Y,
+    };
 
     #[test]
     fn muse_hd128_kernel_extents_reject_derived_u32_overflow() {
@@ -1806,5 +1900,417 @@ mod tests {
             1024,
             256,
         ));
+    }
+
+    #[test]
+    fn muse_hd128_attention_extents_reject_kv_and_output_overflow() {
+        assert!(muse_hd128_attention_extents_fit_u32(
+            64, 128, 256, 128, 256, 1024, 256,
+        ));
+        assert!(!muse_hd128_attention_extents_fit_u32(
+            1,
+            2,
+            256,
+            1usize << 31,
+            256,
+            1024,
+            256,
+        ));
+        assert!(!muse_hd128_attention_extents_fit_u32(
+            1usize << 24,
+            1usize << 24,
+            256,
+            128,
+            256,
+            1024,
+            256,
+        ));
+        assert!(muse_hd128_attention_extents_fit_u32(
+            MUSE_HD128_MAX_GRID_Y,
+            MUSE_HD128_MAX_GRID_Y,
+            256,
+            128,
+            256,
+            256,
+            256,
+        ));
+        assert!(!muse_hd128_attention_extents_fit_u32(
+            MUSE_HD128_MAX_GRID_Y + 1,
+            MUSE_HD128_MAX_GRID_Y + 1,
+            256,
+            128,
+            256,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn muse_hd128_weight_extents_reject_u32_overflow() {
+        assert!(muse_hd128_weight_extents_fit_u32(
+            &[144, u32::MAX as usize,]
+        ));
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert!(!muse_hd128_weight_extents_fit_u32(&[144, too_large,]));
+        }
+    }
+
+    #[test]
+    fn muse_hd128_rope_positions_reject_last_position_overflow() {
+        assert!(muse_hd128_rope_positions_fit_u32(
+            true,
+            u32::MAX as usize,
+            1,
+        ));
+        assert!(!muse_hd128_rope_positions_fit_u32(
+            true,
+            u32::MAX as usize,
+            2,
+        ));
+        assert!(muse_hd128_rope_positions_fit_u32(false, usize::MAX, 2,));
+        assert!(!muse_hd128_rope_positions_fit_u32(true, 0, 0));
+    }
+
+    #[test]
+    fn muse_hd128_chain_rejects_flat_extent_before_cuda_work() {
+        let error = attention_prefill_flash_hd128_muse_dense_chain(
+            &[],
+            &[],
+            &[],
+            &[],
+            2,
+            2,
+            1,
+            1,
+            1.0,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            128,
+            1usize << 31,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("overflowing flat extent must be rejected");
+        assert!(error.contains("kernel extent out of u32 range"), "{error}");
+    }
+
+    #[test]
+    fn muse_hd128_qkv_chain_rejects_rope_overflow_before_cuda_work() {
+        let hidden_input = vec![0.0; 512];
+        let error = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            128,
+            128,
+            256,
+            &hidden_input,
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            1,
+            1,
+            1.0,
+            10_000.0,
+            u32::MAX as usize,
+            true,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            128,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("overflowing RoPE position must be rejected");
+        assert!(error.contains("RoPE position out of u32 range"), "{error}");
+    }
+
+    #[test]
+    fn muse_hd128_qkv_chain_rejects_weight_extent_before_cuda_work() {
+        let hidden_input = vec![0.0; 1024];
+        let num_heads = 65_534;
+        let q_rows = num_heads * 128;
+        let error = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            q_rows,
+            128,
+            1024,
+            &hidden_input,
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            num_heads,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            1024,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("overflowing quantized weight extent must be rejected");
+        assert!(error.contains("weight extent out of u32 range"), "{error}");
+    }
+
+    #[test]
+    fn muse_hd128_chain_rejects_zero_dense_dimensions_before_cuda_work() {
+        let q = vec![0.0; 128];
+        for (n_ff, n_embd) in [(0, 256), (256, 0)] {
+            let error = attention_prefill_flash_hd128_muse_dense_chain(
+                &q,
+                &q,
+                &q,
+                &q,
+                1,
+                1,
+                1,
+                1,
+                1.0,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                12,
+                &[],
+                &[],
+                &[],
+                128,
+                n_ff,
+                n_embd,
+                &mut [],
+                1e-5,
+                1e-5,
+            )
+            .expect_err("zero dense dimension must be rejected");
+            assert!(error.contains("invalid attention geometry"), "{error}");
+        }
+    }
+
+    #[test]
+    fn muse_hd128_chain_rejects_sequence_grid_y_overflow_before_cuda_work() {
+        let error = attention_prefill_flash_hd128_muse_dense_chain(
+            &[],
+            &[],
+            &[],
+            &[],
+            MUSE_HD128_MAX_GRID_Y + 1,
+            MUSE_HD128_MAX_GRID_Y + 1,
+            2,
+            1,
+            1.0,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("sequence grid Y overflow must be rejected");
+        assert!(error.contains("kernel extent out of u32 range"), "{error}");
+    }
+
+    #[test]
+    fn muse_hd128_qkv_chain_rejects_zero_sequence_before_cuda_work() {
+        let error = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            256,
+            128,
+            256,
+            &[],
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            2,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("zero sequence must be rejected");
+        assert!(error.contains("dimensions must be non-zero"), "{error}");
+    }
+
+    #[test]
+    fn muse_hd128_qkv_chain_rejects_zero_dense_dimensions_before_cuda_work() {
+        let hidden_input = vec![0.0; 256];
+        for (n_ff, n_embd) in [(0, 256), (256, 0)] {
+            let error = q4k_muse_prefill_hd128_dense_chain(
+                &[],
+                &[],
+                &[],
+                12,
+                &[],
+                256,
+                128,
+                256,
+                &hidden_input,
+                &[],
+                &[0.0; 128],
+                &[0.0; 128],
+                2,
+                1,
+                1.0,
+                10_000.0,
+                0,
+                false,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                12,
+                &[],
+                &[],
+                &[],
+                256,
+                n_ff,
+                n_embd,
+                &mut [],
+                1e-5,
+                1e-5,
+            )
+            .expect_err("zero fused dense dimension must be rejected");
+            assert!(error.contains("dimensions must be non-zero"), "{error}");
+        }
+    }
+
+    #[test]
+    fn muse_hd128_chains_reject_attention_grid_y_overflow_before_cuda_work() {
+        let num_heads = 65_536;
+        let q_rows = num_heads * 128;
+        let error = attention_prefill_flash_hd128_muse_dense_chain(
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            1,
+            num_heads,
+            1,
+            1.0,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("attention grid Y overflow must be rejected");
+        assert!(error.contains("kernel argument out of range"), "{error}");
+
+        let hidden_input = vec![0.0; 256];
+        let error = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            q_rows,
+            128,
+            256,
+            &hidden_input,
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            num_heads,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect_err("fused attention grid Y overflow must be rejected");
+        assert!(error.contains("invalid head geometry"), "{error}");
     }
 }

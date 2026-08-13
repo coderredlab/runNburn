@@ -2,6 +2,8 @@ use rnb_loader::GGMLType;
 
 use super::{backend, Result};
 
+const MUSE_HD128_MAX_GRID_Y: usize = 65_535;
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode_attention_hd256_if_supported(
     layer_index: Option<usize>,
@@ -199,11 +201,24 @@ pub fn prefill_attention_hd128_muse_dense_chain_if_supported(
     norm_eps: f32,
     post_norm_eps: f32,
 ) -> Result<bool> {
+    let q_rows = num_heads.saturating_mul(128);
+    let kv_rows = num_kv_heads.saturating_mul(128);
     if !backend::tuning::prefill_flash_attention_enabled()
         || has_softcap
+        || seq_len == 0
+        || kv_len < seq_len
+        || num_heads == 0
+        || num_heads > MUSE_HD128_MAX_GRID_Y
         || num_kv_heads == 0
         || num_heads % num_kv_heads != 0
         || head_dim != 128
+        || n_ff == 0
+        || n_embd == 0
+        || muse_hd128_window_is_invalid(sliding_window)
+        || muse_hd128_attention_extents_are_invalid(
+            seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd,
+        )
+        || muse_hd128_dense_tail_weight_extents_are_invalid(o_cols, n_ff, n_embd, down_quant)
         || seq_len < backend::tuning::prefill_flash_attention_min_seq(head_dim)
     {
         return Ok(false);
@@ -249,10 +264,39 @@ fn muse_hd128_head_geometry_is_invalid(
     num_kv_heads: usize,
 ) -> bool {
     num_heads == 0
+        || num_heads > MUSE_HD128_MAX_GRID_Y
         || num_kv_heads == 0
         || num_heads % num_kv_heads != 0
         || num_heads.checked_mul(128) != Some(q_rows)
         || num_kv_heads.checked_mul(128) != Some(kv_rows)
+}
+
+fn muse_hd128_attention_extents_are_invalid(
+    seq_len: usize,
+    kv_len: usize,
+    q_rows: usize,
+    kv_rows: usize,
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+) -> bool {
+    let max = u32::MAX as usize;
+    seq_len > MUSE_HD128_MAX_GRID_Y
+        || [seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd]
+            .into_iter()
+            .any(|value| value > max)
+        || [
+            (seq_len, q_rows),
+            (kv_len, kv_rows),
+            (seq_len, o_cols),
+            (seq_len, n_ff),
+            (seq_len, n_embd),
+        ]
+        .into_iter()
+        .any(|(rows, width)| {
+            rows.checked_mul(width)
+                .is_none_or(|elements| elements > max)
+        })
 }
 
 fn muse_hd128_kernel_extents_are_invalid(
@@ -264,17 +308,79 @@ fn muse_hd128_kernel_extents_are_invalid(
     n_ff: usize,
     n_embd: usize,
 ) -> bool {
-    let max = u32::MAX as usize;
-    [seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
-        .into_iter()
-        .any(|value| value > max)
-        || [q_rows, kv_rows, cols, o_cols, n_ff, n_embd]
-            .into_iter()
-            .any(|width| {
-                seq_len
-                    .checked_mul(width)
-                    .is_none_or(|elements| elements > max)
-            })
+    muse_hd128_attention_extents_are_invalid(
+        seq_len, seq_len, q_rows, kv_rows, o_cols, n_ff, n_embd,
+    ) || cols > u32::MAX as usize
+        || seq_len
+            .checked_mul(cols)
+            .is_none_or(|elements| elements > u32::MAX as usize)
+}
+
+fn muse_hd128_quant_weight_bytes(rows: usize, cols: usize, block_bytes: usize) -> Option<usize> {
+    cols.checked_div(256)
+        .filter(|_| cols.is_multiple_of(256))
+        .and_then(|blocks| blocks.checked_mul(block_bytes))
+        .and_then(|row_bytes| rows.checked_mul(row_bytes))
+}
+
+fn muse_hd128_dense_tail_weight_extents_are_invalid(
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    down_quant: GGMLType,
+) -> bool {
+    let down_block_bytes = match down_quant {
+        GGMLType::Q4_K => 144,
+        GGMLType::Q5_K => 176,
+        GGMLType::Q6_K => 210,
+        _ => return true,
+    };
+    [
+        muse_hd128_quant_weight_bytes(n_embd, o_cols, 144),
+        muse_hd128_quant_weight_bytes(n_ff, n_embd, 144),
+        muse_hd128_quant_weight_bytes(n_embd, n_ff, down_block_bytes),
+    ]
+    .into_iter()
+    .any(|bytes| bytes.is_none_or(|bytes| bytes > u32::MAX as usize))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn muse_hd128_qkv_weight_extents_are_invalid(
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    v_quant: GGMLType,
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    down_quant: GGMLType,
+) -> bool {
+    let v_block_bytes = match v_quant {
+        GGMLType::Q4_K => 144,
+        GGMLType::Q6_K => 210,
+        _ => return true,
+    };
+    [
+        muse_hd128_quant_weight_bytes(q_rows, cols, 144),
+        muse_hd128_quant_weight_bytes(kv_rows, cols, 144),
+        muse_hd128_quant_weight_bytes(kv_rows, cols, v_block_bytes),
+        muse_hd128_quant_weight_bytes(q_rows, cols, 144),
+    ]
+    .into_iter()
+    .any(|bytes| bytes.is_none_or(|bytes| bytes > u32::MAX as usize))
+        || muse_hd128_dense_tail_weight_extents_are_invalid(o_cols, n_ff, n_embd, down_quant)
+}
+
+fn muse_hd128_rope_positions_are_invalid(
+    apply_rope: bool,
+    pos_start: usize,
+    seq_len: usize,
+) -> bool {
+    apply_rope
+        && (seq_len == 0
+            || pos_start
+                .checked_add(seq_len - 1)
+                .is_none_or(|last_pos| last_pos > u32::MAX as usize))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -318,12 +424,19 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
         || muse_hd128_head_geometry_is_invalid(q_rows, kv_rows, num_heads, num_kv_heads)
         || cols == 0
         || !hidden_input.len().is_multiple_of(cols)
+        || seq_len == 0
+        || n_ff == 0
+        || n_embd == 0
         || muse_hd128_kernel_extents_are_invalid(
             seq_len, q_rows, kv_rows, cols, o_cols, n_ff, n_embd,
+        )
+        || muse_hd128_qkv_weight_extents_are_invalid(
+            q_rows, kv_rows, cols, v_quant, o_cols, n_ff, n_embd, down_quant,
         )
         || q_norm.len() != 128
         || k_norm.len() != 128
         || muse_hd128_window_is_invalid(sliding_window)
+        || muse_hd128_rope_positions_are_invalid(apply_rope, pos_start, seq_len)
         || seq_len < backend::tuning::prefill_flash_attention_min_seq(128)
     {
         return Ok(None);
@@ -753,9 +866,13 @@ pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
+        muse_hd128_attention_extents_are_invalid, muse_hd128_dense_tail_weight_extents_are_invalid,
         muse_hd128_head_geometry_is_invalid, muse_hd128_kernel_extents_are_invalid,
-        muse_hd128_window_is_invalid,
+        muse_hd128_qkv_weight_extents_are_invalid, muse_hd128_rope_positions_are_invalid,
+        muse_hd128_window_is_invalid, prefill_attention_hd128_muse_dense_chain_if_supported,
+        prefill_q4k_muse_hd128_dense_chain_if_supported, MUSE_HD128_MAX_GRID_Y,
     };
+    use rnb_loader::GGMLType;
 
     #[test]
     fn muse_hd128_window_rejects_zero_and_kernel_overflow() {
@@ -775,6 +892,18 @@ mod tests {
         assert!(muse_hd128_head_geometry_is_invalid(256, 0, 2, 0));
         assert!(muse_hd128_head_geometry_is_invalid(512, 384, 4, 3));
         assert!(muse_hd128_head_geometry_is_invalid(128, 128, 2, 1));
+        assert!(!muse_hd128_head_geometry_is_invalid(
+            65_535 * 128,
+            128,
+            65_535,
+            1,
+        ));
+        assert!(muse_hd128_head_geometry_is_invalid(
+            65_536 * 128,
+            128,
+            65_536,
+            1,
+        ));
     }
 
     #[test]
@@ -800,5 +929,335 @@ mod tests {
             1024,
             256,
         ));
+        assert!(!muse_hd128_kernel_extents_are_invalid(
+            MUSE_HD128_MAX_GRID_Y,
+            256,
+            128,
+            256,
+            256,
+            256,
+            256,
+        ));
+        assert!(muse_hd128_kernel_extents_are_invalid(
+            MUSE_HD128_MAX_GRID_Y + 1,
+            256,
+            128,
+            256,
+            256,
+            256,
+            256,
+        ));
+    }
+
+    #[test]
+    fn muse_hd128_rope_positions_reject_last_position_overflow() {
+        assert!(!muse_hd128_rope_positions_are_invalid(
+            true,
+            u32::MAX as usize,
+            1,
+        ));
+        assert!(muse_hd128_rope_positions_are_invalid(
+            true,
+            u32::MAX as usize,
+            2,
+        ));
+        assert!(!muse_hd128_rope_positions_are_invalid(false, usize::MAX, 2,));
+        assert!(muse_hd128_rope_positions_are_invalid(true, 0, 0));
+    }
+
+    #[test]
+    fn muse_hd128_weight_extents_reject_u32_overflow() {
+        assert!(!muse_hd128_dense_tail_weight_extents_are_invalid(
+            256,
+            256,
+            256,
+            GGMLType::Q4_K,
+        ));
+        assert!(muse_hd128_dense_tail_weight_extents_are_invalid(
+            256,
+            33_554_176,
+            256,
+            GGMLType::Q4_K,
+        ));
+        assert!(muse_hd128_qkv_weight_extents_are_invalid(
+            65_534 * 128,
+            128,
+            1024,
+            GGMLType::Q4_K,
+            65_534 * 128,
+            256,
+            1024,
+            GGMLType::Q4_K,
+        ));
+    }
+
+    #[test]
+    fn muse_hd128_precomputed_facade_falls_back_on_invalid_extents() {
+        for (n_ff, n_embd) in [(0, 256), (33_554_176, 256), (33_554_432, 256), (256, 0)] {
+            let admitted = prefill_attention_hd128_muse_dense_chain_if_supported(
+                &[],
+                &[],
+                &[],
+                &[],
+                128,
+                128,
+                2,
+                1,
+                128,
+                1.0,
+                None,
+                false,
+                &[],
+                &[],
+                &[],
+                &[],
+                GGMLType::Q4_K,
+                &[],
+                &[],
+                &[],
+                256,
+                n_ff,
+                n_embd,
+                &mut [],
+                1e-5,
+                1e-5,
+            )
+            .expect("unsupported precomputed Muse extent must not error");
+            assert!(!admitted, "n_ff={n_ff} n_embd={n_embd}");
+        }
+        assert!(muse_hd128_attention_extents_are_invalid(
+            128, 128, 256, 128, 256, 33_554_432, 256,
+        ));
+    }
+
+    #[test]
+    fn muse_hd128_precomputed_facade_falls_back_on_sequence_grid_y_overflow() {
+        let admitted = prefill_attention_hd128_muse_dense_chain_if_supported(
+            &[],
+            &[],
+            &[],
+            &[],
+            MUSE_HD128_MAX_GRID_Y + 1,
+            MUSE_HD128_MAX_GRID_Y + 1,
+            2,
+            1,
+            128,
+            1.0,
+            None,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect("oversized sequence grid must not error");
+        assert!(!admitted);
+    }
+    #[test]
+    fn muse_hd128_qkv_facade_falls_back_on_zero_and_weight_overflow() {
+        let result = prefill_q4k_muse_hd128_dense_chain_if_supported(
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            256,
+            128,
+            256,
+            &[],
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            2,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect("zero-sequence Muse QKV must not error");
+        assert!(result.is_none());
+
+        let hidden_input = vec![0.0; 256];
+        for (n_ff, n_embd) in [(0, 256), (256, 0)] {
+            let result = prefill_q4k_muse_hd128_dense_chain_if_supported(
+                &[],
+                &[],
+                &[],
+                GGMLType::Q4_K,
+                &[],
+                256,
+                128,
+                256,
+                &hidden_input,
+                &[],
+                &[0.0; 128],
+                &[0.0; 128],
+                2,
+                1,
+                1.0,
+                10_000.0,
+                0,
+                false,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                GGMLType::Q4_K,
+                &[],
+                &[],
+                &[],
+                256,
+                n_ff,
+                n_embd,
+                &mut [],
+                1e-5,
+                1e-5,
+            )
+            .expect("zero fused dense dimension must not error");
+            assert!(result.is_none(), "n_ff={n_ff} n_embd={n_embd}");
+        }
+
+        let hidden_input = vec![0.0; 128 * 1024];
+        let num_heads = 65_534;
+        let q_rows = num_heads * 128;
+        let result = prefill_q4k_muse_hd128_dense_chain_if_supported(
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            q_rows,
+            128,
+            1024,
+            &hidden_input,
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            num_heads,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            1024,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect("oversized Muse QKV weights must not error");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn muse_hd128_facades_fall_back_on_attention_grid_y_overflow() {
+        let num_heads = 65_536;
+        let q_rows = num_heads * 128;
+        let admitted = prefill_attention_hd128_muse_dense_chain_if_supported(
+            &[],
+            &[],
+            &[],
+            &[],
+            128,
+            128,
+            num_heads,
+            1,
+            128,
+            1.0,
+            None,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect("oversized attention grid must not error");
+        assert!(!admitted);
+
+        let hidden_input = vec![0.0; 128 * 256];
+        let result = prefill_q4k_muse_hd128_dense_chain_if_supported(
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            q_rows,
+            128,
+            256,
+            &hidden_input,
+            &[],
+            &[0.0; 128],
+            &[0.0; 128],
+            num_heads,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            GGMLType::Q4_K,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            256,
+            &mut [],
+            1e-5,
+            1e-5,
+        )
+        .expect("oversized fused attention grid must not error");
+        assert!(result.is_none());
     }
 }
