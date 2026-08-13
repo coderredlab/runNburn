@@ -10147,6 +10147,54 @@ fn cuda_q4k_muse_prefill_hd128_dense_chain_rejects_invalid_window() {
 }
 
 #[test]
+fn cuda_q4k_muse_prefill_hd128_dense_chain_rejects_invalid_head_geometry() {
+    for (q_rows, kv_rows, num_heads, num_kv_heads) in
+        [(0, 128, 0, 1), (512, 384, 4, 3), (256, 0, 2, 0)]
+    {
+        let mut hidden = Vec::new();
+        let err = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            q_rows,
+            kv_rows,
+            256,
+            &[],
+            &[],
+            &[],
+            &[],
+            num_heads,
+            num_kv_heads,
+            1.0,
+            10_000.0,
+            0,
+            true,
+            Some(1),
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            q_rows,
+            256,
+            256,
+            &mut hidden,
+            1.0e-5,
+            1.0e-6,
+        )
+        .expect_err("invalid fused Muse head geometry must fail before CUDA launch");
+        assert!(
+            err.contains("invalid head geometry"),
+            "unexpected error for rows={q_rows}/{kv_rows} heads={num_heads}/{num_kv_heads}: {err}"
+        );
+    }
+}
+#[test]
 fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");

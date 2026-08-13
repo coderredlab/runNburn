@@ -893,6 +893,20 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
             "CUDA Muse QKV dense chain invalid sliding window: {sliding_window:?}"
         ));
     }
+    let expected_q_rows = num_heads.checked_mul(128);
+    let expected_kv_rows = num_kv_heads.checked_mul(128);
+    if num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || num_heads > u32::MAX as usize
+        || num_kv_heads > u32::MAX as usize
+        || expected_q_rows != Some(q_rows)
+        || expected_kv_rows != Some(kv_rows)
+    {
+        return Err(format!(
+            "CUDA Muse QKV dense chain invalid head geometry: q_rows={q_rows} kv_rows={kv_rows} num_heads={num_heads} num_kv_heads={num_kv_heads}"
+        ));
+    }
     if cols == 0 || !cols.is_multiple_of(256) {
         return Err(format!(
             "CUDA Muse QKV dense chain cols must be non-zero and divisible by 256: {cols}"

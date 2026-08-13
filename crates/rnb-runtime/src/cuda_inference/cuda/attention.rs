@@ -242,6 +242,19 @@ fn muse_hd128_window_is_invalid(sliding_window: Option<usize>) -> bool {
     sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
 }
 
+fn muse_hd128_head_geometry_is_invalid(
+    q_rows: usize,
+    kv_rows: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+) -> bool {
+    num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || num_heads.checked_mul(128) != Some(q_rows)
+        || num_kv_heads.checked_mul(128) != Some(kv_rows)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
     q: &[u8],
@@ -280,10 +293,7 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
 ) -> Result<Option<(Vec<u16>, Vec<u16>)>> {
     let seq_len = hidden_input.len().checked_div(cols).unwrap_or(0);
     if !backend::tuning::prefill_flash_attention_enabled()
-        || q_rows != num_heads.saturating_mul(128)
-        || num_kv_heads == 0
-        || num_heads % num_kv_heads != 0
-        || kv_rows != num_kv_heads.saturating_mul(128)
+        || muse_hd128_head_geometry_is_invalid(q_rows, kv_rows, num_heads, num_kv_heads)
         || q_norm.len() != 128
         || k_norm.len() != 128
         || muse_hd128_window_is_invalid(sliding_window)
@@ -715,7 +725,7 @@ pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::muse_hd128_window_is_invalid;
+    use super::{muse_hd128_head_geometry_is_invalid, muse_hd128_window_is_invalid};
 
     #[test]
     fn muse_hd128_window_rejects_zero_and_kernel_overflow() {
@@ -726,5 +736,14 @@ mod tests {
         if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
             assert!(muse_hd128_window_is_invalid(Some(too_large)));
         }
+    }
+
+    #[test]
+    fn muse_hd128_head_geometry_rejects_zero_and_non_divisible_groups() {
+        assert!(!muse_hd128_head_geometry_is_invalid(256, 128, 2, 1));
+        assert!(muse_hd128_head_geometry_is_invalid(0, 128, 0, 1));
+        assert!(muse_hd128_head_geometry_is_invalid(256, 0, 2, 0));
+        assert!(muse_hd128_head_geometry_is_invalid(512, 384, 4, 3));
+        assert!(muse_hd128_head_geometry_is_invalid(128, 128, 2, 1));
     }
 }
