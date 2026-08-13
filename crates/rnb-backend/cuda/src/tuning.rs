@@ -2970,6 +2970,7 @@ mod tests {
 
     #[test]
     fn q6k_gemv_batch_seq4_defaults_on_for_long_narrow_prefill_and_allows_overrides() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8");
         }

@@ -12692,7 +12692,10 @@ fn cuda_q4k_gemv_batch_seq4_matches_warp8_bits() {
         let _seq4 = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", "0");
         q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K warp8 batch GEMV")
     };
-    let seq4 = q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K raw seq4 batch GEMV");
+    let seq4 = {
+        let _seq4 = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_RAW_SEQ4", "1");
+        q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K raw seq4 batch GEMV")
+    };
     assert_eq!(warp8.len(), seq4.len());
     for (idx, (a, b)) in warp8.iter().zip(seq4.iter()).enumerate() {
         assert_eq!(
@@ -14240,7 +14243,10 @@ fn cuda_q6k_gemv_batch_seq4_warp8_matches_warp8_bits() {
         let _seq4 = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", "0");
         q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K warp8 batch GEMV")
     };
-    let seq4 = q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K seq4 batch GEMV");
+    let seq4 = {
+        let _seq4 = EnvVarGuard::set("RNB_CUDA_Q6K_GEMV_BATCH_SEQ4_WARP8", "1");
+        q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K seq4 batch GEMV")
+    };
     assert_eq!(warp8.len(), seq4.len());
     for (idx, (a, b)) in warp8.iter().zip(seq4.iter()).enumerate() {
         assert_eq!(
