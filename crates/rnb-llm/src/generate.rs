@@ -578,6 +578,11 @@ pub fn generate_stream_multimodal_resuming(
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
     validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
+    engine.set_backend_argmax_excluded_token(
+        params
+            .ignore_eos
+            .then_some(engine.tokenizer.vocab.special.eos),
+    );
     let start = Instant::now();
     check_generation_cancellation()?;
     if !state.is_multimodal() {
@@ -709,6 +714,11 @@ pub fn generate_stream_multimodal(
     let params = params_with_model_stop_tokens(&engine.tokenizer, params);
     let params = params.as_ref();
     validate_forced_mtp_constraint(params, engine.mtp_explicitly_forced())?;
+    engine.set_backend_argmax_excluded_token(
+        params
+            .ignore_eos
+            .then_some(engine.tokenizer.vocab.special.eos),
+    );
     let start = Instant::now();
     check_generation_cancellation()?;
     let compiled = engine.compile_multimodal_prompt(rendered_prompt, image)?;
@@ -852,7 +862,7 @@ fn finish_generation(
         if constraint.is_some() {
             logits = engine.forward_with_logits(&[token])?;
             backend_argmax = None;
-        } else if params.backend_argmax_allowed() {
+        } else if engine.has_weights() && params.backend_argmax_allowed() {
             backend_argmax = engine.forward_decode_backend_argmax_only(token)?;
             logits.clear();
         } else {

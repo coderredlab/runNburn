@@ -213,7 +213,13 @@ impl Engine {
         token: u32,
     ) -> crate::error::Result<Option<u32>> {
         #[cfg(feature = "cuda")]
-        if qwen35_device_verify_decode_enabled() && self.mtp_device_verify_requested() {
+        if qwen35_device_verify_decode_enabled()
+            && self.mtp_device_verify_requested()
+            && self
+                .scratch
+                .as_ref()
+                .is_none_or(|scratch| scratch.backend_argmax_excluded_token.is_none())
+        {
             return self.forward_decode_backend_argmax_only_device_verify(token);
         }
         let (_, backend_argmax_token, _) = self.forward_decode_impl(token, true, true)?;
@@ -1268,7 +1274,11 @@ impl Engine {
             #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
             let backend_output_done = false;
             #[cfg(feature = "cuda")]
-            if !force_qwen_imrope && !cu63_device_decode_done && !mtp_collect_hidden {
+            if !force_qwen_imrope
+                && !cu63_device_decode_done
+                && !mtp_collect_hidden
+                && (!backend_argmax_only || scratch.backend_argmax_excluded_token.is_none())
+            {
                 // cu94 Milestone 0: pass scratch.logits as out buffer so the
                 // dispatch path writes full vocab logits back, not just the
                 // argmax token. Required for sampler-chain callers and the

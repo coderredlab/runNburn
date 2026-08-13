@@ -54,7 +54,10 @@ pub(in crate::engine) fn try_backend_output_logits_for_runtime(
     }
 
     #[cfg(feature = "metal")]
-    if scratch.backend_argmax_only && !use_token_embedding_as_output() {
+    if scratch.backend_argmax_only
+        && scratch.backend_argmax_excluded_token.is_none()
+        && !use_token_embedding_as_output()
+    {
         if let Some(raw) = weights.output.data.as_bytes() {
             if let Some(token) = metal_runtime::metal_output_argmax_token_if_supported(
                 weights.output.ggml_type,
@@ -72,18 +75,20 @@ pub(in crate::engine) fn try_backend_output_logits_for_runtime(
     #[cfg(feature = "cuda")]
     if use_gpu_output_logits && !use_token_embedding_as_output() {
         if let Some(raw) = weights.output.data.as_bytes() {
-            if let Some(token) = cuda_runtime::try_output_logits_into_if_enabled(
-                weights.output.ggml_type,
-                weights.output.rows,
-                weights.output.cols,
-                raw,
-                &scratch.norm_buf[..hidden_dim],
-                false,
-                &mut scratch.logits,
-                !scratch.backend_argmax_only,
-            ) {
-                scratch.backend_argmax_token = Some(token);
-                return Ok(true);
+            if !scratch.backend_argmax_only || scratch.backend_argmax_excluded_token.is_none() {
+                if let Some(token) = cuda_runtime::try_output_logits_into_if_enabled(
+                    weights.output.ggml_type,
+                    weights.output.rows,
+                    weights.output.cols,
+                    raw,
+                    &scratch.norm_buf[..hidden_dim],
+                    false,
+                    &mut scratch.logits,
+                    !scratch.backend_argmax_only,
+                ) {
+                    scratch.backend_argmax_token = Some(token);
+                    return Ok(true);
+                }
             }
             if let Some(result) = cuda_runtime::decode_gemv(
                 weights.output.ggml_type,
@@ -102,15 +107,15 @@ pub(in crate::engine) fn try_backend_output_logits_for_runtime(
                 }
                 scratch.logits[..weights.output.rows].copy_from_slice(&logits);
                 if scratch.backend_argmax_only {
-                    let mut best_token = 0usize;
-                    let mut best_value = f32::NEG_INFINITY;
-                    for (token, &value) in logits.iter().enumerate() {
-                        if value > best_value {
-                            best_token = token;
-                            best_value = value;
-                        }
-                    }
-                    scratch.backend_argmax_token = Some(best_token as u32);
+                    let excluded = scratch.backend_argmax_excluded_token;
+                    scratch.backend_argmax_token = logits
+                        .iter()
+                        .enumerate()
+                        .filter(|(token, _)| Some(*token as u32) != excluded)
+                        .max_by(|(_, left), (_, right)| {
+                            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(token, _)| token as u32);
                 }
                 return Ok(true);
             }

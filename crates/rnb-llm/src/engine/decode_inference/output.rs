@@ -2,6 +2,17 @@
 
 use super::*;
 
+fn argmax_token_excluding(logits: &[f32], excluded: Option<u32>) -> Option<u32> {
+    logits
+        .iter()
+        .enumerate()
+        .filter(|(token, _)| Some(*token as u32) != excluded)
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(token, _)| token as u32)
+}
+
 pub(super) fn finalize_decode_logits(
     weights: &ModelWeights,
     scratch: &mut ScratchBuffers,
@@ -69,12 +80,25 @@ pub(super) fn finalize_decode_logits(
                 .gemv_into(&scratch.norm_buf[..hidden_dim], &mut scratch.logits)?;
         }
     }
-    if !scratch.backend_argmax_only {
+    let needs_host_ranking = !scratch.backend_argmax_only || scratch.backend_argmax_token.is_none();
+    if needs_host_ranking {
         super::super::models::muse_glimmer::scale_logits_inplace(
             &mut scratch.logits,
             metadata.logit_scale,
         );
         apply_logit_softcapping(&mut scratch.logits, metadata.final_logit_softcapping);
+    }
+    if scratch.backend_argmax_only {
+        if scratch.backend_argmax_token.is_none() {
+            scratch.backend_argmax_token =
+                argmax_token_excluding(&scratch.logits, scratch.backend_argmax_excluded_token);
+            if scratch.backend_argmax_token.is_none() {
+                return Err(crate::error::LlmError::Forward(
+                    "decode argmax has no eligible output token".to_string(),
+                ));
+            }
+        }
+    } else {
         emit_final_dump("decode_logits", &scratch.logits);
         if crate::engine::policy::env_string("RNB_CUDA_EAGER_LOGITS_RANGE").as_deref() == Some("1")
         {
@@ -107,4 +131,17 @@ pub(super) fn finalize_decode_logits(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::argmax_token_excluding;
+
+    #[test]
+    fn host_argmax_skips_the_excluded_token() {
+        let logits = [1.0, 4.0, 3.0];
+        assert_eq!(argmax_token_excluding(&logits, None), Some(1));
+        assert_eq!(argmax_token_excluding(&logits, Some(1)), Some(2));
+        assert_eq!(argmax_token_excluding(&logits[..1], Some(0)), None);
+    }
 }
