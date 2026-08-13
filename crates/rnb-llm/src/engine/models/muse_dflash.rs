@@ -458,22 +458,37 @@ impl MuseDflashRuntime {
                 self.rope_theta,
             );
 
-            let mut all_k = Vec::with_capacity((prior_count + seq_len) * kv_dim);
-            let mut all_v = Vec::with_capacity((prior_count + seq_len) * kv_dim);
-            all_k.extend(
-                prior_k
-                    .iter()
-                    .map(|bits| half::f16::from_bits(*bits).to_f32()),
-            );
-            all_v.extend(
-                prior_v
-                    .iter()
-                    .map(|bits| half::f16::from_bits(*bits).to_f32()),
-            );
-            all_k.extend_from_slice(&key);
-            all_v.extend_from_slice(&value);
-            let kv_len = prior_count + seq_len;
-            let attention =
+            let attention = if let Some(attention) =
+                crate::engine::backend_runtime::metal_dflash_attention_if_supported(
+                    &query,
+                    &prior_k,
+                    &prior_v,
+                    &key,
+                    &value,
+                    seq_len,
+                    self.position,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.window_size,
+                )? {
+                attention
+            } else {
+                let mut all_k = Vec::with_capacity((prior_count + seq_len) * kv_dim);
+                let mut all_v = Vec::with_capacity((prior_count + seq_len) * kv_dim);
+                all_k.extend(
+                    prior_k
+                        .iter()
+                        .map(|bits| half::f16::from_bits(*bits).to_f32()),
+                );
+                all_v.extend(
+                    prior_v
+                        .iter()
+                        .map(|bits| half::f16::from_bits(*bits).to_f32()),
+                );
+                all_k.extend_from_slice(&key);
+                all_v.extend_from_slice(&value);
+                let kv_len = prior_count + seq_len;
                 crate::engine::backend_runtime::prefill_attention_non_causal_if_supported(
                     &query,
                     &all_k,
@@ -498,7 +513,8 @@ impl MuseDflashRuntime {
                         self.head_dim,
                         Some(self.window_size),
                     )
-                });
+                })
+            };
             let projected = layer.o_weight.gemv_vec(&attention)?;
             add_inplace(&mut hidden, &projected)?;
 
