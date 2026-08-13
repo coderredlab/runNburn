@@ -72,6 +72,8 @@ pub use debug::{PrefillDriftRecord, PrefillDriftTrace};
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 use decode::attn_carrier_eligible;
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+use decode::muse_attn_carrier_eligible;
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 use decode::qwen_attn_moe_chain_eligible;
 use decode::{
     decode_attention_layer, decode_attention_layer_with_rope_pos, GemmaMetalDecodeLookahead,
@@ -88,9 +90,7 @@ use decode_ffn_dispatch::decode_ffn_layer;
 use decode_gdn::decode_gdn_layer;
 use decode_gpu::gpu_gemv_into_if_supported;
 #[cfg(any(not(feature = "cuda"), test))]
-use dequant::dequantize_bytes_to_f32;
-#[cfg(test)]
-use dequant::dequantize_row_to_slice_if_supported;
+use dequant::{dequantize_bytes_to_f32, dequantize_row_to_slice_if_supported};
 pub use gemv_profile::{gemv_profile_report, reset_gemv_profile};
 pub use init::EngineLoadConfig;
 use layer_weights::*;

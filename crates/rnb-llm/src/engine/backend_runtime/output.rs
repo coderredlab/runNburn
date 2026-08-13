@@ -178,7 +178,7 @@ pub(in crate::engine) fn backend_output_argmax_supported_for_runtime(
         }
         return matches!(
             weights.output.ggml_type,
-            rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+            rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q5_K | rnb_loader::GGMLType::Q6_K
         );
     }
     #[cfg(not(any(feature = "cuda", feature = "metal")))]

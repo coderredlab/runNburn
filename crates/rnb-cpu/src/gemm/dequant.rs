@@ -152,6 +152,19 @@ pub fn dequantize_row_to_slice_if_supported(
             }
             true
         }
+        DequantType::Q4K => {
+            if bytes.len() % 144 != 0 || output.len() != (bytes.len() / 144) * 256 {
+                return false;
+            }
+            let mut tmp = [0.0f32; 256];
+            for (bi, chunk) in bytes.chunks_exact(144).enumerate() {
+                let block =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const q::BlockQ4_K) };
+                q::dequantize_q4_k(&block, &mut tmp);
+                output[bi * 256..(bi + 1) * 256].copy_from_slice(&tmp);
+            }
+            true
+        }
         DequantType::Q6K => {
             if bytes.len() % 210 != 0 || output.len() != (bytes.len() / 210) * 256 {
                 return false;
@@ -476,6 +489,25 @@ mod tests {
             ));
         });
 
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn q4k_row_dequant_writes_directly_into_caller_slice() {
+        let mut blocks = (0..288)
+            .map(|index| (index * 31 + 9) as u8)
+            .collect::<Vec<_>>();
+        for block in blocks.chunks_exact_mut(144) {
+            block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3000u16.to_le_bytes());
+        }
+        let expected = dequantize_bytes_to_f32(&blocks, DequantType::Q4K);
+        let mut actual = vec![0.0f32; 512];
+        assert!(dequantize_row_to_slice_if_supported(
+            &blocks,
+            DequantType::Q4K,
+            &mut actual
+        ));
         assert_eq!(actual, expected);
     }
 

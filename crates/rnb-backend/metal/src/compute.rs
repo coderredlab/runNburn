@@ -11,7 +11,7 @@ use objc2_metal::{
     MTLArgumentEncoder, MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLDispatchType, MTLFunction, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLDevice, MTLDispatchType, MTLFunction, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
 };
 
 use crate::ffn_chain::QwenMoeLlamaIdError;
@@ -26,6 +26,7 @@ const GEMM_Q4K_SHARED_SRC: &str = include_str!("gemm_q4k_shared.metal");
 const GEMV_Q4K_SIMD_SRC: &str = include_str!("gemv_q4k_simd.metal");
 const GEMV_Q4K_COALESCED_SRC: &str = include_str!("gemv_q4k_coalesced.metal");
 const GEMV_Q4K_COALESCED_NSG2_SRC: &str = include_str!("gemv_q4k_coalesced_nsg2.metal");
+const GEMV_Q4K_SWIGLU_PAIR_NSG2_SRC: &str = include_str!("gemv_q4k_swiglu_pair_nsg2.metal");
 const GEMV_Q6K_SRC: &str = include_str!("gemv_q6k.metal");
 const GEMM_Q6K_SRC: &str = include_str!("gemm_q6k.metal");
 const GEMM_Q6K_SHARED_SRC: &str = include_str!("gemm_q6k_shared.metal");
@@ -46,6 +47,8 @@ const GEMV_Q2K_SIMD_SRC: &str = include_str!("gemv_q2k_simd.metal");
 const GEMV_Q5K_SRC: &str = include_str!("gemv_q5k.metal");
 const GEMV_Q5K_SIMD_SRC: &str = include_str!("gemv_q5k_simd.metal");
 const GEMV_Q5K_COALESCED_SRC: &str = include_str!("gemv_q5k_coalesced.metal");
+const GEMV_Q5K_NSG2_SRC: &str = include_str!("gemv_q5k_nsg2.metal");
+const GEMV_Q5K_ARGMAX_SRC: &str = include_str!("gemv_q5k_argmax.metal");
 const GEMV_Q8_0_SRC: &str = include_str!("gemv_q8_0.metal");
 const GEMV_Q8_0_COALESCED_SRC: &str = include_str!("gemv_q8_0_coalesced.metal");
 // milestone 2 (MTP verify): B-column weight-amortized GEMV (weight tile 1회 읽어 B 컬럼 계산).
@@ -450,6 +453,7 @@ pub struct MetalContext {
     pub q4k_coalesced_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// llama.cpp N_SG=2/N_R0=2 shape: threadgroup 당 SIMD-group 2개, output row 4개.
     pub q4k_coalesced_nsg2_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub q4k_swiglu_pair_nsg2_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm33: Q4_K batch GEMM(M>1) naive 커널. prefill FFN gate/up + (down Q4_K 시) 경로.
     /// grid 2D (row, tok). 자작 quantized batch matmul — decode GEMV(M=1) 의 M축 확장.
     pub gemm_q4k_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -474,6 +478,9 @@ pub struct MetalContext {
     /// llama.cpp kernel_mul_mv_q5_K_f32_impl nr0=2 multi-row 이식(coalesced + activation reuse).
     /// `gemv_coalesced` flag 시 q5k_simd 대체. q4k_coalesced 와 같은 flag 에 묶임.
     pub q5k_coalesced_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub q5k_nsg2_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) q5k_argmax_partial_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(crate) argmax_partial_f32_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub q8_0_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// llama.cpp kernel_mul_mv_q8_0_f32_impl NR0=2 multi-row 이식(coalesced + activation reuse).
     /// `gemv_coalesced` flag 시 q8_0 대체. q4k_coalesced 와 같은 flag 에 묶임.
@@ -503,6 +510,7 @@ pub struct MetalContext {
     /// pm51: output projection logits -> token id reduction. Used after output GEMV so
     /// host reads back one u32 instead of the full logits vector.
     pub output_argmax_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub output_argmax_excluding_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm26: chain 용 F32 GEMV(gemv_f32_chain). 27B GDN 의 F32 ssm_alpha/beta 무손실 device 화.
     pub f32_chain_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Router 전용 F32 GEMV. output row당 SIMD-group 하나가 K를 coalesced load한다.
@@ -511,6 +519,11 @@ pub struct MetalContext {
     pub rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm132: residual add + RMSNorm fused (hidden += residual → normed = rms_norm(hidden)).
     pub fused_residual_rms_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub fused_post_attn_residual_ffn_rms_norm_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub fused_post_ffn_residual_add_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub fused_post_ffn_residual_next_rms_norm_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub rms_norm_batch_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm43: GDN prefill gated RMSNorm+SiLU(batch, rows>1). rmsnorm(out)*silu(z) fused per-row.
     pub gated_rmsnorm_silu_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -592,6 +605,8 @@ pub struct MetalContext {
     pub qwen_moe_decode_shared_add_pipeline:
         OnceCell<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub attn_decode_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_window_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_f16_gqa16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub kvarn_attention_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm22: per-slot int8 KV decode attention 커널. f16 attn_decode 와 택일(ctx.kv_int8 분기).
     pub attn_decode_i8_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -626,6 +641,8 @@ pub struct MetalContext {
     pub rope_mrope_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub attn_decode_qk_norm_rope_batch_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub attn_decode_qk_norm_rope_pair_pipeline:
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub kv_append_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub kv_append_batch_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -1646,7 +1663,6 @@ pub fn build_metal_context_with_opts(
     let gemv_coalesced = std::env::var("RNB_METAL_GEMV_COALESCED").as_deref() != Ok("0");
     // pm80: llama.cpp Metal Q4_K/Q6_K N_SG=2/N_R0=2 variant default ON.
     // Qwen3.6 x4/d100에서 token-identical, wall 소폭 개선. opt-out:
-    // RNB_METAL_GEMV_COALESCED_NSG2=0|false|off|no.
     let gemv_coalesced_nsg2 = gemv_coalesced_nsg2_enabled(gemv_coalesced);
     // pm33: prefill FFN batch GEMM 커널. default naive(−5% vs CPU). dequant-공유(shared)는
     // 측정상 naive보다 +43% 느려(병렬도 손실, dequant-bound 아님) 폐기 → opt-in 보존만.
@@ -2103,6 +2119,11 @@ pub fn build_metal_context_with_opts(
         GEMV_Q4K_COALESCED_NSG2_SRC,
         "gemv_q4k_coalesced_nsg2",
     );
+    let q4k_swiglu_pair_nsg2_pipeline = build_pipeline(
+        &device,
+        GEMV_Q4K_SWIGLU_PAIR_NSG2_SRC,
+        "gemv_q4k_swiglu_pair_nsg2",
+    );
     let gemm_q4k_pipeline = build_pipeline(&device, GEMM_Q4K_SRC, "gemm_q4k");
     let gemm_q4k_shared_pipeline = build_pipeline(&device, GEMM_Q4K_SHARED_SRC, "gemm_q4k_shared");
     let q6k_pipeline = build_pipeline(&device, GEMV_Q6K_SRC, "gemv_q6k");
@@ -2122,6 +2143,11 @@ pub fn build_metal_context_with_opts(
     let q5k_simd_pipeline = build_pipeline(&device, GEMV_Q5K_SIMD_SRC, "gemv_q5k_simd");
     let q5k_coalesced_pipeline =
         build_pipeline(&device, GEMV_Q5K_COALESCED_SRC, "gemv_q5k_coalesced");
+    let q5k_nsg2_pipeline = build_pipeline(&device, GEMV_Q5K_NSG2_SRC, "gemv_q5k_nsg2");
+    let q5k_argmax_partial_pipeline =
+        build_pipeline(&device, GEMV_Q5K_ARGMAX_SRC, "gemv_q5k_argmax_partial");
+    let argmax_partial_f32_pipeline =
+        build_pipeline(&device, GEMV_Q5K_ARGMAX_SRC, "argmax_partial_f32");
     let q8_0_pipeline = build_pipeline(&device, GEMV_Q8_0_SRC, "gemv_q8_0");
     let q8_0_coalesced_pipeline =
         build_pipeline(&device, GEMV_Q8_0_COALESCED_SRC, "gemv_q8_0_coalesced");
@@ -2145,12 +2171,26 @@ pub fn build_metal_context_with_opts(
     let glm_mla_qpe_rope_pipeline =
         build_pipeline(&device, GEMV_Q8_0_MLA_SLOTS_SRC, "glm_mla_qpe_rope");
     let output_argmax_pipeline = build_pipeline(&device, OUTPUT_ARGMAX_SRC, "argmax_f32");
+    let output_argmax_excluding_pipeline =
+        build_pipeline(&device, OUTPUT_ARGMAX_SRC, "argmax_f32_excluding");
     let f32_chain_pipeline = build_pipeline(&device, GEMV_F32_SRC, "gemv_f32_chain");
     let f32_chain_simd_pipeline = build_pipeline(&device, GEMV_F32_SRC, "gemv_f32_chain_simd");
     let prefill_f32_proj_pipeline = build_pipeline(&device, GEMV_F32_SRC, "prefill_f32_proj");
     let rms_norm_pipeline = build_pipeline(&device, RMS_NORM_SRC, "rms_norm");
     let fused_residual_rms_norm_pipeline =
         build_pipeline(&device, RMS_NORM_SRC, "fused_residual_rms_norm");
+    let fused_post_attn_residual_ffn_rms_norm_pipeline = build_pipeline(
+        &device,
+        RMS_NORM_SRC,
+        "fused_post_attn_residual_ffn_rms_norm",
+    );
+    let fused_post_ffn_residual_add_pipeline =
+        build_pipeline(&device, RMS_NORM_SRC, "fused_post_ffn_residual_add");
+    let fused_post_ffn_residual_next_rms_norm_pipeline = build_pipeline(
+        &device,
+        RMS_NORM_SRC,
+        "fused_post_ffn_residual_next_rms_norm",
+    );
     let rms_norm_batch_pipeline = build_pipeline(&device, RMS_NORM_SRC, "rms_norm_batch");
     let gated_rmsnorm_silu_pipeline =
         build_pipeline(&device, RMS_NORM_SRC, "gated_rmsnorm_silu_batch");
@@ -2303,7 +2343,11 @@ pub fn build_metal_context_with_opts(
     let qwen_moe_decode_reduce_add_slots_pipeline = OnceCell::new();
     let qwen_moe_decode_route_shared_pipeline = OnceCell::new();
     let qwen_moe_decode_shared_add_pipeline = OnceCell::new();
+    let attn_decode_window_pipeline =
+        build_pipeline(&device, ATTN_DECODE_SRC, "attn_decode_window");
     let attn_decode_pipeline = build_pipeline(&device, ATTN_DECODE_SRC, "attn_decode");
+    let attn_decode_f16_gqa16_pipeline =
+        build_pipeline(&device, ATTN_DECODE_SRC, "attn_decode_f16_gqa16");
     let kvarn_attention_pipeline =
         build_pipeline(&device, KVARN_ATTENTION_SRC, "kvarn_attention_decode");
     let attn_decode_i8_pipeline = build_pipeline(&device, ATTN_DECODE_I8_SRC, "attn_decode_i8");
@@ -2371,6 +2415,8 @@ pub fn build_metal_context_with_opts(
     let qk_norm_pipeline = build_pipeline(&device, QK_NORM_SRC, "qk_norm");
     let attn_decode_qk_norm_rope_batch_pipeline =
         build_pipeline(&device, QK_NORM_SRC, "attn_decode_qk_norm_rope_batch");
+    let attn_decode_qk_norm_rope_pair_pipeline =
+        build_pipeline(&device, QK_NORM_SRC, "attn_decode_qk_norm_rope_pair");
     let kv_append_pipeline = build_pipeline(&device, KV_APPEND_SRC, "kv_append");
     let kv_append_batch_pipeline = build_pipeline(&device, KV_APPEND_SRC, "kv_append_batch");
     let kv_append_i8_pipeline = build_pipeline(&device, KV_APPEND_I8_SRC, "kv_append_i8");
@@ -2476,6 +2522,7 @@ pub fn build_metal_context_with_opts(
         q4k_simd_pipeline,
         q4k_coalesced_pipeline,
         q4k_coalesced_nsg2_pipeline,
+        q4k_swiglu_pair_nsg2_pipeline,
         gemm_q4k_pipeline,
         gemm_q4k_shared_pipeline,
         q6k_pipeline,
@@ -2489,6 +2536,9 @@ pub fn build_metal_context_with_opts(
         q5k_pipeline,
         q5k_simd_pipeline,
         q5k_coalesced_pipeline,
+        q5k_nsg2_pipeline,
+        q5k_argmax_partial_pipeline,
+        argmax_partial_f32_pipeline,
         q8_0_pipeline,
         q8_0_coalesced_pipeline,
         q8_0_coalesced_nsg2_pipeline,
@@ -2504,11 +2554,15 @@ pub fn build_metal_context_with_opts(
         glm_mla_kv_rms_rope_pipeline,
         glm_mla_qpe_rope_pipeline,
         output_argmax_pipeline,
+        output_argmax_excluding_pipeline,
         f32_chain_pipeline,
         f32_chain_simd_pipeline,
         prefill_f32_proj_pipeline,
         rms_norm_pipeline,
         fused_residual_rms_norm_pipeline,
+        fused_post_attn_residual_ffn_rms_norm_pipeline,
+        fused_post_ffn_residual_add_pipeline,
+        fused_post_ffn_residual_next_rms_norm_pipeline,
         rms_norm_batch_pipeline,
         gated_rmsnorm_silu_pipeline,
         silu_mul_pipeline,
@@ -2557,6 +2611,8 @@ pub fn build_metal_context_with_opts(
         qwen_moe_decode_route_shared_pipeline,
         qwen_moe_decode_shared_add_pipeline,
         attn_decode_pipeline,
+        attn_decode_window_pipeline,
+        attn_decode_f16_gqa16_pipeline,
         kvarn_attention_pipeline,
         attn_decode_i8_pipeline,
         attn_decode_i8_splitk_part_pipeline,
@@ -2575,6 +2631,7 @@ pub fn build_metal_context_with_opts(
         rope_mrope_pipeline,
         qk_norm_pipeline,
         attn_decode_qk_norm_rope_batch_pipeline,
+        attn_decode_qk_norm_rope_pair_pipeline,
         kv_append_pipeline,
         kv_append_batch_pipeline,
         kv_append_i8_pipeline,
@@ -2716,32 +2773,31 @@ pub(crate) fn chain_barrier(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
 ) {
-    // 진단 상한 측정: RNB_METAL_CHAIN_SKIP_BARRIER=1 이면 모든 chain barrier 를 생략한다.
-    // concurrent encoder 에서 hazard 무시 → 결과는 부정확하지만, barrier 제거 시
-    // gpu_ms 하한(= barrier idle 상한)을 잰다. correctness 판정에 쓰지 않는다.
-    if chain_skip_barrier() {
-        return;
-    }
     if ctx.chain_concurrent {
         enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 }
 
-/// `RNB_METAL_CHAIN_SKIP_BARRIER` 캐시(진단 전용, 첫 호출 시 1회 env read).
-pub(crate) fn chain_skip_barrier() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    match CACHE.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let v = matches!(
-                std::env::var("RNB_METAL_CHAIN_SKIP_BARRIER").as_deref(),
-                Ok("1")
-            );
-            CACHE.store(if v { 2 } else { 1 }, Ordering::Relaxed);
-            v
-        }
+/// concurrent encoder에서 지정한 buffer의 side effect만 가시화한다.
+///
+/// scope barrier와 달리 관계없는 weight·scratch buffer의 cache side effect를
+/// 전역으로 가시화하지 않는다. Metal은 이 경계 앞 dispatch 완료 순서는 그대로
+/// 보장하므로, caller는 다음 dispatch가 실제로 읽을 output buffer만 넘긴다.
+pub(crate) fn chain_barrier_resources<const N: usize>(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    buffers: [&ProtocolObject<dyn MTLBuffer>; N],
+) {
+    if !ctx.chain_concurrent {
+        return;
+    }
+    let mut resources =
+        buffers.map(|buffer| NonNull::from(ProtocolObject::<dyn MTLResource>::from_ref(buffer)));
+    unsafe {
+        enc.memoryBarrierWithResources_count(
+            NonNull::new(resources.as_mut_ptr()).expect("non-empty Metal resource barrier"),
+            N,
+        );
     }
 }
 
@@ -8461,7 +8517,6 @@ pub(crate) fn encode_gemv_q4k_simd(
         enc.setBuffer_offset_atIndex(Some(k_buf), 0, 4);
         enc.setBuffer_offset_atIndex(Some(off_buf), 0, 5);
     }
-    // coalesced는 row 2개/tg, nsg2는 SIMD-group 2개로 row 4개/tg. 기존 simd는 1 row/tg.
     let grid_w = if nsg2 {
         n.div_ceil(4)
     } else if coalesced {
@@ -8476,6 +8531,43 @@ pub(crate) fn encode_gemv_q4k_simd(
     };
     let tg = MTLSize {
         width: if nsg2 { SIMD_WIDTH * 2 } else { SIMD_WIDTH },
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemv_q4k_swiglu_pair(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) {
+    enc.setComputePipelineState(&ctx.q4k_swiglu_pair_nsg2_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(gate_w_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(up_w_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(in_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(out_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(gate_off_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(up_off_buf), 0, 7);
+    }
+    let grid = MTLSize {
+        width: n.div_ceil(2),
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: SIMD_WIDTH * 2,
         height: 1,
         depth: 1,
     };
@@ -8782,10 +8874,11 @@ pub(crate) fn encode_gemv_q5k_simd(
     off_buf: &ProtocolObject<dyn MTLBuffer>,
     n: usize,
 ) {
-    // RNB_METAL_GEMV_COALESCED=1: q5k chain GEMV 를 llama식 nr0=2 multi-row coalesced 커널로.
-    // q4k_simd 와 동일 flag(ctx.gemv_coalesced). carrier(qkv/ssm_out) 전 경로 이 함수 거침.
     let coalesced = ctx.gemv_coalesced;
-    let pipeline = if coalesced {
+    let nsg2 = coalesced && ctx.gemv_coalesced_nsg2;
+    let pipeline = if nsg2 {
+        &ctx.q5k_nsg2_pipeline
+    } else if coalesced {
         &ctx.q5k_coalesced_pipeline
     } else {
         &ctx.q5k_simd_pipeline
@@ -8799,15 +8892,14 @@ pub(crate) fn encode_gemv_q5k_simd(
         enc.setBuffer_offset_atIndex(Some(k_buf), 0, 4);
         enc.setBuffer_offset_atIndex(Some(off_buf), 0, 5);
     }
-    // coalesced(nr0=2)는 threadgroup 1개가 output row 2개 → grid=ceil(N/2). 기존 simd 는 1 row/tg.
-    let grid_w = if coalesced { n.div_ceil(2) } else { n };
+    let grid_w = if nsg2 || coalesced { n.div_ceil(2) } else { n };
     let grid = MTLSize {
         width: grid_w,
         height: 1,
         depth: 1,
     };
     let tg = MTLSize {
-        width: SIMD_WIDTH,
+        width: if nsg2 { SIMD_WIDTH * 2 } else { SIMD_WIDTH },
         height: 1,
         depth: 1,
     };
@@ -8882,6 +8974,67 @@ pub(crate) fn encode_gemv_q5k_auto_offset(
         },
         MTLSize {
             width: tg_w,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemv_q5k_argmax(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    in_buf: &ProtocolObject<dyn MTLBuffer>,
+    partial_value_buf: &ProtocolObject<dyn MTLBuffer>,
+    partial_index_buf: &ProtocolObject<dyn MTLBuffer>,
+    token_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    off_buf: &ProtocolObject<dyn MTLBuffer>,
+    excluded: u32,
+    n: usize,
+) {
+    let partial_count = n.div_ceil(2);
+    enc.setComputePipelineState(&ctx.q5k_argmax_partial_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(w_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(in_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(partial_value_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(partial_index_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(off_buf), 0, 6);
+    }
+    set_u32_bytes(enc, excluded, 7);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: partial_count,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: SIMD_WIDTH * 2,
+            height: 1,
+            depth: 1,
+        },
+    );
+    chain_barrier_resources(ctx, enc, [partial_value_buf, partial_index_buf]);
+    enc.setComputePipelineState(&ctx.argmax_partial_f32_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(partial_value_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(partial_index_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(token_buf), 0, 2);
+    }
+    set_u32_bytes(enc, partial_count as u32, 3);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
             height: 1,
             depth: 1,
         },
@@ -9898,14 +10051,15 @@ pub(crate) struct OutputArgmaxDispatch {
 }
 
 pub(crate) struct OutputArgmaxScratch {
-    n: usize,
-    k: usize,
-    input_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    logits_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    token_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    n_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    off_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) n: usize,
+    pub(crate) k: usize,
+    pub(crate) input_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) logits_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) token_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) partial_index_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) n_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) k_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) off_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl OutputArgmaxScratch {
@@ -9921,6 +10075,10 @@ impl OutputArgmaxScratch {
             .device
             .newBufferWithLength_options(n * std::mem::size_of::<f32>(), shared)
             .expect("Metal: failed to create output argmax logits buffer");
+        let partial_index_buf = ctx
+            .device
+            .newBufferWithLength_options(n.div_ceil(2) * std::mem::size_of::<u32>(), shared)
+            .expect("Metal: failed to create output argmax partial index buffer");
         let token_buf = ctx
             .device
             .newBufferWithLength_options(std::mem::size_of::<u32>(), shared)
@@ -9944,6 +10102,7 @@ impl OutputArgmaxScratch {
             k,
             input_buf,
             logits_buf,
+            partial_index_buf,
             token_buf,
             n_buf,
             k_buf,
@@ -9985,6 +10144,34 @@ pub(crate) fn encode_argmax_f32(
         enc.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
         enc.setBuffer_offset_atIndex(Some(token_buf), 0, 1);
         enc.setBuffer_offset_atIndex(Some(n_buf), 0, 2);
+    }
+    let grid = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+pub(crate) fn encode_argmax_f32_excluding(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    token_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    excluded_buf: &ProtocolObject<dyn MTLBuffer>,
+) {
+    enc.setComputePipelineState(&ctx.output_argmax_excluding_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(logits_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(token_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(excluded_buf), 0, 3);
     }
     let grid = MTLSize {
         width: 1,
@@ -10880,6 +11067,49 @@ pub(crate) fn encode_qk_norm_at(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_qk_norm_rope_pair(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_heads_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_heads_buf: &ProtocolObject<dyn MTLBuffer>,
+    head_dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_rot_buf: &ProtocolObject<dyn MTLBuffer>,
+    theta_scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    eps_buf: &ProtocolObject<dyn MTLBuffer>,
+    pos_buf: &ProtocolObject<dyn MTLBuffer>,
+    total_heads: usize,
+) {
+    enc.setComputePipelineState(&ctx.attn_decode_qk_norm_rope_pair_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(q_weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(k_weight_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(q_heads_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(k_heads_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(head_dim_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(n_rot_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(theta_scale_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 10);
+    }
+    let grid = MTLSize {
+        width: total_heads,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
 pub(crate) fn encode_attn_decode_qk_norm_rope_batch(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -11109,6 +11339,188 @@ pub(crate) fn encode_attn_decode_at(
         depth: 1,
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_window(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    window_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+) {
+    enc.setComputePipelineState(&ctx.attn_decode_window_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(window_buf), 0, 9);
+    }
+    let grid = MTLSize {
+        width: num_heads,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_f16_gqa16(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    window_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    pos_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_current_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_current_buf: &ProtocolObject<dyn MTLBuffer>,
+    num_heads: usize,
+) {
+    enc.setComputePipelineState(&ctx.attn_decode_f16_gqa16_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(window_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 11);
+        enc.setBuffer_offset_atIndex(Some(k_current_buf), 0, 12);
+        enc.setBuffer_offset_atIndex(Some(v_current_buf), 0, 13);
+    }
+    let grid = MTLSize {
+        width: num_heads,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 16 * SIMD_WIDTH,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_decode_f16_gqa16_with_ctx(
+    ctx: &MetalContext,
+    q: &[f32],
+    k_cache: &mut [u16],
+    v_cache: &mut [u16],
+    gate: &[f32],
+    k_current: &[f32],
+    v_current: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    kv_len: usize,
+    pos: usize,
+    scale: f32,
+    window: usize,
+) -> Vec<f32> {
+    let head_dim = 128usize;
+    assert_eq!(q.len(), num_heads * head_dim);
+    assert_eq!(gate.len(), q.len());
+    assert_eq!(k_current.len(), num_kv_heads * head_dim);
+    assert_eq!(v_current.len(), k_current.len());
+    let shared = MTLResourceOptions::StorageModeShared;
+    let shared_bytes = |bytes: &[u8]| unsafe {
+        let ptr = NonNull::new(bytes.as_ptr() as *mut std::ffi::c_void).expect("buffer pointer");
+        ctx.device
+            .newBufferWithBytes_length_options(ptr, bytes.len(), shared)
+            .expect("Metal test buffer")
+    };
+    let as_bytes = |ptr: *const u8, len: usize| unsafe { std::slice::from_raw_parts(ptr, len) };
+    let q_buf = shared_bytes(as_bytes(q.as_ptr().cast(), std::mem::size_of_val(q)));
+    let k_buf = shared_bytes(as_bytes(
+        k_cache.as_ptr().cast(),
+        std::mem::size_of_val(k_cache),
+    ));
+    let v_buf = shared_bytes(as_bytes(
+        v_cache.as_ptr().cast(),
+        std::mem::size_of_val(v_cache),
+    ));
+    let gate_buf = shared_bytes(as_bytes(gate.as_ptr().cast(), std::mem::size_of_val(gate)));
+    let k_current_buf = shared_bytes(as_bytes(
+        k_current.as_ptr().cast(),
+        std::mem::size_of_val(k_current),
+    ));
+    let v_current_buf = shared_bytes(as_bytes(
+        v_current.as_ptr().cast(),
+        std::mem::size_of_val(v_current),
+    ));
+    let out_buf = ctx
+        .device
+        .newBufferWithLength_options(
+            q.len() * std::mem::size_of::<f32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("Metal test output");
+    let nh_buf = crate::ffn_chain::u32_buf(ctx, num_heads as u32);
+    let nkv_buf = crate::ffn_chain::u32_buf(ctx, num_kv_heads as u32);
+    let hd_buf = crate::ffn_chain::u32_buf(ctx, head_dim as u32);
+    let kl_buf = crate::ffn_chain::u32_buf(ctx, kv_len as u32);
+    let scale_buf = crate::ffn_chain::f32_buf(ctx, scale);
+    let window_buf = crate::ffn_chain::u32_buf(ctx, window as u32);
+    let pos_buf = crate::ffn_chain::u32_buf(ctx, pos as u32);
+    let cmd = ctx.queue.commandBuffer().expect("command buffer");
+    let enc = cmd.computeCommandEncoder().expect("compute encoder");
+    encode_attn_decode_f16_gqa16(
+        ctx,
+        &enc,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &out_buf,
+        &nh_buf,
+        &nkv_buf,
+        &hd_buf,
+        &kl_buf,
+        &scale_buf,
+        &window_buf,
+        &gate_buf,
+        &pos_buf,
+        &k_current_buf,
+        &v_current_buf,
+        num_heads,
+    );
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    let out =
+        unsafe { std::slice::from_raw_parts(out_buf.contents().as_ptr().cast::<f32>(), q.len()) };
+    out.to_vec()
 }
 
 /// int8 KV decode attention(q device + int8 K·V + per-slot scale → o_buf)을 encoder 에

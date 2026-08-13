@@ -77,6 +77,147 @@ kernel void fused_residual_rms_norm(
         normed[i] = hidden[i] * inv_rms * weight[i];
     }
 }
+// Muse dense decode: post-attention RMSNorm, residual add, and pre-FFN
+// RMSNorm in one dispatch. The two tree reductions preserve the standalone
+// rms_norm reduction order while avoiding the intermediate normalized write.
+kernel void fused_post_attn_residual_ffn_rms_norm(
+    device const float* projected    [[buffer(0)]],
+    device const float* post_weight  [[buffer(1)]],
+    device float*       hidden       [[buffer(2)]],
+    device const float* ffn_weight   [[buffer(3)]],
+    device float*       normed       [[buffer(4)]],
+    constant uint&      dim          [[buffer(5)]],
+    constant float&     post_eps     [[buffer(6)]],
+    constant float&     ffn_eps      [[buffer(7)]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float partial[256];
+
+    float sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = projected[i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float post_inv_rms = rsqrt(partial[0] / (float)dim + post_eps);
+    sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float residual = projected[i] * post_inv_rms * post_weight[i];
+        float v = hidden[i] + residual;
+        hidden[i] = v;
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float ffn_inv_rms = rsqrt(partial[0] / (float)dim + ffn_eps);
+    for (uint i = tid; i < dim; i += tg_size) {
+        normed[i] = hidden[i] * ffn_inv_rms * ffn_weight[i];
+    }
+}
+
+// Muse dense decode: post-FFN RMSNorm and residual add in one dispatch.
+kernel void fused_post_ffn_residual_add(
+    device const float* projected [[buffer(0)]],
+    device const float* weight    [[buffer(1)]],
+    device float*       hidden    [[buffer(2)]],
+    constant uint&      dim       [[buffer(3)]],
+    constant float&     eps       [[buffer(4)]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float partial[256];
+    float sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = projected[i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(partial[0] / (float)dim + eps);
+    for (uint i = tid; i < dim; i += tg_size) {
+        float residual = projected[i] * inv_rms * weight[i];
+        hidden[i] = hidden[i] + residual;
+    }
+}
+// Muse dense decode across adjacent layers: finish this layer's post-FFN
+// residual and produce the next layer's attention-normalized input in one
+// dispatch. This preserves both standalone tree-reduction orders while
+// eliminating the next layer's RMSNorm dispatch and the intervening device
+// pass over hidden.
+kernel void fused_post_ffn_residual_next_rms_norm(
+    device const float* projected  [[buffer(0)]],
+    device const float* post_weight [[buffer(1)]],
+    device float*       hidden      [[buffer(2)]],
+    device const float* next_weight [[buffer(3)]],
+    device float*       next_normed [[buffer(4)]],
+    constant uint&      dim         [[buffer(5)]],
+    constant float&     post_eps    [[buffer(6)]],
+    constant float&     next_eps    [[buffer(7)]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float partial[256];
+    float sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float v = projected[i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float post_inv_rms = rsqrt(partial[0] / (float)dim + post_eps);
+    sum = 0.0f;
+    for (uint i = tid; i < dim; i += tg_size) {
+        float residual = projected[i] * post_inv_rms * post_weight[i];
+        float v = hidden[i] + residual;
+        hidden[i] = v;
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float next_inv_rms = rsqrt(partial[0] / (float)dim + next_eps);
+    for (uint i = tid; i < dim; i += tg_size) {
+        next_normed[i] = hidden[i] * next_inv_rms * next_weight[i];
+    }
+}
+
+
 
 // pm43: GDN prefill gated RMSNorm + SiLU gate (batch, rows>1).
 //   gated[row*cols + i] = (out_in[row,i] / sqrt(mean(out_in[row]^2) + eps)) * weight[i] * silu(z[row,i]).

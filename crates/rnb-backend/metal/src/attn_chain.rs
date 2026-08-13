@@ -16,18 +16,21 @@ use objc2_metal::{
 };
 
 use crate::compute::{
-    self, chain_barrier, chain_compute_encoder, encode_attn_decode, encode_attn_decode_at,
-    encode_attn_decode_gqa_splitk, encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk,
-    encode_attn_decode_i8_splitk, encode_attn_decode_qk_norm_rope_batch, encode_attn_decode_splitk,
-    encode_attn_decode_splitk_at, encode_attn_decode_splitk_batch, encode_gate_apply,
-    encode_gate_apply_at, encode_gemv_quant_bcol, encode_kv_append, encode_kv_append_batch,
-    encode_kv_append_i8, encode_prefill_gate_apply, encode_prefill_split_q_gate, encode_qk_norm,
-    encode_rms_norm_batch, encode_rope_partial, encode_split_qgate, encode_split_qgate_at,
-    KvResident, MetalContext,
+    self, chain_barrier, chain_barrier_resources, chain_compute_encoder, encode_attn_decode,
+    encode_attn_decode_at, encode_attn_decode_f16_gqa16, encode_attn_decode_gqa_splitk,
+    encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk, encode_attn_decode_i8_splitk,
+    encode_attn_decode_qk_norm_rope_batch, encode_attn_decode_qk_norm_rope_pair,
+    encode_attn_decode_splitk, encode_attn_decode_splitk_at, encode_attn_decode_splitk_batch,
+    encode_attn_decode_window, encode_gate_apply, encode_gate_apply_at, encode_gemv_quant_bcol,
+    encode_kv_append, encode_kv_append_batch, encode_kv_append_i8, encode_prefill_gate_apply,
+    encode_prefill_split_q_gate, encode_qk_norm, encode_rms_norm_batch, encode_rope_partial,
+    encode_split_qgate, encode_split_qgate_at, KvResident, MetalContext,
 };
 use crate::ffn_chain::{
-    empty_f32_buf, encode_residual_add, encode_rms_norm, encode_silu_mul, f32_buf, readback,
-    shared_u32_buf, u32_buf,
+    empty_f32_buf, encode_fused_post_attn_residual_ffn_rms_norm,
+    encode_fused_post_ffn_residual_add, encode_fused_post_ffn_residual_next_rms_norm,
+    encode_fused_residual_rms_norm, encode_residual_add, encode_rms_norm, encode_silu_mul, f32_buf,
+    readback, shared_u32_buf, u32_buf,
 };
 
 // f16 grouped kernel은 register pressure 회귀 때문에 명시적 opt-in만 허용한다.
@@ -57,7 +60,7 @@ fn int8_gqa_matrix_requested(value: Option<&str>) -> bool {
 pub(crate) struct AttnCarrier {
     pub hidden_dim: usize,
     pub q_dim: usize,
-    pub q_out_dim: usize, // gated: q_dim*2 ([query|gate] 인터리브). 비-gated면 q_dim.
+    pub q_out_dim: usize, // packed gated: q_dim*2. Separate gate models keep q_dim.
     pub kv_dim: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
@@ -65,9 +68,9 @@ pub(crate) struct AttnCarrier {
 
     hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     normed_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
-    q_full_dev: Retained<ProtocolObject<dyn MTLBuffer>>, // q GEMV 출력 [q_out_dim] (인터리브)
-    q_dev: Retained<ProtocolObject<dyn MTLBuffer>>,      // split 후 query [q_dim]
-    gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,   // split 후 gate [q_dim]
+    q_full_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    q_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     k_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     v_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     attn_out_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -80,25 +83,25 @@ pub(crate) struct AttnCarrier {
 
     hdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     qdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    qoutdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>, // q GEMV 의 N = q_out_dim
+    qoutdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kvdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     hd_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_norm_eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     nh_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     nkv_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     nrot_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    theta_scale_buf: Retained<ProtocolObject<dyn MTLBuffer>>, // host f32 precompute(theta^(-2/n_rot))
-    k_hidden_buf: Retained<ProtocolObject<dyn MTLBuffer>>,    // q/k/v GEMV 의 K = hidden_dim
-    k_qdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,      // o GEMV 의 K = q_dim
+    theta_scale_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_hidden_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_qdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 
-    // FFN (carrier 통합): ffn_norm→gate/up GEMV→silu_mul→down GEMV→residual
     pub ffn_dim: usize,
     ffn_normed_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_up_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_down_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
-    fdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>, // gate/up GEMV 의 N = ffn_dim
-    k_ffn_buf: Retained<ProtocolObject<dyn MTLBuffer>>, // down GEMV 의 K = ffn_dim
+    fdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_ffn_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl AttnCarrier {
@@ -116,8 +119,10 @@ impl AttnCarrier {
         capacity: usize,
         ffn_dim: usize,
         eps: f32,
+        post_norm_eps: f32,
         theta: f32,
         scale: f32,
+        force_f16_kv: bool,
     ) -> Self {
         // host `rope_partial_inplace`(rope.rs:400-401)와 동일 식·타입(f32, clamp 후).
         let nr = n_rot.min(head_dim);
@@ -156,13 +161,18 @@ impl AttnCarrier {
             attn_splitk_s_dev,
             attn_splitk_splits_buf,
             o_out_dev: empty_f32_buf(ctx, hidden_dim),
-            kv: KvResident::new(ctx, num_kv_heads, head_dim, capacity),
+            kv: if force_f16_kv {
+                KvResident::new_f16(ctx, num_kv_heads, head_dim, capacity)
+            } else {
+                KvResident::new(ctx, num_kv_heads, head_dim, capacity)
+            },
             hdim_buf: u32_buf(ctx, hidden_dim as u32),
             qdim_buf: u32_buf(ctx, q_dim as u32),
             qoutdim_buf: u32_buf(ctx, q_out_dim as u32),
             kvdim_buf: u32_buf(ctx, kv_dim as u32),
             hd_buf: u32_buf(ctx, head_dim as u32),
             eps_buf: f32_buf(ctx, eps),
+            post_norm_eps_buf: f32_buf(ctx, post_norm_eps),
             nh_buf: u32_buf(ctx, num_heads as u32),
             nkv_buf: u32_buf(ctx, num_kv_heads as u32),
             nrot_buf: u32_buf(ctx, n_rot as u32),
@@ -198,6 +208,10 @@ impl AttnCarrier {
 
     pub(crate) fn kv_filled(&self) -> usize {
         self.kv.filled
+    }
+
+    pub(crate) fn normed_buffer(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.normed_dev.clone()
     }
 
     /// decode chain KVarn attn: 방금 계산한 새 토큰 k/v(post-rope, device f32)를
@@ -283,6 +297,7 @@ pub(crate) fn attn_chain_dispatch(
         &enc,
         carrier,
         &carrier.hidden_dev,
+        None,
         norm_w_buf,
         q_w_buf,
         q_off_buf,
@@ -294,8 +309,12 @@ pub(crate) fn attn_chain_dispatch(
         k_norm_w_buf,
         o_w_buf,
         o_off_buf,
+        None,
+        None,
         v_is_q6k,
+        0,
         ffn_norm_w_buf,
+        None,
         ffn_gate_w_buf,
         ffn_gate_off_buf,
         ffn_up_w_buf,
@@ -303,7 +322,11 @@ pub(crate) fn attn_chain_dispatch(
         ffn_down_w_buf,
         ffn_down_off_buf,
         ffn_down_is_q6k,
+        true,
+        None,
+        false,
         pos,
+        None,
     );
 
     enc.endEncoding();
@@ -315,18 +338,12 @@ pub(crate) fn attn_chain_dispatch(
 }
 
 /// Attention layer 의 encode ①~⑪(RMS norm부터 O projection residual까지)를
-/// 주어진 encoder 에 encode 만 한다. upload/KV init/commit/readback/filled 갱신은
-/// caller 가 관리하고, `hidden_dev` 는 다음 FFN/GDN layer 와 그대로 공유한다.
-///
-/// `ctx.chain_profile` 가 All 이 아니면 dispatch 를 class(gemv/small/attn) 별로 격리
-/// emit 한다(pm21 REST 분해 측정용 차감법). 측정 모드에서 중간 buffer 는 stale 이지만
-/// 각 dispatch 의 GPU work 양은 동일하므로 GPU time 비중 측정에 유효.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attn_chain_encode_core(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &AttnCarrier,
     hidden_dev: &ProtocolObject<dyn MTLBuffer>,
+    pre_normed_dev: Option<&ProtocolObject<dyn MTLBuffer>>,
     norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
     q_w_buf: &ProtocolObject<dyn MTLBuffer>,
     q_off_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -342,7 +359,16 @@ pub(crate) fn attn_chain_encode_core(
     k_q: u8,
     v_q: u8,
     o_q: u8,
+    post_attn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    attn_gate: Option<(
+        &ProtocolObject<dyn MTLBuffer>,
+        &ProtocolObject<dyn MTLBuffer>,
+    )>,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    muse_semantics: bool,
     pos: usize,
+    fused_ffn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
     kvarn: Option<compute::KvarnChainEncode>,
 ) {
     let hidden_dim = carrier.hidden_dim;
@@ -359,10 +385,11 @@ pub(crate) fn attn_chain_encode_core(
     let pos_buf = u32_buf(ctx, pos as u32);
     let kl_buf = u32_buf(ctx, kv_len as u32);
     let scale_buf = f32_buf(ctx, carrier.scale);
+    let window_buf = u32_buf(ctx, sliding_window.unwrap_or(0) as u32);
 
     let p = ctx.chain_profile;
     let int8_gqa_group = kvarn.is_none()
-        && ctx.kv_int8
+        && carrier.kv.kv_int8
         && ctx.attn_splitk_splits > 1
         && kv_len >= ctx.attn_splitk_min_kv
         && int8_gqa_group_enabled(std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref())
@@ -372,28 +399,38 @@ pub(crate) fn attn_chain_encode_core(
         && ctx.tensorops_capable
         && int8_gqa_matrix_requested(std::env::var("RNB_METAL_ATTN_GQA_MATRIX").ok().as_deref());
     let int8_gqa_fused_append = int8_gqa_matrix;
+    let muse_gqa16 = muse_semantics && head_dim == 128 && num_heads == num_kv_heads * 16;
+    let muse_norm_fusion = muse_semantics;
 
-    // ① attn_norm: hidden_dev → normed_dev [small]
-    if p.emit_small() {
-        encode_rms_norm(
-            ctx,
-            enc,
-            hidden_dev,
-            norm_w_buf,
-            &carrier.normed_dev,
-            &carrier.hdim_buf,
-            &carrier.eps_buf,
-        );
+    // ① attn_norm: hidden_dev → normed_dev [small]. An adjacent Muse layer can
+    // supply this value from its fused post-FFN tail.
+    let normed_dev = pre_normed_dev.unwrap_or(&carrier.normed_dev);
+    if pre_normed_dev.is_none() {
+        if p.emit_small() {
+            encode_rms_norm(
+                ctx,
+                enc,
+                hidden_dev,
+                norm_w_buf,
+                &carrier.normed_dev,
+                &carrier.hdim_buf,
+                &carrier.eps_buf,
+            );
+        }
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [&*carrier.normed_dev]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
     }
-    chain_barrier(ctx, enc); // ① norm 완료 → 그룹 {q·k·v} 독립 GEMV 진입 (normed_dev read-only 공유)
-                             // ② q: normed_dev → q_full_dev (N=q_out_dim, K=hidden_dim) — gated 면 [query|gate] 인터리브 [gemv]
+    // ② q: normed_dev → q_full_dev (N=q_out_dim, K=hidden_dim) — gated 면 [query|gate] 인터리브 [gemv]
     if p.emit_gemv() {
         compute::encode_gemv_quant(
             ctx,
             enc,
             q_q,
             q_w_buf,
-            &carrier.normed_dev,
+            normed_dev,
             &carrier.q_full_dev,
             &carrier.qoutdim_buf,
             &carrier.k_hidden_buf,
@@ -408,7 +445,7 @@ pub(crate) fn attn_chain_encode_core(
             enc,
             k_q,
             k_w_buf,
-            &carrier.normed_dev,
+            normed_dev,
             &carrier.k_dev,
             &carrier.kvdim_buf,
             &carrier.k_hidden_buf,
@@ -423,7 +460,7 @@ pub(crate) fn attn_chain_encode_core(
             enc,
             v_q,
             v_w_buf,
-            &carrier.normed_dev,
+            normed_dev,
             &carrier.v_dev,
             &carrier.kvdim_buf,
             &carrier.k_hidden_buf,
@@ -431,55 +468,113 @@ pub(crate) fn attn_chain_encode_core(
             kv_dim,
         );
     }
-    chain_barrier(ctx, enc); // 그룹 {q·k·v} 완료
-                             // ②.5 split: q_full_dev → q_dev(query), gate_dev (q 결과 의존, 그룹 후로 재배치 — pm28 2차) [small]
-    if p.emit_small() {
-        encode_split_qgate(
+    if let Some((gate_w_buf, gate_off_buf)) = attn_gate {
+        if p.emit_gemv() {
+            compute::encode_gemv_quant(
+                ctx,
+                enc,
+                0,
+                gate_w_buf,
+                normed_dev,
+                &carrier.gate_dev,
+                &carrier.qdim_buf,
+                &carrier.k_hidden_buf,
+                gate_off_buf,
+                q_dim,
+            );
+        }
+    }
+    if muse_semantics {
+        chain_barrier_resources(
             ctx,
             enc,
-            &carrier.q_full_dev,
-            &carrier.q_dev,
-            &carrier.gate_dev,
-            &carrier.hd_buf,
-            num_heads,
-            q_dim / num_heads,
+            [
+                &*carrier.q_full_dev,
+                &*carrier.k_dev,
+                &*carrier.v_dev,
+                &*carrier.gate_dev,
+            ],
         );
+    } else {
+        chain_barrier(ctx, enc);
     }
-    chain_barrier(ctx, enc);
-    // ⑤ q_norm: per-head RMSNorm q_dev (in-place) [small]
-    if p.emit_small() {
-        encode_qk_norm(
-            ctx,
-            enc,
-            &carrier.q_dev,
-            q_norm_w_buf,
-            &carrier.q_dev,
-            &carrier.hd_buf,
-            &carrier.eps_buf,
-            num_heads,
-        );
+    if attn_gate.is_none() {
+        // Packed Q+gate tensors store [query|gate] within each head.
+        if p.emit_small() {
+            encode_split_qgate(
+                ctx,
+                enc,
+                &carrier.q_full_dev,
+                &carrier.q_dev,
+                &carrier.gate_dev,
+                &carrier.hd_buf,
+                num_heads,
+                q_dim / num_heads,
+            );
+        }
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [&*carrier.q_dev, &*carrier.gate_dev]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
     }
-    chain_barrier(ctx, enc);
-    // ⑥ k_norm: per-head RMSNorm k_dev (in-place) [small]
+    let query_dev = if attn_gate.is_some() {
+        &carrier.q_full_dev
+    } else {
+        &carrier.q_dev
+    };
+    let fused_qk_norm_rope = muse_semantics && apply_rope;
     if p.emit_small() {
-        encode_qk_norm(
-            ctx,
-            enc,
-            &carrier.k_dev,
-            k_norm_w_buf,
-            &carrier.k_dev,
-            &carrier.hd_buf,
-            &carrier.eps_buf,
-            num_kv_heads,
-        );
+        if fused_qk_norm_rope {
+            encode_attn_decode_qk_norm_rope_pair(
+                ctx,
+                enc,
+                query_dev,
+                q_norm_w_buf,
+                &carrier.k_dev,
+                k_norm_w_buf,
+                &carrier.nh_buf,
+                &carrier.nkv_buf,
+                &carrier.hd_buf,
+                &carrier.nrot_buf,
+                &carrier.theta_scale_buf,
+                &carrier.eps_buf,
+                &pos_buf,
+                num_heads + num_kv_heads,
+            );
+        } else {
+            encode_qk_norm(
+                ctx,
+                enc,
+                query_dev,
+                q_norm_w_buf,
+                query_dev,
+                &carrier.hd_buf,
+                &carrier.eps_buf,
+                num_heads,
+            );
+            encode_qk_norm(
+                ctx,
+                enc,
+                &carrier.k_dev,
+                k_norm_w_buf,
+                &carrier.k_dev,
+                &carrier.hd_buf,
+                &carrier.eps_buf,
+                num_kv_heads,
+            );
+        }
     }
-    chain_barrier(ctx, enc);
-    // ⑦ rope: q_dev / k_dev (in-place, partial 인접페어 — 9B production RoPE) [small]
-    if p.emit_small() {
+    if muse_semantics {
+        chain_barrier_resources(ctx, enc, [query_dev, &*carrier.k_dev]);
+    } else {
+        chain_barrier(ctx, enc);
+    }
+    if p.emit_small() && apply_rope && !fused_qk_norm_rope {
         encode_rope_partial(
             ctx,
             enc,
-            &carrier.q_dev,
+            query_dev,
             &carrier.hd_buf,
             &carrier.qdim_buf,
             &carrier.nrot_buf,
@@ -498,8 +593,12 @@ pub(crate) fn attn_chain_encode_core(
             &pos_buf,
             num_kv_heads,
         );
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [query_dev, &*carrier.k_dev]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
     }
-    chain_barrier(ctx, enc);
     // ⑧ kv_append: k_dev/v_dev(f32) → KV_dev[pos] (fused TensorOps는 ⑨에서 처리) [small]
     if p.emit_small() {
         if let Some(kv) = kvarn {
@@ -511,7 +610,7 @@ pub(crate) fn attn_chain_encode_core(
                 kv_dim,
                 kv.append_slot,
             );
-        } else if ctx.kv_int8 {
+        } else if carrier.kv.kv_int8 {
             if !int8_gqa_fused_append {
                 encode_kv_append_i8(
                     ctx,
@@ -528,7 +627,7 @@ pub(crate) fn attn_chain_encode_core(
                     num_kv_heads,
                 );
             }
-        } else {
+        } else if !muse_gqa16 {
             encode_kv_append(
                 ctx,
                 enc,
@@ -542,17 +641,21 @@ pub(crate) fn attn_chain_encode_core(
             );
         }
     }
-    if !int8_gqa_fused_append {
-        chain_barrier(ctx, enc);
+    let muse_fused_append = muse_gqa16 && p.emit_attn();
+    if !int8_gqa_fused_append && !muse_fused_append {
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [&*carrier.kv.k_buf, &*carrier.kv.v_buf]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
     }
-    // ⑨ attn: q_dev + KV_dev[0..kv_len] → attn_out_dev [attn]
     if p.emit_attn() {
         if let Some(kv) = kvarn {
             compute::encode_kvarn_attention_splitk(
                 ctx,
                 enc,
                 kv.resident,
-                &carrier.q_dev,
+                query_dev,
                 &carrier.attn_out_dev,
                 kv.params_buf,
                 kv.num_splits_buf,
@@ -562,13 +665,13 @@ pub(crate) fn attn_chain_encode_core(
                 kv.num_heads,
                 kv.num_splits,
             );
-        } else if ctx.kv_int8 {
+        } else if carrier.kv.kv_int8 {
             if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
                 if int8_gqa_group {
                     encode_attn_decode_i8_gqa_splitk(
                         ctx,
                         enc,
-                        &carrier.q_dev,
+                        query_dev,
                         carrier.kv.k_i8.as_ref().unwrap(),
                         carrier.kv.v_i8.as_ref().unwrap(),
                         carrier.kv.k_scale.as_ref().unwrap(),
@@ -607,7 +710,7 @@ pub(crate) fn attn_chain_encode_core(
                     encode_attn_decode_i8_splitk(
                         ctx,
                         enc,
-                        &carrier.q_dev,
+                        query_dev,
                         carrier.kv.k_i8.as_ref().unwrap(),
                         carrier.kv.v_i8.as_ref().unwrap(),
                         carrier.kv.k_scale.as_ref().unwrap(),
@@ -643,7 +746,7 @@ pub(crate) fn attn_chain_encode_core(
                 encode_attn_decode_i8(
                     ctx,
                     enc,
-                    &carrier.q_dev,
+                    query_dev,
                     carrier.kv.k_i8.as_ref().unwrap(),
                     carrier.kv.v_i8.as_ref().unwrap(),
                     carrier.kv.k_scale.as_ref().unwrap(),
@@ -658,8 +761,43 @@ pub(crate) fn attn_chain_encode_core(
                     head_dim,
                 );
             }
+        } else if muse_gqa16 {
+            encode_attn_decode_f16_gqa16(
+                ctx,
+                enc,
+                query_dev,
+                &carrier.kv.k_buf,
+                &carrier.kv.v_buf,
+                &carrier.attn_out_dev,
+                &carrier.nh_buf,
+                &carrier.nkv_buf,
+                &carrier.hd_buf,
+                &kl_buf,
+                &scale_buf,
+                &window_buf,
+                &carrier.gate_dev,
+                &pos_buf,
+                &carrier.k_dev,
+                &carrier.v_dev,
+                num_heads,
+            );
+        } else if muse_semantics && sliding_window.is_some() {
+            encode_attn_decode_window(
+                ctx,
+                enc,
+                query_dev,
+                &carrier.kv.k_buf,
+                &carrier.kv.v_buf,
+                &carrier.attn_out_dev,
+                &carrier.nh_buf,
+                &carrier.nkv_buf,
+                &carrier.hd_buf,
+                &kl_buf,
+                &scale_buf,
+                &window_buf,
+                num_heads,
+            );
         } else {
-            // f16 KV: 검증된 split-K가 기본. GQA-grouped는 register 압박 때문에 명시적 opt-in.
             let gqa_group =
                 gqa_group_requested(std::env::var("RNB_METAL_ATTN_GQA_GROUP").ok().as_deref())
                     && num_heads > num_kv_heads
@@ -669,7 +807,7 @@ pub(crate) fn attn_chain_encode_core(
                 encode_attn_decode_gqa_splitk(
                     ctx,
                     enc,
-                    &carrier.q_dev,
+                    query_dev,
                     &carrier.kv.k_buf,
                     &carrier.kv.v_buf,
                     carrier
@@ -703,7 +841,7 @@ pub(crate) fn attn_chain_encode_core(
                 encode_attn_decode_splitk(
                     ctx,
                     enc,
-                    &carrier.q_dev,
+                    query_dev,
                     &carrier.kv.k_buf,
                     &carrier.kv.v_buf,
                     carrier
@@ -736,7 +874,7 @@ pub(crate) fn attn_chain_encode_core(
                 encode_attn_decode(
                     ctx,
                     enc,
-                    &carrier.q_dev,
+                    query_dev,
                     &carrier.kv.k_buf,
                     &carrier.kv.v_buf,
                     &carrier.attn_out_dev,
@@ -750,19 +888,29 @@ pub(crate) fn attn_chain_encode_core(
             }
         }
     }
-    chain_barrier(ctx, enc);
-    // ⑨.5 gated: attn_out_dev *= sigmoid(gate_dev) (q_dim elementwise) [small]
-    if p.emit_small() {
-        encode_gate_apply(
-            ctx,
-            enc,
-            &carrier.attn_out_dev,
-            &carrier.gate_dev,
-            &carrier.qdim_buf,
-            q_dim,
-        );
+    let muse_fused_gate = muse_gqa16 && p.emit_attn();
+    if !muse_fused_gate {
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [&*carrier.attn_out_dev]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
+        if p.emit_small() {
+            encode_gate_apply(
+                ctx,
+                enc,
+                &carrier.attn_out_dev,
+                &carrier.gate_dev,
+                &carrier.qdim_buf,
+                q_dim,
+            );
+        }
     }
-    chain_barrier(ctx, enc);
+    if muse_semantics {
+        chain_barrier_resources(ctx, enc, [&*carrier.attn_out_dev]);
+    } else {
+        chain_barrier(ctx, enc);
+    }
     // ⑩ o: attn_out_dev → o_out_dev (N=hidden_dim, K=q_dim) [gemv]
     if p.emit_gemv() {
         compute::encode_gemv_quant(
@@ -778,20 +926,86 @@ pub(crate) fn attn_chain_encode_core(
             hidden_dim,
         );
     }
-    chain_barrier(ctx, enc);
-    // ⑪ residual: hidden_dev += o_out_dev (attention 출력) [small]
-    if p.emit_small() {
-        encode_residual_add(
+    if muse_semantics {
+        chain_barrier_resources(ctx, enc, [&*carrier.o_out_dev]);
+    } else {
+        chain_barrier(ctx, enc);
+    }
+    let fused_muse_norms = if muse_norm_fusion && p.emit_small() {
+        post_attn_norm_w_buf.zip(fused_ffn_norm_w_buf)
+    } else {
+        None
+    };
+    if let Some((post_attn_norm_w_buf, ffn_norm_w_buf)) = fused_muse_norms {
+        encode_fused_post_attn_residual_ffn_rms_norm(
             ctx,
             enc,
-            hidden_dev,
             &carrier.o_out_dev,
+            post_attn_norm_w_buf,
+            hidden_dev,
+            ffn_norm_w_buf,
+            &carrier.ffn_normed_dev,
             &carrier.hdim_buf,
-            hidden_dim,
+            &carrier.post_norm_eps_buf,
+            &carrier.eps_buf,
         );
+        chain_barrier_resources(ctx, enc, [hidden_dev, &*carrier.ffn_normed_dev]);
+    } else {
+        let attn_residual = if let Some(post_attn_norm_w_buf) = post_attn_norm_w_buf {
+            if p.emit_small() {
+                encode_rms_norm(
+                    ctx,
+                    enc,
+                    &carrier.o_out_dev,
+                    post_attn_norm_w_buf,
+                    &carrier.ffn_normed_dev,
+                    &carrier.hdim_buf,
+                    &carrier.post_norm_eps_buf,
+                );
+            }
+            if muse_semantics {
+                chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
+            } else {
+                chain_barrier(ctx, enc);
+            }
+            &carrier.ffn_normed_dev
+        } else {
+            &carrier.o_out_dev
+        };
+        if let Some(ffn_norm_w_buf) = fused_ffn_norm_w_buf.filter(|_| p.emit_small()) {
+            encode_fused_residual_rms_norm(
+                ctx,
+                enc,
+                hidden_dev,
+                attn_residual,
+                ffn_norm_w_buf,
+                &carrier.ffn_normed_dev,
+                &carrier.hdim_buf,
+                &carrier.eps_buf,
+            );
+            if muse_semantics {
+                chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
+            } else {
+                chain_barrier(ctx, enc);
+            }
+        } else {
+            if p.emit_small() {
+                encode_residual_add(
+                    ctx,
+                    enc,
+                    hidden_dev,
+                    attn_residual,
+                    &carrier.hdim_buf,
+                    hidden_dim,
+                );
+            }
+            if muse_semantics {
+                chain_barrier_resources(ctx, enc, [hidden_dev]);
+            } else {
+                chain_barrier(ctx, enc);
+            }
+        }
     }
-
-    chain_barrier(ctx, enc); // attention residual 완료 → 다음 FFN/layer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,6 +1015,8 @@ fn attn_dense_ffn_chain_encode(
     carrier: &AttnCarrier,
     hidden_dev: &ProtocolObject<dyn MTLBuffer>,
     ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_ffn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    next_attn_norm: Option<(&ProtocolObject<dyn MTLBuffer>, f32)>,
     ffn_gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_up_w_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -808,57 +1024,76 @@ fn attn_dense_ffn_chain_encode(
     ffn_down_w_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_down_off_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_down_is_q6k: bool,
+    muse_semantics: bool,
+    input_already_normed: bool,
 ) {
-    // FFN (carrier 통합, 같은 command buffer):
-    // ⑫ ffn_norm → ⑬ gate GEMV → ⑭ up GEMV → ⑮ silu_mul → ⑯ down GEMV → ⑰ residual
     let hidden_dim = carrier.hidden_dim;
+    let muse_norm_fusion = muse_semantics;
     let ffn_dim = carrier.ffn_dim;
     let p = ctx.chain_profile;
+    let fuse_muse_swiglu = muse_semantics;
 
-    // ⑫ ffn_norm [small]
-    if p.emit_small() {
-        encode_rms_norm(
-            ctx,
-            enc,
-            hidden_dev,
-            ffn_norm_w_buf,
-            &carrier.ffn_normed_dev,
-            &carrier.hdim_buf,
-            &carrier.eps_buf,
-        );
+    if !input_already_normed {
+        if p.emit_small() {
+            encode_rms_norm(
+                ctx,
+                enc,
+                hidden_dev,
+                ffn_norm_w_buf,
+                &carrier.ffn_normed_dev,
+                &carrier.hdim_buf,
+                &carrier.eps_buf,
+            );
+        }
+        if muse_semantics {
+            chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
+        } else {
+            chain_barrier(ctx, enc);
+        }
     }
-    chain_barrier(ctx, enc); // ffn_norm 완료 → 그룹 B(ffn_gate·up) 독립 GEMV 진입
-                             // ⑬ gate GEMV [gemv]
     if p.emit_gemv() {
-        compute::encode_gemv_q4k_auto(
-            ctx,
-            enc,
-            ffn_gate_w_buf,
-            &carrier.ffn_normed_dev,
-            &carrier.ffn_gate_dev,
-            &carrier.fdim_buf,
-            &carrier.k_hidden_buf,
-            ffn_gate_off_buf,
-            ffn_dim,
-        );
+        if fuse_muse_swiglu {
+            compute::encode_gemv_q4k_swiglu_pair(
+                ctx,
+                enc,
+                ffn_gate_w_buf,
+                ffn_up_w_buf,
+                &carrier.ffn_normed_dev,
+                &carrier.ffn_gate_dev,
+                &carrier.fdim_buf,
+                &carrier.k_hidden_buf,
+                ffn_gate_off_buf,
+                ffn_up_off_buf,
+                ffn_dim,
+            );
+            chain_barrier_resources(ctx, enc, [&*carrier.ffn_gate_dev]);
+        } else {
+            compute::encode_gemv_q4k_auto(
+                ctx,
+                enc,
+                ffn_gate_w_buf,
+                &carrier.ffn_normed_dev,
+                &carrier.ffn_gate_dev,
+                &carrier.fdim_buf,
+                &carrier.k_hidden_buf,
+                ffn_gate_off_buf,
+                ffn_dim,
+            );
+            compute::encode_gemv_q4k_auto(
+                ctx,
+                enc,
+                ffn_up_w_buf,
+                &carrier.ffn_normed_dev,
+                &carrier.ffn_up_dev,
+                &carrier.fdim_buf,
+                &carrier.k_hidden_buf,
+                ffn_up_off_buf,
+                ffn_dim,
+            );
+            chain_barrier(ctx, enc);
+        }
     }
-    // ⑭ up GEMV [gemv]
-    if p.emit_gemv() {
-        compute::encode_gemv_q4k_auto(
-            ctx,
-            enc,
-            ffn_up_w_buf,
-            &carrier.ffn_normed_dev,
-            &carrier.ffn_up_dev,
-            &carrier.fdim_buf,
-            &carrier.k_hidden_buf,
-            ffn_up_off_buf,
-            ffn_dim,
-        );
-    }
-    chain_barrier(ctx, enc); // 그룹 B(ffn_gate·up) 완료
-                             // ⑮ silu_mul [small]
-    if p.emit_small() {
+    if p.emit_small() && !fuse_muse_swiglu {
         encode_silu_mul(
             ctx,
             enc,
@@ -867,9 +1102,8 @@ fn attn_dense_ffn_chain_encode(
             &carrier.fdim_buf,
             ffn_dim,
         );
+        chain_barrier(ctx, enc);
     }
-    chain_barrier(ctx, enc);
-    // ⑯ down GEMV [gemv]
     if p.emit_gemv() {
         if ffn_down_is_q6k {
             compute::encode_gemv_q6k_auto(
@@ -897,19 +1131,70 @@ fn attn_dense_ffn_chain_encode(
             );
         }
     }
-    chain_barrier(ctx, enc);
-    // ⑰ residual [small]
-    if p.emit_small() {
-        encode_residual_add(
-            ctx,
-            enc,
-            hidden_dev,
-            &carrier.ffn_down_dev,
-            &carrier.hdim_buf,
-            hidden_dim,
-        );
+    if muse_semantics {
+        chain_barrier_resources(ctx, enc, [&*carrier.ffn_down_dev]);
+    } else {
+        chain_barrier(ctx, enc);
     }
-    chain_barrier(ctx, enc); // layer 경계 — 다음 layer 의 norm 이 이 layer hidden 완료를 보게
+    if let (true, Some(post_ffn_norm_w_buf)) = (muse_norm_fusion, post_ffn_norm_w_buf) {
+        if p.emit_small() {
+            if let Some((next_norm_w_buf, next_eps)) = next_attn_norm {
+                encode_fused_post_ffn_residual_next_rms_norm(
+                    ctx,
+                    enc,
+                    &carrier.ffn_down_dev,
+                    post_ffn_norm_w_buf,
+                    hidden_dev,
+                    next_norm_w_buf,
+                    &carrier.normed_dev,
+                    &carrier.hdim_buf,
+                    &carrier.post_norm_eps_buf,
+                    next_eps,
+                );
+                chain_barrier_resources(ctx, enc, [hidden_dev, &*carrier.normed_dev]);
+            } else {
+                encode_fused_post_ffn_residual_add(
+                    ctx,
+                    enc,
+                    &carrier.ffn_down_dev,
+                    post_ffn_norm_w_buf,
+                    hidden_dev,
+                    &carrier.hdim_buf,
+                    &carrier.post_norm_eps_buf,
+                );
+                chain_barrier_resources(ctx, enc, [hidden_dev]);
+            }
+        }
+    } else {
+        let ffn_residual = if let Some(post_ffn_norm_w_buf) = post_ffn_norm_w_buf {
+            if p.emit_small() {
+                encode_rms_norm(
+                    ctx,
+                    enc,
+                    &carrier.ffn_down_dev,
+                    post_ffn_norm_w_buf,
+                    &carrier.o_out_dev,
+                    &carrier.hdim_buf,
+                    &carrier.post_norm_eps_buf,
+                );
+            }
+            chain_barrier(ctx, enc);
+            &carrier.o_out_dev
+        } else {
+            &carrier.ffn_down_dev
+        };
+        if p.emit_small() {
+            encode_residual_add(
+                ctx,
+                enc,
+                hidden_dev,
+                ffn_residual,
+                &carrier.hdim_buf,
+                hidden_dim,
+            );
+        }
+        chain_barrier(ctx, enc);
+    }
 }
 
 /// Attention core ①~⑪와 기존 dense FFN ⑫~⑰를 같은 encoder에 이어 encode한다.
@@ -919,6 +1204,7 @@ pub(crate) fn attn_chain_encode(
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &AttnCarrier,
     hidden_dev: &ProtocolObject<dyn MTLBuffer>,
+    pre_normed_dev: Option<&ProtocolObject<dyn MTLBuffer>>,
     norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
     q_w_buf: &ProtocolObject<dyn MTLBuffer>,
     q_off_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -930,8 +1216,15 @@ pub(crate) fn attn_chain_encode(
     k_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
     o_w_buf: &ProtocolObject<dyn MTLBuffer>,
     o_off_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_attn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    attn_gate: Option<(
+        &ProtocolObject<dyn MTLBuffer>,
+        &ProtocolObject<dyn MTLBuffer>,
+    )>,
     v_is_q6k: bool,
+    o_q: u8,
     ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_ffn_norm_w_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
     ffn_gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_gate_off_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_up_w_buf: &ProtocolObject<dyn MTLBuffer>,
@@ -939,13 +1232,18 @@ pub(crate) fn attn_chain_encode(
     ffn_down_w_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_down_off_buf: &ProtocolObject<dyn MTLBuffer>,
     ffn_down_is_q6k: bool,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    muse_semantics: bool,
     pos: usize,
-) {
+    next_attn_norm: Option<(&ProtocolObject<dyn MTLBuffer>, f32)>,
+) -> bool {
     attn_chain_encode_core(
         ctx,
         enc,
         carrier,
         hidden_dev,
+        pre_normed_dev,
         norm_w_buf,
         q_w_buf,
         q_off_buf,
@@ -960,8 +1258,14 @@ pub(crate) fn attn_chain_encode(
         0,
         0,
         if v_is_q6k { 2 } else { 0 },
-        0,
+        o_q,
+        post_attn_norm_w_buf,
+        attn_gate,
+        apply_rope,
+        sliding_window,
+        muse_semantics,
         pos,
+        Some(ffn_norm_w_buf).filter(|_| muse_semantics),
         None,
     );
     attn_dense_ffn_chain_encode(
@@ -970,6 +1274,8 @@ pub(crate) fn attn_chain_encode(
         carrier,
         hidden_dev,
         ffn_norm_w_buf,
+        post_ffn_norm_w_buf,
+        next_attn_norm,
         ffn_gate_w_buf,
         ffn_gate_off_buf,
         ffn_up_w_buf,
@@ -977,7 +1283,13 @@ pub(crate) fn attn_chain_encode(
         ffn_down_w_buf,
         ffn_down_off_buf,
         ffn_down_is_q6k,
+        muse_semantics,
+        muse_semantics,
     );
+    muse_semantics
+        && ctx.chain_profile.emit_small()
+        && post_ffn_norm_w_buf.is_some()
+        && next_attn_norm.is_some()
 }
 
 /// 연속 chain run 의 attention carrier layer 하나의 per-layer 인자를 borrow 로 묶은 spec.
@@ -998,27 +1310,26 @@ pub(crate) fn attn_chain_encode(
 #[derive(Clone, Copy)]
 pub struct AttnChainSpecRef<'a> {
     pub layer: usize,
-    // f32 weight (작아서 복사 업로드).
     pub norm_weight: &'a [f32],
     pub q_norm_weight: &'a [f32],
     pub k_norm_weight: &'a [f32],
     pub ffn_norm_weight: &'a [f32],
-    // 양자화 GEMV weight raw bytes (NoCopy resident wrap 대상). q/k/o/ffn_gate/ffn_up = Q4_K.
+    pub post_attn_norm_weight: Option<&'a [f32]>,
+    pub post_ffn_norm_weight: Option<&'a [f32]>,
     pub q_raw: &'a [u8],
     pub k_raw: &'a [u8],
+    pub o_q: u8,
     pub v_raw: &'a [u8],
     pub o_raw: &'a [u8],
+    pub attn_gate_raw: Option<&'a [u8]>,
     pub ffn_gate_raw: &'a [u8],
     pub ffn_up_raw: &'a [u8],
     pub ffn_down_raw: &'a [u8],
-    // v / ffn_down 만 Q4_K|Q6_K 구분.
     pub v_is_q6k: bool,
     pub ffn_down_is_q6k: bool,
-    // prior KV(host f16 bits, [pos*kv_dim]) — 첫 token KV init 용.
     pub prior_k: &'a [u16],
     pub prior_v: &'a [u16],
     pub pos: usize,
-    // shape (carrier entry 생성 + dispatch 에 사용).
     pub hidden_dim: usize,
     pub q_dim: usize,
     pub q_out_dim: usize,
@@ -1030,8 +1341,12 @@ pub struct AttnChainSpecRef<'a> {
     pub capacity: usize,
     pub ffn_dim: usize,
     pub eps: f32,
+    pub post_norm_eps: f32,
     pub theta: f32,
     pub scale: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+    pub muse_semantics: bool,
 }
 
 /// Batched(B-lane) attention core carrier — milestone 4 (MTP verify body fusion, mixed

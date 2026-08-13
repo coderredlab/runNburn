@@ -101,3 +101,71 @@ kernel void attn_decode_qk_norm_rope_batch(
         out[base + i] = normed[i];
     }
 }
+
+// Muse single-token decode Q/K RMSNorm + RoPE. One dispatch covers Q and K
+// heads, replacing two launches while preserving the per-head reduction and
+// rotation arithmetic of attn_decode_qk_norm_rope_batch.
+kernel void attn_decode_qk_norm_rope_pair(
+    device float*       q              [[buffer(0)]],
+    device const float* q_weight       [[buffer(1)]],
+    device float*       k              [[buffer(2)]],
+    device const float* k_weight       [[buffer(3)]],
+    constant uint&      q_heads        [[buffer(4)]],
+    constant uint&      k_heads        [[buffer(5)]],
+    constant uint&      head_dim       [[buffer(6)]],
+    constant uint&      n_rot          [[buffer(7)]],
+    constant float&     theta_scale    [[buffer(8)]],
+    constant float&     eps            [[buffer(9)]],
+    constant uint&      pos            [[buffer(10)]],
+    uint group   [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    bool is_q = group < q_heads;
+    uint head = is_q ? group : group - q_heads;
+    if ((!is_q && head >= k_heads) || head_dim > 256u) return;
+    device float* values = is_q ? q : k;
+    device const float* weight = is_q ? q_weight : k_weight;
+    uint base = head * head_dim;
+    threadgroup float partial[256];
+    threadgroup float normed[256];
+
+    float sum = 0.0f;
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        float v = values[base + i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt(partial[0] / (float)head_dim + eps);
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        normed[i] = values[base + i] * inv_rms * weight[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u && n_rot != 0u) {
+        uint nr = min(n_rot, head_dim);
+        float angle = (float)pos;
+        for (uint i = 0u; i < nr; i += 2u) {
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+            float x0 = normed[i];
+            float x1 = normed[i + 1u];
+            normed[i] = x0 * cos_a - x1 * sin_a;
+            normed[i + 1u] = x0 * sin_a + x1 * cos_a;
+            angle *= theta_scale;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < head_dim; i += tg_size) {
+        values[base + i] = normed[i];
+    }
+}

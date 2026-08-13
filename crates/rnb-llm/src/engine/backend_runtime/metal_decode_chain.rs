@@ -39,6 +39,10 @@ pub(in crate::engine) struct ChainAttnShape {
     pub pos: usize,
     pub theta: f32,
     pub scale: f32,
+    pub post_norm_eps: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+    pub muse_semantics: bool,
 }
 
 #[cfg_attr(not(all(feature = "metal", not(feature = "cuda"))), allow(dead_code))]
@@ -48,6 +52,7 @@ pub(in crate::engine) struct MetalDecodeOutputArgmax<'a> {
     pub rows: usize,
     pub cols: usize,
     pub eps: f32,
+    pub excluded_token: Option<u32>,
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -243,7 +248,14 @@ fn metal_decode_chain_run_impl(
                         ) else {
                             return Ok(fallback("missing attention ffn backend view"));
                         };
-                        views.push(vec![q_v, k_v, v_v, o_v, fg_v, fu_v, fd_v]);
+                        let mut layer_views = vec![q_v, k_v, v_v, o_v, fg_v, fu_v, fd_v];
+                        if let Some(attn_gate) = &w.attn_gate_weight {
+                            let Some(attn_gate_v) = attn_gate.backend_view() else {
+                                return Ok(fallback("missing attention gate backend view"));
+                            };
+                            layer_views.push(attn_gate_v);
+                        }
+                        views.push(layer_views);
                     }
                 }
                 LayerType::GatedDeltaNet(w) => {
@@ -374,6 +386,15 @@ fn metal_decode_chain_run_impl(
                             },
                         ));
                     } else {
+                        let (attn_gate_ggml, attn_gate_raw) = if w.attn_gate_weight.is_some() {
+                            (Some(backend_ggml_type(v[7].quant())), Some(v[7].raw()))
+                        } else {
+                            (None, None)
+                        };
+                        let post_attn_norm_weight =
+                            w.post_attn_norm.as_ref().map(kernels::tensor_as_f32_slice);
+                        let post_ffn_norm_weight =
+                            w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice);
                         specs.push(metal_runtime::MetalChainLayer::Attn(
                             metal_runtime::MetalAttnChainLayer {
                                 layer: *layer_idx,
@@ -381,6 +402,8 @@ fn metal_decode_chain_run_impl(
                                 q_norm_weight: kernels::tensor_as_f32_slice(q_norm),
                                 k_norm_weight: kernels::tensor_as_f32_slice(k_norm),
                                 ffn_norm_weight: kernels::tensor_as_f32_slice(&w.ffn_norm),
+                                post_attn_norm_weight,
+                                post_ffn_norm_weight,
                                 q_ggml,
                                 q_raw: v[0].raw(),
                                 k_ggml,
@@ -389,6 +412,8 @@ fn metal_decode_chain_run_impl(
                                 v_raw: v[2].raw(),
                                 o_ggml,
                                 o_raw: v[3].raw(),
+                                attn_gate_ggml,
+                                attn_gate_raw,
                                 ffn_gate_ggml: backend_ggml_type(v[4].quant()),
                                 ffn_gate_raw: v[4].raw(),
                                 ffn_up_ggml: backend_ggml_type(v[5].quant()),
@@ -409,8 +434,12 @@ fn metal_decode_chain_run_impl(
                                 capacity,
                                 ffn_dim: w.ffn_gate_weight.rows,
                                 eps,
+                                post_norm_eps: shape.post_norm_eps,
                                 theta: shape.theta,
                                 scale: shape.scale,
+                                apply_rope: shape.apply_rope,
+                                sliding_window: shape.sliding_window,
+                                muse_semantics: shape.muse_semantics,
                             },
                         ));
                     }
@@ -536,6 +565,7 @@ fn metal_decode_chain_run_impl(
                 rows: tail.rows,
                 cols: tail.cols,
                 eps: tail.eps,
+                excluded_token: tail.excluded_token,
             }),
             (Some(_), None) => {
                 return Ok(fallback("missing output backend view"));

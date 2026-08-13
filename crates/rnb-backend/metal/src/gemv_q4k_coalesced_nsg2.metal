@@ -1,3 +1,4 @@
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 #include <metal_stdlib>
 using namespace metal;
 
@@ -42,7 +43,7 @@ kernel void gemv_q4k_coalesced_nsg2(
 
     for (uint ib = ix; ib < nb; ib += 4u) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (ushort i = 0; i < 8; ++i) {
+        FOR_UNROLL (ushort i = 0; i < 8; ++i) {
             yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
             yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
             yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
@@ -61,7 +62,7 @@ kernel void gemv_q4k_coalesced_nsg2(
             device const ushort* q2 = q1 + 32u;
             float4 acc1 = {0.f,0.f,0.f,0.f};
             float4 acc2 = {0.f,0.f,0.f,0.f};
-            for (ushort i = 0; i < 4; ++i) {
+            FOR_UNROLL (ushort i = 0; i < 4; ++i) {
                 acc1[0] += yl[2*i+0] * (q1[i] & 0x000F);
                 acc1[1] += yl[2*i+1] * (q1[i] & 0x0F00);
                 acc1[2] += yl[2*i+8] * (q1[i] & 0x00F0);
@@ -90,7 +91,7 @@ kernel void gemv_q4k_coalesced_nsg2(
             device const ushort* q2 = q1 + 32u;
             float4 acc1 = {0.f,0.f,0.f,0.f};
             float4 acc2 = {0.f,0.f,0.f,0.f};
-            for (ushort i = 0; i < 4; ++i) {
+            FOR_UNROLL (ushort i = 0; i < 4; ++i) {
                 acc1[0] += yl[2*i+0] * (q1[i] & 0x000F);
                 acc1[1] += yl[2*i+1] * (q1[i] & 0x0F00);
                 acc1[2] += yl[2*i+8] * (q1[i] & 0x00F0);

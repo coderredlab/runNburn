@@ -1593,6 +1593,130 @@ fn apply_metal_qwen_prefill_chain_output(
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
+fn try_run_metal_muse_prefill_layer_range(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    hidden: &Tensor,
+    layer_range: &Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    imrope_positions: Option<(&[[u32; 4]], [usize; 4])>,
+    non_causal: bool,
+    norm_eps: f32,
+    profiler_enabled: bool,
+) -> crate::error::Result<Option<Tensor>> {
+    if architecture != ModelArchitecture::MuseGlimmer
+        || non_causal
+        || imrope_positions.is_some()
+        || pos_start != 0
+        || metal_prefill_host_requirement(layer_range, profiler_enabled).is_some()
+        || layer_range.start >= layer_range.end
+        || layer_range.end > weights.layers.len()
+    {
+        return Ok(None);
+    }
+    let hidden_data = kernels::tensor_as_f32_slice(hidden);
+    if hidden_data.len() != seq_len * metadata.hidden_dim {
+        return Ok(None);
+    }
+    let mut specs = Vec::with_capacity(layer_range.len());
+    for layer_idx in layer_range.clone() {
+        let Some(LayerType::Attention(w)) = weights.layers.get(layer_idx) else {
+            return Ok(None);
+        };
+        let layout = resolve_attention_layout(metadata, w, None)?;
+        let (
+            Some(attention_gate),
+            Some(q_norm),
+            Some(k_norm),
+            Some(post_attn_norm),
+            Some(post_ffn_norm),
+        ) = (
+            &w.attn_gate_weight,
+            &w.q_norm,
+            &w.k_norm,
+            &w.post_attn_norm,
+            &w.post_ffw_norm,
+        )
+        else {
+            return Ok(None);
+        };
+        let (rope_dim, rope_theta, proportional_rope) =
+            resolve_rope_params(metadata, architecture, layer_idx, layout.head_dim);
+        let sliding_window = active_sliding_window(metadata, architecture, layer_idx);
+        if proportional_rope
+            || !matches!(rope_dim, 0 | 128)
+            || layout.head_dim != 128
+            || resolve_attention_softcap(architecture).is_some()
+            || w.v_proj_missing
+            || w.moe.is_some()
+            || w.shared_expert_moe.is_some()
+            || w.ffn_gate_up_fused.is_some()
+            || w.q_bias.is_some()
+            || w.k_bias.is_some()
+            || w.v_bias.is_some()
+        {
+            return Ok(None);
+        }
+        let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+        specs.push(backend_runtime::MusePrefillLayerRangeSpec {
+            layer_idx,
+            hidden: hidden_data,
+            attn_norm_w: kernels::tensor_as_f32_slice(&w.attn_norm).to_vec(),
+            q_norm_w: kernels::tensor_as_f32_slice(q_norm).to_vec(),
+            k_norm_w: kernels::tensor_as_f32_slice(k_norm).to_vec(),
+            post_attn_norm_w: kernels::tensor_as_f32_slice(post_attn_norm).to_vec(),
+            ffn_norm_w: kernels::tensor_as_f32_slice(ffn_norm).to_vec(),
+            post_ffn_norm_w: kernels::tensor_as_f32_slice(post_ffn_norm).to_vec(),
+            q_weight: &w.q_weight,
+            k_weight: &w.k_weight,
+            v_weight: &w.v_weight,
+            attention_gate_weight: attention_gate,
+            o_weight: &w.o_weight,
+            ffn_gate_weight: &w.ffn_gate_weight,
+            ffn_up_weight: &w.ffn_up_weight,
+            ffn_down_weight: &w.ffn_down_weight,
+            seq_len,
+            num_heads: layout.num_heads,
+            num_kv_heads: layout.num_kv_heads,
+            head_dim: layout.head_dim,
+            hidden_dim: metadata.hidden_dim,
+            q_dim: layout.q_dim,
+            kv_dim: layout.kv_dim,
+            ffn_dim: w.ffn_gate_weight.rows,
+            rope_theta,
+            scale: resolve_attention_scale(metadata, architecture),
+            norm_eps,
+            post_norm_eps: metadata.post_norm_eps,
+            apply_rope: sliding_window.is_some(),
+            sliding_window,
+        });
+    }
+    let out = backend_runtime::metal_muse_prefill_layer_range_if_supported(
+        hidden_data,
+        &specs,
+        |layer_idx, k_bits, v_bits| {
+            kv_cache
+                .replace_layer_f16_range_compacted(layer_idx, 0, seq_len, k_bits, v_bits)
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    let Some(out) = out else {
+        return Ok(None);
+    };
+    debug_assert_eq!(out.hidden_uploads, 1);
+    debug_assert_eq!(out.hidden_readbacks, 1);
+    debug_assert_eq!(out.intermediate_hidden_transfers, 0);
+    debug_assert_eq!(out.kv_layers_streamed, layer_range.len());
+    Ok(Some(Tensor::from_vec(
+        out.hidden,
+        &[seq_len, metadata.hidden_dim],
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_run_metal_gemma_prefill_layer_range(
     kv_cache: &mut KVCache,
     metadata: &ModelMetadata,
@@ -2120,6 +2244,29 @@ fn run_prefill_layers_cpu_range_impl(
     let mut profiler = super::profile::PrefillLayerProfiler::new(weights.layers.len());
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if prefix_collector.is_none() && dflash_features.is_none() && gemma_per_layer_base.is_none() {
+        crate::generate::check_generation_cancellation()?;
+        let chain_input = hidden
+            .as_host()
+            .expect("Metal Muse prefill range input must be host-resident");
+        if let Some(chain_hidden) = try_run_metal_muse_prefill_layer_range(
+            kv_cache,
+            metadata,
+            architecture,
+            weights,
+            chain_input,
+            &layer_range,
+            seq_len,
+            pos_start,
+            imrope_positions,
+            non_causal,
+            norm_eps,
+            profiler.enabled(),
+        )? {
+            return Ok(hidden_carrier::PrefillHidden::Host(chain_hidden));
+        }
+    }
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     if prefix_collector.is_none() && dflash_features.is_none() && gemma_per_layer_base.is_none() {
         crate::generate::check_generation_cancellation()?;

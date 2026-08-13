@@ -116,6 +116,54 @@ pub(crate) struct MusePrefillOTailFfnCarrier {
     post_norm_eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
+pub(crate) struct MusePrefillFullLayerCarrier {
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    core: PrefillAtnCoreCarrier,
+    tail: MusePrefillOTailFfnCarrier,
+    attention_gate_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+pub(crate) struct MusePrefillLayerRangeState {
+    hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_elements: usize,
+}
+
+impl MusePrefillLayerRangeState {
+    pub(crate) fn new(ctx: &MetalContext, hidden: &[f32]) -> Self {
+        let hidden_dev = empty_f32_buf(ctx, hidden.len());
+        copy_f32(hidden, &hidden_dev);
+        Self {
+            hidden_dev,
+            hidden_elements: hidden.len(),
+        }
+    }
+
+    pub(crate) fn finish(&self) -> Vec<f32> {
+        readback(&self.hidden_dev, self.hidden_elements)
+    }
+}
+
+pub(crate) struct MusePrefillLayerRangePending {
+    layer_idx: usize,
+    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    k_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    v_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    kv_len: usize,
+    completed: bool,
+}
+
+impl Drop for MusePrefillLayerRangePending {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.command.waitUntilCompleted();
+        }
+    }
+}
 pub(crate) struct PrefillAtnOTailCarrier {
     pub core: PrefillAtnCoreCarrier,
     o_in_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -243,7 +291,7 @@ impl PrefillAtnCoreCarrier {
             ),
             scale_buf: f32_buf(ctx, scale),
             hidden_cols_buf: u32_buf(ctx, hidden_dim as u32),
-            q_n_buf: u32_buf(ctx, (q_dim * 2) as u32),
+            q_n_buf: u32_buf(ctx, q_dim as u32),
             kv_n_buf: u32_buf(ctx, kv_dim as u32),
             hidden_elems_buf: u32_buf(ctx, (seq_len * hidden_dim) as u32),
             q_elems_buf: u32_buf(ctx, (seq_len * q_dim) as u32),
@@ -390,8 +438,7 @@ impl MusePrefillOTailFfnCarrier {
         copy_f32(attn_out, &self.attn_out_dev);
     }
 
-    fn upload_ops(&self, attention_gate: Option<&[f32]>, req: MuseOTailFfnOpsRequest<'_>) {
-        debug_assert_eq!(req.hidden.len(), self.seq_len * self.hidden_dim);
+    fn upload_op_weights(&self, attention_gate: Option<&[f32]>, req: MuseOTailFfnOpsRequest<'_>) {
         debug_assert_eq!(req.post_attn_norm_w.len(), self.hidden_dim);
         debug_assert_eq!(req.ffn_norm_w.len(), self.hidden_dim);
         debug_assert_eq!(req.post_ffn_norm_w.len(), self.hidden_dim);
@@ -399,10 +446,70 @@ impl MusePrefillOTailFfnCarrier {
             debug_assert_eq!(gate.len(), self.seq_len * self.q_dim);
             copy_f32(gate, &self.attention_gate_dev);
         }
-        copy_f32(req.hidden, &self.hidden_dev);
         copy_f32(req.post_attn_norm_w, &self.post_attn_norm_w_dev);
         copy_f32(req.ffn_norm_w, &self.ffn_norm_w_dev);
         copy_f32(req.post_ffn_norm_w, &self.post_ffn_norm_w_dev);
+    }
+
+    fn upload_ops(&self, attention_gate: Option<&[f32]>, req: MuseOTailFfnOpsRequest<'_>) {
+        debug_assert_eq!(req.hidden.len(), self.seq_len * self.hidden_dim);
+        self.upload_op_weights(attention_gate, req);
+        copy_f32(req.hidden, &self.hidden_dev);
+    }
+}
+
+impl MusePrefillFullLayerCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        ffn_dim: usize,
+        rope_theta: f32,
+        scale: f32,
+        norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Self {
+        let core = PrefillAtnCoreCarrier::new(
+            ctx,
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_dim,
+            q_dim,
+            kv_dim,
+            head_dim,
+            rope_theta,
+            scale,
+            norm_eps,
+            0,
+        );
+        let tail = MusePrefillOTailFfnCarrier::new(
+            ctx,
+            seq_len,
+            q_dim,
+            hidden_dim,
+            ffn_dim,
+            norm_eps,
+            post_norm_eps,
+        );
+        Self {
+            seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            q_dim,
+            kv_dim,
+            core,
+            tail,
+            attention_gate_dev: empty_f32_buf(ctx, seq_len * q_dim),
+        }
     }
 }
 
@@ -582,6 +689,31 @@ pub(crate) struct MuseTargetAttentionOTailFfnDispatchRequest<'a> {
     pub scale: f32,
     pub attention_gate: &'a [f32],
     pub ops: MuseOTailFfnOpsRequest<'a>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct MusePrefillFullLayerDispatchRequest<'a> {
+    pub hidden: &'a [f32],
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub q_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub q_w_off: u32,
+    pub q_quant: TensoropsQuant,
+    pub k_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub k_w_off: u32,
+    pub k_quant: TensoropsQuant,
+    pub v_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub v_w_off: u32,
+    pub v_quant: TensoropsQuant,
+    pub attention_gate_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub attention_gate_w_off: u32,
+    pub attention_gate_quant: TensoropsQuant,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+    pub ops: MuseOTailFfnOpsRequest<'a>,
+    pub norm_eps: f32,
+    pub scale: f32,
 }
 
 pub(crate) struct PrefillAtnOTailDispatchRequest<'a> {
@@ -1244,6 +1376,7 @@ fn encode_muse_o_tail_ffn_ops(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     carrier: &MusePrefillOTailFfnCarrier,
+    hidden_dev: &ProtocolObject<dyn MTLBuffer>,
     attn_out: &ProtocolObject<dyn MTLBuffer>,
     req: MuseOTailFfnOpsRequest<'_>,
 ) {
@@ -1282,7 +1415,7 @@ fn encode_muse_o_tail_ffn_ops(
     crate::ffn_chain::encode_residual_add(
         ctx,
         enc,
-        &carrier.hidden_dev,
+        hidden_dev,
         &carrier.ffn_normed_dev,
         &carrier.hidden_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
@@ -1290,7 +1423,7 @@ fn encode_muse_o_tail_ffn_ops(
     encode_rms_norm_batch(
         ctx,
         enc,
-        &carrier.hidden_dev,
+        hidden_dev,
         &carrier.ffn_norm_w_dev,
         &carrier.ffn_normed_dev,
         &carrier.hidden_dim_buf,
@@ -1369,11 +1502,305 @@ fn encode_muse_o_tail_ffn_ops(
     crate::ffn_chain::encode_residual_add(
         ctx,
         enc,
-        &carrier.hidden_dev,
+        hidden_dev,
         &carrier.ffn_normed_dev,
         &carrier.hidden_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_muse_full_layer_ops(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &MusePrefillFullLayerCarrier,
+    hidden_dev: &ProtocolObject<dyn MTLBuffer>,
+    req: &MusePrefillFullLayerDispatchRequest<'_>,
+) -> Result<(), String> {
+    let core = &carrier.core;
+
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        hidden_dev,
+        &core.attn_norm_w_dev,
+        &core.normed_dev,
+        core.seq_len,
+        core.hidden_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &core.normed_dev,
+        &core.normed_f16_dev,
+        &core.hidden_elems_buf,
+        core.seq_len * core.hidden_dim,
+    );
+    compute::chain_barrier(ctx, &enc);
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.q_quant,
+        req.q_w_buf,
+        req.q_w_off,
+        &core.normed_f16_dev,
+        &core.q_dev,
+        &core.q_n_buf,
+        &core.hidden_cols_buf,
+        &core.seq_buf,
+        core.q_dim,
+        core.seq_len,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.k_quant,
+        req.k_w_buf,
+        req.k_w_off,
+        &core.normed_f16_dev,
+        &core.k_dev,
+        &core.kv_n_buf,
+        &core.hidden_cols_buf,
+        &core.seq_buf,
+        core.kv_dim,
+        core.seq_len,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.v_quant,
+        req.v_w_buf,
+        req.v_w_off,
+        &core.normed_f16_dev,
+        &core.v_dev,
+        &core.kv_n_buf,
+        &core.hidden_cols_buf,
+        &core.seq_buf,
+        core.kv_dim,
+        core.seq_len,
+    );
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.attention_gate_quant,
+        req.attention_gate_w_buf,
+        req.attention_gate_w_off,
+        &core.normed_f16_dev,
+        &carrier.attention_gate_dev,
+        &core.q_n_buf,
+        &core.hidden_cols_buf,
+        &core.seq_buf,
+        core.q_dim,
+        core.seq_len,
+    );
+    compute::chain_barrier(ctx, &enc);
+
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        &core.q_dev,
+        &core.q_norm_w_dev,
+        &core.q_normed_dev,
+        core.seq_len * core.num_heads,
+        core.head_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal Muse prefill Q RMS norm failed: {error:?}"))?;
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        &core.k_dev,
+        &core.k_norm_w_dev,
+        &core.k_normed_dev,
+        core.seq_len * core.num_kv_heads,
+        core.head_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal Muse prefill K RMS norm failed: {error:?}"))?;
+    compute::chain_barrier(ctx, &enc);
+    if req.apply_rope {
+        compute::encode_prefill_rope_only(
+            ctx,
+            &enc,
+            &core.q_normed_dev,
+            &core.q_normed_dev,
+            &core.rope_cos_sin_dev,
+            core.num_heads,
+            core.head_dim,
+            core.head_dim,
+            core.seq_len,
+        )
+        .map_err(|error| format!("Metal Muse prefill Q RoPE failed: {error:?}"))?;
+        compute::encode_prefill_rope_only(
+            ctx,
+            &enc,
+            &core.k_normed_dev,
+            &core.k_normed_dev,
+            &core.rope_cos_sin_dev,
+            core.num_kv_heads,
+            core.head_dim,
+            core.head_dim,
+            core.seq_len,
+        )
+        .map_err(|error| format!("Metal Muse prefill K RoPE failed: {error:?}"))?;
+    }
+    compute::chain_barrier(ctx, &enc);
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &core.k_normed_dev,
+        &core.k_f16_dev,
+        &core.kv_elems_buf,
+        core.seq_len * core.kv_dim,
+    );
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &core.v_dev,
+        &core.v_f16_dev,
+        &core.kv_elems_buf,
+        core.seq_len * core.kv_dim,
+    );
+    compute::chain_barrier(ctx, &enc);
+    crate::dflash_attention::encode_muse_target_attention_f16_hd128(
+        ctx,
+        &enc,
+        &core.q_normed_dev,
+        &core.k_f16_dev,
+        &core.v_f16_dev,
+        &core.attn_out_dev,
+        core.seq_len,
+        core.seq_len,
+        core.num_heads,
+        core.num_kv_heads,
+        req.sliding_window,
+        req.scale,
+    )?;
+    compute::chain_barrier(ctx, &enc);
+    encode_prefill_gate_apply(
+        ctx,
+        &enc,
+        &core.attn_out_dev,
+        &carrier.attention_gate_dev,
+        &core.attn_gated_dev,
+        &core.q_elems_buf,
+        core.seq_len * core.q_dim,
+    );
+    compute::chain_barrier(ctx, &enc);
+    encode_muse_o_tail_ffn_ops(
+        ctx,
+        enc,
+        &carrier.tail,
+        hidden_dev,
+        &core.attn_gated_dev,
+        req.ops,
+    );
+    compute::chain_barrier(ctx, &enc);
+    Ok(())
+}
+
+pub(crate) fn prefill_muse_full_layer_dispatch(
+    ctx: &MetalContext,
+    carrier: &MusePrefillFullLayerCarrier,
+    req: MusePrefillFullLayerDispatchRequest<'_>,
+) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
+    let core = &carrier.core;
+    core.upload(req.hidden, req.attn_norm_w, req.q_norm_w, req.k_norm_w);
+    carrier.tail.upload_ops(None, req.ops);
+
+    let cmd = ctx.queue.commandBuffer().ok_or_else(|| {
+        "Metal Muse prefill full layer: command buffer creation failed".to_string()
+    })?;
+    let enc = cmd.computeCommandEncoder().ok_or_else(|| {
+        "Metal Muse prefill full layer: compute encoder creation failed".to_string()
+    })?;
+    encode_muse_full_layer_ops(ctx, &enc, carrier, &core.hidden_dev, &req)?;
+
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    ensure_command_completed(&cmd)?;
+
+    let hidden = readback(
+        &carrier.tail.hidden_dev,
+        carrier.seq_len * carrier.tail.hidden_dim,
+    );
+    let k_bits = unsafe {
+        std::slice::from_raw_parts(
+            core.k_f16_dev.contents().as_ptr().cast::<u16>(),
+            carrier.seq_len * carrier.kv_dim,
+        )
+        .to_vec()
+    };
+
+    let v_bits = unsafe {
+        std::slice::from_raw_parts(
+            core.v_f16_dev.contents().as_ptr().cast::<u16>(),
+            carrier.seq_len * carrier.kv_dim,
+        )
+        .to_vec()
+    };
+    Ok((hidden, k_bits, v_bits))
+}
+
+pub(crate) fn prefill_muse_layer_range_submit(
+    ctx: &MetalContext,
+    state: &mut MusePrefillLayerRangeState,
+    carrier: &MusePrefillFullLayerCarrier,
+    layer_idx: usize,
+    req: MusePrefillFullLayerDispatchRequest<'_>,
+) -> Result<MusePrefillLayerRangePending, String> {
+    let core = &carrier.core;
+    if state.hidden_elements != core.seq_len * core.hidden_dim {
+        return Err("Metal Muse prefill range hidden shape mismatch".to_string());
+    }
+    copy_f32(req.attn_norm_w, &core.attn_norm_w_dev);
+    copy_f32(req.q_norm_w, &core.q_norm_w_dev);
+    copy_f32(req.k_norm_w, &core.k_norm_w_dev);
+    carrier.tail.upload_op_weights(None, req.ops);
+    let command = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal Muse prefill range command buffer creation failed".to_string())?;
+    let encoder = command
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal Muse prefill range encoder creation failed".to_string())?;
+    encode_muse_full_layer_ops(ctx, &encoder, carrier, &state.hidden_dev, &req)?;
+    encoder.endEncoding();
+    command.commit();
+    Ok(MusePrefillLayerRangePending {
+        layer_idx,
+        command,
+        k_f16_dev: core.k_f16_dev.clone(),
+        v_f16_dev: core.v_f16_dev.clone(),
+        kv_len: core.seq_len * core.kv_dim,
+        completed: false,
+    })
+}
+
+pub(crate) fn prefill_muse_layer_range_complete(
+    mut pending: MusePrefillLayerRangePending,
+    on_kv: &mut impl FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
+) -> Result<(), String> {
+    pending.command.waitUntilCompleted();
+    pending.completed = true;
+    ensure_command_completed(&pending.command)?;
+
+    let k_bits = unsafe {
+        std::slice::from_raw_parts(
+            pending.k_f16_dev.contents().as_ptr().cast::<u16>(),
+            pending.kv_len,
+        )
+    };
+    let v_bits = unsafe {
+        std::slice::from_raw_parts(
+            pending.v_f16_dev.contents().as_ptr().cast::<u16>(),
+            pending.kv_len,
+        )
+    };
+    on_kv(pending.layer_idx, k_bits, v_bits)
 }
 
 pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
@@ -1390,7 +1817,14 @@ pub(crate) fn prefill_muse_o_tail_ffn_dispatch(
     let enc = cmd
         .computeCommandEncoder()
         .ok_or_else(|| "Metal Muse prefill O+FFN: compute encoder creation failed".to_string())?;
-    encode_muse_o_tail_ffn_ops(ctx, &enc, carrier, &carrier.attn_out_dev, req.ops);
+    encode_muse_o_tail_ffn_ops(
+        ctx,
+        &enc,
+        carrier,
+        &carrier.hidden_dev,
+        &carrier.attn_out_dev,
+        req.ops,
+    );
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();
@@ -1434,7 +1868,14 @@ pub(crate) fn prefill_muse_target_attention_o_tail_ffn_dispatch(
         &carrier.q_elems_buf,
         carrier.seq_len * carrier.q_dim,
     );
-    encode_muse_o_tail_ffn_ops(ctx, &enc, carrier, &carrier.attention_gated_dev, req.ops);
+    encode_muse_o_tail_ffn_ops(
+        ctx,
+        &enc,
+        carrier,
+        &carrier.hidden_dev,
+        &carrier.attention_gated_dev,
+        req.ops,
+    );
     enc.endEncoding();
     cmd.commit();
     cmd.waitUntilCompleted();

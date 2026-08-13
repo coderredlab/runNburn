@@ -549,6 +549,7 @@ impl Engine {
             rows: weights.output.rows,
             cols: weights.output.cols,
             eps: metadata.norm_eps,
+            excluded_token: None,
         });
 
         // 전체 layer 를 run 으로 수집(full chain). attn prior 는 항상 host 전량([0..base_pos]).
@@ -629,6 +630,10 @@ impl Engine {
                         pos: base_pos,
                         theta: carrier_rope_theta,
                         scale: (layout.head_dim as f32).sqrt().recip(),
+                        post_norm_eps: metadata.post_norm_eps,
+                        apply_rope: true,
+                        sliding_window: None,
+                        muse_semantics: false,
                     }));
                     kv_dims.push(Some(layout.kv_dim));
                     run.push((li, &weights.layers[li]));
@@ -1000,8 +1005,14 @@ impl Engine {
                 let row_bytes = embd_bytes.len() / embd.rows;
                 let row_start = token as usize * row_bytes;
                 let row_data = &embd_bytes[row_start..row_start + row_bytes];
-                let f32_row = dequantize_bytes_to_f32(row_data, embd.ggml_type);
-                scratch.hidden[..hidden_dim].copy_from_slice(&f32_row[..hidden_dim]);
+                if !dequantize_row_to_slice_if_supported(
+                    row_data,
+                    embd.ggml_type,
+                    &mut scratch.hidden[..hidden_dim],
+                ) {
+                    let f32_row = dequantize_bytes_to_f32(row_data, embd.ggml_type);
+                    scratch.hidden[..hidden_dim].copy_from_slice(&f32_row[..hidden_dim]);
+                }
             }
         }
         let gemma_ple_active = gemma_per_layer_enabled_for_model(weights, metadata, architecture);
@@ -1539,14 +1550,22 @@ impl Engine {
                                         resolve_attention_layout(metadata, w, layer_kv_override)?
                                     };
                                     (attn_layer_env
-                                        && attn_carrier_eligible(
+                                        && (attn_carrier_eligible(
                                             w,
                                             layout.has_gated_attn,
                                             owns_kv,
                                             pos,
                                             pos,
                                             gemma4_reuse_q_only,
-                                        ))
+                                        ) || muse_attn_carrier_eligible(
+                                            architecture,
+                                            w,
+                                            layout.has_gated_attn,
+                                            owns_kv,
+                                            pos,
+                                            pos,
+                                            gemma4_reuse_q_only,
+                                        )))
                                         || qwen_attn_moe_chain_eligible(
                                             w,
                                             layout.has_gated_attn,
@@ -2091,7 +2110,7 @@ fn try_run_decode_chain(
     let n_group = metadata.ssm_n_group;
     let dt_rank = metadata.ssm_dt_rank;
     let conv_kernel = metadata.ssm_conv_kernel;
-    let head_v_dim = d_inner / dt_rank;
+    let head_v_dim = d_inner.checked_div(dt_rank).unwrap_or(0);
     let head_k_dim = d_state;
     let num_v_heads = dt_rank;
     let num_k_heads = n_group;
@@ -2166,14 +2185,22 @@ fn try_run_decode_chain(
                     resolve_attention_layout(metadata, w, layer_kv_override)?
                 };
                 if !((attn_layer_env
-                    && attn_carrier_eligible(
+                    && (attn_carrier_eligible(
                         w,
                         layout.has_gated_attn,
                         owns_kv,
                         pos,
                         pos,
                         gemma4_reuse_q_only,
-                    ))
+                    ) || muse_attn_carrier_eligible(
+                        architecture,
+                        w,
+                        layout.has_gated_attn,
+                        owns_kv,
+                        pos,
+                        pos,
+                        gemma4_reuse_q_only,
+                    )))
                     || qwen_attn_moe_chain_eligible(
                         w,
                         layout.has_gated_attn,
@@ -2242,7 +2269,19 @@ fn try_run_decode_chain(
                     n_rot: carrier_rope_dim,
                     pos,
                     theta: carrier_rope_theta,
-                    scale: (layout.head_dim as f32).sqrt().recip(),
+                    scale: resolve_attention_scale(metadata, architecture),
+                    post_norm_eps: metadata.post_norm_eps,
+                    apply_rope: !matches!(architecture, ModelArchitecture::MuseGlimmer)
+                        || is_sliding_window_layer(metadata, architecture, li),
+                    sliding_window: if models::muse_glimmer::uses_muse_glimmer_semantics(
+                        architecture,
+                    ) && is_sliding_window_layer(metadata, architecture, li)
+                    {
+                        active_sliding_window(metadata, architecture, li)
+                    } else {
+                        None
+                    },
+                    muse_semantics: models::muse_glimmer::uses_muse_glimmer_semantics(architecture),
                 }));
                 run.push((li, &weights.layers[li]));
                 li += 1;
@@ -2369,17 +2408,25 @@ fn decode_chain_output_argmax_tail<'a>(
         || use_token_embedding_as_output()
         || !matches!(
             architecture,
-            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+            ModelArchitecture::Qwen35
+                | ModelArchitecture::Qwen35MoE
+                | ModelArchitecture::MuseGlimmer
         )
-        || metadata.final_logit_softcapping != 0.0
+        || (metadata.final_logit_softcapping != 0.0
+            && !matches!(architecture, ModelArchitecture::MuseGlimmer))
         || weights.output.cols != hidden_dim
     {
         if crate::engine::policy::env_string("RNB_METAL_CHAIN_GPU_TIME").as_deref() == Some("1") {
             eprintln!(
-                "[argmax-tail] SKIP argmax_only={} emb_as_out={} arch_qwen35={} softcap={} out_cols={} hdim={}",
+                "[argmax-tail] SKIP argmax_only={} emb_as_out={} arch_supported={} softcap={} out_cols={} hdim={}",
                 scratch.backend_argmax_only,
                 use_token_embedding_as_output(),
-                matches!(architecture, ModelArchitecture::Qwen35),
+                matches!(
+                    architecture,
+                    ModelArchitecture::Qwen35
+                        | ModelArchitecture::Qwen35MoE
+                        | ModelArchitecture::MuseGlimmer
+                ),
                 metadata.final_logit_softcapping,
                 weights.output.cols,
                 hidden_dim,
@@ -2397,6 +2444,7 @@ fn decode_chain_output_argmax_tail<'a>(
         rows: weights.output.rows,
         cols: weights.output.cols,
         eps: metadata.norm_eps,
+        excluded_token: scratch.backend_argmax_excluded_token,
     })
 }
 

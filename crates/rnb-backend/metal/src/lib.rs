@@ -153,7 +153,6 @@ impl ConstantF32Entry {
             })
     }
 }
-
 #[cfg(target_os = "macos")]
 /// pm112: GLM MoE decode 의 UD-quant 레이어 조합 선택. 기본값은
 /// IQ2_XXS gate/up + IQ3_XXS down + Q5K/Q5K/Q6K shared.
@@ -422,7 +421,6 @@ impl WeightResidencyLru {
                 .collect();
         }
     }
-
     /// wrap batch 끝에서 add/remove 반영. dirty 아닐 때 no-op.
     fn commit_if_dirty(&mut self) {
         if self.dirty {
@@ -1066,6 +1064,7 @@ pub struct DecodeOutputArgmaxSpecRef<'a> {
     pub rows: usize,
     pub cols: usize,
     pub eps: f32,
+    pub excluded_token: Option<u32>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1455,6 +1454,32 @@ struct MusePrefillOTailFfnCarrierKey {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MusePrefillFullLayerCarrierKey {
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    ffn_dim: usize,
+    rope_theta_bits: u32,
+    scale_bits: u32,
+    norm_eps_bits: u32,
+    post_norm_eps_bits: u32,
+    slot: u8,
+    q_quant: TensoropsQuant,
+    k_quant: TensoropsQuant,
+    v_quant: TensoropsQuant,
+    attention_gate_quant: TensoropsQuant,
+    o_quant: TensoropsQuant,
+    ffn_gate_quant: TensoropsQuant,
+    ffn_up_quant: TensoropsQuant,
+    ffn_down_quant: TensoropsQuant,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct PrefillAtnCoreWeightView<'a> {
     pub raw: &'a [u8],
@@ -1557,6 +1582,55 @@ pub struct MusePrefillOTailFfnBackendRequest<'a> {
     pub post_norm_eps: f32,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct MusePrefillFullLayerBackendRequest<'a> {
+    pub hidden: &'a [f32],
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub q_weight: PrefillAtnCoreWeightView<'a>,
+    pub k_weight: PrefillAtnCoreWeightView<'a>,
+    pub v_weight: PrefillAtnCoreWeightView<'a>,
+    pub attention_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub o_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub post_norm_eps: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct MusePrefillLayerRangeBackendLayer<'a> {
+    pub layer_idx: usize,
+    pub request: MusePrefillFullLayerBackendRequest<'a>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct MusePrefillLayerRangeBackendOut {
+    pub hidden: Vec<f32>,
+    pub hidden_uploads: usize,
+    pub hidden_readbacks: usize,
+    pub intermediate_hidden_transfers: usize,
+    pub kv_layers_streamed: usize,
+}
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub struct GemmaPrefillLayerRangeBackendLayer<'a> {
@@ -2028,6 +2102,13 @@ pub struct MetalBackend {
             prefill_atn_core_chain::MusePrefillOTailFfnCarrier,
         )>,
     >,
+    /// Muse full-layer scratch keyed by prompt shape and layer semantics.
+    muse_prefill_full_layer_carriers: RefCell<
+        HashMap<
+            MusePrefillFullLayerCarrierKey,
+            prefill_atn_core_chain::MusePrefillFullLayerCarrier,
+        >,
+    >,
     qwen_prefill_gdn_carriers:
         RefCell<HashMap<QwenGdnPrefillCarrierKey, gdn_chain::QwenGdnPrefillCarrier>>,
     qwen_prefill_atn_o_tail_carriers:
@@ -2270,6 +2351,7 @@ impl MetalBackend {
                 gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
                 muse_prefill_o_ffn_carrier: RefCell::new(None),
+                muse_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 qkv_carriers: RefCell::new(HashMap::new()),
@@ -2510,6 +2592,7 @@ impl MetalBackend {
             gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
             muse_prefill_o_ffn_carrier: RefCell::new(None),
+            muse_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             qkv_carriers: RefCell::new(HashMap::new()),
@@ -4888,6 +4971,204 @@ impl MetalBackend {
         Ok(Some(output))
     }
 
+    /// Muse dense full layer: QKV+attention gate, causal attention, O projection,
+    /// both normalized residual branches, and SwiGLU FFN in one command buffer.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_muse_full_layer_if_supported(
+        &self,
+        req: MusePrefillFullLayerBackendRequest<'_>,
+    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if ctx.cast_f32_f16_pipeline.is_none()
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.q_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.k_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.v_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.attention_gate_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.o_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_gate_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_up_weight.quant)
+            || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_down_weight.quant)
+        {
+            return Ok(None);
+        }
+        if req.seq_len == 0
+            || req.num_heads == 0
+            || req.num_kv_heads == 0
+            || req.num_heads % req.num_kv_heads != 0
+            || req.head_dim != 128
+            || req.q_dim != req.num_heads * req.head_dim
+            || req.kv_dim != req.num_kv_heads * req.head_dim
+            || !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+            || !req.post_norm_eps.is_finite()
+            || req.post_norm_eps <= 0.0
+            || !req.scale.is_finite()
+        {
+            return Err("Metal Muse prefill full layer contract mismatch".to_string());
+        }
+        Self::atn_core_require_eq(
+            "hidden len",
+            req.hidden.len(),
+            Self::atn_core_checked_mul(req.seq_len, req.hidden_dim, "hidden len")?,
+        )?;
+        for (role, norm, len) in [
+            ("attn norm", req.attn_norm_w, req.hidden_dim),
+            ("q norm", req.q_norm_w, req.head_dim),
+            ("k norm", req.k_norm_w, req.head_dim),
+            ("post-attn norm", req.post_attn_norm_w, req.hidden_dim),
+            ("ffn norm", req.ffn_norm_w, req.hidden_dim),
+            ("post-ffn norm", req.post_ffn_norm_w, req.hidden_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} len"), norm.len(), len)?;
+        }
+        for (role, weight, rows, cols) in [
+            ("q", req.q_weight, req.q_dim, req.hidden_dim),
+            ("k", req.k_weight, req.kv_dim, req.hidden_dim),
+            ("v", req.v_weight, req.kv_dim, req.hidden_dim),
+            (
+                "attention gate",
+                req.attention_gate_weight,
+                req.q_dim,
+                req.hidden_dim,
+            ),
+            ("o", req.o_weight, req.hidden_dim, req.q_dim),
+            ("ffn gate", req.ffn_gate_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn up", req.ffn_up_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn down", req.ffn_down_weight, req.hidden_dim, req.ffn_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+
+        let (
+            q_w_buf,
+            q_w_off,
+            k_w_buf,
+            k_w_off,
+            v_w_buf,
+            v_w_off,
+            attention_gate_w_buf,
+            attention_gate_w_off,
+            o_w_buf,
+            o_w_off,
+            ffn_gate_w_buf,
+            ffn_gate_w_off,
+            ffn_up_w_buf,
+            ffn_up_w_off,
+            ffn_down_w_buf,
+            ffn_down_w_off,
+        ) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (q, qo) = wrap(req.q_weight.raw);
+            let (k, ko) = wrap(req.k_weight.raw);
+            let (v, vo) = wrap(req.v_weight.raw);
+            let (ag, ago) = wrap(req.attention_gate_weight.raw);
+            let (o, oo) = wrap(req.o_weight.raw);
+            let (fg, fgo) = wrap(req.ffn_gate_weight.raw);
+            let (fu, fuo) = wrap(req.ffn_up_weight.raw);
+            let (fd, fdo) = wrap(req.ffn_down_weight.raw);
+            (
+                q, qo, k, ko, v, vo, ag, ago, o, oo, fg, fgo, fu, fuo, fd, fdo,
+            )
+        };
+
+        let key = MusePrefillFullLayerCarrierKey {
+            seq_len: req.seq_len,
+            num_heads: req.num_heads,
+            num_kv_heads: req.num_kv_heads,
+            head_dim: req.head_dim,
+            hidden_dim: req.hidden_dim,
+            q_dim: req.q_dim,
+            kv_dim: req.kv_dim,
+            ffn_dim: req.ffn_dim,
+            rope_theta_bits: req.rope_theta.to_bits(),
+            scale_bits: req.scale.to_bits(),
+            norm_eps_bits: req.norm_eps.to_bits(),
+            post_norm_eps_bits: req.post_norm_eps.to_bits(),
+            slot: 0,
+            q_quant: req.q_weight.quant,
+            k_quant: req.k_weight.quant,
+            v_quant: req.v_weight.quant,
+            attention_gate_quant: req.attention_gate_weight.quant,
+            o_quant: req.o_weight.quant,
+            ffn_gate_quant: req.ffn_gate_weight.quant,
+            ffn_up_quant: req.ffn_up_weight.quant,
+            ffn_down_quant: req.ffn_down_weight.quant,
+        };
+        let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_atn_core_chain::MusePrefillFullLayerCarrier::new(
+                ctx,
+                req.seq_len,
+                req.num_heads,
+                req.num_kv_heads,
+                req.head_dim,
+                req.hidden_dim,
+                req.q_dim,
+                req.kv_dim,
+                req.ffn_dim,
+                req.rope_theta,
+                req.scale,
+                req.norm_eps,
+                req.post_norm_eps,
+            )
+        });
+        let out = prefill_atn_core_chain::prefill_muse_full_layer_dispatch(
+            ctx,
+            carrier,
+            prefill_atn_core_chain::MusePrefillFullLayerDispatchRequest {
+                hidden: req.hidden,
+                attn_norm_w: req.attn_norm_w,
+                q_norm_w: req.q_norm_w,
+                k_norm_w: req.k_norm_w,
+                q_w_buf: &q_w_buf,
+                q_w_off,
+                q_quant: req.q_weight.quant,
+                k_w_buf: &k_w_buf,
+                k_w_off,
+                k_quant: req.k_weight.quant,
+                v_w_buf: &v_w_buf,
+                v_w_off,
+                v_quant: req.v_weight.quant,
+                attention_gate_w_buf: &attention_gate_w_buf,
+                attention_gate_w_off,
+                attention_gate_quant: req.attention_gate_weight.quant,
+                apply_rope: req.apply_rope,
+                sliding_window: req.sliding_window,
+                ops: prefill_atn_core_chain::MuseOTailFfnOpsRequest {
+                    hidden: req.hidden,
+                    post_attn_norm_w: req.post_attn_norm_w,
+                    ffn_norm_w: req.ffn_norm_w,
+                    post_ffn_norm_w: req.post_ffn_norm_w,
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: req.o_weight.quant,
+                    ffn_gate_w_buf: &ffn_gate_w_buf,
+                    ffn_gate_w_off,
+                    ffn_gate_quant: req.ffn_gate_weight.quant,
+                    ffn_up_w_buf: &ffn_up_w_buf,
+                    ffn_up_w_off,
+                    ffn_up_quant: req.ffn_up_weight.quant,
+                    ffn_down_w_buf: &ffn_down_w_buf,
+                    ffn_down_w_off,
+                    ffn_down_quant: req.ffn_down_weight.quant,
+                },
+                norm_eps: req.norm_eps,
+                scale: req.scale,
+            },
+        )?;
+        Ok(Some(out))
+    }
+
     /// Gemma dense layer: attention carrier output, post-attention norm/residual,
     /// GeGLU FFN, post-FFN norm, and final residual in one command buffer.
     #[cfg(target_os = "macos")]
@@ -5239,6 +5520,170 @@ impl MetalBackend {
             Self::atn_core_validate_weight(role, weight)?;
         }
         Ok(true)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn prefill_muse_layer_range_if_supported<F>(
+        &self,
+        hidden: &[f32],
+        layers: &[MusePrefillLayerRangeBackendLayer<'_>],
+        mut on_kv: F,
+    ) -> Result<Option<MusePrefillLayerRangeBackendOut>, String>
+    where
+        F: FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
+    {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let mut state = prefill_atn_core_chain::MusePrefillLayerRangeState::new(ctx, hidden);
+        let mut pending: Option<prefill_atn_core_chain::MusePrefillLayerRangePending> = None;
+        let mut kv_layers_streamed = 0usize;
+        for (layer_offset, layer) in layers.iter().copied().enumerate() {
+            let req = layer.request;
+            let key = MusePrefillFullLayerCarrierKey {
+                seq_len: req.seq_len,
+                num_heads: req.num_heads,
+                num_kv_heads: req.num_kv_heads,
+                head_dim: req.head_dim,
+                hidden_dim: req.hidden_dim,
+                q_dim: req.q_dim,
+                kv_dim: req.kv_dim,
+                ffn_dim: req.ffn_dim,
+                rope_theta_bits: req.rope_theta.to_bits(),
+                scale_bits: req.scale.to_bits(),
+                norm_eps_bits: req.norm_eps.to_bits(),
+                post_norm_eps_bits: req.post_norm_eps.to_bits(),
+                slot: (layer_offset & 1) as u8,
+                q_quant: req.q_weight.quant,
+                k_quant: req.k_weight.quant,
+                v_quant: req.v_weight.quant,
+                attention_gate_quant: req.attention_gate_weight.quant,
+                o_quant: req.o_weight.quant,
+                ffn_gate_quant: req.ffn_gate_weight.quant,
+                ffn_up_quant: req.ffn_up_weight.quant,
+                ffn_down_quant: req.ffn_down_weight.quant,
+            };
+            let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
+            let carrier = carriers.entry(key).or_insert_with(|| {
+                prefill_atn_core_chain::MusePrefillFullLayerCarrier::new(
+                    ctx,
+                    req.seq_len,
+                    req.num_heads,
+                    req.num_kv_heads,
+                    req.head_dim,
+                    req.hidden_dim,
+                    req.q_dim,
+                    req.kv_dim,
+                    req.ffn_dim,
+                    req.rope_theta,
+                    req.scale,
+                    req.norm_eps,
+                    req.post_norm_eps,
+                )
+            });
+            let (
+                q_w_buf,
+                q_w_off,
+                k_w_buf,
+                k_w_off,
+                v_w_buf,
+                v_w_off,
+                attention_gate_w_buf,
+                attention_gate_w_off,
+                o_w_buf,
+                o_w_off,
+                ffn_gate_w_buf,
+                ffn_gate_w_off,
+                ffn_up_w_buf,
+                ffn_up_w_off,
+                ffn_down_w_buf,
+                ffn_down_w_off,
+            ) = {
+                let mut resident = self.resident.borrow_mut();
+                let mut wrap = |raw: &[u8]| {
+                    let entry = resident
+                        .entry(resident_key(raw))
+                        .or_insert_with(|| resident_cache_entry(ctx, raw));
+                    (entry.0.clone(), entry.1)
+                };
+                let (q, qo) = wrap(req.q_weight.raw);
+                let (k, ko) = wrap(req.k_weight.raw);
+                let (v, vo) = wrap(req.v_weight.raw);
+                let (ag, ago) = wrap(req.attention_gate_weight.raw);
+                let (o, oo) = wrap(req.o_weight.raw);
+                let (fg, fgo) = wrap(req.ffn_gate_weight.raw);
+                let (fu, fuo) = wrap(req.ffn_up_weight.raw);
+                let (fd, fdo) = wrap(req.ffn_down_weight.raw);
+                (
+                    q, qo, k, ko, v, vo, ag, ago, o, oo, fg, fgo, fu, fuo, fd, fdo,
+                )
+            };
+            let next_pending = prefill_atn_core_chain::prefill_muse_layer_range_submit(
+                ctx,
+                &mut state,
+                carrier,
+                layer.layer_idx,
+                prefill_atn_core_chain::MusePrefillFullLayerDispatchRequest {
+                    hidden: req.hidden,
+                    attn_norm_w: req.attn_norm_w,
+                    q_norm_w: req.q_norm_w,
+                    k_norm_w: req.k_norm_w,
+                    q_w_buf: &q_w_buf,
+                    q_w_off,
+                    q_quant: req.q_weight.quant,
+                    k_w_buf: &k_w_buf,
+                    k_w_off,
+                    k_quant: req.k_weight.quant,
+                    v_w_buf: &v_w_buf,
+                    v_w_off,
+                    v_quant: req.v_weight.quant,
+                    attention_gate_w_buf: &attention_gate_w_buf,
+                    attention_gate_w_off,
+                    attention_gate_quant: req.attention_gate_weight.quant,
+                    apply_rope: req.apply_rope,
+                    sliding_window: req.sliding_window,
+                    ops: prefill_atn_core_chain::MuseOTailFfnOpsRequest {
+                        hidden: req.hidden,
+                        post_attn_norm_w: req.post_attn_norm_w,
+                        ffn_norm_w: req.ffn_norm_w,
+                        post_ffn_norm_w: req.post_ffn_norm_w,
+                        o_w_buf: &o_w_buf,
+                        o_w_off,
+                        o_quant: req.o_weight.quant,
+                        ffn_gate_w_buf: &ffn_gate_w_buf,
+                        ffn_gate_w_off,
+                        ffn_gate_quant: req.ffn_gate_weight.quant,
+                        ffn_up_w_buf: &ffn_up_w_buf,
+                        ffn_up_w_off,
+                        ffn_up_quant: req.ffn_up_weight.quant,
+                        ffn_down_w_buf: &ffn_down_w_buf,
+                        ffn_down_w_off,
+                        ffn_down_quant: req.ffn_down_weight.quant,
+                    },
+                    norm_eps: req.norm_eps,
+                    scale: req.scale,
+                },
+            )?;
+            drop(carriers);
+            if let Some(previous) = pending.replace(next_pending) {
+                prefill_atn_core_chain::prefill_muse_layer_range_complete(previous, &mut on_kv)?;
+                kv_layers_streamed += 1;
+            }
+        }
+        if let Some(previous) = pending {
+            prefill_atn_core_chain::prefill_muse_layer_range_complete(previous, &mut on_kv)?;
+            kv_layers_streamed += 1;
+        }
+        Ok(Some(MusePrefillLayerRangeBackendOut {
+            hidden: state.finish(),
+            hidden_uploads: 1,
+            hidden_readbacks: 1,
+            intermediate_hidden_transfers: 0,
+            kv_layers_streamed,
+        }))
     }
 
     /// Gemma dense prefill range with one hidden upload/readback and no intermediate
@@ -10781,8 +11226,10 @@ impl MetalBackend {
                 capacity,
                 ffn_dim,
                 eps,
+                eps,
                 theta,
                 scale,
+                false,
             )
         });
 
@@ -11533,7 +11980,6 @@ impl MetalBackend {
                 .or_insert_with(|| resident_cache_entry(ctx, raw));
             (e.0.clone(), e.1)
         };
-
         // encode(dispatch 인코딩) 시작 — command buffer 생성 ~ endEncoding.
         let t_encode_start = if chain_gpu_time {
             Some(std::time::Instant::now())
@@ -11548,7 +11994,8 @@ impl MetalBackend {
         let mut attn_filled_updates: Vec<(usize, usize)> = Vec::new();
         let mut attn_moe_filled_updates: Vec<(usize, usize)> = Vec::new();
 
-        for spec in specs {
+        let mut pre_normed_dev: Option<Retained<ProtocolObject<dyn MTLBuffer>>> = None;
+        for (spec_index, spec) in specs.iter().enumerate() {
             match spec {
                 ChainLayerSpecRef::Attn(s) => {
                     let (q_w, q_off) = wrap(s.q_raw);
@@ -11558,6 +12005,10 @@ impl MetalBackend {
                     let (ffn_gate_w, ffn_gate_off) = wrap(s.ffn_gate_raw);
                     let (ffn_up_w, ffn_up_off) = wrap(s.ffn_up_raw);
                     let (ffn_down_w, ffn_down_off) = wrap(s.ffn_down_raw);
+                    let attn_gate = s.attn_gate_raw.map(|raw| {
+                        let (weight, offset) = wrap(raw);
+                        (weight, constant_u32(offset))
+                    });
 
                     let q_off_buf = constant_u32(q_off);
                     let k_off_buf = constant_u32(k_off);
@@ -11571,6 +12022,20 @@ impl MetalBackend {
                     let q_norm_w_buf = constant_f32(s.q_norm_weight);
                     let k_norm_w_buf = constant_f32(s.k_norm_weight);
                     let ffn_norm_w_buf = constant_f32(s.ffn_norm_weight);
+                    let post_attn_norm_w_buf =
+                        s.post_attn_norm_weight.map(|weight| constant_f32(weight));
+                    let post_ffn_norm_w_buf =
+                        s.post_ffn_norm_weight.map(|weight| constant_f32(weight));
+                    let next_attn = specs.get(spec_index + 1).and_then(|next| match next {
+                        ChainLayerSpecRef::Attn(next_s)
+                            if s.muse_semantics
+                                && next_s.muse_semantics
+                                && next_s.hidden_dim == s.hidden_dim =>
+                        {
+                            Some((constant_f32(next_s.norm_weight), next_s.eps))
+                        }
+                        _ => None,
+                    });
 
                     let mut carriers = self.attn_carriers.borrow_mut();
                     let carrier = carriers.entry(s.layer).or_insert_with(|| {
@@ -11587,8 +12052,10 @@ impl MetalBackend {
                             s.capacity,
                             s.ffn_dim,
                             s.eps,
+                            s.post_norm_eps,
                             s.theta,
                             s.scale,
+                            s.muse_semantics,
                         )
                     });
                     // 첫 token(filled==0)만 prefill KV(host f16, 0..pos)를 device 로 1회 init.
@@ -11596,11 +12063,12 @@ impl MetalBackend {
                     carrier.kv_ensure_filled(s.prior_k, s.prior_v, s.pos);
                     attn_filled_updates.push((s.layer, s.pos + 1));
 
-                    attn_chain::attn_chain_encode(
+                    let produced_next_norm = attn_chain::attn_chain_encode(
                         ctx,
                         &enc,
                         carrier,
                         &shared_hidden,
+                        pre_normed_dev.as_deref(),
                         &norm_w_buf,
                         &q_w,
                         &q_off_buf,
@@ -11612,8 +12080,14 @@ impl MetalBackend {
                         &k_norm_w_buf,
                         &o_w,
                         &o_off_buf,
+                        post_attn_norm_w_buf.as_deref(),
+                        attn_gate
+                            .as_ref()
+                            .map(|(weight, offset)| (&**weight, &**offset)),
                         s.v_is_q6k,
+                        s.o_q,
                         &ffn_norm_w_buf,
+                        post_ffn_norm_w_buf.as_deref(),
                         &ffn_gate_w,
                         &ffn_gate_off_buf,
                         &ffn_up_w,
@@ -11621,10 +12095,16 @@ impl MetalBackend {
                         &ffn_down_w,
                         &ffn_down_off_buf,
                         s.ffn_down_is_q6k,
+                        s.apply_rope,
+                        s.sliding_window,
+                        s.muse_semantics,
                         s.pos,
+                        next_attn.as_ref().map(|(weight, eps)| (&**weight, *eps)),
                     );
+                    pre_normed_dev = produced_next_norm.then(|| carrier.normed_buffer());
                 }
                 ChainLayerSpecRef::AttnMoeQwen(s) => {
+                    pre_normed_dev = None;
                     let router_bytes = unsafe {
                         std::slice::from_raw_parts(
                             s.router_w.as_ptr().cast::<u8>(),
@@ -11750,8 +12230,10 @@ impl MetalBackend {
                             s.capacity,
                             1,
                             s.eps,
+                            s.eps,
                             s.theta,
                             s.scale,
+                            false,
                         )
                     });
                     if s.kvarn.is_none() {
@@ -11790,6 +12272,7 @@ impl MetalBackend {
                         &enc,
                         carrier,
                         &shared_hidden,
+                        None,
                         &norm_w_buf,
                         &q_w,
                         &q_off_buf,
@@ -11805,7 +12288,13 @@ impl MetalBackend {
                         s.k_q,
                         s.v_q,
                         s.o_q,
+                        None,
+                        None,
+                        true,
+                        None,
+                        false,
                         s.pos,
+                        None,
                         kvarn_ctx,
                     );
 
@@ -11860,6 +12349,7 @@ impl MetalBackend {
                     report.qwen_moe_layers += 1;
                 }
                 ChainLayerSpecRef::Gdn(s) => {
+                    pre_normed_dev = None;
                     let (qkv_w, qkv_off) = wrap(s.qkv_raw);
                     let (gate_w, gate_off) = wrap(s.gate_raw);
                     let (alpha_w, alpha_off) = wrap(s.alpha_raw);
@@ -11948,6 +12438,7 @@ impl MetalBackend {
                     );
                 }
                 ChainLayerSpecRef::GdnMoeQwen(s) => {
+                    pre_normed_dev = None;
                     let router_bytes = unsafe {
                         std::slice::from_raw_parts(
                             s.router_w.as_ptr().cast::<u8>(),
@@ -12086,13 +12577,6 @@ impl MetalBackend {
                     report.qwen_moe_layers += 1;
                 }
             }
-            // 진단(RNB_METAL_CHAIN_SKIP_BARRIER=1): layer 내부 barrier 는 생략되지만
-            // layer 경계는 강제 barrier 로 순차성만 유지 → "layer 순차 + layer 내 병렬"
-            // achievable 하한을 측정한다. 비-skip 모드에선 각 encode 끝 barrier 가 이미
-            // 경계라 이 블록은 실행되지 않는다(무해).
-            if compute::chain_skip_barrier() {
-                enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-            }
         }
 
         let mut output_token_buf: Option<Retained<ProtocolObject<dyn MTLBuffer>>> = None;
@@ -12107,27 +12591,31 @@ impl MetalBackend {
                 "decode_chain output norm weight length mismatch"
             );
             assert!(
-                matches!(tail.output_quant, 0 | 2),
-                "decode_chain output tail supports Q4_K/Q6_K only"
+                matches!(tail.output_quant, 0..=2),
+                "decode_chain output tail supports Q4_K/Q5_K/Q6_K only"
             );
             assert!(tail.rows > 0, "decode_chain output tail rows must be > 0");
 
             let (out_w, out_off) = wrap(tail.output_raw);
             let norm_w_buf = ffn_chain::shared_f32_buf(ctx, tail.norm_weight);
-            let normed_buf = ffn_chain::empty_f32_buf(ctx, hidden_dim);
-            let logits_buf = ffn_chain::empty_f32_buf(ctx, tail.rows);
-            let token_buf = ctx
-                .device
-                .newBufferWithLength_options(
-                    std::mem::size_of::<u32>(),
-                    objc2_metal::MTLResourceOptions::StorageModeShared,
-                )
-                .expect("Metal: failed to create decode output token buffer");
-            let dim_buf = ffn_chain::u32_buf(ctx, hidden_dim as u32);
+            let mut output_carriers = self.output_argmax_carriers.borrow_mut();
+            let scratch = output_carriers
+                .entry((tail.rows, hidden_dim))
+                .or_insert_with(|| compute::OutputArgmaxScratch::new(ctx, tail.rows, hidden_dim));
+            let normed_buf = &scratch.input_buf;
+            let logits_buf = &scratch.logits_buf;
+            let token_buf = &scratch.token_buf;
+            let dim_buf = &scratch.k_buf;
+            let rows_buf = &scratch.n_buf;
+            let cols_buf = &scratch.k_buf;
+            unsafe {
+                *(scratch.off_buf.contents().as_ptr() as *mut u32) = out_off;
+            }
+            let out_off_buf = &scratch.off_buf;
             let eps_buf = ffn_chain::f32_buf(ctx, tail.eps);
-            let rows_buf = ffn_chain::u32_buf(ctx, tail.rows as u32);
-            let cols_buf = ffn_chain::u32_buf(ctx, tail.cols as u32);
-            let out_off_buf = ffn_chain::u32_buf(ctx, out_off);
+            let excluded_buf = tail
+                .excluded_token
+                .map(|token| ffn_chain::u32_buf(ctx, token));
 
             ffn_chain::encode_rms_norm(
                 ctx,
@@ -12138,34 +12626,73 @@ impl MetalBackend {
                 &dim_buf,
                 &eps_buf,
             );
-            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-            match tail.output_quant {
-                0 => compute::encode_gemv_q4k_simd(
+            compute::chain_barrier_resources(ctx, &enc, [&**normed_buf]);
+            if tail.output_quant == 1 {
+                compute::encode_gemv_q5k_argmax(
                     ctx,
                     &enc,
                     &out_w,
                     &normed_buf,
                     &logits_buf,
+                    &scratch.partial_index_buf,
+                    &token_buf,
                     &rows_buf,
                     &cols_buf,
                     &out_off_buf,
+                    tail.excluded_token.unwrap_or(u32::MAX),
                     tail.rows,
-                ),
-                2 => compute::encode_gemv_q6k_simd(
-                    ctx,
-                    &enc,
-                    &out_w,
-                    &normed_buf,
-                    &logits_buf,
-                    &rows_buf,
-                    &cols_buf,
-                    &out_off_buf,
-                    tail.rows,
-                ),
-                _ => unreachable!("validated above"),
+                );
+            } else {
+                match tail.output_quant {
+                    0 => compute::encode_gemv_q4k_simd(
+                        ctx,
+                        &enc,
+                        &out_w,
+                        &normed_buf,
+                        &logits_buf,
+                        &rows_buf,
+                        &cols_buf,
+                        &out_off_buf,
+                        tail.rows,
+                    ),
+                    1 => compute::encode_gemv_q5k_simd(
+                        ctx,
+                        &enc,
+                        &out_w,
+                        &normed_buf,
+                        &logits_buf,
+                        &rows_buf,
+                        &cols_buf,
+                        &out_off_buf,
+                        tail.rows,
+                    ),
+                    2 => compute::encode_gemv_q6k_simd(
+                        ctx,
+                        &enc,
+                        &out_w,
+                        &normed_buf,
+                        &logits_buf,
+                        &rows_buf,
+                        &cols_buf,
+                        &out_off_buf,
+                        tail.rows,
+                    ),
+                    _ => unreachable!("validated above"),
+                }
+                compute::chain_barrier_resources(ctx, &enc, [&**logits_buf]);
+                if let Some(excluded_buf) = excluded_buf.as_ref() {
+                    compute::encode_argmax_f32_excluding(
+                        ctx,
+                        &enc,
+                        &logits_buf,
+                        &token_buf,
+                        &rows_buf,
+                        excluded_buf,
+                    );
+                } else {
+                    compute::encode_argmax_f32(ctx, &enc, &logits_buf, &token_buf, &rows_buf);
+                }
             }
-            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-            compute::encode_argmax_f32(ctx, &enc, &logits_buf, &token_buf, &rows_buf);
             report.argmax_only = true;
             report.output_argmax = OutputArgmaxReport {
                 attempted: true,
@@ -12176,7 +12703,7 @@ impl MetalBackend {
                 readback_bytes: std::mem::size_of::<u32>(),
                 fallback_reason: None,
             };
-            output_token_buf = Some(token_buf);
+            output_token_buf = Some(token_buf.clone());
         }
 
         enc.endEncoding();
@@ -19807,6 +20334,309 @@ kernel void q4k_ro_vec4(
         }
     }
 
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn muse_decode_fused_norms_match_standalone_sequence() {
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(false) else {
+            return;
+        };
+        let dim = 6656usize;
+        let projected = (0..dim)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) * 0.003)
+            .collect::<Vec<_>>();
+        let hidden = (0..dim)
+            .map(|i| ((i * 29 % 113) as f32 - 56.0) * 0.002)
+            .collect::<Vec<_>>();
+        let post_weight = (0..dim)
+            .map(|i| 0.9 + (i % 19) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let ffn_weight = (0..dim)
+            .map(|i| 0.8 + (i % 23) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let projected_buf = ffn_chain::shared_f32_buf(&ctx, &projected);
+        let post_weight_buf = ffn_chain::shared_f32_buf(&ctx, &post_weight);
+        let hidden_buf = ffn_chain::shared_f32_buf(&ctx, &hidden);
+        let ffn_weight_buf = ffn_chain::shared_f32_buf(&ctx, &ffn_weight);
+        let normed_buf = ffn_chain::empty_f32_buf(&ctx, dim);
+        let dim_buf = ffn_chain::u32_buf(&ctx, dim as u32);
+        let post_eps_buf = ffn_chain::f32_buf(&ctx, 1e-8);
+        let ffn_eps_buf = ffn_chain::f32_buf(&ctx, 1e-6);
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        ffn_chain::encode_fused_post_attn_residual_ffn_rms_norm(
+            &ctx,
+            &enc,
+            &projected_buf,
+            &post_weight_buf,
+            &hidden_buf,
+            &ffn_weight_buf,
+            &normed_buf,
+            &dim_buf,
+            &post_eps_buf,
+            &ffn_eps_buf,
+        );
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let mut expected_post = vec![0.0f32; dim];
+        let mut expected_hidden = hidden.clone();
+        let mut expected_normed = vec![0.0f32; dim];
+        rnb_cpu::kernels::norm::rms_norm_into(&projected, &post_weight, 1e-8, &mut expected_post);
+        for (dst, residual) in expected_hidden.iter_mut().zip(expected_post) {
+            *dst += residual;
+        }
+        rnb_cpu::kernels::norm::rms_norm_into(
+            &expected_hidden,
+            &ffn_weight,
+            1e-6,
+            &mut expected_normed,
+        );
+        let got_hidden = ffn_chain::readback(&hidden_buf, dim);
+        let got_normed = ffn_chain::readback(&normed_buf, dim);
+        for (index, ((got_h, expected_h), (got_n, expected_n))) in got_hidden
+            .iter()
+            .zip(&expected_hidden)
+            .zip(got_normed.iter().zip(&expected_normed))
+            .enumerate()
+        {
+            assert!(
+                (got_h - expected_h).abs() <= 2e-6,
+                "hidden[{index}] got={got_h} expected={expected_h}"
+            );
+            assert!(
+                (got_n - expected_n).abs() <= 2e-6,
+                "normed[{index}] got={got_n} expected={expected_n}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn muse_decode_cross_layer_norm_fusion_matches_standalone_sequence() {
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(false) else {
+            return;
+        };
+        let dim = 6656usize;
+        let projected = (0..dim)
+            .map(|i| ((i * 31 % 127) as f32 - 63.0) * 0.002)
+            .collect::<Vec<_>>();
+        let hidden = (0..dim)
+            .map(|i| ((i * 43 % 109) as f32 - 54.0) * 0.003)
+            .collect::<Vec<_>>();
+        let post_weight = (0..dim)
+            .map(|i| 0.85 + (i % 17) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let next_weight = (0..dim)
+            .map(|i| 0.75 + (i % 29) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let projected_buf = ffn_chain::shared_f32_buf(&ctx, &projected);
+        let post_weight_buf = ffn_chain::shared_f32_buf(&ctx, &post_weight);
+        let hidden_buf = ffn_chain::shared_f32_buf(&ctx, &hidden);
+        let next_weight_buf = ffn_chain::shared_f32_buf(&ctx, &next_weight);
+        let next_normed_buf = ffn_chain::empty_f32_buf(&ctx, dim);
+        let dim_buf = ffn_chain::u32_buf(&ctx, dim as u32);
+        let post_eps_buf = ffn_chain::f32_buf(&ctx, 1e-8);
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        ffn_chain::encode_fused_post_ffn_residual_next_rms_norm(
+            &ctx,
+            &enc,
+            &projected_buf,
+            &post_weight_buf,
+            &hidden_buf,
+            &next_weight_buf,
+            &next_normed_buf,
+            &dim_buf,
+            &post_eps_buf,
+            1e-6,
+        );
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let mut expected_post = vec![0.0f32; dim];
+        let mut expected_hidden = hidden.clone();
+        let mut expected_normed = vec![0.0f32; dim];
+        rnb_cpu::kernels::norm::rms_norm_into(&projected, &post_weight, 1e-8, &mut expected_post);
+        for (dst, residual) in expected_hidden.iter_mut().zip(expected_post) {
+            *dst += residual;
+        }
+        rnb_cpu::kernels::norm::rms_norm_into(
+            &expected_hidden,
+            &next_weight,
+            1e-6,
+            &mut expected_normed,
+        );
+        let got_hidden = ffn_chain::readback(&hidden_buf, dim);
+        let got_normed = ffn_chain::readback(&next_normed_buf, dim);
+        for (index, ((got_h, expected_h), (got_n, expected_n))) in got_hidden
+            .iter()
+            .zip(&expected_hidden)
+            .zip(got_normed.iter().zip(&expected_normed))
+            .enumerate()
+        {
+            assert!(
+                (got_h - expected_h).abs() <= 2e-6,
+                "hidden[{index}] got={got_h} expected={expected_h}"
+            );
+            assert!(
+                (got_n - expected_n).abs() <= 2e-6,
+                "normed[{index}] got={got_n} expected={expected_n}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn muse_gqa16_attention_reads_full_kv_tile() {
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(false) else {
+            return;
+        };
+        let (num_heads, num_kv_heads, head_dim, kv_len) = (32usize, 2usize, 128usize, 33usize);
+        let pos = kv_len - 1;
+        let kv_dim = num_kv_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q = (0..num_heads * head_dim)
+            .map(|index| (((index * 17 + 3) as f32) * 0.007).sin())
+            .collect::<Vec<_>>();
+        let gate = (0..q.len())
+            .map(|index| ((index * 13 % 101) as f32 - 50.0) * 0.01)
+            .collect::<Vec<_>>();
+        let k_values = (0..kv_len * kv_dim)
+            .map(|index| (((index * 19 + 11) as f32) * 0.005).sin())
+            .collect::<Vec<_>>();
+        let v_values = (0..kv_len * kv_dim)
+            .map(|index| (((index * 23 + 7) as f32) * 0.006).cos())
+            .collect::<Vec<_>>();
+        let mut k_cache = k_values
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits())
+            .collect::<Vec<_>>();
+        let mut v_cache = v_values
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits())
+            .collect::<Vec<_>>();
+        let current_off = pos * kv_dim;
+        let k_current = k_values[current_off..current_off + kv_dim].to_vec();
+        let v_current = v_values[current_off..current_off + kv_dim].to_vec();
+        let actual = crate::compute::attn_decode_f16_gqa16_with_ctx(
+            &ctx,
+            &q,
+            &mut k_cache,
+            &mut v_cache,
+            &gate,
+            &k_current,
+            &v_current,
+            num_heads,
+            num_kv_heads,
+            kv_len,
+            pos,
+            scale,
+            0,
+        );
+
+        let mut expected = crate::compute::attn_decode_with_ctx(
+            &ctx,
+            &q,
+            &k_cache,
+            &v_cache,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            scale,
+        );
+        for (value, gate_value) in expected.iter_mut().zip(&gate) {
+            *value *= 1.0 / (1.0 + (-gate_value).exp());
+        }
+        let output_scale = expected
+            .iter()
+            .fold(0.0f32, |maximum, &value| maximum.max(value.abs()))
+            .max(1e-4);
+        let max_rel = actual
+            .iter()
+            .zip(&expected)
+            .fold(0.0f32, |maximum, (actual, expected)| {
+                maximum.max((actual - expected).abs() / output_scale)
+            });
+        assert!(
+            max_rel < 4e-3,
+            "Muse GQA16 attention max_rel {max_rel} >= 4e-3"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn q5k_fused_argmax_matches_materialized_logits() {
+        let Some(ctx) = crate::compute::build_metal_context_with_kv_int8(false) else {
+            return;
+        };
+        let (n, k) = (202_049usize, 256usize);
+        let weight = build_q5k_rows(n, k);
+        let input = det_vals(k, 0.1);
+        let w_buf = unsafe {
+            let ptr = std::ptr::NonNull::new(weight.as_ptr() as *mut std::ffi::c_void)
+                .expect("weight pointer");
+            ctx.device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    weight.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("weight buffer")
+        };
+        let input_buf = ffn_chain::shared_f32_buf(&ctx, &input);
+        let partial_values = ffn_chain::empty_f32_buf(&ctx, n);
+        let partial_indices = ctx
+            .device
+            .newBufferWithLength_options(
+                n.div_ceil(2) * std::mem::size_of::<u32>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("partial index buffer");
+        let token_buf = ffn_chain::u32_buf(&ctx, 0);
+        let n_buf = ffn_chain::u32_buf(&ctx, n as u32);
+        let k_buf = ffn_chain::u32_buf(&ctx, k as u32);
+        let off_buf = ffn_chain::u32_buf(&ctx, 0);
+        let excluded = 200_377u32;
+        let cmd = ctx.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        compute::encode_gemv_q5k_argmax(
+            &ctx,
+            &enc,
+            &w_buf,
+            &input_buf,
+            &partial_values,
+            &partial_indices,
+            &token_buf,
+            &n_buf,
+            &k_buf,
+            &off_buf,
+            excluded,
+            n,
+        );
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let logits = compute::gemv_q5k_simd_with_ctx(&ctx, &weight, &input, n, k);
+        let expected = logits
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != excluded as usize)
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.total_cmp(right).then(left_index.cmp(right_index))
+            })
+            .map(|(index, _)| index as u32)
+            .expect("non-empty logits");
+        let got = unsafe { *(token_buf.contents().as_ptr() as *const u32) };
+        assert_eq!(got, expected);
+    }
+
     /// M2: text M-RoPE 커널이 CPU `rope_mrope_text_inplace` 와 token-identical 한지.
     #[cfg(target_os = "macos")]
     #[test]
@@ -22540,6 +23370,7 @@ kernel void q4k_ro_vec4(
             rows: out_rows,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
 
         // 단일 GdnMoeQwen layer 순차 decode 참조: 한 backend 에서 conv/delta 를 threading 하며
@@ -22862,6 +23693,7 @@ kernel void q4k_ro_vec4(
             rows: out_rows,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
 
         // 순차 참조: ONE backend 를 재사용해 토큰마다 pos=base_pos+i 로 decode_chain_run.
@@ -23041,6 +23873,7 @@ kernel void q4k_ro_vec4(
             rows: out_rows,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
         // 순차 참조: ONE backend. attn KV 는 carrier device append, GDN conv/delta 는 out_states.
         let sequential_reference = |embs: &[Vec<f32>]| -> (Vec<Vec<f32>>, Vec<Option<u32>>) {
@@ -23194,6 +24027,7 @@ kernel void q4k_ro_vec4(
             rows: out_rows,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
 
         // 순차 참조(ONE backend, KV device-threaded): 토큰 0,1,2 → 3번째 hidden/token 이 ground truth.
@@ -23328,6 +24162,7 @@ kernel void q4k_ro_vec4(
             rows: 8,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
 
         // 참조: single-token decode_chain_run(pos=base_pos).
@@ -23443,6 +24278,7 @@ kernel void q4k_ro_vec4(
             rows: 8,
             cols: hidden_dim,
             eps: 1e-6,
+            excluded_token: None,
         };
 
         // f16 ctx 순차 참조(tokens 0,1).

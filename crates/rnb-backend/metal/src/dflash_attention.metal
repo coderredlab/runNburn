@@ -198,28 +198,22 @@ kernel void muse_target_attention_f16_hd128(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (thread_index == 0u) {
-            const uint tile_len = min(KV_TILE, kv_len - tile_start);
-            float tile_max = -INFINITY;
-            for (uint index = 0u; index < tile_len; ++index) {
-                tile_max = max(tile_max, probabilities[index]);
-            }
+        if (thread_index < KV_TILE) {
+            const float tile_max = simd_max(probabilities[thread_index]);
             const float new_max = max(shared_row_max, tile_max);
             const float rescale = isfinite(shared_row_max)
                 ? exp(shared_row_max - new_max)
                 : 0.0f;
-            shared_row_sum *= rescale;
-            shared_rescale = rescale;
-            float tile_sum = 0.0f;
-            for (uint index = 0u; index < tile_len; ++index) {
-                const float probability = isfinite(probabilities[index])
-                    ? exp(probabilities[index] - new_max)
-                    : 0.0f;
-                probabilities[index] = probability;
-                tile_sum += probability;
+            const float probability = isfinite(probabilities[thread_index])
+                ? exp(probabilities[thread_index] - new_max)
+                : 0.0f;
+            probabilities[thread_index] = probability;
+            const float tile_sum = simd_sum(probability);
+            if (thread_index == 0u) {
+                shared_row_sum = shared_row_sum * rescale + tile_sum;
+                shared_rescale = rescale;
+                shared_row_max = new_max;
             }
-            shared_row_sum += tile_sum;
-            shared_row_max = new_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

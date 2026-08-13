@@ -3,7 +3,7 @@ use crate::engine::cuda_runtime;
 #[allow(unused_imports)]
 use crate::engine::layer_weights::LayerType;
 use crate::engine::layer_weights::ModelWeights;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(feature = "metal", not(feature = "cuda"))))]
 use crate::engine::quantized_weight_types::backend_ggml_type;
 use crate::engine::quantized_weight_types::QuantizedWeight;
 use crate::runtime::QuantFormat;
@@ -2843,7 +2843,73 @@ pub(in crate::engine) fn prefill_q4k_muse_hd128_dense_chain_if_supported(
         )
         .map_err(cuda_error);
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let out = crate::engine::metal_runtime::metal_muse_prefill_full_layer_if_supported(
+            crate::engine::metal_runtime::MetalMusePrefillFullLayerRequest {
+                hidden: hidden_input,
+                attn_norm_w: attn_norm_weight,
+                q_norm_w: q_norm,
+                k_norm_w: k_norm,
+                post_attn_norm_w: post_attn_norm_weight,
+                ffn_norm_w: ffn_norm_weight,
+                post_ffn_norm_w: post_ffn_norm_weight,
+                q_weight_ggml: backend_ggml_type(q.quant()),
+                q_weight_raw: q.raw(),
+                q_weight_rows: q.rows(),
+                q_weight_cols: q.cols(),
+                k_weight_ggml: backend_ggml_type(k.quant()),
+                k_weight_raw: k.raw(),
+                k_weight_rows: k.rows(),
+                k_weight_cols: k.cols(),
+                v_weight_ggml: backend_ggml_type(v.quant()),
+                v_weight_raw: v.raw(),
+                v_weight_rows: v.rows(),
+                v_weight_cols: v.cols(),
+                attention_gate_weight_ggml: backend_ggml_type(attention_gate.quant()),
+                attention_gate_weight_raw: attention_gate.raw(),
+                attention_gate_weight_rows: attention_gate.rows(),
+                attention_gate_weight_cols: attention_gate.cols(),
+                o_weight_ggml: backend_ggml_type(o.quant()),
+                o_weight_raw: o.raw(),
+                o_weight_rows: o.rows(),
+                o_weight_cols: o.cols(),
+                ffn_gate_weight_ggml: backend_ggml_type(gate.quant()),
+                ffn_gate_weight_raw: gate.raw(),
+                ffn_gate_weight_rows: gate.rows(),
+                ffn_gate_weight_cols: gate.cols(),
+                ffn_up_weight_ggml: backend_ggml_type(up.quant()),
+                ffn_up_weight_raw: up.raw(),
+                ffn_up_weight_rows: up.rows(),
+                ffn_up_weight_cols: up.cols(),
+                ffn_down_weight_ggml: backend_ggml_type(down.quant()),
+                ffn_down_weight_raw: down.raw(),
+                ffn_down_weight_rows: down.rows(),
+                ffn_down_weight_cols: down.cols(),
+                seq_len: hidden_input.len() / n_embd,
+                num_heads,
+                num_kv_heads,
+                head_dim: 128,
+                hidden_dim: n_embd,
+                q_dim: q.rows(),
+                kv_dim: k.rows(),
+                ffn_dim: n_ff,
+                rope_theta,
+                scale,
+                norm_eps,
+                post_norm_eps,
+                apply_rope,
+                sliding_window,
+            },
+        )
+        .map_err(crate::error::LlmError::Forward)?;
+        let Some(out) = out else {
+            return Ok(None);
+        };
+        hidden.copy_from_slice(&out.hidden);
+        return Ok(Some((out.k_bits, out.v_bits)));
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     Ok(None)
 }
 

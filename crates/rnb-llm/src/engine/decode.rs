@@ -159,6 +159,35 @@ pub(in crate::engine) fn attn_carrier_eligible(
         && w.post_ffw_norm.is_none()
 }
 
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+pub(in crate::engine) fn muse_attn_carrier_eligible(
+    architecture: ModelArchitecture,
+    w: &AttentionLayerWeights,
+    has_gated_attn: bool,
+    owns_kv: bool,
+    rope_pos: usize,
+    cache_pos: usize,
+    gemma4_reuse_q_only: bool,
+) -> bool {
+    super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+        && attn_chain_core_eligible(
+            w,
+            has_gated_attn,
+            owns_kv,
+            rope_pos,
+            cache_pos,
+            gemma4_reuse_q_only,
+        )
+        && w.moe.is_none()
+        && w.shared_expert_moe.is_none()
+        && w.ffn_gate_up_fused.is_none()
+        && w.attn_gate_weight
+            .as_ref()
+            .is_some_and(|gate| gate.rows == w.q_weight.rows)
+        && w.post_attn_norm.is_some()
+        && w.post_ffw_norm.is_some()
+}
+
 /// Attention layer decode with separate cache and RoPE positions.
 ///
 /// MTP NextN draft blocks can intentionally skip retaining some MTP KV rows

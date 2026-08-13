@@ -39,6 +39,40 @@ pub(in crate::engine) struct GemmaPrefillLayerRangeSpec<'a> {
     pub softcap: Option<f32>,
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(in crate::engine) struct MusePrefillLayerRangeSpec<'a> {
+    pub layer_idx: usize,
+    pub hidden: &'a [f32],
+    pub attn_norm_w: Vec<f32>,
+    pub q_norm_w: Vec<f32>,
+    pub k_norm_w: Vec<f32>,
+    pub post_attn_norm_w: Vec<f32>,
+    pub ffn_norm_w: Vec<f32>,
+    pub post_ffn_norm_w: Vec<f32>,
+    pub q_weight: &'a QuantizedWeight,
+    pub k_weight: &'a QuantizedWeight,
+    pub v_weight: &'a QuantizedWeight,
+    pub attention_gate_weight: &'a QuantizedWeight,
+    pub o_weight: &'a QuantizedWeight,
+    pub ffn_gate_weight: &'a QuantizedWeight,
+    pub ffn_up_weight: &'a QuantizedWeight,
+    pub ffn_down_weight: &'a QuantizedWeight,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub post_norm_eps: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn metal_dflash_attention_if_supported(
     query: &[f32],
@@ -372,6 +406,122 @@ pub(in crate::engine) fn metal_gemma_prefill_full_layer_if_supported(
     .map_err(crate::error::LlmError::Forward)
 }
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(in crate::engine) fn metal_muse_prefill_layer_range_if_supported(
+    hidden: &[f32],
+    layers: &[MusePrefillLayerRangeSpec<'_>],
+    mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
+) -> crate::error::Result<Option<metal_runtime::MetalMusePrefillLayerRangeOut>> {
+    fn view(weight: &QuantizedWeight) -> Option<(rnb_loader::GGMLType, &[u8], usize, usize)> {
+        let backend = weight.backend_view()?;
+        Some((
+            backend_ggml_type(backend.quant()),
+            backend.raw(),
+            backend.rows(),
+            backend.cols(),
+        ))
+    }
+
+    let mut runtime_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let (q_ggml, q_raw, q_rows, q_cols) = match view(layer.q_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (k_ggml, k_raw, k_rows, k_cols) = match view(layer.k_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (v_ggml, v_raw, v_rows, v_cols) = match view(layer.v_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (ag_ggml, ag_raw, ag_rows, ag_cols) = match view(layer.attention_gate_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (o_ggml, o_raw, o_rows, o_cols) = match view(layer.o_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (fg_ggml, fg_raw, fg_rows, fg_cols) = match view(layer.ffn_gate_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (fu_ggml, fu_raw, fu_rows, fu_cols) = match view(layer.ffn_up_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let (fd_ggml, fd_raw, fd_rows, fd_cols) = match view(layer.ffn_down_weight) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        runtime_layers.push(metal_runtime::MetalMusePrefillLayerRangeLayer {
+            layer_idx: layer.layer_idx,
+            request: metal_runtime::MetalMusePrefillFullLayerRequest {
+                hidden: layer.hidden,
+                attn_norm_w: &layer.attn_norm_w,
+                q_norm_w: &layer.q_norm_w,
+                k_norm_w: &layer.k_norm_w,
+                post_attn_norm_w: &layer.post_attn_norm_w,
+                ffn_norm_w: &layer.ffn_norm_w,
+                post_ffn_norm_w: &layer.post_ffn_norm_w,
+                q_weight_ggml: q_ggml,
+                q_weight_raw: q_raw,
+                q_weight_rows: q_rows,
+                q_weight_cols: q_cols,
+                k_weight_ggml: k_ggml,
+                k_weight_raw: k_raw,
+                k_weight_rows: k_rows,
+                k_weight_cols: k_cols,
+                v_weight_ggml: v_ggml,
+                v_weight_raw: v_raw,
+                v_weight_rows: v_rows,
+                v_weight_cols: v_cols,
+                attention_gate_weight_ggml: ag_ggml,
+                attention_gate_weight_raw: ag_raw,
+                attention_gate_weight_rows: ag_rows,
+                attention_gate_weight_cols: ag_cols,
+                o_weight_ggml: o_ggml,
+                o_weight_raw: o_raw,
+                o_weight_rows: o_rows,
+                o_weight_cols: o_cols,
+                ffn_gate_weight_ggml: fg_ggml,
+                ffn_gate_weight_raw: fg_raw,
+                ffn_gate_weight_rows: fg_rows,
+                ffn_gate_weight_cols: fg_cols,
+                ffn_up_weight_ggml: fu_ggml,
+                ffn_up_weight_raw: fu_raw,
+                ffn_up_weight_rows: fu_rows,
+                ffn_up_weight_cols: fu_cols,
+                ffn_down_weight_ggml: fd_ggml,
+                ffn_down_weight_raw: fd_raw,
+                ffn_down_weight_rows: fd_rows,
+                ffn_down_weight_cols: fd_cols,
+                seq_len: layer.seq_len,
+                num_heads: layer.num_heads,
+                num_kv_heads: layer.num_kv_heads,
+                head_dim: layer.head_dim,
+                hidden_dim: layer.hidden_dim,
+                q_dim: layer.q_dim,
+                kv_dim: layer.kv_dim,
+                ffn_dim: layer.ffn_dim,
+                rope_theta: layer.rope_theta,
+                scale: layer.scale,
+                norm_eps: layer.norm_eps,
+                post_norm_eps: layer.post_norm_eps,
+                apply_rope: layer.apply_rope,
+                sliding_window: layer.sliding_window,
+            },
+        });
+    }
+    metal_runtime::metal_muse_prefill_layer_range_if_supported(
+        hidden,
+        &runtime_layers,
+        |layer, k, v| on_kv(layer, k, v),
+    )
+    .map_err(crate::error::LlmError::Forward)
+}
+
 pub(in crate::engine) fn metal_gemma_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[GemmaPrefillLayerRangeSpec<'_>],

@@ -136,6 +136,14 @@ impl GenerateParams {
     pub(crate) fn should_stop(&self, token: u32, eos: u32) -> bool {
         self.stop_tokens.contains(&token) || (!self.ignore_eos && token == eos)
     }
+    pub(crate) fn backend_argmax_allowed(&self) -> bool {
+        self.temperature == 0.0
+            && self.repetition_penalty == 1.0
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
+            && self.mirostat.is_none()
+            && self.constraint.is_none()
+    }
 
     pub(crate) fn suppress_eos_logit(
         &self,
@@ -844,6 +852,9 @@ fn finish_generation(
         if constraint.is_some() {
             logits = engine.forward_with_logits(&[token])?;
             backend_argmax = None;
+        } else if params.backend_argmax_allowed() {
+            backend_argmax = engine.forward_decode_backend_argmax_only(token)?;
+            logits.clear();
         } else {
             logits = engine.forward(&[token])?;
             backend_argmax = engine.last_backend_argmax_token();
@@ -1283,6 +1294,27 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn backend_argmax_preserves_greedy_stop_semantics() {
+        let params = GenerateParams {
+            temperature: 0.0,
+            stop_tokens: vec![7],
+            ignore_eos: false,
+            ..GenerateParams::default()
+        };
+        assert!(params.backend_argmax_allowed());
+
+        let mut penalized = params.clone();
+        penalized.repetition_penalty = 1.1;
+        assert!(!penalized.backend_argmax_allowed());
+
+        let mut constrained = params;
+        constrained.constraint = Some(crate::GenerationConstraint::Lark(
+            "start: \"ok\"".to_string(),
+        ));
+        assert!(!constrained.backend_argmax_allowed());
     }
 
     /// Mirostat은 `mu` state가 draft prefix를 따라 갈라져 rollback 계약이 필요하므로

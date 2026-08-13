@@ -158,6 +158,81 @@ pub struct MetalMusePrefillOTailFfnOut {
     pub hidden: Vec<f32>,
 }
 
+pub struct MetalMusePrefillFullLayerRequest<'a> {
+    pub hidden: &'a [f32],
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub post_attn_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub post_ffn_norm_w: &'a [f32],
+    pub q_weight_ggml: GGMLType,
+    pub q_weight_raw: &'a [u8],
+    pub q_weight_rows: usize,
+    pub q_weight_cols: usize,
+    pub k_weight_ggml: GGMLType,
+    pub k_weight_raw: &'a [u8],
+    pub k_weight_rows: usize,
+    pub k_weight_cols: usize,
+    pub v_weight_ggml: GGMLType,
+    pub v_weight_raw: &'a [u8],
+    pub v_weight_rows: usize,
+    pub v_weight_cols: usize,
+    pub attention_gate_weight_ggml: GGMLType,
+    pub attention_gate_weight_raw: &'a [u8],
+    pub attention_gate_weight_rows: usize,
+    pub attention_gate_weight_cols: usize,
+    pub o_weight_ggml: GGMLType,
+    pub o_weight_raw: &'a [u8],
+    pub o_weight_rows: usize,
+    pub o_weight_cols: usize,
+    pub ffn_gate_weight_ggml: GGMLType,
+    pub ffn_gate_weight_raw: &'a [u8],
+    pub ffn_gate_weight_rows: usize,
+    pub ffn_gate_weight_cols: usize,
+    pub ffn_up_weight_ggml: GGMLType,
+    pub ffn_up_weight_raw: &'a [u8],
+    pub ffn_up_weight_rows: usize,
+    pub ffn_up_weight_cols: usize,
+    pub ffn_down_weight_ggml: GGMLType,
+    pub ffn_down_weight_raw: &'a [u8],
+    pub ffn_down_weight_rows: usize,
+    pub ffn_down_weight_cols: usize,
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub post_norm_eps: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+}
+
+pub struct MetalMusePrefillFullLayerOut {
+    pub hidden: Vec<f32>,
+    pub k_bits: Vec<u16>,
+    pub v_bits: Vec<u16>,
+}
+
+pub struct MetalMusePrefillLayerRangeLayer<'a> {
+    pub layer_idx: usize,
+    pub request: MetalMusePrefillFullLayerRequest<'a>,
+}
+
+pub struct MetalMusePrefillLayerRangeOut {
+    pub hidden: Vec<f32>,
+    pub hidden_uploads: usize,
+    pub hidden_readbacks: usize,
+    pub intermediate_hidden_transfers: usize,
+    pub kv_layers_streamed: usize,
+}
+
 pub struct MetalPrefillAtnOTailRequest<'a> {
     pub core: MetalPrefillAtnCoreRequest<'a>,
     pub o_weight_ggml: GGMLType,
@@ -2516,6 +2591,8 @@ pub struct MetalAttnChainLayer<'a> {
     pub q_norm_weight: &'a [f32],
     pub k_norm_weight: &'a [f32],
     pub ffn_norm_weight: &'a [f32],
+    pub post_attn_norm_weight: Option<&'a [f32]>,
+    pub post_ffn_norm_weight: Option<&'a [f32]>,
     pub q_ggml: GGMLType,
     pub q_raw: &'a [u8],
     pub k_ggml: GGMLType,
@@ -2524,6 +2601,8 @@ pub struct MetalAttnChainLayer<'a> {
     pub v_raw: &'a [u8],
     pub o_ggml: GGMLType,
     pub o_raw: &'a [u8],
+    pub attn_gate_ggml: Option<GGMLType>,
+    pub attn_gate_raw: Option<&'a [u8]>,
     pub ffn_gate_ggml: GGMLType,
     pub ffn_gate_raw: &'a [u8],
     pub ffn_up_ggml: GGMLType,
@@ -2544,8 +2623,12 @@ pub struct MetalAttnChainLayer<'a> {
     pub capacity: usize,
     pub ffn_dim: usize,
     pub eps: f32,
+    pub post_norm_eps: f32,
     pub theta: f32,
     pub scale: f32,
+    pub apply_rope: bool,
+    pub sliding_window: Option<usize>,
+    pub muse_semantics: bool,
 }
 
 #[cfg(feature = "metal")]
@@ -2619,6 +2702,7 @@ pub struct MetalDecodeOutputArgmax<'a> {
     pub rows: usize,
     pub cols: usize,
     pub eps: f32,
+    pub excluded_token: Option<u32>,
 }
 
 /// 지원 quant(Q4_K=0/Q5_K=1/Q6_K=2/Q8_0=3)을 code 로. 그 외는 None → host fallback.
@@ -2928,10 +3012,12 @@ fn chain_layer_to_ref<'a>(
 ) -> std::result::Result<rnb_backend_metal::ChainLayerSpecRef<'a>, &'static str> {
     Ok(match s {
         MetalChainLayer::Attn(a) => {
-            // q/k/o/ffn_gate/ffn_up = Q4_K, v/ffn_down = Q4_K|Q6_K. 그 외 quant 는 미지원.
+            // Dense chain projection GEMV supports Q4_K/Q5_K/Q6_K/Q8_0.
+            let Some(o_q) = gdn_quant_code(a.o_ggml) else {
+                return Err("unsupported attention o quant");
+            };
             if a.q_ggml != GGMLType::Q4_K
                 || a.k_ggml != GGMLType::Q4_K
-                || a.o_ggml != GGMLType::Q4_K
                 || a.ffn_gate_ggml != GGMLType::Q4_K
                 || a.ffn_up_ggml != GGMLType::Q4_K
             {
@@ -2950,18 +3036,34 @@ fn chain_layer_to_ref<'a>(
             if a.num_kv_heads == 0 || a.num_heads % a.num_kv_heads != 0 || a.head_dim > 256 {
                 return Err("unsupported attention shape");
             }
+            let attn_gate_raw = match (a.attn_gate_ggml, a.attn_gate_raw) {
+                (Some(GGMLType::Q4_K), Some(raw)) => Some(raw),
+                (None, None) => None,
+                _ => return Err("unsupported attention gate quant"),
+            };
+            if a.muse_semantics
+                && (attn_gate_raw.is_none()
+                    || a.post_attn_norm_weight.is_none()
+                    || a.post_ffn_norm_weight.is_none())
+            {
+                return Err("incomplete Muse attention chain");
+            }
             rnb_backend_metal::ChainLayerSpecRef::Attn(rnb_backend_metal::AttnChainSpecRef {
                 layer: a.layer,
                 norm_weight: a.norm_weight,
                 q_norm_weight: a.q_norm_weight,
                 k_norm_weight: a.k_norm_weight,
                 ffn_norm_weight: a.ffn_norm_weight,
+                post_attn_norm_weight: a.post_attn_norm_weight,
+                post_ffn_norm_weight: a.post_ffn_norm_weight,
                 q_raw: a.q_raw,
                 k_raw: a.k_raw,
                 v_raw: a.v_raw,
                 o_raw: a.o_raw,
+                attn_gate_raw,
                 ffn_gate_raw: a.ffn_gate_raw,
                 ffn_up_raw: a.ffn_up_raw,
+                o_q,
                 ffn_down_raw: a.ffn_down_raw,
                 v_is_q6k,
                 ffn_down_is_q6k,
@@ -2979,8 +3081,12 @@ fn chain_layer_to_ref<'a>(
                 capacity: a.capacity,
                 ffn_dim: a.ffn_dim,
                 eps: a.eps,
+                post_norm_eps: a.post_norm_eps,
                 theta: a.theta,
                 scale: a.scale,
+                apply_rope: a.apply_rope,
+                sliding_window: a.sliding_window,
+                muse_semantics: a.muse_semantics,
             })
         }
         MetalChainLayer::AttnMoeQwen(s) => rnb_backend_metal::ChainLayerSpecRef::AttnMoeQwen(
@@ -3066,6 +3172,7 @@ fn chain_output_argmax_to_ref<'a>(
     };
     let output_quant = match output.output_ggml {
         GGMLType::Q4_K => 0,
+        GGMLType::Q5_K => 1,
         GGMLType::Q6_K => 2,
         _ => return Err("unsupported output quant"),
     };
@@ -3076,6 +3183,7 @@ fn chain_output_argmax_to_ref<'a>(
         rows: output.rows,
         cols: output.cols,
         eps: output.eps,
+        excluded_token: output.excluded_token,
     }))
 }
 
@@ -5911,6 +6019,250 @@ mod muse_target_attention_policy_tests {
             }
         }
     }
+}
+
+pub fn metal_muse_prefill_full_layer_if_supported(
+    req: MetalMusePrefillFullLayerRequest<'_>,
+) -> Result<Option<MetalMusePrefillFullLayerOut>> {
+    if env_falsey("RNB_METAL_MUSE_PREFILL_FULL_LAYER_CHAIN") {
+        return Ok(None);
+    }
+    let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(k_quant) = tensorops_quant_from_ggml(req.k_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(v_quant) = tensorops_quant_from_ggml(req.v_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(attention_gate_quant) = tensorops_quant_from_ggml(req.attention_gate_weight_ggml)
+    else {
+        return Ok(None);
+    };
+    let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_gate_quant) = tensorops_quant_from_ggml(req.ffn_gate_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_up_quant) = tensorops_quant_from_ggml(req.ffn_up_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight_ggml) else {
+        return Ok(None);
+    };
+    METAL.with(|backend| {
+        backend
+            .prefill_muse_full_layer_if_supported(
+                rnb_backend_metal::MusePrefillFullLayerBackendRequest {
+                    hidden: req.hidden,
+                    attn_norm_w: req.attn_norm_w,
+                    q_norm_w: req.q_norm_w,
+                    k_norm_w: req.k_norm_w,
+                    post_attn_norm_w: req.post_attn_norm_w,
+                    ffn_norm_w: req.ffn_norm_w,
+                    post_ffn_norm_w: req.post_ffn_norm_w,
+                    q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.q_weight_raw,
+                        quant: q_quant,
+                        rows: req.q_weight_rows,
+                        cols: req.q_weight_cols,
+                    },
+                    k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.k_weight_raw,
+                        quant: k_quant,
+                        rows: req.k_weight_rows,
+                        cols: req.k_weight_cols,
+                    },
+                    v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.v_weight_raw,
+                        quant: v_quant,
+                        rows: req.v_weight_rows,
+                        cols: req.v_weight_cols,
+                    },
+                    attention_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.attention_gate_weight_raw,
+                        quant: attention_gate_quant,
+                        rows: req.attention_gate_weight_rows,
+                        cols: req.attention_gate_weight_cols,
+                    },
+                    o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.o_weight_raw,
+                        quant: o_quant,
+                        rows: req.o_weight_rows,
+                        cols: req.o_weight_cols,
+                    },
+                    ffn_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.ffn_gate_weight_raw,
+                        quant: ffn_gate_quant,
+                        rows: req.ffn_gate_weight_rows,
+                        cols: req.ffn_gate_weight_cols,
+                    },
+                    ffn_up_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.ffn_up_weight_raw,
+                        quant: ffn_up_quant,
+                        rows: req.ffn_up_weight_rows,
+                        cols: req.ffn_up_weight_cols,
+                    },
+                    ffn_down_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                        raw: req.ffn_down_weight_raw,
+                        quant: ffn_down_quant,
+                        rows: req.ffn_down_weight_rows,
+                        cols: req.ffn_down_weight_cols,
+                    },
+                    seq_len: req.seq_len,
+                    num_heads: req.num_heads,
+                    num_kv_heads: req.num_kv_heads,
+                    head_dim: req.head_dim,
+                    hidden_dim: req.hidden_dim,
+                    q_dim: req.q_dim,
+                    kv_dim: req.kv_dim,
+                    ffn_dim: req.ffn_dim,
+                    rope_theta: req.rope_theta,
+                    scale: req.scale,
+                    norm_eps: req.norm_eps,
+                    post_norm_eps: req.post_norm_eps,
+                    apply_rope: req.apply_rope,
+                    sliding_window: req.sliding_window,
+                },
+            )
+            .map(|result| {
+                result.map(|(hidden, k_bits, v_bits)| MetalMusePrefillFullLayerOut {
+                    hidden,
+                    k_bits,
+                    v_bits,
+                })
+            })
+    })
+}
+
+pub fn metal_muse_prefill_layer_range_if_supported(
+    hidden: &[f32],
+    layers: &[MetalMusePrefillLayerRangeLayer<'_>],
+    mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<()>,
+) -> Result<Option<MetalMusePrefillLayerRangeOut>> {
+    if env_falsey("RNB_METAL_MUSE_PREFILL_LAYER_RANGE_CHAIN") || layers.is_empty() {
+        return Ok(None);
+    }
+    let mut backend_layers = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let req = &layer.request;
+        let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(k_quant) = tensorops_quant_from_ggml(req.k_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(v_quant) = tensorops_quant_from_ggml(req.v_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(attention_gate_quant) = tensorops_quant_from_ggml(req.attention_gate_weight_ggml)
+        else {
+            return Ok(None);
+        };
+        let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(ffn_gate_quant) = tensorops_quant_from_ggml(req.ffn_gate_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(ffn_up_quant) = tensorops_quant_from_ggml(req.ffn_up_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight_ggml) else {
+            return Ok(None);
+        };
+        backend_layers.push(rnb_backend_metal::MusePrefillLayerRangeBackendLayer {
+            layer_idx: layer.layer_idx,
+            request: rnb_backend_metal::MusePrefillFullLayerBackendRequest {
+                hidden: req.hidden,
+                attn_norm_w: req.attn_norm_w,
+                q_norm_w: req.q_norm_w,
+                k_norm_w: req.k_norm_w,
+                post_attn_norm_w: req.post_attn_norm_w,
+                ffn_norm_w: req.ffn_norm_w,
+                post_ffn_norm_w: req.post_ffn_norm_w,
+                q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.q_weight_raw,
+                    quant: q_quant,
+                    rows: req.q_weight_rows,
+                    cols: req.q_weight_cols,
+                },
+                k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.k_weight_raw,
+                    quant: k_quant,
+                    rows: req.k_weight_rows,
+                    cols: req.k_weight_cols,
+                },
+                v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.v_weight_raw,
+                    quant: v_quant,
+                    rows: req.v_weight_rows,
+                    cols: req.v_weight_cols,
+                },
+                attention_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.attention_gate_weight_raw,
+                    quant: attention_gate_quant,
+                    rows: req.attention_gate_weight_rows,
+                    cols: req.attention_gate_weight_cols,
+                },
+                o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.o_weight_raw,
+                    quant: o_quant,
+                    rows: req.o_weight_rows,
+                    cols: req.o_weight_cols,
+                },
+                ffn_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_gate_weight_raw,
+                    quant: ffn_gate_quant,
+                    rows: req.ffn_gate_weight_rows,
+                    cols: req.ffn_gate_weight_cols,
+                },
+                ffn_up_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_up_weight_raw,
+                    quant: ffn_up_quant,
+                    rows: req.ffn_up_weight_rows,
+                    cols: req.ffn_up_weight_cols,
+                },
+                ffn_down_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_down_weight_raw,
+                    quant: ffn_down_quant,
+                    rows: req.ffn_down_weight_rows,
+                    cols: req.ffn_down_weight_cols,
+                },
+                seq_len: req.seq_len,
+                num_heads: req.num_heads,
+                num_kv_heads: req.num_kv_heads,
+                head_dim: req.head_dim,
+                hidden_dim: req.hidden_dim,
+                q_dim: req.q_dim,
+                kv_dim: req.kv_dim,
+                ffn_dim: req.ffn_dim,
+                rope_theta: req.rope_theta,
+                scale: req.scale,
+                norm_eps: req.norm_eps,
+                post_norm_eps: req.post_norm_eps,
+                apply_rope: req.apply_rope,
+                sliding_window: req.sliding_window,
+            },
+        });
+    }
+    METAL.with(|backend| {
+        backend
+            .prefill_muse_layer_range_if_supported(hidden, &backend_layers, |layer, k, v| {
+                on_kv(layer, k, v)
+            })
+            .map(|result| {
+                result.map(|output| MetalMusePrefillLayerRangeOut {
+                    hidden: output.hidden,
+                    hidden_uploads: output.hidden_uploads,
+                    hidden_readbacks: output.hidden_readbacks,
+                    intermediate_hidden_transfers: output.intermediate_hidden_transfers,
+                    kv_layers_streamed: output.kv_layers_streamed,
+                })
+            })
+    })
 }
 
 pub fn metal_muse_prefill_o_tail_ffn_if_supported(

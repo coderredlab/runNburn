@@ -283,6 +283,109 @@ pub(crate) fn encode_fused_residual_rms_norm(
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fused_post_attn_residual_ffn_rms_norm(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    projected_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden_buf: &ProtocolObject<dyn MTLBuffer>,
+    ffn_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    normed_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_eps_buf: &ProtocolObject<dyn MTLBuffer>,
+    ffn_eps_buf: &ProtocolObject<dyn MTLBuffer>,
+) {
+    enc.setComputePipelineState(&ctx.fused_post_attn_residual_ffn_rms_norm_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(projected_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(post_weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(hidden_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(ffn_weight_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(normed_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(post_eps_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(ffn_eps_buf), 0, 7);
+    }
+    let one = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: RMS_TG_SIZE,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
+}
+
+pub(crate) fn encode_fused_post_ffn_residual_add(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    projected_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    eps_buf: &ProtocolObject<dyn MTLBuffer>,
+) {
+    enc.setComputePipelineState(&ctx.fused_post_ffn_residual_add_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(projected_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(hidden_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(eps_buf), 0, 4);
+    }
+    let one = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: RMS_TG_SIZE,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_fused_post_ffn_residual_next_rms_norm(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    projected_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_weight_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_normed_buf: &ProtocolObject<dyn MTLBuffer>,
+    dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_eps_buf: &ProtocolObject<dyn MTLBuffer>,
+    next_eps: f32,
+) {
+    enc.setComputePipelineState(&ctx.fused_post_ffn_residual_next_rms_norm_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(projected_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(post_weight_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(hidden_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(next_weight_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(next_normed_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(dim_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(post_eps_buf), 0, 6);
+        set_f32_bytes(enc, next_eps, 7);
+    }
+    let one = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: RMS_TG_SIZE,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatchThreadgroups_threadsPerThreadgroup(one, tg);
+}
 
 /// `encode_rms_norm` 의 in/out offset 변형 — in/out buffer 의 byte offset 을 받아 batched
 /// 경로(여러 lane 의 hidden/normed 를 한 [B*dim] buffer 에 담을 때) 컬럼별로 호출한다.

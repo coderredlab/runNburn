@@ -175,6 +175,58 @@ pub(crate) struct MuseTargetAttentionCarrier {
     output: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_muse_target_attention_f16_hd128(
+    ctx: &MetalContext,
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    query: &ProtocolObject<dyn MTLBuffer>,
+    key: &ProtocolObject<dyn MTLBuffer>,
+    value: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+) -> Result<(), String> {
+    if seq_len == 0
+        || kv_len < seq_len
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || !scale.is_finite()
+    {
+        return Err("Metal Muse target attention cache contract mismatch".to_string());
+    }
+    encoder.setComputePipelineState(&ctx.muse_target_attention_f16_hd128_pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(query), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(key), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(value), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
+    }
+    set_u32(encoder, kv_len, 4)?;
+    set_u32(encoder, seq_len, 5)?;
+    set_u32(encoder, num_heads, 6)?;
+    set_u32(encoder, num_kv_heads, 7)?;
+    set_u32(encoder, sliding_window.unwrap_or(0), 8)?;
+    set_f32(encoder, scale, 9);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: seq_len * num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 impl MuseTargetAttentionCarrier {
     pub(crate) fn new(
         ctx: &MetalContext,
@@ -226,35 +278,20 @@ impl MuseTargetAttentionCarrier {
         sliding_window: Option<usize>,
         scale: f32,
     ) -> Result<(), String> {
-        if kv_len < self.seq_len || !scale.is_finite() {
-            return Err("Metal Muse target attention cache contract mismatch".to_string());
-        }
-        encoder.setComputePipelineState(&ctx.muse_target_attention_f16_hd128_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&self.query), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(key), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(value), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&self.output), 0, 3);
-        }
-        set_u32(encoder, kv_len, 4)?;
-        set_u32(encoder, self.seq_len, 5)?;
-        set_u32(encoder, self.num_heads, 6)?;
-        set_u32(encoder, self.num_kv_heads, 7)?;
-        set_u32(encoder, sliding_window.unwrap_or(0), 8)?;
-        set_f32(encoder, scale, 9);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: self.seq_len * self.num_heads,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 256,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(())
+        encode_muse_target_attention_f16_hd128(
+            ctx,
+            encoder,
+            &self.query,
+            key,
+            value,
+            &self.output,
+            self.seq_len,
+            kv_len,
+            self.num_heads,
+            self.num_kv_heads,
+            sliding_window,
+            scale,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

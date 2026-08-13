@@ -47,7 +47,6 @@ pub(super) fn dequantize_bytes_to_f32(bytes: &[u8], ggml_type: GGMLType) -> Vec<
     dequant::dequantize_bytes_to_f32(bytes, dequant_type(ggml_type))
 }
 
-#[cfg(test)]
 pub(super) fn dequantize_row_to_slice_if_supported(
     bytes: &[u8],
     ggml_type: GGMLType,
