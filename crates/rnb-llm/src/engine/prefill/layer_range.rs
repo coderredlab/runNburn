@@ -1716,6 +1716,7 @@ fn try_run_metal_muse_prefill_layer_range(
     )))
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
 fn try_run_metal_gemma_prefill_layer_range(
     kv_cache: &mut KVCache,

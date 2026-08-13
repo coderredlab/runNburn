@@ -522,6 +522,7 @@ pub(in crate::engine) fn metal_muse_prefill_layer_range_if_supported(
     .map_err(crate::error::LlmError::Forward)
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(in crate::engine) fn metal_gemma_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[GemmaPrefillLayerRangeSpec<'_>],
