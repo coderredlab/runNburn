@@ -733,3 +733,247 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
 #endif
 }
 
+// 128-row x 128-sequence Ampere MMQ tile. Eight warps each own one
+// 16-row slab and sweep sixteen 8-column MMA fragments. Full-block Q4
+// unpacking is reused across the complete sequence tile.
+extern "C" __global__ void __launch_bounds__(256, 1)
+rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+#if __CUDA_ARCH__ < 800
+    (void)out;
+    (void)weights;
+    (void)input_qs;
+    (void)input_ds;
+    (void)rows;
+    (void)blocks_per_row;
+    (void)seq_len;
+    return;
+#else
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5;
+    const unsigned lane = tid & 31u;
+    const unsigned row_base = blockIdx.x * 128u;
+    const unsigned seq_base = blockIdx.y * 128u;
+    const unsigned warp_row_off = warp * 16u;
+    const unsigned t_row_a = lane >> 2;
+    const unsigned t_row_b = t_row_a + 8u;
+
+    // Complete Q4 tile plus a two-sub-block activation window stays below
+    // the CUDA 48-KiB static shared-memory limit.
+    __shared__ signed char a_tile[8][128 * 32];
+    __shared__ signed char b_tile[2][128 * 36];
+    __shared__ float x_d[128];
+    __shared__ float x_dmin[128];
+    __shared__ unsigned char x_sc[8][128];
+    __shared__ unsigned char x_mn[8][128];
+    __shared__ float y_d[2][128];
+    __shared__ float y_s[2][128];
+
+        const unsigned row_a = row_base + warp_row_off + t_row_a;
+        const unsigned row_b = row_base + warp_row_off + t_row_b;
+
+    float acc[64];
+#pragma unroll
+    for (unsigned i = 0; i < 64u; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    const unsigned row_bytes = blocks_per_row * 144u;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        if (tid < 128u) {
+            const unsigned global_row = row_base + tid;
+            if (global_row < rows) {
+                const unsigned char* packed =
+                    weights + global_row * row_bytes + block * 144u;
+                const unsigned raw_d = static_cast<unsigned>(packed[0])
+                    | (static_cast<unsigned>(packed[1]) << 8);
+                const unsigned raw_dmin = static_cast<unsigned>(packed[2])
+                    | (static_cast<unsigned>(packed[3]) << 8);
+                x_d[tid] =
+                    __half2float(__ushort_as_half(static_cast<unsigned short>(raw_d)));
+                x_dmin[tid] =
+                    __half2float(__ushort_as_half(static_cast<unsigned short>(raw_dmin)));
+#pragma unroll
+                for (unsigned sub = 0; sub < 8u; ++sub) {
+                    unsigned scale;
+                    unsigned minimum;
+                    if (sub < 4u) {
+                        scale = packed[4u + sub] & 63u;
+                        minimum = packed[8u + sub] & 63u;
+                    } else {
+                        scale = (packed[8u + sub] & 0x0fu)
+                            | ((packed[sub] >> 6) << 4);
+                        minimum = (packed[8u + sub] >> 4)
+                            | ((packed[4u + sub] >> 6) << 4);
+                    }
+                    x_sc[sub][tid] = static_cast<unsigned char>(scale);
+                    x_mn[sub][tid] = static_cast<unsigned char>(minimum);
+                }
+            } else {
+                x_d[tid] = 0.0f;
+                x_dmin[tid] = 0.0f;
+#pragma unroll
+                for (unsigned sub = 0; sub < 8u; ++sub) {
+                    x_sc[sub][tid] = 0u;
+                    x_mn[sub][tid] = 0u;
+                }
+            }
+        }
+
+        for (unsigned item = tid; item < 4096u; item += 256u) {
+            const unsigned load_row = item >> 5;
+            const unsigned packed_word = item & 31u;
+            const unsigned pair = packed_word >> 3;
+            const unsigned word_in_sub = packed_word & 7u;
+            const unsigned global_row = row_base + load_row;
+            unsigned packed_qs = 0u;
+            if (global_row < rows) {
+                const unsigned char* packed =
+                    weights + global_row * row_bytes + block * 144u;
+                packed_qs = *reinterpret_cast<const unsigned*>(
+                    packed + 16u + pair * 32u + word_in_sub * 4u);
+            }
+            *reinterpret_cast<unsigned*>(
+                &a_tile[pair * 2u][load_row * 32u + word_in_sub * 4u]) =
+                packed_qs & 0x0f0f0f0fu;
+            *reinterpret_cast<unsigned*>(
+                &a_tile[pair * 2u + 1u][load_row * 32u + word_in_sub * 4u]) =
+                (packed_qs >> 4) & 0x0f0f0f0fu;
+        }
+        __syncthreads();
+        const float d_a = x_d[warp_row_off + t_row_a];
+        const float d_b = x_d[warp_row_off + t_row_b];
+        const float dmin_a = x_dmin[warp_row_off + t_row_a];
+        const float dmin_b = x_dmin[warp_row_off + t_row_b];
+
+
+
+#pragma unroll
+        for (unsigned pair = 0; pair < 4u; ++pair) {
+            for (unsigned item = tid; item < 2048u; item += 256u) {
+                const unsigned slot = item >> 10;
+                const unsigned local = item & 1023u;
+                const unsigned load_seq = local >> 3;
+                const unsigned seq_off = (local & 7u) * 4u;
+                const unsigned sub = pair * 2u + slot;
+                const unsigned global_seq = seq_base + load_seq;
+                const unsigned chunk = block * 8u + sub;
+                int b_word = 0;
+                if (global_seq < seq_len) {
+                    const signed char* b_src = input_qs
+                        + global_seq * blocks_per_row * 256u
+                        + chunk * 32u + seq_off;
+                    b_word = *reinterpret_cast<const int*>(b_src);
+                    if (seq_off == 0u) {
+                        y_d[slot][load_seq] =
+                            input_ds[global_seq * blocks_per_row * 8u + chunk];
+                    }
+                } else if (seq_off == 0u) {
+                    y_d[slot][load_seq] = 0.0f;
+                }
+                *reinterpret_cast<int*>(
+                    &b_tile[slot][load_seq * 36u + seq_off]) = b_word;
+                int chunk_sum = __dp4a(0x01010101, b_word, 0);
+                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 4u, 8);
+                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 2u, 8);
+                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 1u, 8);
+                if ((local & 7u) == 0u) {
+                    y_s[slot][load_seq] = static_cast<float>(chunk_sum);
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (unsigned slot = 0; slot < 2u; ++slot) {
+                const unsigned sub = pair * 2u + slot;
+                const unsigned a_col_lo = (lane & 3u) * 4u;
+                const unsigned a_col_hi = a_col_lo + 16u;
+                const int a0 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_lo]);
+                const int a1 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_lo]);
+                const int a2 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_hi]);
+                const int a3 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_hi]);
+                const float scale_a =
+                    static_cast<float>(x_sc[sub][warp_row_off + t_row_a]);
+                const float scale_b =
+                    static_cast<float>(x_sc[sub][warp_row_off + t_row_b]);
+                const float min_a =
+                    static_cast<float>(x_mn[sub][warp_row_off + t_row_a]);
+                const float min_b =
+                    static_cast<float>(x_mn[sub][warp_row_off + t_row_b]);
+
+#pragma unroll
+                for (unsigned frag = 0; frag < 16u; ++frag) {
+                    const unsigned frag_base = frag * 8u;
+                    const unsigned b_seq = frag_base + (lane >> 2);
+                    const unsigned b_col_lo = (lane & 3u) * 4u;
+                    const unsigned b_col_hi = b_col_lo + 16u;
+                    const int b0 = *reinterpret_cast<const int*>(
+                        &b_tile[slot][b_seq * 36u + b_col_lo]);
+                    const int b1 = *reinterpret_cast<const int*>(
+                        &b_tile[slot][b_seq * 36u + b_col_hi]);
+                    int dot0 = 0;
+                    int dot1 = 0;
+                    int dot2 = 0;
+                    int dot3 = 0;
+                    rnb_mma_m16n8k32_s8(
+                        dot0, dot1, dot2, dot3,
+                        a0, a1, a2, a3,
+                        b0, b1,
+                        0, 0, 0, 0);
+
+                    const unsigned col_a = frag_base + ((lane & 3u) << 1);
+                    const unsigned col_b = col_a + 1u;
+                    const float dy_a = y_d[slot][col_a];
+                    const float dy_b = y_d[slot][col_b];
+                    const float sum_a = y_s[slot][col_a];
+                    const float sum_b = y_s[slot][col_b];
+                    acc[frag * 4u + 0u] +=
+                        d_a * dy_a * scale_a * static_cast<float>(dot0)
+                        - dmin_a * dy_a * min_a * sum_a;
+                    acc[frag * 4u + 1u] +=
+                        d_a * dy_b * scale_a * static_cast<float>(dot1)
+                        - dmin_a * dy_b * min_a * sum_b;
+                    acc[frag * 4u + 2u] +=
+                        d_b * dy_a * scale_b * static_cast<float>(dot2)
+                        - dmin_b * dy_a * min_b * sum_a;
+                    acc[frag * 4u + 3u] +=
+                        d_b * dy_b * scale_b * static_cast<float>(dot3)
+                        - dmin_b * dy_b * min_b * sum_b;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (unsigned frag = 0; frag < 16u; ++frag) {
+        const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+        const unsigned col_b = col_a + 1u;
+        const unsigned seq_a = seq_base + col_a;
+        const unsigned seq_b = seq_base + col_b;
+        if (row_a < rows && seq_a < seq_len) {
+            out[seq_a * rows + row_a] = acc[frag * 4u + 0u];
+        }
+        if (row_a < rows && seq_b < seq_len) {
+            out[seq_b * rows + row_a] = acc[frag * 4u + 1u];
+        }
+        if (row_b < rows && seq_a < seq_len) {
+            out[seq_a * rows + row_b] = acc[frag * 4u + 2u];
+        }
+        if (row_b < rows && seq_b < seq_len) {
+            out[seq_b * rows + row_b] = acc[frag * 4u + 3u];
+        }
+    }
+#endif
+}
+

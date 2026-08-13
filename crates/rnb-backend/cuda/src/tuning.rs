@@ -189,6 +189,13 @@ pub fn q4k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
     mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q4K_MMQ_TILE64", true)
 }
 
+/// 128x128 Q4_K MMQ diagnostic generation for Ampere. The kernel trades
+/// occupancy for fourfold Q4 tile reuse and is only eligible when both axes
+/// fill a complete tile. Keep opt-in until product A/B and output validation.
+pub fn q4k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
+    seq_len >= 128 && rows >= 128 && env_bool("RNB_CUDA_Q4K_MMQ_TILE128", false)
+}
+
 /// cu228: Q5_K/Q6_K 64x64 tile 게이트 — Q4 와 같은 b-side 상각 (rows >= 64
 /// 는 tile 높이의 구조적 최소치). 진단 대조는 각 env `=0`.
 pub fn q5k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {

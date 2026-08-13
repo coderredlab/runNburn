@@ -13380,6 +13380,54 @@ fn cuda_q4k_mmq_tile64_matches_tile32_bitwise_with_tails() {
     }
 }
 
+#[test]
+fn cuda_q4k_mmq_tile128_matches_tile64_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile64 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE64", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 141usize;
+    let weights = make_test_q4k_weights(1, rows, blocks_per_row, 99)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let tile64 = {
+        let _tile128_off = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "0");
+        q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K tile64 baseline")
+    };
+    let _tile128_on = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..3 {
+        let actual = q4k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q4_K MMQ tile128");
+        assert_close_rows_abs_rel(
+            &format!("Q4_K MMQ tile128 run {run}"),
+            &actual,
+            &tile64,
+            2e-3,
+            2e-4,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q4_K MMQ tile128 run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual);
+        }
+    }
+}
+
 // cu222: Q5_K MMQ tile32 — Q4 tails 테스트의 Q5 판. GPU quantizer 의 qs/ds
 // 를 내려받아 dequantize 한 CPU reference 와 비교하고(호스트 참조 quantizer
 // LSB 오염 방지, cu219 관례), partial row/seq tile 마스킹과 bitwise 결정성을

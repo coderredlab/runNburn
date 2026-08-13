@@ -880,6 +880,17 @@ impl CudaState {
             // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 — a-tile 재로드/unpack
             // 이 절반이 된다 (bitwise 동일 산술, RNB_CUDA_MMQ_TILE_SEQ64=0 대조).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
+                if tuning::q4k_mmq_tile128_enabled(seq_len, rows) {
+                    return self.launch_q4k_q8_1_matmul_mmq_tile128_seq128(
+                        weights,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        input_qs_dev,
+                        input_ds_dev,
+                        output_dev,
+                    );
+                }
                 // cu228: rows >= 64 는 64x64 tile — b-side 상각 (bitwise 동일).
                 if tuning::q4k_mmq_tile64_enabled(seq_len, rows) {
                     return self.launch_q4k_q8_1_matmul_mmq_tile64_seq64(
