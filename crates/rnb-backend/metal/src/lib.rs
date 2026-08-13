@@ -1990,9 +1990,13 @@ pub struct MetalBackend {
             prefill_gemma_attn_chain::GemmaPrefillFullLayerCarrier,
         >,
     >,
-    /// Muse attention output→post norms/residual→SwiGLU FFN carrier.
-    muse_prefill_o_ffn_carriers: RefCell<
-        HashMap<MusePrefillOTailFfnCarrierKey, prefill_atn_core_chain::MusePrefillOTailFfnCarrier>,
+    /// Single active Muse attention-output→SwiGLU FFN shape. Its scratch is too large
+    /// to retain for every prompt length.
+    muse_prefill_o_ffn_carrier: RefCell<
+        Option<(
+            MusePrefillOTailFfnCarrierKey,
+            prefill_atn_core_chain::MusePrefillOTailFfnCarrier,
+        )>,
     >,
     qwen_prefill_gdn_carriers:
         RefCell<HashMap<QwenGdnPrefillCarrierKey, gdn_chain::QwenGdnPrefillCarrier>>,
@@ -2233,7 +2237,7 @@ impl MetalBackend {
                 gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
                 gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
-                muse_prefill_o_ffn_carriers: RefCell::new(HashMap::new()),
+                muse_prefill_o_ffn_carrier: RefCell::new(None),
                 qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
                 qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
                 qkv_carriers: RefCell::new(HashMap::new()),
@@ -2471,7 +2475,7 @@ impl MetalBackend {
             gemma_prefill_qkv_o_tail_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_qkv_o_resident_carriers: RefCell::new(HashMap::new()),
             gemma_prefill_full_layer_carriers: RefCell::new(HashMap::new()),
-            muse_prefill_o_ffn_carriers: RefCell::new(HashMap::new()),
+            muse_prefill_o_ffn_carrier: RefCell::new(None),
             qwen_prefill_gdn_carriers: RefCell::new(HashMap::new()),
             qwen_prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
             qkv_carriers: RefCell::new(HashMap::new()),
@@ -4633,9 +4637,15 @@ impl MetalBackend {
             ffn_up_quant: req.ffn_up_weight.quant,
             ffn_down_quant: req.ffn_down_weight.quant,
         };
-        let mut carriers = self.muse_prefill_o_ffn_carriers.borrow_mut();
-        let carrier = carriers.entry(key).or_insert_with(|| {
-            prefill_atn_core_chain::MusePrefillOTailFfnCarrier::new(
+        let mut carrier_slot = self.muse_prefill_o_ffn_carrier.borrow_mut();
+        let requires_replacement = carrier_slot
+            .as_ref()
+            .map(|(cached_key, _)| cached_key != &key)
+            .unwrap_or(true);
+        if requires_replacement {
+            // Drop the previous shape before allocating hundreds of MiB of replacement scratch.
+            *carrier_slot = None;
+            let carrier = prefill_atn_core_chain::MusePrefillOTailFfnCarrier::new(
                 ctx,
                 req.seq_len,
                 req.q_dim,
@@ -4643,8 +4653,13 @@ impl MetalBackend {
                 req.ffn_dim,
                 req.norm_eps,
                 req.post_norm_eps,
-            )
-        });
+            );
+            *carrier_slot = Some((key, carrier));
+        }
+        let carrier = &carrier_slot
+            .as_ref()
+            .ok_or_else(|| "Muse prefill O+FFN carrier slot initialization failed".to_string())?
+            .1;
         let output = prefill_atn_core_chain::prefill_muse_o_tail_ffn_dispatch(
             ctx,
             carrier,
@@ -14957,6 +14972,58 @@ mod tests {
             out.extend(quantize_q4_k_vec(&vals[row * k..(row + 1) * k]));
         }
         out
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a TensorOps-capable Metal device"]
+    fn muse_prefill_o_ffn_cache_keeps_only_active_prompt_shape() {
+        const DIM: usize = 256;
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            eprintln!("no Metal ctx; skip Muse carrier cache test");
+            return;
+        }
+        let weight = quantize_rows_q4k(&det_vals(DIM * DIM, 0.003), DIM, DIM);
+        let mapped_weight = mapped_test_tensor(&weight);
+        let weight_view = PrefillAtnCoreWeightView {
+            raw: mapped_weight.as_bytes().expect("mapped weight bytes"),
+            quant: TensoropsQuant::Q4K,
+            rows: DIM,
+            cols: DIM,
+        };
+        let norm = vec![1.0f32; DIM];
+
+        for seq_len in [1usize, 2, 1] {
+            let output = backend
+                .prefill_muse_o_tail_ffn_if_supported(MusePrefillOTailFfnBackendRequest {
+                    attn_out: &det_vals(seq_len * DIM, 0.01),
+                    hidden: &det_vals(seq_len * DIM, 0.02),
+                    post_attn_norm_w: &norm,
+                    ffn_norm_w: &norm,
+                    post_ffn_norm_w: &norm,
+                    o_weight: weight_view,
+                    ffn_gate_weight: weight_view,
+                    ffn_up_weight: weight_view,
+                    ffn_down_weight: weight_view,
+                    seq_len,
+                    q_dim: DIM,
+                    hidden_dim: DIM,
+                    ffn_dim: DIM,
+                    norm_eps: 1.0e-6,
+                    post_norm_eps: 1.0e-5,
+                })
+                .expect("Muse prefill O+FFN dispatch")
+                .expect("TensorOps-capable Metal device");
+            assert_eq!(output.len(), seq_len * DIM);
+
+            let carrier_slot = backend.muse_prefill_o_ffn_carrier.borrow();
+            let (active_key, _) = carrier_slot.as_ref().expect("active Muse carrier");
+            assert_eq!(active_key.seq_len, seq_len);
+            assert_eq!(active_key.q_dim, DIM);
+            assert_eq!(active_key.hidden_dim, DIM);
+            assert_eq!(active_key.ffn_dim, DIM);
+        }
     }
 
     /// weight[N,K] Q4_K bytes, input[M,K] f32 → out[M,N], out[tok*N+row] = dequant(w[row])·input[tok].
