@@ -39,6 +39,56 @@ pub(in crate::engine) struct GemmaPrefillLayerRangeSpec<'a> {
     pub softcap: Option<f32>,
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_dflash_attention_if_supported(
+    query: &[f32],
+    context_key: &[u16],
+    context_value: &[u16],
+    block_key: &[f32],
+    block_value: &[f32],
+    seq_len: usize,
+    position: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+) -> crate::error::Result<Option<Vec<f32>>> {
+    #[cfg(feature = "metal")]
+    {
+        return metal_runtime::metal_dflash_attention_if_supported(
+            query,
+            context_key,
+            context_value,
+            block_key,
+            block_value,
+            seq_len,
+            position,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+        )
+        .map_err(crate::error::LlmError::Forward);
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (
+            query,
+            context_key,
+            context_value,
+            block_key,
+            block_value,
+            seq_len,
+            position,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+        );
+        Ok(None)
+    }
+}
+
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn metal_gemma_prefill_qkv_o_tail_if_supported(

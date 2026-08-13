@@ -198,6 +198,16 @@ pub(super) use metal_policy::{
 pub(super) use metal_policy::{
     metal_decode_parity_counters_report, metal_decode_parity_counters_reset,
 };
+pub(super) use metal_prefill::{
+    metal_dflash_attention_if_supported, metal_prefill_atn_full_counters_report,
+    metal_prefill_atn_full_counters_reset, metal_prefill_atn_full_expected_dense_layer,
+    metal_prefill_atn_full_record_adapter_reject, metal_prefill_atn_full_record_backend_err,
+    metal_prefill_atn_full_record_core_hit, metal_prefill_atn_full_record_full_layer_hit,
+    metal_prefill_atn_full_record_skip, metal_prefill_atn_full_timing_enabled,
+    metal_prefill_atn_o_tail_counters_report, metal_prefill_atn_o_tail_counters_reset,
+    metal_prefill_atn_o_tail_expected_dense_layer, metal_prefill_atn_o_tail_requested,
+    metal_prefill_attn_chain_if_supported,
+};
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(super) use metal_prefill::{
     metal_gemma_prefill_full_layer_if_supported, metal_gemma_prefill_layer_range_if_supported,
@@ -206,15 +216,6 @@ pub(super) use metal_prefill::{
     metal_prefill_atn_full_layer_if_supported, metal_prefill_atn_o_tail_if_supported,
     metal_prefill_atn_o_tail_record_adapter_reject, GemmaPrefillLayerRangeSpec,
     MetalPrefillAtnCoreShape,
-};
-pub(super) use metal_prefill::{
-    metal_prefill_atn_full_counters_report, metal_prefill_atn_full_counters_reset,
-    metal_prefill_atn_full_expected_dense_layer, metal_prefill_atn_full_record_adapter_reject,
-    metal_prefill_atn_full_record_backend_err, metal_prefill_atn_full_record_core_hit,
-    metal_prefill_atn_full_record_full_layer_hit, metal_prefill_atn_full_record_skip,
-    metal_prefill_atn_full_timing_enabled, metal_prefill_atn_o_tail_counters_report,
-    metal_prefill_atn_o_tail_counters_reset, metal_prefill_atn_o_tail_expected_dense_layer,
-    metal_prefill_atn_o_tail_requested, metal_prefill_attn_chain_if_supported,
 };
 #[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
 pub(super) use metal_prefill::{

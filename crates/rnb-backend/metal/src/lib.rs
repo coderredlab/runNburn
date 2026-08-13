@@ -35,6 +35,8 @@ mod device;
 mod compute;
 #[cfg(target_os = "macos")]
 mod deepseek4_decode;
+#[cfg(target_os = "macos")]
+mod dflash_attention;
 #[cfg(all(test, target_os = "macos"))]
 mod qwen_moe_llama_id_microbench;
 
@@ -1960,6 +1962,10 @@ pub struct MetalBackend {
     /// (seq, num_heads, num_kv_heads, head_dim).
     prefill_attn_chain_carriers:
         RefCell<HashMap<(usize, usize, usize, usize), prefill_attn_chain::PrefillAttnChainCarrier>>,
+    /// DFlash attention scratch, keyed by block shape and sliding-window capacity.
+    dflash_attention_carriers: RefCell<
+        HashMap<(usize, usize, usize, usize, usize), dflash_attention::DflashAttentionCarrier>,
+    >,
     /// pm50 M1: prefill dense gated ATN core(q/k/v→flash→gate) carrier.
     prefill_atn_core_carriers:
         RefCell<HashMap<AtnCoreKey, prefill_atn_core_chain::PrefillAtnCoreCarrier>>,
@@ -2231,6 +2237,7 @@ impl MetalBackend {
                 prefill_gdn_full_carriers: RefCell::new(HashMap::new()),
                 prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
                 prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
+                dflash_attention_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_core_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -2469,6 +2476,7 @@ impl MetalBackend {
             prefill_gdn_full_carriers: RefCell::new(HashMap::new()),
             prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
             prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
+            dflash_attention_carriers: RefCell::new(HashMap::new()),
             prefill_atn_core_carriers: RefCell::new(HashMap::new()),
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
             prefill_atn_o_tail_carriers: RefCell::new(HashMap::new()),
@@ -2839,6 +2847,54 @@ impl MetalBackend {
         compute::delta_net_scan_ar_with_ctx(
             ctx, q, k, v, gate, beta, state, seq_len, num_heads, head_k_dim, head_v_dim,
         )
+    }
+
+    /// Muse DFlash non-causal sliding-window attention. The committed cache remains F16 and
+    /// the current block remains F32, matching the CPU drafter's source-value contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_attention_if_supported(
+        &self,
+        query: &[f32],
+        context_key: &[u16],
+        context_value: &[u16],
+        block_key: &[f32],
+        block_value: &[f32],
+        seq_len: usize,
+        position: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        sliding_window: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if head_dim != 128 || sliding_window == 0 {
+            return Ok(None);
+        }
+        let key = (seq_len, num_heads, num_kv_heads, head_dim, sliding_window);
+        let mut carriers = self.dflash_attention_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            dflash_attention::DflashAttentionCarrier::new(
+                ctx,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+            )
+        });
+        carrier
+            .dispatch(
+                ctx,
+                query,
+                context_key,
+                context_value,
+                block_key,
+                block_value,
+                position,
+            )
+            .map(Some)
     }
 
     /// pm48 ①: dense causal GQA prefill attention compute(simdgroup matmul2d flash). q[seq*nh*hd]

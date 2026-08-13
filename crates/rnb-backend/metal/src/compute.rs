@@ -57,6 +57,7 @@ const PREFILL_FLASH_ATTN_TG_SRC: &str = include_str!("prefill_flash_attn_tg.meta
 const PREFILL_FLASH_ATTN_HD512_GEMMA_SRC: &str =
     include_str!("prefill_flash_attn_hd512_gemma.metal");
 const OUTPUT_ARGMAX_SRC: &str = include_str!("output_argmax.metal");
+const DFLASH_ATTENTION_SRC: &str = include_str!("dflash_attention.metal");
 
 /// Apple Silicon SIMD-group width. 32 고정(구조적 상수 — threadExecutionWidth 와 일치).
 pub(crate) const SIMD_WIDTH: usize = 32;
@@ -831,6 +832,9 @@ pub struct MetalContext {
     /// Gemma 4 causal GQA prefill attention. HD=512 with sliding-window mask and softcap.
     pub(crate) flash_attn_prefill_hd512_gemma_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Muse DFlash non-causal sliding-window attention. HD=128, one SIMD-group per row/head.
+    pub(crate) dflash_attention_hd128_pipeline:
+        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm48 ② prefill qk_norm→rope fused 커널(device-resident attention chain 부품).
     /// per-head RMSNorm → text M-RoPE(partial n_rot) 를 device q/k 에 in-chain 적용. 항상 build.
     pub(crate) prefill_rope_qk_norm_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -2080,6 +2084,8 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let dflash_attention_hd128_pipeline =
+        build_pipeline(&device, DFLASH_ATTENTION_SRC, "dflash_attention_hd128");
     let q4k_pipeline = build_pipeline(&device, GEMV_Q4K_SRC, "gemv_q4k");
     let q4k_simd_pipeline = build_pipeline(&device, GEMV_Q4K_SIMD_SRC, "gemv_q4k_simd");
     let q4k_coalesced_pipeline =
@@ -2655,6 +2661,7 @@ pub fn build_metal_context_with_opts(
         delta_net_scan_chunk_step45gemm_pipeline,
         flash_attn_prefill_tg_pipeline,
         flash_attn_prefill_hd512_gemma_pipeline,
+        dflash_attention_hd128_pipeline,
         prefill_rope_qk_norm_pipeline,
         prefill_neox_qk_norm_pipeline,
         prefill_neox_qk_norm_table_pipeline,

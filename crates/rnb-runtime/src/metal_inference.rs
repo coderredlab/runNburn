@@ -6444,6 +6444,46 @@ pub fn metal_prefill_atn_full_layer_if_supported(
     }
 }
 
+pub fn metal_dflash_attention_requested() -> bool {
+    !env_falsey("RNB_METAL_DFLASH_ATTN")
+}
+
+/// Muse DFlash non-causal sliding-window attention. Default ON for the explicit DFlash path;
+/// `RNB_METAL_DFLASH_ATTN=0|false|off|no` preserves the CPU oracle for A/B diagnosis.
+#[allow(clippy::too_many_arguments)]
+pub fn metal_dflash_attention_if_supported(
+    query: &[f32],
+    context_key: &[u16],
+    context_value: &[u16],
+    block_key: &[f32],
+    block_value: &[f32],
+    seq_len: usize,
+    position: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sliding_window: usize,
+) -> Result<Option<Vec<f32>>> {
+    if !metal_dflash_attention_requested() {
+        return Ok(None);
+    }
+    METAL.with(|backend| {
+        backend.dflash_attention_if_supported(
+            query,
+            context_key,
+            context_value,
+            block_key,
+            block_value,
+            seq_len,
+            position,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window,
+        )
+    })
+}
+
 /// pm43: GDN prefill conv1d+silu Metal seam(gpu_gdn 공통 facade가 cuda/metal 분기로 호출).
 /// input[(seq_len+kernel_size-1)*channels] + weight[kernel_size*channels] → out[seq_len*channels].
 /// f32 exact(quant 무관, token-identical). default ON, opt-out=RNB_METAL_PREFILL_CONV1D=0.
@@ -8619,8 +8659,33 @@ mod qwen_prefill_chain_conversion_tests {
             post_attn_norm_w: &post_norm,
             norm_eps: 1.0e-6,
         };
+
         assert!(qwen_prefill_chain_gdn_spec(&spec).is_some());
         spec.conv_kernel_size = 1;
         assert!(qwen_prefill_chain_gdn_spec(&spec).is_none());
+    }
+}
+#[cfg(test)]
+mod dflash_attention_policy_tests {
+    use super::*;
+
+    #[test]
+    fn dflash_attention_defaults_on_with_falsey_opt_out() {
+        let key = "RNB_METAL_DFLASH_ATTN";
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert!(metal_dflash_attention_requested());
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert!(!metal_dflash_attention_requested(), "{value}");
+        }
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(key, value);
+            assert!(metal_dflash_attention_requested(), "{value}");
+        }
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 }
