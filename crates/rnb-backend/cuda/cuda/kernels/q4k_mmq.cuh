@@ -500,15 +500,18 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
     const unsigned warp_row_off = (warp & 3u) * 16u;
     const unsigned warp_seq_off = (warp >> 2) * 16u;
 
-    __shared__ signed char a_tile[64 * 36];
-    __shared__ signed char b_tile[64 * 36];
+    // Alternate sub-block slabs so the barrier before stage N compute also
+    // retires stage N-1 before that parity is reused. This removes the second
+    // block-wide barrier from every sub-block without changing math order.
+    __shared__ signed char a_tile[2][64 * 36];
+    __shared__ signed char b_tile[2][64 * 36];
     __shared__ unsigned char raw_stage[64 * 160];
     __shared__ float x_d[64];
     __shared__ float x_dmin[64];
-    __shared__ unsigned char x_sc[64];
-    __shared__ unsigned char x_mn[64];
-    __shared__ float y_d[64];
-    __shared__ float y_s[64];
+    __shared__ unsigned char x_sc[2][64];
+    __shared__ unsigned char x_mn[2][64];
+    __shared__ float y_d[2][64];
+    __shared__ float y_s[2][64];
 
     const unsigned t_row_a = lane >> 2;
     const unsigned t_row_b = t_row_a + 8u;
@@ -553,11 +556,15 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
         unsigned packed_scales1 = 0u;
         unsigned packed_scales2 = 0u;
 
+        // Full unrolling resolves stage parity at compile time; a dynamic
+        // shared-memory index costs more than the barrier this layout removes.
+#pragma unroll
         for (unsigned sub = 0; sub < 8u; ++sub) {
+            const unsigned stage = sub & 1u;
             const unsigned load_row = tid >> 3;
             const unsigned load_off = (tid & 7u) * 4u;
             const unsigned global_row = row_base + load_row;
-            signed char* a_dst = a_tile + load_row * 36u + load_off;
+            signed char* a_dst = a_tile[stage] + load_row * 36u + load_off;
 
             if (global_row < rows) {
                 const unsigned char* packed = raw_stage + load_row * 160u;
@@ -589,8 +596,8 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                         minimum = (tail >> 4)
                             | (((packed_scales1 >> shift) & 0xffu) >> 6 << 4);
                     }
-                    x_sc[load_row] = static_cast<unsigned char>(scale);
-                    x_mn[load_row] = static_cast<unsigned char>(minimum);
+                    x_sc[stage][load_row] = static_cast<unsigned char>(scale);
+                    x_mn[stage][load_row] = static_cast<unsigned char>(minimum);
                 }
                 const unsigned nibble_base = 16u + (sub >> 1) * 32u;
                 if ((sub & 1u) == 0u) {
@@ -608,8 +615,8 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                     x_dmin[load_row] = 0.0f;
                 }
                 if (load_off == 0u) {
-                    x_sc[load_row] = 0u;
-                    x_mn[load_row] = 0u;
+                    x_sc[stage][load_row] = 0u;
+                    x_mn[stage][load_row] = 0u;
                 }
             }
 
@@ -620,7 +627,7 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                 const unsigned load_seq = tid >> 3;
                 const unsigned seq_off = (tid & 7u) * 4u;
                 const unsigned global_seq = seq_base + load_seq;
-                signed char* b_dst = b_tile + load_seq * 36u + seq_off;
+                signed char* b_dst = b_tile[stage] + load_seq * 36u + seq_off;
                 int b_word = 0;
                 if (global_seq < seq_len) {
                     const signed char* b_src = input_qs +
@@ -628,12 +635,13 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                     b_word = *reinterpret_cast<const int*>(b_src);
                     *reinterpret_cast<int*>(b_dst) = b_word;
                     if (seq_off == 0u) {
-                        y_d[load_seq] = input_ds[global_seq * blocks_per_row * 8u + chunk];
+                        y_d[stage][load_seq] =
+                            input_ds[global_seq * blocks_per_row * 8u + chunk];
                     }
                 } else {
                     *reinterpret_cast<int*>(b_dst) = 0;
                     if (seq_off == 0u) {
-                        y_d[load_seq] = 0.0f;
+                        y_d[stage][load_seq] = 0.0f;
                     }
                 }
                 int chunk_sum = __dp4a(0x01010101, b_word, 0);
@@ -641,7 +649,7 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                 chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 2u, 8);
                 chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 1u, 8);
                 if ((tid & 7u) == 0u) {
-                    y_s[load_seq] = static_cast<float>(chunk_sum);
+                    y_s[stage][load_seq] = static_cast<float>(chunk_sum);
                 }
             }
             __syncthreads();
@@ -649,18 +657,18 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
             const unsigned a_col_lo = (lane & 3u) * 4u;
             const unsigned a_col_hi = a_col_lo + 16u;
             const int a0 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_lo]);
+                &a_tile[stage][(warp_row_off + t_row_a) * 36u + a_col_lo]);
             const int a1 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_lo]);
+                &a_tile[stage][(warp_row_off + t_row_b) * 36u + a_col_lo]);
             const int a2 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_a) * 36u + a_col_hi]);
+                &a_tile[stage][(warp_row_off + t_row_a) * 36u + a_col_hi]);
             const int a3 = *reinterpret_cast<const int*>(
-                &a_tile[(warp_row_off + t_row_b) * 36u + a_col_hi]);
+                &a_tile[stage][(warp_row_off + t_row_b) * 36u + a_col_hi]);
 
-            const float scale_a = static_cast<float>(x_sc[warp_row_off + t_row_a]);
-            const float scale_b = static_cast<float>(x_sc[warp_row_off + t_row_b]);
-            const float min_a = static_cast<float>(x_mn[warp_row_off + t_row_a]);
-            const float min_b = static_cast<float>(x_mn[warp_row_off + t_row_b]);
+            const float scale_a = static_cast<float>(x_sc[stage][warp_row_off + t_row_a]);
+            const float scale_b = static_cast<float>(x_sc[stage][warp_row_off + t_row_b]);
+            const float min_a = static_cast<float>(x_mn[stage][warp_row_off + t_row_a]);
+            const float min_b = static_cast<float>(x_mn[stage][warp_row_off + t_row_b]);
 
             const unsigned b_seq0 = warp_seq_off + (lane >> 2);
             const unsigned b_col_lo = (lane & 3u) * 4u;
@@ -668,8 +676,10 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
 #pragma unroll
             for (unsigned half = 0; half < 2u; ++half) {
                 const unsigned b_seq = b_seq0 + half * 8u;
-                const int b0 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_lo]);
-                const int b1 = *reinterpret_cast<const int*>(&b_tile[b_seq * 36u + b_col_hi]);
+                const int b0 =
+                    *reinterpret_cast<const int*>(&b_tile[stage][b_seq * 36u + b_col_lo]);
+                const int b1 =
+                    *reinterpret_cast<const int*>(&b_tile[stage][b_seq * 36u + b_col_hi]);
 
                 int d0 = 0;
                 int d1 = 0;
@@ -681,10 +691,10 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                 const unsigned col_hi = t_col_b + half * 8u;
                 const bool seq_lo_valid = (seq_base + col_lo) < seq_len;
                 const bool seq_hi_valid = (seq_base + col_hi) < seq_len;
-                const float sum_qy_lo = y_s[col_lo];
-                const float sum_qy_hi = y_s[col_hi];
-                const float dy_lo = seq_lo_valid ? y_d[col_lo] : 0.0f;
-                const float dy_hi = seq_hi_valid ? y_d[col_hi] : 0.0f;
+                const float sum_qy_lo = y_s[stage][col_lo];
+                const float sum_qy_hi = y_s[stage][col_hi];
+                const float dy_lo = seq_lo_valid ? y_d[stage][col_lo] : 0.0f;
+                const float dy_hi = seq_hi_valid ? y_d[stage][col_hi] : 0.0f;
 
                 block_d[half * 4u + 0u] += dy_lo * scale_a * static_cast<float>(d0);
                 block_d[half * 4u + 1u] += dy_hi * scale_a * static_cast<float>(d1);
@@ -695,7 +705,6 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
                 block_m[half * 4u + 2u] += dy_lo * min_b * sum_qy_lo;
                 block_m[half * 4u + 3u] += dy_hi * min_b * sum_qy_hi;
             }
-            __syncthreads();
         }
 
         const float d_a = x_d[warp_row_off + t_row_a];
