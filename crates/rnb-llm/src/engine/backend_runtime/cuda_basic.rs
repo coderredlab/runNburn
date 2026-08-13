@@ -1752,6 +1752,30 @@ mod tests {
     }
 
     #[test]
+    fn dense_q4k_silu_batch_down_quant_support_matches_cuda_backend() {
+        for quant in [
+            QuantFormat::Q51,
+            QuantFormat::Q80,
+            QuantFormat::Q4K,
+            QuantFormat::Q5K,
+            QuantFormat::Q6K,
+        ] {
+            assert!(dense_q4k_silu_batch_down_quant_supported(quant));
+        }
+        for quant in [
+            QuantFormat::Q2K,
+            QuantFormat::Q50,
+            QuantFormat::Q3K,
+            QuantFormat::IQ2XXS,
+            QuantFormat::IQ2S,
+            QuantFormat::IQ3XXS,
+            QuantFormat::IQ4XS,
+        ] {
+            assert!(!dense_q4k_silu_batch_down_quant_supported(quant));
+        }
+    }
+
+    #[test]
     fn nemotron_device_mamba_trace_bytes_separate_hidden_and_state() {
         let trace = super::NemotronMamba2DeviceTrace {
             boundary_d2h_bytes: 0,
@@ -2086,6 +2110,17 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_batch_if_supported(
     Ok(None)
 }
 
+fn dense_q4k_silu_batch_down_quant_supported(quant: QuantFormat) -> bool {
+    matches!(
+        quant,
+        QuantFormat::Q51
+            | QuantFormat::Q80
+            | QuantFormat::Q4K
+            | QuantFormat::Q5K
+            | QuantFormat::Q6K
+    )
+}
+
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn dense_q4k_silu_ffn_batch_if_supported(
     gate_weight: &QuantizedWeight,
@@ -2104,7 +2139,10 @@ pub(in crate::engine) fn dense_q4k_silu_ffn_batch_if_supported(
     ) else {
         return Ok(None);
     };
-    if gate.quant() != QuantFormat::Q4K || up.quant() != QuantFormat::Q4K {
+    if gate.quant() != QuantFormat::Q4K
+        || up.quant() != QuantFormat::Q4K
+        || !dense_q4k_silu_batch_down_quant_supported(down.quant())
+    {
         return Ok(None);
     }
     #[cfg(feature = "cuda")]

@@ -888,6 +888,11 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
     norm_eps: f32,
     post_norm_eps: f32,
 ) -> Result<Option<(Vec<u16>, Vec<u16>)>, String> {
+    if sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize) {
+        return Err(format!(
+            "CUDA Muse QKV dense chain invalid sliding window: {sliding_window:?}"
+        ));
+    }
     if cols == 0 || !cols.is_multiple_of(256) {
         return Err(format!(
             "CUDA Muse QKV dense chain cols must be non-zero and divisible by 256: {cols}"

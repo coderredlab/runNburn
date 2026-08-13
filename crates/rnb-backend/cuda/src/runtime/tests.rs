@@ -10096,6 +10096,57 @@ fn cuda_prefill_hd128_muse_dense_chain_rejects_invalid_attention_geometry() {
 }
 
 #[test]
+fn cuda_q4k_muse_prefill_hd128_dense_chain_rejects_invalid_window() {
+    let mut invalid_windows = vec![0usize];
+    if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+        invalid_windows.push(too_large);
+    }
+    for window in invalid_windows {
+        let mut hidden = Vec::new();
+        let err = q4k_muse_prefill_hd128_dense_chain(
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            256,
+            128,
+            256,
+            &[],
+            &[],
+            &[],
+            &[],
+            2,
+            1,
+            1.0,
+            10_000.0,
+            0,
+            true,
+            Some(window),
+            &[],
+            &[],
+            &[],
+            &[],
+            12,
+            &[],
+            &[],
+            &[],
+            256,
+            256,
+            256,
+            &mut hidden,
+            1.0e-5,
+            1.0e-6,
+        )
+        .expect_err("invalid fused Muse window must fail before CUDA launch");
+        assert!(
+            err.contains("invalid sliding window"),
+            "unexpected error for window={window}: {err}"
+        );
+    }
+}
+
+#[test]
 fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
