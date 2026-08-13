@@ -3742,6 +3742,7 @@ impl CudaState {
         n_ff: usize,
         n_embd: usize,
         norm_eps: f32,
+        post_norm_eps: f32,
         unit_offset_post_attn_norm: bool,
         unit_offset_ffn_norm: bool,
         hidden_dev: u64,
@@ -3769,7 +3770,7 @@ impl CudaState {
         let mut prequantized_q8 = None;
         if let Some(weight) = post_attn_norm_weight {
             let norm_weight_dev = self.resident_f32_ptr(weight)?;
-            if dense_combined_norms_enabled(true) {
+            if dense_combined_norms_enabled(true) && post_norm_eps.to_bits() == norm_eps.to_bits() {
                 if dense_q8dot_gate_up_enabled(ffn_uses_gelu) {
                     let q8_qs_dev = self.compute_gate_ptrs_ptr(n_embd)?;
                     let q8_ds_dev =
@@ -3818,7 +3819,7 @@ impl CudaState {
                     proj_dev,
                     norm_weight_dev,
                     hidden_dev,
-                    norm_eps,
+                    post_norm_eps,
                     n_embd,
                     unit_offset_post_attn_norm,
                 )?;
@@ -3880,7 +3881,7 @@ impl CudaState {
                 proj_dev,
                 norm_weight_dev,
                 hidden_dev,
-                norm_eps,
+                post_norm_eps,
                 n_embd,
                 unit_offset_ffn_norm,
             )?;
@@ -6148,6 +6149,7 @@ impl CudaState {
         n_embd: usize,
         hidden: &[f32],
         norm_eps: f32,
+        post_norm_eps: f32,
         unit_offset_norm: bool,
         gelu: bool,
     ) -> Result<Vec<f32>, String> {
@@ -6210,7 +6212,7 @@ impl CudaState {
                 ffn_out_dev,
                 norm_weight_dev,
                 hidden_dev,
-                norm_eps,
+                post_norm_eps,
                 n_embd,
                 unit_offset_norm,
             )?;
@@ -6253,6 +6255,7 @@ impl CudaState {
         hidden: &mut [f32],
         attn_out: &[f32],
         norm_eps: f32,
+        post_norm_eps: f32,
         unit_offset_post_attn_norm: bool,
         unit_offset_ffn_norm: bool,
         unit_offset_ple_norm: bool,
@@ -6500,7 +6503,8 @@ impl CudaState {
             && skip_d2h_hidden
             && ple_graph_supported
         {
-            let combined_norms = dense_combined_norms_enabled(true);
+            let combined_norms =
+                dense_combined_norms_enabled(true) && post_norm_eps.to_bits() == norm_eps.to_bits();
             let o_blocks = o_cols / 256;
             let o_q8dot = dense_q4k_gemv_q8dot_enabled(n_embd >= 1024 && o_blocks >= 4);
             let o_weight_dev = self.resident_q4k_weights_ptr_pinned(o_weights)?;
@@ -6681,6 +6685,7 @@ impl CudaState {
                     n_ff,
                     n_embd,
                     norm_eps_bits: norm_eps.to_bits(),
+                    post_norm_eps_bits: post_norm_eps.to_bits(),
                     ffn_uses_gelu,
                     combined_norms,
                     o_q8dot,
@@ -6888,6 +6893,7 @@ impl CudaState {
                                 n_ff,
                                 n_embd,
                                 norm_eps,
+                                post_norm_eps,
                                 unit_offset_post_attn_norm,
                                 unit_offset_ffn_norm,
                                 hidden_dev,
@@ -6994,6 +7000,7 @@ impl CudaState {
                             n_ff,
                             n_embd,
                             norm_eps,
+                            post_norm_eps,
                             unit_offset_post_attn_norm,
                             unit_offset_ffn_norm,
                             hidden_dev,
@@ -7076,7 +7083,9 @@ impl CudaState {
             let mut prequantized_q8 = None;
             if let Some(weight) = post_attn_norm_weight {
                 let norm_weight_dev = self.resident_f32_ptr(weight)?;
-                if dense_combined_norms_enabled(true) {
+                if dense_combined_norms_enabled(true)
+                    && post_norm_eps.to_bits() == norm_eps.to_bits()
+                {
                     if dense_q8dot_gate_up_enabled(ffn_uses_gelu) {
                         let q8_qs_dev = self.compute_gate_ptrs_ptr(n_embd)?;
                         let q8_ds_dev =
@@ -7125,7 +7134,7 @@ impl CudaState {
                         proj_dev,
                         norm_weight_dev,
                         hidden_dev,
-                        norm_eps,
+                        post_norm_eps,
                         n_embd,
                         unit_offset_post_attn_norm,
                     )?;
@@ -7192,7 +7201,7 @@ impl CudaState {
                     proj_dev,
                     norm_weight_dev,
                     hidden_dev,
-                    norm_eps,
+                    post_norm_eps,
                     n_embd,
                     unit_offset_ffn_norm,
                 )?;

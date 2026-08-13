@@ -958,6 +958,7 @@ pub(super) struct DenseChainGraphKey {
     pub(super) n_ff: usize,
     pub(super) n_embd: usize,
     pub(super) norm_eps_bits: u32,
+    pub(super) post_norm_eps_bits: u32,
     pub(super) ffn_uses_gelu: bool,
     pub(super) combined_norms: bool,
     pub(super) o_q8dot: bool,

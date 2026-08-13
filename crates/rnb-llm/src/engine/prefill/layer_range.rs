@@ -44,8 +44,55 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range(
         true,
         false,
         None,
+        None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
+}
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_dflash_features(
+    kv_cache: &mut KVCache,
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+    gemma_per_layer_base: Option<&GemmaPerLayerBase>,
+    hidden: Tensor,
+    layer_range: Range<usize>,
+    seq_len: usize,
+    pos_start: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+    target_layers: &[usize],
+) -> crate::error::Result<(Tensor, Vec<f32>)> {
+    let mut feature_rows = Vec::new();
+    let hidden = run_prefill_layers_cpu_range_impl(
+        kv_cache,
+        metadata,
+        architecture,
+        weights,
+        gemma_per_layer_base,
+        hidden,
+        layer_range,
+        seq_len,
+        pos_start,
+        None,
+        false,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        rope_theta,
+        norm_eps,
+        true,
+        true,
+        None,
+        Some((target_layers, &mut feature_rows)),
+    )?
+    .into_host_for_layer(None, "range_end")?;
+    Ok((hidden, feature_rows))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -86,6 +133,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_external_target_batch(
         norm_eps,
         true,
         true,
+        None,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -129,6 +177,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_non_causal(
         norm_eps,
         true,
         false,
+        None,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -180,6 +229,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_with_positions(
         true,
         false,
         None,
+        None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
 }
@@ -223,6 +273,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_mtp_resident_kv(
         norm_eps,
         false,
         false,
+        None,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -268,6 +319,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_carrier(
         true,
         false,
         None,
+        None,
     )
 }
 
@@ -310,6 +362,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_prefix_state(
         true,
         false,
         prefix_collector,
+        None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
 }
@@ -1988,6 +2041,7 @@ fn run_prefill_layers_cpu_range_impl(
     _mirror_attention_kv_to_host: bool,
     external_target_batch: bool,
     mut prefix_collector: Option<&mut verify_window::GdnPrefixStateCollector>,
+    mut dflash_features: Option<(&[usize], &mut Vec<f32>)>,
 ) -> crate::error::Result<hidden_carrier::PrefillHidden> {
     #[cfg(feature = "cuda")]
     let nemotron_workspace_plan =
@@ -2067,7 +2121,7 @@ fn run_prefill_layers_cpu_range_impl(
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
+    if prefix_collector.is_none() && dflash_features.is_none() && gemma_per_layer_base.is_none() {
         crate::generate::check_generation_cancellation()?;
         let chain_input = hidden
             .as_host()
@@ -2090,7 +2144,7 @@ fn run_prefill_layers_cpu_range_impl(
         }
     }
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
+    if prefix_collector.is_none() && dflash_features.is_none() && gemma_per_layer_base.is_none() {
         let chain_end = match metal_qwen_prefill_chain_diag_layers() {
             Some(0) => layer_range.start,
             Some(prefix_layers) => layer_range
@@ -2126,6 +2180,33 @@ fn run_prefill_layers_cpu_range_impl(
         }
     }
     while layer_idx < layer_range.end {
+        if let Some((target_layers, feature_rows)) = dflash_features.as_mut() {
+            if let Some(feature_index) = target_layers.iter().position(|&layer| layer == layer_idx)
+            {
+                hidden = hidden
+                    .into_host_for_layer(Some(layer_idx), "dflash_target_input")
+                    .map(hidden_carrier::PrefillHidden::Host)?;
+                let source = hidden
+                    .as_host()
+                    .expect("DFlash feature capture materializes host hidden");
+                let source = kernels::tensor_as_f32_slice(source);
+                let feature_dim = target_layers
+                    .len()
+                    .checked_mul(metadata.hidden_dim)
+                    .ok_or_else(|| {
+                        crate::error::LlmError::Forward(
+                            "DFlash target feature width overflow".to_string(),
+                        )
+                    })?;
+                feature_rows.resize(seq_len * feature_dim, 0.0);
+                for token in 0..seq_len {
+                    let src = token * metadata.hidden_dim;
+                    let dst = token * feature_dim + feature_index * metadata.hidden_dim;
+                    feature_rows[dst..dst + metadata.hidden_dim]
+                        .copy_from_slice(&source[src..src + metadata.hidden_dim]);
+                }
+            }
+        }
         if let Err(error) = crate::generate::check_generation_cancellation() {
             #[cfg(feature = "cuda")]
             if nemotron_workspace_active {

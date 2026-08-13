@@ -84,6 +84,14 @@ pub struct MtpLayerTensors {
     pub embed_tokens_weight: Option<String>,
     pub shared_head_head_weight: Option<String>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DFlashMetadata {
+    /// Number of tokens in one DFlash verify block, including the anchor token.
+    pub block_size: usize,
+    /// Target transformer layer-input indices concatenated for feature injection.
+    pub target_layers: Vec<usize>,
+    pub mask_token_id: u32,
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelMetadata {
@@ -151,6 +159,8 @@ pub struct ModelMetadata {
     /// GlmDsa 에서 세 키가 모두 있을 때만 Some.
     pub glm_indexer: Option<GlmIndexerMetadata>,
     pub deepseek4: Option<DeepSeek4Metadata>,
+    /// Generic DFlash sidecar metadata. DeepSeek DSpark and Muse DFlash both use it.
+    pub dflash: Option<DFlashMetadata>,
 }
 
 /// pm119: DSA lightning indexer 하이퍼파라미터 (GLM-5.2: heads=32, key=128, top_k=2048).
@@ -179,11 +189,6 @@ pub struct DeepSeek4Metadata {
     pub rope_original_context_length: usize,
     pub rope_yarn_beta_fast: f32,
     pub rope_yarn_beta_slow: f32,
-    /// DFlash/DSpark sidecar-only metadata. `target_layers` uses the GGUF
-    /// layer-input numbering, so `num_layers` denotes the final trunk output.
-    pub dspark_block_size: Option<usize>,
-    pub dspark_target_layers: Vec<usize>,
-    pub dspark_mask_token_id: Option<u32>,
 }
 
 pub fn detect_architecture(metadata: &[(String, GGUFValue)]) -> Result<Architecture, LoaderError> {
@@ -420,7 +425,38 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
     } else {
         None
     };
-    let deepseek4 = if matches!(arch, Architecture::DeepSeek4 | Architecture::DFlash) {
+    let dflash = if arch == Architecture::DFlash {
+        let block_size = get_u32(metadata, &format!("{prefix}.block_size"))? as usize;
+        let target_layers = get_u32_array(metadata, &format!("{prefix}.target_layers"))?
+            .into_iter()
+            .map(|value| value as usize)
+            .collect::<Vec<_>>();
+        let mask_token_id = get_u32(metadata, "tokenizer.ggml.mask_token_id")?;
+        if block_size < 2 {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!("{prefix}.block_size must be at least 2"),
+            });
+        }
+        if target_layers.is_empty() {
+            return Err(LoaderError::ParseError {
+                offset: 0,
+                msg: format!("{prefix}.target_layers must not be empty"),
+            });
+        }
+        Some(DFlashMetadata {
+            block_size,
+            target_layers,
+            mask_token_id,
+        })
+    } else {
+        None
+    };
+
+    let deepseek4 = if arch == Architecture::DeepSeek4
+        || (arch == Architecture::DFlash
+            && get_u32_opt(metadata, &format!("{prefix}.hyper_connection.count"))?.is_some())
+    {
         let compress_ratios =
             get_u32_array(metadata, &format!("{prefix}.attention.compress_ratios"))?
                 .into_iter()
@@ -491,21 +527,6 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
                 metadata,
                 &format!("{prefix}.rope.scaling.yarn_beta_slow"),
             )?,
-            dspark_block_size: (arch == Architecture::DFlash)
-                .then(|| get_u32(metadata, &format!("{prefix}.block_size")))
-                .transpose()?
-                .map(|value| value as usize),
-            dspark_target_layers: if arch == Architecture::DFlash {
-                get_u32_array(metadata, &format!("{prefix}.target_layers"))?
-                    .into_iter()
-                    .map(|value| value as usize)
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            dspark_mask_token_id: (arch == Architecture::DFlash)
-                .then(|| get_u32(metadata, "tokenizer.ggml.mask_token_id"))
-                .transpose()?,
         })
     } else {
         None
@@ -638,7 +659,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         get_u32_opt(metadata, &format!("{prefix}.expert_gating_func"))?.unwrap_or(0);
     let expert_weights_norm =
         get_bool_opt(metadata, &format!("{prefix}.expert_weights_norm"))?.unwrap_or(false);
-    if matches!(arch, Architecture::DeepSeek4 | Architecture::DFlash) && expert_gating_func != 4 {
+    if deepseek4.is_some() && expert_gating_func != 4 {
         return Err(LoaderError::ParseError {
             offset: 0,
             msg: format!(
@@ -740,9 +761,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         ("tokenizer.ggml.padding_token_id", padding_id),
         (
             "tokenizer.ggml.mask_token_id",
-            deepseek4
-                .as_ref()
-                .and_then(|metadata| metadata.dspark_mask_token_id),
+            dflash.as_ref().map(|metadata| metadata.mask_token_id),
         ),
     ] {
         if id.is_some_and(|id| id as usize >= effective_vocab_size) {
@@ -862,6 +881,7 @@ pub fn extract_metadata(metadata: &[(String, GGUFValue)]) -> Result<ModelMetadat
         assistant,
         glm_indexer,
         deepseek4,
+        dflash,
     })
 }
 
@@ -1917,11 +1937,11 @@ mod tests {
             ),
         ]);
         let metadata = extract_metadata(&dflash_meta).unwrap();
-        assert_eq!(metadata.architecture, Architecture::DFlash);
-        let dflash = metadata.deepseek4.expect("DFlash metadata");
-        assert_eq!(dflash.dspark_block_size, Some(5));
-        assert_eq!(dflash.dspark_target_layers, vec![41, 42, 43]);
-        assert_eq!(dflash.dspark_mask_token_id, Some(128799));
+        assert!(metadata.deepseek4.is_some());
+        let dflash = metadata.dflash.expect("DFlash metadata");
+        assert_eq!(dflash.block_size, 5);
+        assert_eq!(dflash.target_layers, vec![41, 42, 43]);
+        assert_eq!(dflash.mask_token_id, 128799);
 
         let mut invalid_mask = dflash_meta.clone();
         invalid_mask

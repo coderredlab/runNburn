@@ -1052,6 +1052,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
                 &mut scratch.hidden[..hidden_dim],
                 &scratch.attn_out[..q_dim],
                 norm_eps,
+                args.post_norm_eps.unwrap_or(norm_eps),
                 args.unit_offset_post_attn_norm,
                 args.unit_offset_ffn_norm,
                 args.unit_offset_ple_norm,

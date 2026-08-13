@@ -54,6 +54,16 @@ impl MtpStats {
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
+
+fn dflash_should_fallback_to_target(
+    rounds: usize,
+    accepted: usize,
+    speculative_ms: f64,
+    target_token_ms: f64,
+) -> bool {
+    let committed = rounds + accepted;
+    rounds >= 1 && committed > 0 && speculative_ms > target_token_ms * committed as f64 * 1.05
+}
 fn trace_mtp_sequence_state(engine: &Engine, label: &str) {
     if crate::engine::policy::env_os_string("RNB_MTP_STATE_TRACE").is_none() {
         return;
@@ -807,6 +817,17 @@ fn generate_stream_mtp_with_tokens(
     let start = prefilled
         .as_ref()
         .map_or_else(Instant::now, |prompt| prompt.started_at);
+
+    if engine.mtp_is_muse_dflash_runtime() {
+        return generate_with_muse_dflash(
+            engine,
+            prompt_tokens,
+            resume_from,
+            prefilled,
+            params,
+            callback,
+        );
+    }
 
     if engine.mtp_is_dspark_runtime() {
         return generate_with_dspark(
@@ -2016,6 +2037,340 @@ fn dspark_confident_prefix_len(confidences: &[f32], max_tokens: usize) -> usize 
 /// 4. EOS/stop token/max_tokens 도달 시 종료.
 ///
 /// Greedy와 target-sampler-equality 확률 verify를 같은 DSpark batch 결과로 처리한다.
+fn generate_with_muse_dflash(
+    engine: &mut Engine,
+    prompt_tokens: &[u32],
+    resume_from: Option<usize>,
+    prefilled: Option<MtpPrefilledPrompt>,
+    params: &GenerateParams,
+    mut callback: impl FnMut(&str) -> bool,
+) -> crate::error::Result<GenerateResult> {
+    let start = prefilled
+        .as_ref()
+        .map_or_else(Instant::now, |prompt| prompt.started_at);
+    let eos = engine.tokenizer.vocab.special.eos;
+    let prompt_len = prefilled
+        .as_ref()
+        .map_or(prompt_tokens.len(), |prompt| prompt.physical_prompt_len);
+    let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
+        (prefilled.logits, elapsed_ms(start))
+    } else {
+        let forward_tokens = if let Some(resume_from) = resume_from {
+            prompt_tokens.get(resume_from..).ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "Muse DFlash resume offset {resume_from} exceeds prompt length {prompt_len}"
+                ))
+            })?
+        } else {
+            engine.clear_sequence_state()?;
+            prompt_tokens
+        };
+        if forward_tokens.is_empty() {
+            return Err(crate::error::LlmError::Forward(
+                "Muse DFlash resume requires at least one uncached prompt token".to_string(),
+            ));
+        }
+        let prefill_start = Instant::now();
+        let logits = engine.forward_prompt(forward_tokens)?;
+        (logits, elapsed_ms(prefill_start))
+    };
+
+    let mut rng = match params.seed {
+        Some(seed) => SmallRng::seed_from_u64(seed),
+        None => SmallRng::from_entropy(),
+    };
+    let mut sampler = SamplerChain::from_params(params);
+    let sampled_verify = mtp_sampled_verify_allowed(params);
+    let mut generated_tokens = Vec::new();
+    let mut generated_text = GeneratedTextStream::new();
+    let Some(mut tokens_remaining) = mtp_initial_generation_budget(params.max_tokens)? else {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    };
+    let first_token = next_token_from_current_logits(
+        engine,
+        &mut logits,
+        &mut sampler,
+        &generated_tokens,
+        &mut rng,
+        params,
+    )?;
+    if params.should_stop(first_token, eos) {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            0,
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    }
+    generated_tokens.push(first_token);
+    if !generated_text.push(&engine.tokenizer, first_token, &mut callback) {
+        return Ok(GenerateResult::new(
+            generated_text.finish(&mut callback),
+            generated_tokens.len(),
+            prompt_len,
+            start.elapsed().as_secs_f32(),
+            generated_tokens,
+        ));
+    }
+    tokens_remaining = tokens_remaining.saturating_sub(1);
+    let mut current_token = first_token;
+    let mut stats = MtpStats {
+        rounds: 0,
+        drafted: 0,
+        accepted: 0,
+        carried: 0,
+        target_verify_steps: 0,
+        target_verify_invocations: 0,
+    };
+    let mut phase = MtpPhaseTimings::default();
+    let decode_loop_start = Instant::now();
+    let adaptive_target = crate::engine::policy::env_string("RNB_MTP_DFLASH_ADAPTIVE_TARGET")
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true);
+    let target_token_probe_ms = if adaptive_target {
+        let checkpoint = SpecCheckpoint::save_engine(engine)?;
+        let probe_start = Instant::now();
+        let _ = engine.forward(&[current_token])?;
+        let probe_ms = elapsed_ms(probe_start);
+        checkpoint.restore_engine(engine)?;
+        Some(probe_ms)
+    } else {
+        None
+    };
+
+    while tokens_remaining > 0 {
+        crate::generate::check_generation_cancellation()?;
+        let max_draft_tokens = params.spec_k.max(1).min(tokens_remaining).min(15);
+        let draft_start = Instant::now();
+        let draft = engine.mtp_dflash_draft(current_token, max_draft_tokens)?;
+        phase.draft_ms += elapsed_ms(draft_start);
+        let effective_n = draft.tokens.len();
+        if effective_n == 0 {
+            break;
+        }
+        let drafts = &draft.tokens[..effective_n];
+        stats.rounds += 1;
+        stats.drafted += effective_n;
+
+        let checkpoint_start = Instant::now();
+        let checkpoint = SpecCheckpoint::save_engine(engine)?;
+        phase.checkpoint_ms += elapsed_ms(checkpoint_start);
+        let mut verify_tokens = Vec::with_capacity(effective_n + 1);
+        verify_tokens.push(current_token);
+        verify_tokens.extend_from_slice(drafts);
+        let verify_start = Instant::now();
+        let (mut verify, dflash_features) =
+            engine.forward_prefill_dflash_verify(&verify_tokens, sampled_verify)?;
+        phase.verify_ms += elapsed_ms(verify_start);
+        stats.add_target_verify(verify.target_tokens.len(), 1);
+        if verify.target_tokens.len() != verify_tokens.len() {
+            return Err(crate::error::LlmError::Forward(format!(
+                "Muse DFlash verify returned {} predictions for {} tokens",
+                verify.target_tokens.len(),
+                verify_tokens.len()
+            )));
+        }
+        if !sampled_verify && params.ignore_eos {
+            let hidden_dim = engine.metadata.hidden_dim;
+            for (index, prediction) in verify.target_tokens.iter_mut().enumerate() {
+                let start = index * hidden_dim;
+                let hidden = verify
+                    .output_hidden_rows
+                    .get(start..start + hidden_dim)
+                    .ok_or_else(|| {
+                        crate::error::LlmError::Forward(format!(
+                            "Muse DFlash verify hidden row missing at index {index}"
+                        ))
+                    })?;
+                *prediction =
+                    replace_ignored_eos_output_target(engine, params, *prediction, hidden, eos)?;
+            }
+        }
+
+        let (accepted, correction, sampled_stopped, target_trace) = if sampled_verify {
+            let (accepted, correction, stopped) = sample_target_window_prefix(
+                &verify.output_logits,
+                drafts,
+                engine.metadata.vocab_size,
+                params,
+                eos,
+                &mut sampler,
+                &mut generated_tokens,
+                &mut rng,
+            )?;
+            let mut target_trace = drafts[..accepted].to_vec();
+            if stopped {
+                if let Some(&stop_token) = drafts.get(accepted) {
+                    target_trace.push(stop_token);
+                }
+            } else if let Some(correction) = correction {
+                target_trace.push(correction);
+            }
+            (accepted, correction, stopped, target_trace)
+        } else {
+            let accepted =
+                crate::mtp_sampling::greedy_matched_prefix(drafts, &verify.target_tokens);
+            (
+                accepted,
+                Some(verify.target_tokens[accepted]),
+                false,
+                verify.target_tokens.clone(),
+            )
+        };
+        if crate::runtime::mtp_trace_enabled() {
+            eprintln!(
+                "[MTP/dflash-trace] anchor={current_token} draft={drafts:?} probability={:?} target={target_trace:?} accepted={accepted}",
+                &draft.probabilities[..effective_n],
+            );
+        }
+        stats.accepted += accepted;
+        let mut round = crate::mtp_sampling::GreedyRound::new();
+        for index in 0..accepted {
+            match round.observe(index, drafts[index], drafts[index], accepted, params, eos) {
+                crate::mtp_sampling::RoundAction::Reject
+                | crate::mtp_sampling::RoundAction::Stop => break,
+                crate::mtp_sampling::RoundAction::AcceptWithoutEmit => continue,
+                crate::mtp_sampling::RoundAction::Emit => {}
+            }
+            generated_tokens.push(drafts[index]);
+            let keep_going = generated_text.push(&engine.tokenizer, drafts[index], &mut callback);
+            if !round.after_emit(keep_going, &mut tokens_remaining) {
+                break;
+            }
+        }
+        let emitted = round.emitted();
+        let stopped = sampled_stopped || round.stopped();
+        let committed_tokens = 1 + emitted;
+        if committed_tokens != verify_tokens.len() {
+            let retain_start = Instant::now();
+            let feature_dim = engine
+                .metadata
+                .hidden_dim
+                .checked_mul(engine.mtp_dflash_target_layers().len())
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Muse DFlash committed feature width overflow".to_string(),
+                    )
+                })?;
+            let committed_feature_values =
+                committed_tokens.checked_mul(feature_dim).ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Muse DFlash committed feature length overflow".to_string(),
+                    )
+                })?;
+            let committed_features = dflash_features.get(..committed_feature_values)
+                .ok_or_else(|| {
+                    crate::error::LlmError::Forward(format!(
+                        "Muse DFlash verify features too short: committed={committed_tokens} feature_dim={feature_dim} values={}",
+                        dflash_features.len()
+                    ))
+                })?;
+            engine.commit_kv_through((checkpoint.kv_len + committed_tokens) as u32)?;
+            engine
+                .restore_batch_verify_last_hidden(&verify.output_hidden_rows, committed_tokens)?;
+            let mtp_checkpoint = checkpoint.mtp_checkpoint().ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "Muse DFlash checkpoint has no drafter state".to_string(),
+                )
+            })?;
+            engine.mtp_dflash_retain_verified_prefix(
+                mtp_checkpoint,
+                committed_features,
+                committed_tokens,
+            )?;
+            phase.retain_ms += elapsed_ms(retain_start);
+        }
+        if stopped || tokens_remaining == 0 {
+            break;
+        }
+        let correction = correction.ok_or_else(|| {
+            crate::error::LlmError::Forward(
+                "Muse DFlash sampled verify did not produce a correction token".to_string(),
+            )
+        })?;
+        if params.should_stop(correction, eos) {
+            break;
+        }
+        generated_tokens.push(correction);
+        if !generated_text.push(&engine.tokenizer, correction, &mut callback) {
+            break;
+        }
+        tokens_remaining = tokens_remaining.saturating_sub(1);
+        current_token = correction;
+        if let Some(target_token_ms) = target_token_probe_ms {
+            let speculative_ms =
+                phase.checkpoint_ms + phase.draft_ms + phase.verify_ms + phase.retain_ms;
+            let committed = stats.rounds + stats.accepted;
+            if dflash_should_fallback_to_target(
+                stats.rounds,
+                stats.accepted,
+                speculative_ms,
+                target_token_ms,
+            ) {
+                if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
+                    eprintln!(
+                        "  [MTP/dflash] adaptive_target rounds={} speculative={:.1}ms committed={} target_probe={:.1}ms",
+                        stats.rounds, speculative_ms, committed, target_token_ms,
+                    );
+                }
+                let mut target_logits = engine.forward(&[current_token])?;
+                while tokens_remaining > 0 {
+                    crate::generate::check_generation_cancellation()?;
+                    let token = next_token_from_current_logits(
+                        engine,
+                        &mut target_logits,
+                        &mut sampler,
+                        &generated_tokens,
+                        &mut rng,
+                        params,
+                    )?;
+                    if params.should_stop(token, eos) {
+                        break;
+                    }
+                    generated_tokens.push(token);
+                    if !generated_text.push(&engine.tokenizer, token, &mut callback) {
+                        break;
+                    }
+                    tokens_remaining = tokens_remaining.saturating_sub(1);
+                    current_token = token;
+                    target_logits = engine.forward(&[current_token])?;
+                    if tokens_remaining == 0 {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
+        eprintln!("[MTP/dflash] {}", stats.report());
+        eprintln!("{}", phase.report(stats.rounds));
+        eprintln!(
+            "  [MTP/dflash] wall_split prompt_prefill={:.1}ms decode_loop={:.1}ms",
+            prompt_prefill_ms,
+            elapsed_ms(decode_loop_start),
+        );
+    }
+    Ok(GenerateResult::new(
+        generated_text.finish(&mut callback),
+        generated_tokens.len(),
+        prompt_len,
+        start.elapsed().as_secs_f32(),
+        generated_tokens,
+    ))
+}
+
 fn generate_with_dspark(
     engine: &mut Engine,
     prompt_tokens: &[u32],
@@ -2929,6 +3284,13 @@ mod tests {
     fn mtp_zero_token_budget_skips_initial_sample() {
         assert_eq!(mtp_initial_generation_budget(0).unwrap(), None);
         assert_eq!(mtp_initial_generation_budget(1).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn dflash_falls_back_when_speculation_loses_to_measured_target() {
+        assert!(!dflash_should_fallback_to_target(0, 0, 1_000.0, 50.0));
+        assert!(!dflash_should_fallback_to_target(1, 2, 157.5, 50.0));
+        assert!(dflash_should_fallback_to_target(1, 2, 157.6, 50.0));
     }
 
     #[test]

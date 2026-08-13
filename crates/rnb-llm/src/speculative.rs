@@ -82,6 +82,10 @@ impl SpecCheckpoint {
         })
     }
 
+    pub(crate) fn mtp_checkpoint(&self) -> Option<&crate::engine::mtp::EngineMtpCheckpoint> {
+        self.mtp.as_ref()
+    }
+
     /// Checkpoint 시점으로 KV cache + SSM state 복원.
     /// KV cache의 데이터는 남아있지만 current_len 기준으로 무시됨.
     /// &self로 받아서 restore 후에도 kv_len 등 필드 참조 가능.

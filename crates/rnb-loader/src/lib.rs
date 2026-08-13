@@ -6,7 +6,8 @@ mod mtp_sidecar;
 pub mod vision_projector;
 
 pub use arch::{
-    Architecture, DeepSeek4Metadata, ModelLayerKind, ModelMetadata, MtpLayerTensors, MtpMetadata,
+    Architecture, DFlashMetadata, DeepSeek4Metadata, ModelLayerKind, ModelMetadata,
+    MtpLayerTensors, MtpMetadata,
 };
 pub use error::LoaderError;
 pub use gguf::types::GGMLType;
@@ -230,6 +231,7 @@ mod model_ir_tests {
             assistant: None,
             glm_indexer: None,
             deepseek4: None,
+            dflash: None,
         }
     }
 
@@ -462,6 +464,7 @@ mod mtp_sidecar_tests {
             assistant: None,
             glm_indexer: None,
             deepseek4: None,
+            dflash: None,
         };
         metadata.architecture = Architecture::Qwen35;
         let mut weights: HashMap<String, Tensor> = HashMap::new();
@@ -554,6 +557,7 @@ mod mtp_sidecar_tests {
             assistant: None,
             glm_indexer: None,
             deepseek4: None,
+            dflash: None,
         };
         let mut weights: HashMap<String, Tensor> = HashMap::new();
         let mut float_shapes: HashMap<String, Vec<usize>> = HashMap::new();

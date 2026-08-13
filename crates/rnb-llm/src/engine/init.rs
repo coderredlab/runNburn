@@ -751,17 +751,24 @@ impl Engine {
                                     &sidecar.metadata.tokenizer,
                                 ) {
                                     return Err(crate::error::LlmError::ModelLoad(
-                                        "DSpark tokenizer contract does not match target GGUF"
+                                        "DFlash tokenizer contract does not match target GGUF"
                                             .to_string(),
                                     ));
                                 }
-                                let runtime = super::weight_loading::load_dspark_runtime(
-                                    &sidecar,
-                                    sparse_moe_cuda_enabled,
-                                )?;
-                                engine.attach_dspark_runtime(runtime)
-                            })
-                            .map(|()| "DeepSeek4 DSpark"),
+                                if sidecar.metadata.deepseek4.is_some() {
+                                    let runtime = super::weight_loading::load_dspark_runtime(
+                                        &sidecar,
+                                        sparse_moe_cuda_enabled,
+                                    )?;
+                                    engine.attach_dspark_runtime(runtime)?;
+                                    Ok("DeepSeek4 DSpark")
+                                } else {
+                                    let runtime =
+                                        super::weight_loading::load_muse_dflash_runtime(&sidecar)?;
+                                    engine.attach_muse_dflash_runtime(runtime)?;
+                                    Ok("Muse DFlash")
+                                }
+                            }),
                         Ok(_) => rnb_mtp::drafter::load_drafter(drafter_path)
                             .map_err(|error| crate::error::LlmError::ModelLoad(error.to_string()))
                             .and_then(|drafter| engine.attach_external_drafter(drafter))

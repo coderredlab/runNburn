@@ -276,6 +276,7 @@ pub(super) fn compute_prefill_attention(
             num_kv_heads,
             head_dim,
             resolve_attention_scale(metadata, architecture),
+            None,
         )? {
             Tensor::from_vec(out, &[seq_len, layout.q_dim])
         } else {

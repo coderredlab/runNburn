@@ -1,4 +1,25 @@
 use std::sync::OnceLock;
+thread_local! {
+    static DFLASH_EXACT_VERIFY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct DflashExactVerifyGuard;
+
+impl Drop for DflashExactVerifyGuard {
+    fn drop(&mut self) {
+        DFLASH_EXACT_VERIFY_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub fn with_dflash_exact_verify<T>(f: impl FnOnce() -> T) -> T {
+    DFLASH_EXACT_VERIFY_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    let _guard = DflashExactVerifyGuard;
+    f()
+}
+
+fn dflash_exact_verify_active() -> bool {
+    DFLASH_EXACT_VERIFY_DEPTH.with(|depth| depth.get() != 0)
+}
 
 fn env_bool(name: &str, default: bool) -> bool {
     match std::env::var(name) {
@@ -145,7 +166,7 @@ pub fn mmq_tile32_min_seq() -> usize {
 
 pub fn q4k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
     let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
-    eligible && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
+    eligible && !dflash_exact_verify_active() && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
 }
 
 /// cu226: MMQ tile 의 CTA 당 seq 폭 64 확대 게이트. ncu 재귀속에서 tile32 가
@@ -818,6 +839,18 @@ pub fn decode_attention_hd512_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_HD512", true)
 }
 
+pub fn decode_attention_hd128_split_enabled() -> bool {
+    env_bool("RNB_CUDA_DECODE_ATTN_HD128_SPLIT", true)
+}
+
+pub fn decode_attention_hd128_split_chunk_size() -> usize {
+    std::env::var("RNB_CUDA_DECODE_ATTN_HD128_SPLIT_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&chunk| matches!(chunk, 64 | 128 | 256 | 512))
+        .unwrap_or(128)
+}
+
 pub fn decode_attention_hd256_split_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_HD256_SPLIT", true)
 }
@@ -1149,6 +1182,10 @@ pub fn prefill_flash_attention_hd512_w256_enabled() -> bool {
     env_bool("RNB_CUDA_PREFILL_FLASH_ATTN_HD512_W256", true)
 }
 
+pub fn attention_decode_hd128_warp_enabled() -> bool {
+    env_bool("RNB_CUDA_ATTENTION_DECODE_HD128_WARP", true)
+}
+
 pub fn prefill_flash_attention_min_seq(head_dim: usize) -> usize {
     let env_name = match head_dim {
         128 => "RNB_CUDA_PREFILL_FLASH_ATTN_HD128_MIN_SEQ",
@@ -1408,6 +1445,18 @@ mod tests {
         assert!(!nemotron_prefill_group4_enabled(15, 64));
         assert!(!nemotron_prefill_group4_enabled(16, 63));
         assert!(nemotron_prefill_group4_enabled(16, 64));
+    }
+
+    #[test]
+    fn dflash_exact_verify_scope_is_nested_and_restored() {
+        assert!(!dflash_exact_verify_active());
+        with_dflash_exact_verify(|| {
+            assert!(dflash_exact_verify_active());
+            with_dflash_exact_verify(|| assert!(dflash_exact_verify_active()));
+            assert!(dflash_exact_verify_active());
+            assert!(!q4k_mmq_tile32_enabled(8, 1024, 4));
+        });
+        assert!(!dflash_exact_verify_active());
     }
 
     #[test]

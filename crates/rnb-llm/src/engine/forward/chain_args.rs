@@ -41,6 +41,7 @@ pub(in crate::engine) struct ChainArgs<'a> {
     pub post_attn_norm: Option<&'a [f32]>,
     pub ffn_norm: &'a [f32],
     pub post_ffn_norm: Option<&'a [f32]>,
+    pub post_norm_eps: Option<f32>,
 
     pub ple_gate_weight: Option<&'a QuantizedWeight>,
     pub ple_proj_weight: Option<&'a QuantizedWeight>,
@@ -200,7 +201,9 @@ pub(in crate::engine) fn chain_function_active(ctx: &ChainCallerCtx<'_>) -> bool
                 }
                 true
             }
-            ModelArchitecture::LLaMA | ModelArchitecture::Qwen35 => true,
+            ModelArchitecture::LLaMA
+            | ModelArchitecture::Qwen35
+            | ModelArchitecture::MuseGlimmer => true,
             _ => false,
         }
     }
@@ -223,7 +226,10 @@ pub(in crate::engine) fn chain_hidden_carrier_continuous(ctx: &ChainCallerCtx<'_
 
 /// arch 단독 게이트 — 모든 decode 층이 chain 을 타는 arch 만 true.
 fn arch_hidden_carrier_continuous(architecture: ModelArchitecture) -> bool {
-    !matches!(architecture, ModelArchitecture::Qwen35)
+    !matches!(
+        architecture,
+        ModelArchitecture::Qwen35 | ModelArchitecture::MuseGlimmer
+    )
 }
 
 /// Build the chain function arguments for this `(arch, layer)`, or `None` if
@@ -286,6 +292,7 @@ pub(in crate::engine) fn compute_chain_function_args<'a>(
             // residual + post_attention_norm 이 ffn_norm 슬롯에 로드됨). GDN 층이
             // 사이에 껴 hidden carrier 연속성이 없으므로 skip_h2d/d2h 없이 진입.
             ModelArchitecture::Qwen35 => build_silu_dense_args(ctx, false),
+            ModelArchitecture::MuseGlimmer => build_muse_args(ctx),
             // Phi dense 등은 후속.
             _ => None,
         };
@@ -383,6 +390,7 @@ fn build_silu_dense_args<'a>(
         post_attn_norm: None, // Llama 없음
         ffn_norm: ffn_norm_data,
         post_ffn_norm: None, // Llama 없음
+        post_norm_eps: None,
         ple_gate_weight: None,
         ple_proj_weight: None,
         ple_post_norm_weight: None,
@@ -402,6 +410,53 @@ fn build_silu_dense_args<'a>(
         layer_segment_graph_allowed: false,
         layer_segment_graph_request: None,
         ffn_uses_gelu: false, // Llama FFN = silu
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn build_muse_args<'a>(ctx: &ChainCallerCtx<'a>) -> Option<ChainArgs<'a>> {
+    let w = ctx.w;
+    let post_attn_norm = w
+        .post_attn_norm
+        .as_ref()
+        .map(kernels::tensor_as_f32_slice)?;
+    let post_ffn_norm = w.post_ffw_norm.as_ref().map(kernels::tensor_as_f32_slice)?;
+    let hidden_carrier_dev = {
+        let bytes = ctx.hidden_dim * std::mem::size_of::<f32>();
+        backend_runtime::acquire_decode_hidden_carrier(bytes).ok()
+    };
+
+    Some(ChainArgs {
+        o_weight: &w.o_weight,
+        gate_weight: &w.ffn_gate_weight,
+        up_weight: &w.ffn_up_weight,
+        down_weight: &w.ffn_down_weight,
+        post_attn_norm: Some(post_attn_norm),
+        ffn_norm: kernels::tensor_as_f32_slice(&w.ffn_norm),
+        post_ffn_norm: Some(post_ffn_norm),
+        post_norm_eps: Some(ctx.metadata.post_norm_eps),
+        ple_gate_weight: None,
+        ple_proj_weight: None,
+        ple_post_norm_weight: None,
+        ple_input: None,
+        ple_input_device_offset: None,
+        ple_dim: 0,
+        ple_fused: false,
+        unit_offset_post_attn_norm: false,
+        unit_offset_ffn_norm: false,
+        unit_offset_ple_norm: false,
+        layer_output_scale: None,
+        hidden_carrier_dev,
+        skip_h2d_hidden: false,
+        skip_d2h_hidden: false,
+        attn_out_dev_carrier: ctx
+            .attn_on_device
+            .then_some(ctx.attn_out_carrier_dev)
+            .flatten(),
+        dense_chain_graph_allowed: false,
+        layer_segment_graph_allowed: false,
+        layer_segment_graph_request: None,
+        ffn_uses_gelu: false,
     })
 }
 
@@ -590,6 +645,7 @@ fn build_gemma_args<'a>(ctx: &ChainCallerCtx<'a>) -> Option<ChainArgs<'a>> {
         post_attn_norm,
         ffn_norm: ffn_norm_data,
         post_ffn_norm,
+        post_norm_eps: None,
         ple_gate_weight,
         ple_proj_weight,
         ple_post_norm_weight,
@@ -650,11 +706,14 @@ mod tests {
         ));
     }
 
-    // cu203: Qwen35 는 GDN 층이 사이에 껴 hidden carrier 가 층간 stale — W1 rms
-    // carrier 게이트가 반드시 꺼져야 한다 (켜지면 stale carrier 로 norm → garbage).
+    // Qwen35 는 GDN 층이, Muse 는 gated QKV host path 가 층 사이에서 host hidden 을
+    // 소비한다. 둘 다 chain 끝의 device carrier 를 다음 층 입력으로 재사용할 수 없다.
     #[test]
-    fn qwen35_hidden_carrier_is_not_continuous() {
+    fn qwen35_and_muse_hidden_carriers_are_not_continuous() {
         assert!(!arch_hidden_carrier_continuous(ModelArchitecture::Qwen35));
+        assert!(!arch_hidden_carrier_continuous(
+            ModelArchitecture::MuseGlimmer
+        ));
         assert!(arch_hidden_carrier_continuous(ModelArchitecture::LLaMA));
         assert!(arch_hidden_carrier_continuous(ModelArchitecture::Gemma4));
     }

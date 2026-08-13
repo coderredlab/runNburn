@@ -253,6 +253,86 @@ pub fn prefill_attention_hd128_muse_dense_chain_if_supported(
     .map_err(|err| format!("CUDA Muse prefill attention dense chain failed: {err}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_hd128_f16kv_muse_dense_chain_if_supported(
+    q: &[f32],
+    k: &[u16],
+    v: &[u16],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    has_softcap: bool,
+    o: &[u8],
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    down_quant: GGMLType,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<bool> {
+    let q_rows = num_heads.saturating_mul(128);
+    let kv_rows = num_kv_heads.saturating_mul(128);
+    if !backend::tuning::prefill_flash_attention_enabled()
+        || has_softcap
+        || seq_len == 0
+        || kv_len < seq_len
+        || num_heads == 0
+        || num_heads > MUSE_HD128_MAX_GRID_Y
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || head_dim != 128
+        || n_ff == 0
+        || n_embd == 0
+        || muse_hd128_window_is_invalid(sliding_window)
+        || muse_hd128_attention_extents_are_invalid(
+            seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd,
+        )
+        || muse_hd128_dense_tail_weight_extents_are_invalid(o_cols, n_ff, n_embd, down_quant)
+    {
+        return Ok(false);
+    }
+    backend::attention_prefill_flash_hd128_f16kv_muse_dense_chain(
+        q,
+        k,
+        v,
+        attention_gate,
+        seq_len,
+        kv_len,
+        num_heads,
+        num_kv_heads,
+        scale,
+        sliding_window,
+        o,
+        gate,
+        up,
+        down,
+        down_quant as u32,
+        post_attn_norm_weight,
+        ffn_norm_weight,
+        post_ffn_norm_weight,
+        o_cols,
+        n_ff,
+        n_embd,
+        hidden,
+        norm_eps,
+        post_norm_eps,
+    )
+    .map(|()| true)
+    .map_err(|err| format!("CUDA Muse F16 KV prefill attention dense chain failed: {err}"))
+}
+
 fn muse_hd128_window_is_invalid(sliding_window: Option<usize>) -> bool {
     sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
 }
@@ -480,6 +560,66 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn dflash_q4k_layer_chain(
+    q_weights: &[u8],
+    k_weights: &[u8],
+    v_weights: &[u8],
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    prior_k: &[u16],
+    prior_v: &[u16],
+    hidden: &mut [f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    ffn_norm_weight: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    window: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+) -> Result<()> {
+    backend::dflash_q4k_layer_chain(
+        q_weights,
+        k_weights,
+        v_weights,
+        o_weights,
+        gate_weights,
+        up_weights,
+        down_weights,
+        q_rows,
+        kv_rows,
+        cols,
+        prior_k,
+        prior_v,
+        hidden,
+        attn_norm_weight,
+        q_norm,
+        k_norm,
+        ffn_norm_weight,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        window,
+        n_ff,
+        n_embd,
+        norm_eps,
+    )
+    .map_err(|err| format!("CUDA DFlash layer chain failed: {err}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_attention_non_causal_if_supported(
     q: &[f32],
     k: &[f32],
@@ -490,6 +630,7 @@ pub fn prefill_attention_non_causal_if_supported(
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    sliding_window: Option<usize>,
 ) -> Result<Option<Vec<f32>>> {
     backend::attention_prefill_flash_f32_non_causal(
         q,
@@ -501,6 +642,7 @@ pub fn prefill_attention_non_causal_if_supported(
         num_kv_heads,
         head_dim,
         scale,
+        sliding_window,
     )
     .map(Some)
     .map_err(|err| format!("CUDA non-causal prefill attention failed: {err}"))

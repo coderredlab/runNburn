@@ -15,6 +15,99 @@ fn cuda_error(err: String) -> crate::error::LlmError {
     crate::error::LlmError::Forward(err)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
+    q_weight: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v_weight: &QuantizedWeight,
+    o_weight: &QuantizedWeight,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    prior_k: &[u16],
+    prior_v: &[u16],
+    hidden: &mut [f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    ffn_norm_weight: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    window: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+) -> crate::error::Result<bool> {
+    #[cfg(feature = "cuda")]
+    {
+        if crate::engine::policy::env_string("RNB_DFLASH_DEVICE_CHAIN").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        }) {
+            return Ok(false);
+        }
+        let (Some(q), Some(k), Some(v), Some(o), Some(gate), Some(up), Some(down)) = (
+            q_weight.backend_view(),
+            k_weight.backend_view(),
+            v_weight.backend_view(),
+            o_weight.backend_view(),
+            gate_weight.backend_view(),
+            up_weight.backend_view(),
+            down_weight.backend_view(),
+        ) else {
+            return Ok(false);
+        };
+        if q.quant() != QuantFormat::Q4K
+            || k.quant() != QuantFormat::Q4K
+            || v.quant() != QuantFormat::Q6K
+            || o.quant() != QuantFormat::Q4K
+            || gate.quant() != QuantFormat::Q4K
+            || up.quant() != QuantFormat::Q4K
+            || down.quant() != QuantFormat::Q6K
+        {
+            return Ok(false);
+        }
+        cuda_runtime::dflash_q4k_layer_chain(
+            q.raw(),
+            k.raw(),
+            v.raw(),
+            o.raw(),
+            gate.raw(),
+            up.raw(),
+            down.raw(),
+            q.rows(),
+            k.rows(),
+            q.cols(),
+            prior_k,
+            prior_v,
+            hidden,
+            attn_norm_weight,
+            q_norm,
+            k_norm,
+            ffn_norm_weight,
+            num_heads,
+            num_kv_heads,
+            scale,
+            rope_theta,
+            pos_start,
+            window,
+            n_ff,
+            n_embd,
+            norm_eps,
+        )
+        .map_err(cuda_error)?;
+        return Ok(true);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(false)
+}
+
 #[cfg(feature = "cuda")]
 pub(in crate::engine) fn gemma4_moe_admitted(
     gate_up_weight_bytes: usize,
@@ -2010,6 +2103,7 @@ pub(in crate::engine) fn prefill_attention_non_causal_if_supported(
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    sliding_window: Option<usize>,
 ) -> crate::error::Result<Option<Vec<f32>>> {
     #[cfg(feature = "cuda")]
     {
@@ -2023,6 +2117,7 @@ pub(in crate::engine) fn prefill_attention_non_causal_if_supported(
             num_kv_heads,
             head_dim,
             scale,
+            sliding_window,
         )
         .map_err(cuda_error);
     }
@@ -2221,6 +2316,7 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
     post_norm_weight: Option<&[f32]>,
     hidden: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_norm: bool,
     ffn_uses_gelu: bool,
 ) -> crate::error::Result<Option<Vec<f32>>> {
@@ -2253,6 +2349,7 @@ pub(in crate::engine) fn dense_q4k_gelu_ffn_norm_residual_if_supported(
             gate.cols(),
             hidden,
             norm_eps,
+            post_norm_eps,
             unit_offset_norm,
             ffn_uses_gelu,
         )
@@ -2282,6 +2379,7 @@ pub(in crate::engine) fn dense_q4k_attention_output_gelu_ffn_norm_residual_if_su
     hidden: &mut [f32],
     attn_out: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_post_attn_norm: bool,
     unit_offset_ffn_norm: bool,
     unit_offset_ple_norm: bool,
@@ -2349,6 +2447,7 @@ pub(in crate::engine) fn dense_q4k_attention_output_gelu_ffn_norm_residual_if_su
             hidden,
             attn_out,
             norm_eps,
+            post_norm_eps,
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_ple_norm,
@@ -2496,6 +2595,100 @@ pub(in crate::engine) fn prefill_attention_hd128_muse_dense_chain_if_supported(
     #[cfg(feature = "cuda")]
     {
         return cuda_runtime::prefill_attention_hd128_muse_dense_chain_if_supported(
+            q,
+            k,
+            v,
+            attention_gate,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            sliding_window,
+            has_softcap,
+            o.raw(),
+            gate.raw(),
+            up.raw(),
+            down.raw(),
+            backend_ggml_type(down.quant()),
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+        .map_err(cuda_error);
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn prefill_attention_hd128_f16kv_muse_dense_chain_if_supported(
+    q: &[f32],
+    k: &[u16],
+    v: &[u16],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    has_softcap: bool,
+    o_weight: &QuantizedWeight,
+    gate_weight: &QuantizedWeight,
+    up_weight: &QuantizedWeight,
+    down_weight: &QuantizedWeight,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> crate::error::Result<bool> {
+    if seq_len <= 1 {
+        return Ok(false);
+    }
+    let (Some(o), Some(gate), Some(up), Some(down)) = (
+        o_weight.backend_view(),
+        gate_weight.backend_view(),
+        up_weight.backend_view(),
+        down_weight.backend_view(),
+    ) else {
+        return Ok(false);
+    };
+    if o.quant() != QuantFormat::Q4K
+        || gate.quant() != QuantFormat::Q4K
+        || up.quant() != QuantFormat::Q4K
+        || !matches!(
+            down.quant(),
+            QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K
+        )
+        || o.rows() != n_embd
+        || o.cols() != o_cols
+        || gate.rows() != n_ff
+        || gate.cols() != n_embd
+        || up.rows() != n_ff
+        || up.cols() != n_embd
+        || down.rows() != n_embd
+        || down.cols() != n_ff
+    {
+        return Ok(false);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        return cuda_runtime::prefill_attention_hd128_f16kv_muse_dense_chain_if_supported(
             q,
             k,
             v,

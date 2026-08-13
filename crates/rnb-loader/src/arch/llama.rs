@@ -215,6 +215,7 @@ mod tests {
             assistant: None,
             glm_indexer: None,
             deepseek4: None,
+            dflash: None,
         }
     }
 

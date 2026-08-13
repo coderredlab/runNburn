@@ -6,9 +6,11 @@ mod prefill;
 mod qwen_moe;
 
 pub use attention::{
-    decode_attention_hd256_if_supported, prefill_attention_f16kv_dense_chain_if_supported,
-    prefill_attention_f16kv_if_supported, prefill_attention_f16kv_window_dense_chain_if_supported,
+    decode_attention_hd256_if_supported, dflash_q4k_layer_chain,
+    prefill_attention_f16kv_dense_chain_if_supported, prefill_attention_f16kv_if_supported,
+    prefill_attention_f16kv_window_dense_chain_if_supported,
     prefill_attention_f16kv_window_if_supported,
+    prefill_attention_hd128_f16kv_muse_dense_chain_if_supported,
     prefill_attention_hd128_muse_dense_chain_if_supported, prefill_attention_hd256_if_supported,
     prefill_attention_non_causal_if_supported, prefill_q4k_muse_hd128_dense_chain_if_supported,
     qwen35_gdn_decode_core_chain, qwen35_gdn_decode_core_chain_admitted,
@@ -125,6 +127,7 @@ pub use rnb_backend_api::{
 };
 
 // cu19: expose CUDA cache hit/miss stats for prefill profiling instrumentation.
+pub use backend::with_dflash_exact_verify;
 pub use backend::Cu71LayerSegmentGraphRuntimeContext;
 pub use backend::{cuda_cache_snapshot, CudaCacheSnapshot};
 
@@ -1189,6 +1192,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
     n_embd: usize,
     hidden: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_norm: bool,
     gelu: bool,
 ) -> Result<Vec<f32>> {
@@ -1203,6 +1207,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
         n_embd,
         hidden,
         norm_eps,
+        post_norm_eps,
         unit_offset_norm,
         gelu,
     )
@@ -1231,6 +1236,7 @@ pub fn dense_q4k_attention_output_gelu_ffn_norm_residual(
     hidden: &mut [f32],
     attn_out: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_post_attn_norm: bool,
     unit_offset_ffn_norm: bool,
     unit_offset_ple_norm: bool,
@@ -1264,6 +1270,7 @@ pub fn dense_q4k_attention_output_gelu_ffn_norm_residual(
         hidden,
         attn_out,
         norm_eps,
+        post_norm_eps,
         unit_offset_post_attn_norm,
         unit_offset_ffn_norm,
         unit_offset_ple_norm,

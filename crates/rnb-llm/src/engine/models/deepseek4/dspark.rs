@@ -68,23 +68,14 @@ impl DsparkRuntime {
                 model.metadata.architecture
             )));
         }
-        let metadata = model.metadata.deepseek4.as_ref().ok_or_else(|| {
+        model.metadata.deepseek4.as_ref().ok_or_else(|| {
             LlmError::ModelLoad("DFlash sidecar has no DeepSeek4-compatible metadata".into())
         })?;
-        let block_size = metadata
-            .dspark_block_size
-            .filter(|size| *size > 0)
-            .ok_or_else(|| {
-                LlmError::ModelLoad("DFlash sidecar has no positive dflash.block_size".into())
-            })?;
-        let mask_token_id = metadata.dspark_mask_token_id.ok_or_else(|| {
-            LlmError::ModelLoad("DFlash sidecar has no tokenizer.ggml.mask_token_id".into())
+        let dflash = model.metadata.dflash.as_ref().ok_or_else(|| {
+            LlmError::ModelLoad("DFlash sidecar has no generic DFlash metadata".into())
         })?;
-        if metadata.dspark_target_layers.is_empty() {
-            return Err(LlmError::ModelLoad(
-                "DFlash sidecar has no dflash.target_layers".into(),
-            ));
-        }
+        let block_size = dflash.block_size;
+        let mask_token_id = dflash.mask_token_id;
         super::dspark_contract::validate_dspark_weight_contract(model)?;
 
         let mut dspark =
@@ -105,7 +96,7 @@ impl DsparkRuntime {
             markov_w2: load_quantized(model, "markov_w2.weight"),
             confidence_projection: load_quantized(model, "conf_proj.weight"),
             vocab_size: model.metadata.vocab_size,
-            target_layers: metadata.dspark_target_layers.clone(),
+            target_layers: dflash.target_layers.clone(),
             block_size,
             mask_token_id,
             committed_keys,

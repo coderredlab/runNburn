@@ -1,5 +1,5 @@
 use rnb_core::tensor::Tensor;
-use rnb_loader::{DeepSeek4Metadata, GGMLType, LoadedModel};
+use rnb_loader::{DFlashMetadata, DeepSeek4Metadata, GGMLType, LoadedModel};
 
 use crate::error::{LlmError, Result};
 const SUPPORTED_BLOCK_SIZE: usize = 5;
@@ -10,21 +10,22 @@ pub(super) fn validate_dspark_weight_contract(model: &LoadedModel) -> Result<()>
     let metadata = model.metadata.deepseek4.as_ref().ok_or_else(|| {
         LlmError::ModelLoad("DFlash sidecar has no DeepSeek4-compatible metadata".into())
     })?;
+    let dflash = model.metadata.dflash.as_ref().ok_or_else(|| {
+        LlmError::ModelLoad("DFlash sidecar has no generic DFlash metadata".into())
+    })?;
     validate_runtime_contract(
-        metadata.dspark_block_size,
-        &metadata.dspark_target_layers,
+        dflash,
         model.metadata.num_layers,
         model.metadata.sliding_window,
         &metadata.compress_ratios,
     )?;
     let hidden = model.metadata.hidden_size;
     let vocab = model.metadata.vocab_size;
-    let extracted_width = metadata
-        .dspark_target_layers
+    let extracted_width = dflash
+        .target_layers
         .len()
         .checked_mul(hidden)
         .ok_or_else(|| LlmError::ModelLoad("DSpark target feature width overflows usize".into()))?;
-
     require_matrix(model, "fc.weight", hidden, extracted_width)?;
     require_numel(model, "enc.output_norm.weight", hidden)?;
     require_numel(model, "output_norm.weight", hidden)?;
@@ -311,20 +312,21 @@ fn select_logical_shape<'a>(
 }
 
 fn validate_runtime_contract(
-    block_size: Option<usize>,
-    target_layers: &[usize],
+    dflash: &DFlashMetadata,
     stage_count: usize,
     sliding_window: usize,
     compress_ratios: &[usize],
 ) -> Result<()> {
-    if block_size != Some(SUPPORTED_BLOCK_SIZE) {
+    if dflash.block_size != SUPPORTED_BLOCK_SIZE {
         return Err(LlmError::ModelLoad(format!(
-            "DSpark block size {block_size:?} is unsupported; expected {SUPPORTED_BLOCK_SIZE}"
+            "DSpark block size {} is unsupported; expected {SUPPORTED_BLOCK_SIZE}",
+            dflash.block_size
         )));
     }
-    if target_layers != SUPPORTED_TARGET_LAYERS {
+    if dflash.target_layers != SUPPORTED_TARGET_LAYERS {
         return Err(LlmError::ModelLoad(format!(
-            "DSpark target layers {target_layers:?} are unsupported; expected {SUPPORTED_TARGET_LAYERS:?}"
+            "DSpark target layers {:?} are unsupported; expected {SUPPORTED_TARGET_LAYERS:?}",
+            dflash.target_layers
         )));
     }
     if stage_count != SUPPORTED_STAGE_COUNT {
@@ -366,44 +368,45 @@ mod tests {
 
     #[test]
     fn rejects_runtime_metadata_outside_supported_dspark_contract() {
-        let block_size = Some(SUPPORTED_BLOCK_SIZE);
-        let target_layers = SUPPORTED_TARGET_LAYERS;
+        let supported = DFlashMetadata {
+            block_size: SUPPORTED_BLOCK_SIZE,
+            target_layers: SUPPORTED_TARGET_LAYERS.to_vec(),
+            mask_token_id: 128799,
+        };
         let compress_ratios = [0, 0, 0];
+        assert!(
+            validate_runtime_contract(&supported, SUPPORTED_STAGE_COUNT, 0, &compress_ratios,)
+                .is_err()
+        );
+        assert!(
+            validate_runtime_contract(&supported, SUPPORTED_STAGE_COUNT, 1, &[0, 4, 0],).is_err()
+        );
+
+        let wrong_block = DFlashMetadata {
+            block_size: SUPPORTED_BLOCK_SIZE + 1,
+            ..supported.clone()
+        };
         assert!(validate_runtime_contract(
-            block_size,
-            target_layers,
-            SUPPORTED_STAGE_COUNT,
-            0,
-            &compress_ratios,
-        )
-        .is_err());
-        assert!(validate_runtime_contract(
-            block_size,
-            target_layers,
-            SUPPORTED_STAGE_COUNT,
-            1,
-            &[0, 4, 0],
-        )
-        .is_err());
-        assert!(validate_runtime_contract(
-            Some(SUPPORTED_BLOCK_SIZE + 1),
-            target_layers,
+            &wrong_block,
             SUPPORTED_STAGE_COUNT,
             1,
             &compress_ratios,
         )
         .is_err());
+
+        let wrong_layers = DFlashMetadata {
+            target_layers: vec![40, 41, 42],
+            ..supported.clone()
+        };
         assert!(validate_runtime_contract(
-            block_size,
-            &[40, 41, 42],
+            &wrong_layers,
             SUPPORTED_STAGE_COUNT,
             1,
             &compress_ratios,
         )
         .is_err());
         assert!(validate_runtime_contract(
-            block_size,
-            target_layers,
+            &supported,
             SUPPORTED_STAGE_COUNT + 1,
             1,
             &compress_ratios,

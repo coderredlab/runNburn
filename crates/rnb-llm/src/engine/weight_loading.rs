@@ -5,7 +5,7 @@ mod tensor_values;
 
 use super::backend_runtime::is_attention_layer;
 use super::layer_weights::{LayerType, ModelWeights, MtpLayerWeights};
-use super::models::{deepseek4, gemma, nemotron, shared_expert_moe};
+use super::models::{deepseek4, gemma, muse_dflash, nemotron, shared_expert_moe};
 use output::build_tied_output_weight;
 use quantized::load_quantized_weight;
 use rnb_loader::{Architecture as ModelArchitecture, LoadedModel, ModelLayerKind};
@@ -20,6 +20,16 @@ pub(super) fn load_dspark_runtime(
         sparse_moe_cuda_enabled,
         tensor_values::load_f32_weight,
         quantized::load_quantized_weight,
+    )
+}
+pub(super) fn load_muse_dflash_runtime(
+    model: &LoadedModel,
+) -> crate::error::Result<muse_dflash::MuseDflashRuntime> {
+    muse_dflash::MuseDflashRuntime::load(
+        model,
+        tensor_values::load_f32_weight,
+        quantized::load_quantized_weight,
+        |model, layer| layers::load_attention_layer(model, layer, false, false, None),
     )
 }
 

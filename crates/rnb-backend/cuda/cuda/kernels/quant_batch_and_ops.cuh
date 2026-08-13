@@ -286,6 +286,7 @@ extern "C" __global__ void rnb_q4k_gemv_batch_seq4_warp8(
     }
 }
 
+
 extern "C" __global__ void rnb_q4k_gemv_batch_q8dot_warp8(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,

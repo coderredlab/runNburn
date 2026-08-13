@@ -9351,7 +9351,7 @@ fn attention_prefill_non_causal_exposes_future_rows() {
     let v = [vec![2.0f32; head_dim], vec![10.0f32; head_dim]].concat();
 
     let actual = match attention_prefill_flash_f32_non_causal(
-        &q, &k, &v, seq_len, kv_len, 1, 1, head_dim, 1.0,
+        &q, &k, &v, seq_len, kv_len, 1, 1, head_dim, 1.0, None,
     ) {
         Ok(output) => output,
         Err(error) => {
@@ -9363,6 +9363,49 @@ fn attention_prefill_non_causal_exposes_future_rows() {
     assert_eq!(actual.len(), seq_len * head_dim);
     for value in actual {
         assert!((value - 6.0).abs() < 1e-5, "expected 6, got {value}");
+    }
+}
+
+#[test]
+fn attention_prefill_non_causal_applies_standard_swa_per_query() {
+    let _guard = runtime_test_lock();
+    let seq_len = 2usize;
+    let kv_len = 4usize;
+    let head_dim = 4usize;
+    let q = vec![0.0f32; seq_len * head_dim];
+    let k = vec![0.0f32; kv_len * head_dim];
+    let v = [
+        vec![1.0f32; head_dim],
+        vec![2.0f32; head_dim],
+        vec![4.0f32; head_dim],
+        vec![8.0f32; head_dim],
+    ]
+    .concat();
+
+    let actual = match attention_prefill_flash_f32_non_causal(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        kv_len,
+        1,
+        1,
+        head_dim,
+        1.0,
+        Some(2),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping CUDA non-causal SWA test: {error}");
+            return;
+        }
+    };
+
+    for value in &actual[..head_dim] {
+        assert!((*value - 14.0 / 3.0).abs() < 1e-5);
+    }
+    for value in &actual[head_dim..] {
+        assert!((*value - 6.0).abs() < 1e-5);
     }
 }
 
@@ -10404,6 +10447,173 @@ fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
 }
 
 #[test]
+fn cuda_dflash_q4k_layer_chain_matches_separate_cuda_path() {
+    let _guard = runtime_test_lock();
+    let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
+    let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
+
+    let seq_len = 3usize;
+    let prior_tokens = 2usize;
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let q_rows = num_heads * head_dim;
+    let kv_rows = num_kv_heads * head_dim;
+    let n_embd = 256usize;
+    let n_ff = 256usize;
+    let blocks = n_embd / 256;
+    let scale = (head_dim as f32).sqrt().recip();
+    let rope_theta = 10_000.0f32;
+    let pos_start = 19usize;
+    let window = 16usize;
+    let norm_eps = 1.0e-5f32;
+    let q_weights = make_test_q4k_weights(1, q_rows, blocks, 701).pop().unwrap();
+    let k_weights = make_test_q4k_weights(1, kv_rows, blocks, 709)
+        .pop()
+        .unwrap();
+    let v_weights = make_test_q6k_weights(1, kv_rows, blocks, 719)
+        .pop()
+        .unwrap();
+    let o_weights = make_test_q4k_weights(1, n_embd, q_rows / 256, 727)
+        .pop()
+        .unwrap();
+    let gate_weights = make_test_q4k_weights(1, n_ff, blocks, 733).pop().unwrap();
+    let up_weights = make_test_q4k_weights(1, n_ff, blocks, 739).pop().unwrap();
+    let down_weights = make_test_q6k_weights(1, n_embd, n_ff / 256, 743)
+        .pop()
+        .unwrap();
+    let initial_hidden = (0..seq_len * n_embd)
+        .map(|i| ((i % 43) as f32 - 21.0) * 0.004)
+        .collect::<Vec<_>>();
+    let attn_norm = (0..n_embd)
+        .map(|i| 0.77 + (i % 13) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let q_norm = (0..head_dim)
+        .map(|i| 0.81 + (i % 11) as f32 * 0.004)
+        .collect::<Vec<_>>();
+    let k_norm = (0..head_dim)
+        .map(|i| 0.79 + (i % 17) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let ffn_norm = (0..n_embd)
+        .map(|i| 0.82 + (i % 19) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let prior_k = (0..prior_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i % 31) as f32 - 15.0) * 0.006).to_bits())
+        .collect::<Vec<_>>();
+    let prior_v = (0..prior_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i % 37) as f32 - 18.0) * 0.005).to_bits())
+        .collect::<Vec<_>>();
+
+    let mut normed = vec![0.0f32; initial_hidden.len()];
+    rms_norm_rows_f32(&initial_hidden, &attn_norm, &mut normed, norm_eps, false)
+        .expect("separate CUDA DFlash attention norm");
+    let mut q =
+        q4k_gemv_batch(&q_weights, q_rows, n_embd, &normed).expect("separate CUDA DFlash Q");
+    let mut current_k =
+        q4k_gemv_batch(&k_weights, kv_rows, n_embd, &normed).expect("separate CUDA DFlash K");
+    let current_v =
+        q6k_gemv_batch(&v_weights, kv_rows, n_embd, &normed).expect("separate CUDA DFlash V");
+    let q_raw = q.clone();
+    rms_norm_rows_f32(&q_raw, &q_norm, &mut q, norm_eps, false)
+        .expect("separate CUDA DFlash Q norm");
+    let current_k_raw = current_k.clone();
+    rms_norm_rows_f32(&current_k_raw, &k_norm, &mut current_k, norm_eps, false)
+        .expect("separate CUDA DFlash K norm");
+    rope_f32_inplace(
+        &mut q, q_rows, head_dim, head_dim, pos_start, rope_theta, 1, None,
+    )
+    .expect("separate CUDA DFlash Q NEOX RoPE");
+    rope_f32_inplace(
+        &mut current_k,
+        kv_rows,
+        head_dim,
+        head_dim,
+        pos_start,
+        rope_theta,
+        1,
+        None,
+    )
+    .expect("separate CUDA DFlash K NEOX RoPE");
+    let mut all_k = prior_k
+        .iter()
+        .map(|bits| half::f16::from_bits(*bits).to_f32())
+        .collect::<Vec<_>>();
+    all_k.extend_from_slice(&current_k);
+    let mut all_v = prior_v
+        .iter()
+        .map(|bits| half::f16::from_bits(*bits).to_f32())
+        .collect::<Vec<_>>();
+    all_v.extend_from_slice(&current_v);
+    let attention = attention_prefill_flash_f32_non_causal(
+        &q,
+        &all_k,
+        &all_v,
+        seq_len,
+        prior_tokens + seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        scale,
+        Some(window),
+    )
+    .expect("separate CUDA DFlash noncausal attention");
+    let projected =
+        q4k_gemv_batch(&o_weights, n_embd, q_rows, &attention).expect("separate CUDA DFlash O");
+    let mut expected = initial_hidden.clone();
+    add_f32_inplace(&mut expected, &projected).expect("separate CUDA DFlash attention residual");
+    let residual = expected.clone();
+    rms_norm_rows_f32(&residual, &ffn_norm, &mut expected, norm_eps, false)
+        .expect("separate CUDA DFlash FFN norm");
+    let ffn = dense_q4k_gelu_ffn_batch(
+        &gate_weights,
+        &up_weights,
+        &down_weights,
+        14,
+        n_ff,
+        n_embd,
+        seq_len,
+        &expected,
+    )
+    .expect("separate CUDA DFlash FFN");
+    expected.clone_from(&residual);
+    add_f32_inplace(&mut expected, &ffn).expect("separate CUDA DFlash FFN residual");
+
+    let mut actual = initial_hidden;
+    dflash_q4k_layer_chain(
+        &q_weights,
+        &k_weights,
+        &v_weights,
+        &o_weights,
+        &gate_weights,
+        &up_weights,
+        &down_weights,
+        q_rows,
+        kv_rows,
+        n_embd,
+        &prior_k,
+        &prior_v,
+        &mut actual,
+        &attn_norm,
+        &q_norm,
+        &k_norm,
+        &ffn_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        pos_start,
+        window,
+        n_ff,
+        n_embd,
+        norm_eps,
+    )
+    .expect("CUDA DFlash layer chain");
+
+    assert_close_rows_abs_rel("CUDA DFlash layer chain", &actual, &expected, 2e-3, 2e-4);
+}
+
+#[test]
 fn attention_decode_hd128_matches_cpu_reference() {
     let kv_len = 5usize;
     let num_heads = 2usize;
@@ -10476,7 +10686,7 @@ fn attention_decode_hd128_matches_cpu_reference() {
 #[test]
 fn attention_decode_cached_hd128_matches_cpu_reference_after_append() {
     let _guard = runtime_test_lock();
-    let kv_len = 6usize;
+    let kv_len = 300usize;
     let num_heads = 2usize;
     let num_kv_heads = 1usize;
     let head_dim = 128usize;
@@ -14806,6 +15016,7 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
         n_embd,
         &hidden,
         norm_eps,
+        norm_eps,
         false,
         false,
     )
@@ -14822,6 +15033,7 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
         n_ff,
         n_embd,
         &hidden,
+        norm_eps,
         norm_eps,
         false,
         false,
@@ -14856,6 +15068,7 @@ fn cuda_dense_q4k_silu_ffn_norm_residual_q8dot_matches_staged_reference() {
         n_ff,
         n_embd,
         &hidden,
+        norm_eps,
         norm_eps,
         false,
         false,
@@ -15502,17 +15715,25 @@ fn cu69_dense_chain_graph_fixture_with_dims(
 }
 
 fn cu69_dense_chain_graph_expected(fixture: &Cu69DenseChainGraphFixture, eps: f32) -> Vec<f32> {
+    cu69_dense_chain_graph_expected_with_eps(fixture, eps, eps)
+}
+
+fn cu69_dense_chain_graph_expected_with_eps(
+    fixture: &Cu69DenseChainGraphFixture,
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Vec<f32> {
     let q_blocks = fixture.q_dim / 256;
     let hidden_blocks = fixture.n_embd / 256;
     let down_blocks = fixture.n_ff / 256;
     let mut expected = fixture.hidden.clone();
 
     let o_proj = cpu_q4k_gemv_rows(&fixture.o, fixture.n_embd, q_blocks, &fixture.attn_out);
-    let post_attn = cpu_rms_norm(&o_proj, &fixture.post_attn_norm, eps, true);
+    let post_attn = cpu_rms_norm(&o_proj, &fixture.post_attn_norm, post_norm_eps, true);
     for i in 0..fixture.n_embd {
         expected[i] += post_attn[i];
     }
-    let ffn_input = cpu_rms_norm(&expected, &fixture.ffn_norm, eps, true);
+    let ffn_input = cpu_rms_norm(&expected, &fixture.ffn_norm, norm_eps, true);
     let mut gate_out = cpu_q4k_gemv_rows(&fixture.gate, fixture.n_ff, hidden_blocks, &ffn_input);
     let up_out = cpu_q4k_gemv_rows(&fixture.up, fixture.n_ff, hidden_blocks, &ffn_input);
     for (gate_value, up_value) in gate_out.iter_mut().zip(up_out.iter()) {
@@ -15523,7 +15744,7 @@ fn cu69_dense_chain_graph_expected(fixture: &Cu69DenseChainGraphFixture, eps: f3
         *gate_value = gelu * *up_value;
     }
     let down_out = cpu_q6k_gemv_rows(&fixture.down, fixture.n_embd, down_blocks, &gate_out);
-    let post_ffn = cpu_rms_norm(&down_out, &fixture.post_ffn_norm, eps, true);
+    let post_ffn = cpu_rms_norm(&down_out, &fixture.post_ffn_norm, post_norm_eps, true);
     for i in 0..fixture.n_embd {
         expected[i] += post_ffn[i];
     }
@@ -15611,6 +15832,7 @@ fn run_cu69_dense_chain_graph_fixture_with_eps_and_allowed(
                 fixture.n_embd,
                 &mut hidden,
                 &fixture.attn_out,
+                norm_eps,
                 norm_eps,
                 true,
                 true,
@@ -15745,6 +15967,7 @@ fn run_cu69_dense_chain_graph_fixture_with_tail(
                 &mut hidden,
                 &fixture.attn_out,
                 1.0e-5,
+                1.0e-5,
                 true,
                 true,
                 true,
@@ -15782,8 +16005,9 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_norm_residual_matches_cpu_reference(
     let _down = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
     let fixture = cu69_dense_chain_graph_fixture(0);
     let mut hidden = fixture.hidden.clone();
-    let eps = 1.0e-5;
-    let expected = cu69_dense_chain_graph_expected(&fixture, eps);
+    let norm_eps = 1.0e-5;
+    let post_norm_eps = 1.0e-6;
+    let expected = cu69_dense_chain_graph_expected_with_eps(&fixture, norm_eps, post_norm_eps);
 
     let mut state = match CudaState::open() {
         Ok(state) => state,
@@ -15813,7 +16037,8 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_norm_residual_matches_cpu_reference(
             fixture.n_embd,
             &mut hidden,
             &fixture.attn_out,
-            eps,
+            norm_eps,
+            post_norm_eps,
             true,
             true,
             true,

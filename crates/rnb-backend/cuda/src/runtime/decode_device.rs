@@ -557,13 +557,15 @@ impl CudaState {
         // TODO: pass attn_scale as parameter for non-Gemma4 models.
         let scale = 1.0f32;
 
-        let kernel = match head_dim {
-            128 => "rnb_attention_decode_hd128",
-            256 => "rnb_attention_decode_hd256",
-            512 => "rnb_attention_decode_hd512",
+        let (kernel, block) = match head_dim {
+            128 if crate::tuning::attention_decode_hd128_warp_enabled() => {
+                ("rnb_attention_decode_hd128_warp", (32, 1, 1))
+            }
+            128 => ("rnb_attention_decode_hd128", (128, 1, 1)),
+            256 => ("rnb_attention_decode_hd256", (256, 1, 1)),
+            512 => ("rnb_attention_decode_hd512", (512, 1, 1)),
             _ => unreachable!("validated head_dim"),
         };
-
         let mut output_arg = output_dev;
         let mut q_arg = q_dev;
         let mut k_arg = k_cache_dev;
@@ -585,7 +587,7 @@ impl CudaState {
                 (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
             ],
             (num_heads as u32, 1, 1),
-            (head_dim as u32, 1, 1),
+            block,
         )
     }
 

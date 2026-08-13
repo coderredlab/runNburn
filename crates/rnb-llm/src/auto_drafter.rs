@@ -26,6 +26,13 @@ pub(crate) fn find_sibling_drafter_candidates(target_path: &Path) -> Vec<PathBuf
     };
     let model_stems = candidate_model_stems(stem);
     let mut candidates = Vec::new();
+    if stem.to_ascii_lowercase().contains("muse-glimmer-30b") {
+        extend_prefixed_ggufs(&mut candidates, dir, "dflash-Muse-Glimmer-30B-");
+    }
+
+    for model_stem in &model_stems {
+        extend_prefixed_ggufs(&mut candidates, dir, &format!("dflash-{model_stem}-"));
+    }
 
     for candidate_dir in [dir.to_path_buf(), dir.join("DSpark"), dir.join("dspark")] {
         for model_stem in &model_stems {
@@ -215,6 +222,25 @@ mod tests {
         std::fs::write(&assistant, []).unwrap();
 
         assert_eq!(find_sibling_drafter(&target), Some(assistant));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finds_official_muse_dflash_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "rnb-auto-muse-dflash-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("muse-glimmer-30B-kquant-17gb.gguf");
+        let dflash = root.join("dflash-Muse-Glimmer-30B-Q4_K_M.gguf");
+        std::fs::write(&target, []).unwrap();
+        std::fs::write(&dflash, []).unwrap();
+
+        assert_eq!(find_sibling_drafter(&target), Some(dflash));
 
         std::fs::remove_dir_all(root).unwrap();
     }

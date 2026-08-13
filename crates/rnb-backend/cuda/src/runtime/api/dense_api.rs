@@ -483,6 +483,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
     n_embd: usize,
     hidden: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_norm: bool,
     gelu: bool,
 ) -> Result<Vec<f32>, String> {
@@ -564,6 +565,7 @@ pub fn dense_q4k_gelu_ffn_norm_residual(
             n_embd,
             hidden,
             norm_eps,
+            post_norm_eps,
             unit_offset_norm,
             gelu,
         )
@@ -591,6 +593,7 @@ pub fn dense_q4k_attention_output_gelu_ffn_norm_residual(
     hidden: &mut [f32],
     attn_out: &[f32],
     norm_eps: f32,
+    post_norm_eps: f32,
     unit_offset_post_attn_norm: bool,
     unit_offset_ffn_norm: bool,
     unit_offset_ple_norm: bool,
@@ -790,6 +793,7 @@ pub fn dense_q4k_attention_output_gelu_ffn_norm_residual(
             hidden,
             attn_out,
             norm_eps,
+            post_norm_eps,
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_ple_norm,

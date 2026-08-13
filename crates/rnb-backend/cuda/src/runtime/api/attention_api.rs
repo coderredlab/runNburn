@@ -549,6 +549,7 @@ pub fn attention_prefill_flash_f32_non_causal(
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    sliding_window: Option<usize>,
 ) -> Result<Vec<f32>, String> {
     attention_prefill_flash_f32_with_mask(
         q,
@@ -560,7 +561,7 @@ pub fn attention_prefill_flash_f32_non_causal(
         num_kv_heads,
         head_dim,
         scale,
-        None,
+        sliding_window,
         None,
         false,
     )
@@ -606,10 +607,8 @@ fn attention_prefill_flash_f32_with_mask(
     if softcap.is_some_and(|cap| !cap.is_finite() || cap <= 0.0) {
         return Err("CUDA attention softcap must be finite and positive".to_string());
     }
-    if !causal && (sliding_window.is_some() || softcap.is_some()) {
-        return Err(
-            "CUDA non-causal attention does not support sliding window or softcap".to_string(),
-        );
+    if !causal && softcap.is_some() {
+        return Err("CUDA non-causal attention does not support softcap".to_string());
     }
     let q_expected = seq_len
         .checked_mul(num_heads)
@@ -857,6 +856,193 @@ pub fn attention_prefill_flash_hd128_muse_dense_chain(
         .as_mut()
         .expect("cuda compute state initialized")
         .attention_prefill_flash_hd128_muse_dense_chain(
+            q,
+            k,
+            v,
+            attention_gate,
+            seq_len,
+            kv_len,
+            num_heads,
+            num_kv_heads,
+            scale,
+            sliding_window,
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            post_attn_norm_weight,
+            ffn_norm_weight,
+            post_ffn_norm_weight,
+            o_cols,
+            n_ff,
+            n_embd,
+            hidden,
+            norm_eps,
+            post_norm_eps,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_flash_hd128_f16kv_muse_dense_chain(
+    q: &[f32],
+    k: &[u16],
+    v: &[u16],
+    attention_gate: &[f32],
+    seq_len: usize,
+    kv_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    sliding_window: Option<usize>,
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    down_quant: u32,
+    post_attn_norm_weight: &[f32],
+    ffn_norm_weight: &[f32],
+    post_ffn_norm_weight: &[f32],
+    o_cols: usize,
+    n_ff: usize,
+    n_embd: usize,
+    hidden: &mut [f32],
+    norm_eps: f32,
+    post_norm_eps: f32,
+) -> Result<(), String> {
+    if seq_len == 0
+        || kv_len < seq_len
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || n_ff == 0
+        || n_embd == 0
+    {
+        return Err(format!(
+            "CUDA Muse F16 KV attention chain invalid attention geometry: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads}"
+        ));
+    }
+    if seq_len > u32::MAX as usize
+        || kv_len > u32::MAX as usize
+        || num_heads > MUSE_HD128_MAX_GRID_Y
+        || num_kv_heads > u32::MAX as usize
+        || sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+    {
+        return Err(format!(
+            "CUDA Muse F16 KV attention chain kernel argument out of range: seq_len={seq_len} kv_len={kv_len} num_heads={num_heads} num_kv_heads={num_kv_heads} sliding_window={sliding_window:?}"
+        ));
+    }
+    let q_rows = num_heads
+        .checked_mul(128)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain Q row overflow".to_string())?;
+    let kv_rows = num_kv_heads
+        .checked_mul(128)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain KV row overflow".to_string())?;
+    if !muse_hd128_attention_extents_fit_u32(seq_len, kv_len, q_rows, kv_rows, o_cols, n_ff, n_embd)
+    {
+        return Err(format!(
+            "CUDA Muse F16 KV attention chain kernel extent out of u32 range: seq_len={seq_len} kv_len={kv_len} q_rows={q_rows} kv_rows={kv_rows} o_cols={o_cols} n_ff={n_ff} n_embd={n_embd}"
+        ));
+    }
+    let expected_q = seq_len
+        .checked_mul(q_rows)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain Q length overflow".to_string())?;
+    let expected_kv = kv_len
+        .checked_mul(kv_rows)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain KV length overflow".to_string())?;
+    let o_blocks = o_cols
+        .checked_div(256)
+        .filter(|_| o_cols.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse F16 KV attention chain o_cols must be divisible by 256: {o_cols}")
+        })?;
+    let hidden_blocks = n_embd
+        .checked_div(256)
+        .filter(|_| n_embd.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse F16 KV attention chain n_embd must be divisible by 256: {n_embd}")
+        })?;
+    let down_blocks = n_ff
+        .checked_div(256)
+        .filter(|_| n_ff.is_multiple_of(256))
+        .ok_or_else(|| {
+            format!("CUDA Muse F16 KV attention chain n_ff must be divisible by 256: {n_ff}")
+        })?;
+    let down_row_bytes = match down_quant {
+        12 => down_blocks.checked_mul(144),
+        13 => down_blocks.checked_mul(176),
+        14 => down_blocks.checked_mul(210),
+        other => {
+            return Err(format!(
+                "CUDA Muse F16 KV attention chain unsupported down quant {other}"
+            ))
+        }
+    }
+    .ok_or_else(|| "CUDA Muse F16 KV attention chain down row byte overflow".to_string())?;
+    let expected_o_bytes = n_embd
+        .checked_mul(o_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain O weight byte overflow".to_string())?;
+    let expected_gate_up_bytes = n_ff
+        .checked_mul(hidden_blocks)
+        .and_then(|len| len.checked_mul(144))
+        .ok_or_else(|| {
+            "CUDA Muse F16 KV attention chain gate/up weight byte overflow".to_string()
+        })?;
+    let expected_down_bytes = n_embd
+        .checked_mul(down_row_bytes)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain down weight byte overflow".to_string())?;
+    if !muse_hd128_weight_extents_fit_u32(&[
+        expected_o_bytes,
+        expected_gate_up_bytes,
+        expected_down_bytes,
+    ]) {
+        return Err(format!(
+            "CUDA Muse F16 KV attention chain weight extent out of u32 range: o={expected_o_bytes} gate_up={expected_gate_up_bytes} down={expected_down_bytes}"
+        ));
+    }
+    let expected_hidden = seq_len
+        .checked_mul(n_embd)
+        .ok_or_else(|| "CUDA Muse F16 KV attention chain hidden length overflow".to_string())?;
+    if q.len() != expected_q
+        || k.len() != expected_kv
+        || v.len() != expected_kv
+        || attention_gate.len() != expected_q
+        || hidden.len() != expected_hidden
+        || o_cols != q_rows
+        || post_attn_norm_weight.len() != n_embd
+        || ffn_norm_weight.len() != n_embd
+        || post_ffn_norm_weight.len() != n_embd
+        || o_weights.len() != expected_o_bytes
+        || gate_weights.len() != expected_gate_up_bytes
+        || up_weights.len() != expected_gate_up_bytes
+        || down_weights.len() != expected_down_bytes
+    {
+        return Err(format!(
+            "CUDA Muse F16 KV attention chain shape mismatch: q={} expected_q={expected_q} k={} v={} expected_kv={expected_kv} gate={} hidden={} expected_hidden={} o_cols={o_cols} expected_o_cols={} post_attn_norm={} ffn_norm={} post_ffn_norm={} n_embd={n_embd}",
+            q.len(),
+            k.len(),
+            v.len(),
+            attention_gate.len(),
+            hidden.len(),
+            expected_hidden,
+            q_rows,
+            post_attn_norm_weight.len(),
+            ffn_norm_weight.len(),
+            post_ffn_norm_weight.len(),
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .attention_prefill_flash_hd128_f16kv_muse_dense_chain(
             q,
             k,
             v,
@@ -1185,6 +1371,199 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
             hidden,
             norm_eps,
             post_norm_eps,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_q4k_layer_chain(
+    q_weights: &[u8],
+    k_weights: &[u8],
+    v_weights: &[u8],
+    o_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    q_rows: usize,
+    kv_rows: usize,
+    cols: usize,
+    prior_k: &[u16],
+    prior_v: &[u16],
+    hidden: &mut [f32],
+    attn_norm_weight: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
+    ffn_norm_weight: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    scale: f32,
+    rope_theta: f32,
+    pos_start: usize,
+    window: usize,
+    n_ff: usize,
+    n_embd: usize,
+    norm_eps: f32,
+) -> Result<(), String> {
+    if cols == 0
+        || !cols.is_multiple_of(256)
+        || n_ff == 0
+        || !n_ff.is_multiple_of(256)
+        || n_embd != cols
+        || hidden.is_empty()
+        || !hidden.len().is_multiple_of(n_embd)
+        || num_heads == 0
+        || num_kv_heads == 0
+        || num_heads % num_kv_heads != 0
+        || q_rows != num_heads.saturating_mul(128)
+        || kv_rows != num_kv_heads.saturating_mul(128)
+        || window == 0
+        || window > u32::MAX as usize
+    {
+        return Err(format!(
+            "CUDA DFlash layer chain invalid geometry: q_rows={q_rows} kv_rows={kv_rows} cols={cols} hidden={} heads={num_heads}/{num_kv_heads} window={window} n_ff={n_ff} n_embd={n_embd}",
+            hidden.len()
+        ));
+    }
+    let seq_len = hidden.len() / n_embd;
+    if !muse_hd128_rope_positions_fit_u32(true, pos_start, seq_len)
+        || !muse_hd128_attention_extents_fit_u32(
+            seq_len,
+            prior_k.len() / kv_rows + seq_len,
+            q_rows,
+            kv_rows,
+            q_rows,
+            n_ff,
+            n_embd,
+        )
+    {
+        return Err(format!(
+            "CUDA DFlash layer chain kernel extent out of range: seq_len={seq_len} prior_values={} pos_start={pos_start}",
+            prior_k.len()
+        ));
+    }
+    if prior_k.len() != prior_v.len()
+        || !prior_k.len().is_multiple_of(kv_rows)
+        || prior_k.len() / kv_rows >= window
+        || attn_norm_weight.len() != n_embd
+        || ffn_norm_weight.len() != n_embd
+        || q_norm.len() != 128
+        || k_norm.len() != 128
+    {
+        return Err(format!(
+            "CUDA DFlash layer chain state shape mismatch: prior_k={} prior_v={} kv_rows={kv_rows} attn_norm={} ffn_norm={} q_norm={} k_norm={}",
+            prior_k.len(),
+            prior_v.len(),
+            attn_norm_weight.len(),
+            ffn_norm_weight.len(),
+            q_norm.len(),
+            k_norm.len(),
+        ));
+    }
+    let blocks = cols / 256;
+    let q4_row_bytes = blocks
+        .checked_mul(144)
+        .ok_or_else(|| "CUDA DFlash Q4 row byte overflow".to_string())?;
+    let q6_row_bytes = blocks
+        .checked_mul(210)
+        .ok_or_else(|| "CUDA DFlash Q6 row byte overflow".to_string())?;
+    let o_blocks = q_rows / 256;
+    let down_blocks = n_ff / 256;
+    let expected = [
+        (
+            "q",
+            q_weights.len(),
+            q_rows
+                .checked_mul(q4_row_bytes)
+                .ok_or_else(|| "CUDA DFlash Q weight byte overflow".to_string())?,
+        ),
+        (
+            "k",
+            k_weights.len(),
+            kv_rows
+                .checked_mul(q4_row_bytes)
+                .ok_or_else(|| "CUDA DFlash K weight byte overflow".to_string())?,
+        ),
+        (
+            "v",
+            v_weights.len(),
+            kv_rows
+                .checked_mul(q6_row_bytes)
+                .ok_or_else(|| "CUDA DFlash V weight byte overflow".to_string())?,
+        ),
+        (
+            "o",
+            o_weights.len(),
+            n_embd
+                .checked_mul(o_blocks)
+                .and_then(|rows| rows.checked_mul(144))
+                .ok_or_else(|| "CUDA DFlash O weight byte overflow".to_string())?,
+        ),
+        (
+            "gate",
+            gate_weights.len(),
+            n_ff.checked_mul(q4_row_bytes)
+                .ok_or_else(|| "CUDA DFlash gate weight byte overflow".to_string())?,
+        ),
+        (
+            "up",
+            up_weights.len(),
+            n_ff.checked_mul(q4_row_bytes)
+                .ok_or_else(|| "CUDA DFlash up weight byte overflow".to_string())?,
+        ),
+        (
+            "down",
+            down_weights.len(),
+            n_embd
+                .checked_mul(down_blocks)
+                .and_then(|rows| rows.checked_mul(210))
+                .ok_or_else(|| "CUDA DFlash down weight byte overflow".to_string())?,
+        ),
+    ];
+    if let Some((name, actual, expected)) = expected
+        .into_iter()
+        .find(|(_, actual, expected)| actual != expected)
+    {
+        return Err(format!(
+            "CUDA DFlash {name} weight byte mismatch: got {actual}, expected {expected}"
+        ));
+    }
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .dflash_q4k_layer_chain(
+            q_weights,
+            k_weights,
+            v_weights,
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            q_rows,
+            kv_rows,
+            blocks,
+            seq_len,
+            prior_k,
+            prior_v,
+            hidden,
+            attn_norm_weight,
+            q_norm,
+            k_norm,
+            ffn_norm_weight,
+            num_heads,
+            num_kv_heads,
+            scale,
+            rope_theta,
+            pos_start,
+            window,
+            n_ff,
+            n_embd,
+            norm_eps,
         )
 }
 

@@ -21,6 +21,7 @@ use super::models::gemma::{apply_embedding_scale, prepare_gemma_per_layer_base};
 use super::policy;
 use super::prefill::{
     new_empty_kv_cache, run_prefill_layers_cpu_range,
+    run_prefill_layers_cpu_range_collect_dflash_features,
     run_prefill_layers_cpu_range_collect_prefix_state,
     run_prefill_layers_cpu_range_external_target_batch,
 };
@@ -191,6 +192,9 @@ impl Engine {
     }
 
     pub(super) fn select_prefill_path(&self, token_count: usize) -> PrefillExecutionPath {
+        if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
+            return PrefillExecutionPath::Cpu;
+        }
         let target = crate::runtime::platform::RuntimeTarget::current();
         let profile = crate::runtime::scheduler::select_runtime_execution_profile(
             crate::runtime::scheduler::ExecutionProfileRequest {
@@ -355,7 +359,31 @@ impl Engine {
             ));
         }
         #[cfg(feature = "cuda")]
-        let prefill_result = if self.mtp_spec_requested() {
+        let mut dflash_features = Vec::new();
+        #[cfg(feature = "cuda")]
+        let prefill_result = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
+            let target_layers = self.mtp_dflash_target_layers();
+            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
+                &target_layers,
+            )?;
+            dflash_features = features;
+            Ok(hidden)
+        } else if self.mtp_spec_requested() {
             run_prefill_layers_cpu_range_mtp_resident_kv(
                 &mut self.kv_cache,
                 &self.metadata,
@@ -393,23 +421,49 @@ impl Engine {
             )
         };
         #[cfg(not(feature = "cuda"))]
-        let prefill_result = run_prefill_layers_cpu_range(
-            &mut self.kv_cache,
-            &self.metadata,
-            self.architecture,
-            weights,
-            gemma_per_layer_base.as_ref(),
-            hidden,
-            0..self.metadata.num_layers,
-            seq_len,
-            pos_start,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_dim,
-            rope_theta,
-            norm_eps,
-        );
+        let mut dflash_features = Vec::new();
+        #[cfg(not(feature = "cuda"))]
+        let prefill_result = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
+            let target_layers = self.mtp_dflash_target_layers();
+            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
+                &target_layers,
+            )?;
+            dflash_features = features;
+            Ok(hidden)
+        } else {
+            run_prefill_layers_cpu_range(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
+            )
+        };
         hidden = prefill_result?;
 
         if profiling {
@@ -440,6 +494,9 @@ impl Engine {
                 if let Some(hidden_rows) = mtp_hidden_rows {
                     self.mtp_observe_prompt_batch(tokens, &hidden_rows)?;
                 }
+                if !dflash_features.is_empty() {
+                    self.mtp_dflash_observe_target_batch(&dflash_features, seq_len, pos_start)?;
+                }
                 return Ok(Vec::new());
             }
         }
@@ -456,6 +513,9 @@ impl Engine {
         )?;
         if let Some(hidden_rows) = mtp_hidden_rows {
             self.mtp_observe_prompt_batch(tokens, &hidden_rows)?;
+        }
+        if !dflash_features.is_empty() {
+            self.mtp_dflash_observe_target_batch(&dflash_features, seq_len, pos_start)?;
         }
         Ok(logits)
     }
@@ -540,6 +600,33 @@ impl Engine {
     ) -> crate::error::Result<crate::engine::verify_window::VerifyWindowResult> {
         self.forward_prefill_argmax_tokens_collect_mtp_impl(tokens, None, true, false, false)
             .map(|(result, _)| result)
+    }
+
+    pub(crate) fn forward_prefill_dflash_verify(
+        &mut self,
+        tokens: &[u32],
+        collect_output_logits: bool,
+    ) -> crate::error::Result<(crate::engine::verify_window::VerifyWindowResult, Vec<f32>)> {
+        #[cfg(feature = "cuda")]
+        {
+            return crate::engine::cuda_runtime::with_dflash_exact_verify(|| {
+                self.forward_prefill_argmax_tokens_collect_mtp_impl(
+                    tokens,
+                    None,
+                    false,
+                    collect_output_logits,
+                    false,
+                )
+            });
+        }
+        #[cfg(not(feature = "cuda"))]
+        self.forward_prefill_argmax_tokens_collect_mtp_impl(
+            tokens,
+            None,
+            false,
+            collect_output_logits,
+            false,
+        )
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp_prefix_state(
@@ -916,9 +1003,6 @@ impl Engine {
         let rope_theta = self.metadata.rope_theta;
         let norm_eps = self.metadata.norm_eps;
 
-        // pm117: `RNB_GLM_PREFILL_PROFILE=1` 시 verify forward 의 층 밖 구간 분해
-        // (embed / 층 루프 / argmax / observe+prefix tail) — 층 합과 phase 계측의
-        // 차이(~220ms/round)를 특정하기 위한 진단.
         let verify_profiling = crate::engine::models::glm_dsa::prefill_profile_enabled();
         let mut vp_mark = std::time::Instant::now();
         let mut vp_ms = [0.0f64; 4];
@@ -944,7 +1028,35 @@ impl Engine {
         }
         let mut prefix_collector =
             prefix_tokens.map(crate::engine::verify_window::GdnPrefixStateCollector::new_many);
-        let hidden = if prefix_collector.is_some() {
+        let mut dflash_features = Vec::new();
+        let hidden = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
+            if prefix_collector.is_some() {
+                return Err(crate::error::LlmError::Forward(
+                    "Muse DFlash verify does not use recurrent prefix snapshots".to_string(),
+                ));
+            }
+            let target_layers = self.mtp_dflash_target_layers();
+            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
+                &target_layers,
+            )?;
+            dflash_features = features;
+            hidden
+        } else if prefix_collector.is_some() {
             run_prefill_layers_cpu_range_collect_prefix_state(
                 &mut self.kv_cache,
                 &self.metadata,
@@ -1040,6 +1152,9 @@ impl Engine {
                 self.mtp_observe_target_batch(tokens, hidden_rows)?;
             }
         }
+        if !dflash_features.is_empty() {
+            self.mtp_dflash_observe_target_batch(&dflash_features, seq_len, pos_start)?;
+        }
         let mut prefix_states = prefix_collector
             .map(|collector| {
                 // pm116: attention-only(GLM 등)는 recurrent layer 가 없어 빈
@@ -1064,6 +1179,11 @@ impl Engine {
                 vp_ms[0], vp_ms[1], vp_ms[2], vp_ms[3]
             );
         }
+        let auxiliary_rows = if dflash_features.is_empty() {
+            external_output_hidden_rows
+        } else {
+            dflash_features
+        };
         Ok((
             crate::engine::verify_window::VerifyWindowResult {
                 target_tokens,
@@ -1078,7 +1198,7 @@ impl Engine {
                 #[cfg(any(feature = "cuda", test))]
                 attention_kv_states: Vec::new(),
             },
-            external_output_hidden_rows,
+            auxiliary_rows,
         ))
     }
 
@@ -1875,7 +1995,10 @@ impl Engine {
         super::backend_runtime::clear_host_registered_ranges_before_prefill()?;
         super::backend_runtime::clear_decode_attention_kv_cache_before_prefill()?;
         let result = (|| {
-            let chunk_size = self.prefill_chunk_size();
+            let chunk_size = self
+                .mtp_dflash_window_size()
+                .unwrap_or_else(|| self.prefill_chunk_size())
+                .min(self.prefill_chunk_size());
             let full_path = self.select_prefill_path(tokens.len());
             let logits = if matches!(full_path, PrefillExecutionPath::Fullpath) {
                 self.forward_prefill_fullpath(tokens)?

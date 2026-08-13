@@ -1114,6 +1114,154 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd128_window(
     out[out_base + lane + 96u] = acc3 * inv_sum;
 }
 
+extern "C" __global__ void rnb_attention_prefill_flash_hd128_f16kv(
+    float* __restrict__ out,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    unsigned seq_len,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale) {
+    const unsigned lane = threadIdx.x;
+    const unsigned i = blockIdx.x;
+    const unsigned h = blockIdx.y;
+    if (lane >= 32u || i >= seq_len || h >= num_heads || num_kv_heads == 0u) {
+        return;
+    }
+
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned global_pos = kv_len - seq_len + i;
+    const unsigned q_base = i * num_heads * 128u + h * 128u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+    const float q2 = q[q_base + lane + 64u];
+    const float q3 = q[q_base + lane + 96u];
+
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (unsigned j = 0; j <= global_pos; ++j) {
+        const unsigned kv_base = j * num_kv_heads * 128u + kv_h * 128u;
+        float dot0 = q0 * __half2float(__ushort_as_half(k[kv_base + lane]));
+        float dot1 = q1 * __half2float(__ushort_as_half(k[kv_base + lane + 32u]));
+        float dot2 = q2 * __half2float(__ushort_as_half(k[kv_base + lane + 64u]));
+        float dot3 = q3 * __half2float(__ushort_as_half(k[kv_base + lane + 96u]));
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot0 += __shfl_down_sync(0xffffffffu, dot0, offset);
+            dot1 += __shfl_down_sync(0xffffffffu, dot1, offset);
+            dot2 += __shfl_down_sync(0xffffffffu, dot2, offset);
+            dot3 += __shfl_down_sync(0xffffffffu, dot3, offset);
+        }
+        float dot = (dot0 + dot2) + (dot1 + dot3);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        const float score = dot * scale;
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float p = expf(score - new_max);
+        acc0 = acc0 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane]));
+        acc1 = acc1 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 32u]));
+        acc2 = acc2 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 64u]));
+        acc3 = acc3 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 96u]));
+        row_sum = row_sum * old_scale + p;
+        row_max = new_max;
+    }
+
+    const unsigned out_base = i * num_heads * 128u + h * 128u;
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    out[out_base + lane] = acc0 * inv_sum;
+    out[out_base + lane + 32u] = acc1 * inv_sum;
+    out[out_base + lane + 64u] = acc2 * inv_sum;
+    out[out_base + lane + 96u] = acc3 * inv_sum;
+}
+
+extern "C" __global__ void rnb_attention_prefill_flash_hd128_f16kv_window(
+    float* __restrict__ out,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    unsigned seq_len,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale,
+    unsigned window) {
+    const unsigned lane = threadIdx.x;
+    const unsigned i = blockIdx.x;
+    const unsigned h = blockIdx.y;
+    if (lane >= 32u || i >= seq_len || h >= num_heads || num_kv_heads == 0u || window == 0u) {
+        return;
+    }
+
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned global_pos = kv_len - seq_len + i;
+    const unsigned start = global_pos + 1u > window ? global_pos + 1u - window : 0u;
+    const unsigned q_base = i * num_heads * 128u + h * 128u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+    const float q2 = q[q_base + lane + 64u];
+    const float q3 = q[q_base + lane + 96u];
+
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (unsigned j = start; j <= global_pos; ++j) {
+        const unsigned kv_base = j * num_kv_heads * 128u + kv_h * 128u;
+        float dot0 = q0 * __half2float(__ushort_as_half(k[kv_base + lane]));
+        float dot1 = q1 * __half2float(__ushort_as_half(k[kv_base + lane + 32u]));
+        float dot2 = q2 * __half2float(__ushort_as_half(k[kv_base + lane + 64u]));
+        float dot3 = q3 * __half2float(__ushort_as_half(k[kv_base + lane + 96u]));
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot0 += __shfl_down_sync(0xffffffffu, dot0, offset);
+            dot1 += __shfl_down_sync(0xffffffffu, dot1, offset);
+            dot2 += __shfl_down_sync(0xffffffffu, dot2, offset);
+            dot3 += __shfl_down_sync(0xffffffffu, dot3, offset);
+        }
+        float dot = (dot0 + dot2) + (dot1 + dot3);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        const float score = dot * scale;
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float p = expf(score - new_max);
+        acc0 = acc0 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane]));
+        acc1 = acc1 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 32u]));
+        acc2 = acc2 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 64u]));
+        acc3 = acc3 * old_scale
+            + p * __half2float(__ushort_as_half(v[kv_base + lane + 96u]));
+        row_sum = row_sum * old_scale + p;
+        row_max = new_max;
+    }
+
+    const unsigned out_base = i * num_heads * 128u + h * 128u;
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    out[out_base + lane] = acc0 * inv_sum;
+    out[out_base + lane + 32u] = acc1 * inv_sum;
+    out[out_base + lane + 64u] = acc2 * inv_sum;
+    out[out_base + lane + 96u] = acc3 * inv_sum;
+}
+
 extern "C" __global__ void rnb_attention_decode_hd256(
     float* __restrict__ out,
     const float* __restrict__ q,
@@ -1523,6 +1671,194 @@ extern "C" __global__ void rnb_attention_decode_hd128(
 
     out[h * 128u + lane] = row_sum > 0.0f ? acc / row_sum : 0.0f;
 }
+
+extern "C" __global__ void rnb_attention_decode_hd128_warp(
+    float* __restrict__ out,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale) {
+    const unsigned lane = threadIdx.x;
+    const unsigned h = blockIdx.x;
+    if (lane >= 32u || h >= num_heads || num_kv_heads == 0u) {
+        return;
+    }
+
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned q_base = h * 128u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+    const float q2 = q[q_base + lane + 64u];
+    const float q3 = q[q_base + lane + 96u];
+
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (unsigned j = 0; j < kv_len; ++j) {
+        const unsigned kv_base = j * num_kv_heads * 128u + kv_h * 128u;
+        const float k0 = __half2float(__ushort_as_half(k[kv_base + lane]));
+        const float k1 = __half2float(__ushort_as_half(k[kv_base + lane + 32u]));
+        const float k2 = __half2float(__ushort_as_half(k[kv_base + lane + 64u]));
+        const float k3 = __half2float(__ushort_as_half(k[kv_base + lane + 96u]));
+        float dot = (q0 * k0 + q2 * k2) + (q1 * k1 + q3 * k3);
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+
+        const float score = dot * scale;
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float p = expf(score - new_max);
+        acc0 = acc0 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane]));
+        acc1 = acc1 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 32u]));
+        acc2 = acc2 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 64u]));
+        acc3 = acc3 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 96u]));
+        row_sum = row_sum * old_scale + p;
+        row_max = new_max;
+    }
+
+    const unsigned out_base = h * 128u;
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    out[out_base + lane] = acc0 * inv_sum;
+    out[out_base + lane + 32u] = acc1 * inv_sum;
+    out[out_base + lane + 64u] = acc2 * inv_sum;
+    out[out_base + lane + 96u] = acc3 * inv_sum;
+}
+
+extern "C" __global__ void rnb_attention_decode_hd128_split_partials(
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_meta,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale,
+    unsigned chunk_size) {
+    const unsigned lane = threadIdx.x;
+    const unsigned h = blockIdx.x;
+    const unsigned chunk = blockIdx.y;
+    if (lane >= 32u || h >= num_heads || num_kv_heads == 0u || chunk_size == 0u) {
+        return;
+    }
+
+    const unsigned num_chunks = (kv_len + chunk_size - 1u) / chunk_size;
+    const unsigned start = chunk * chunk_size;
+    unsigned end = start + chunk_size;
+    if (end > kv_len) {
+        end = kv_len;
+    }
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned q_base = h * 128u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+    const float q2 = q[q_base + lane + 64u];
+    const float q3 = q[q_base + lane + 96u];
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (unsigned j = start; j < end; ++j) {
+        const unsigned kv_base = j * num_kv_heads * 128u + kv_h * 128u;
+        const float k0 = __half2float(__ushort_as_half(k[kv_base + lane]));
+        const float k1 = __half2float(__ushort_as_half(k[kv_base + lane + 32u]));
+        const float k2 = __half2float(__ushort_as_half(k[kv_base + lane + 64u]));
+        const float k3 = __half2float(__ushort_as_half(k[kv_base + lane + 96u]));
+        float dot = (q0 * k0 + q2 * k2) + (q1 * k1 + q3 * k3);
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        const float score = dot * scale;
+        const float new_max = fmaxf(row_max, score);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float p = expf(score - new_max);
+        acc0 = acc0 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane]));
+        acc1 = acc1 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 32u]));
+        acc2 = acc2 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 64u]));
+        acc3 = acc3 * old_scale + p * __half2float(__ushort_as_half(v[kv_base + lane + 96u]));
+        row_sum = row_sum * old_scale + p;
+        row_max = new_max;
+    }
+
+    const unsigned chunk_base = h * num_chunks + chunk;
+    const unsigned acc_base = chunk_base * 128u;
+    partial_acc[acc_base + lane] = acc0;
+    partial_acc[acc_base + lane + 32u] = acc1;
+    partial_acc[acc_base + lane + 64u] = acc2;
+    partial_acc[acc_base + lane + 96u] = acc3;
+    if (lane == 0u) {
+        partial_meta[chunk_base * 2u] = row_max;
+        partial_meta[chunk_base * 2u + 1u] = row_sum;
+    }
+}
+
+extern "C" __global__ void rnb_attention_decode_hd128_split_reduce(
+    float* __restrict__ out,
+    const float* __restrict__ partial_acc,
+    const float* __restrict__ partial_meta,
+    unsigned num_heads,
+    unsigned num_chunks) {
+    const unsigned lane = threadIdx.x;
+    const unsigned h = blockIdx.x;
+    if (lane >= 32u || h >= num_heads || num_chunks == 0u) {
+        return;
+    }
+
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    for (unsigned chunk = 0; chunk < num_chunks; ++chunk) {
+        const unsigned chunk_base = h * num_chunks + chunk;
+        const float chunk_max = partial_meta[chunk_base * 2u];
+        const float chunk_sum = partial_meta[chunk_base * 2u + 1u];
+        if (chunk_sum <= 0.0f) {
+            continue;
+        }
+        const float new_max = fmaxf(row_max, chunk_max);
+        const float old_scale = row_max == -3.4028234663852886e38f
+            ? 0.0f
+            : expf(row_max - new_max);
+        const float chunk_scale = expf(chunk_max - new_max);
+        const unsigned acc_base = chunk_base * 128u;
+        acc0 = acc0 * old_scale + partial_acc[acc_base + lane] * chunk_scale;
+        acc1 = acc1 * old_scale + partial_acc[acc_base + lane + 32u] * chunk_scale;
+        acc2 = acc2 * old_scale + partial_acc[acc_base + lane + 64u] * chunk_scale;
+        acc3 = acc3 * old_scale + partial_acc[acc_base + lane + 96u] * chunk_scale;
+        row_sum = row_sum * old_scale + chunk_sum * chunk_scale;
+        row_max = new_max;
+    }
+
+    const unsigned out_base = h * 128u;
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+    out[out_base + lane] = acc0 * inv_sum;
+    out[out_base + lane + 32u] = acc1 * inv_sum;
+    out[out_base + lane + 64u] = acc2 * inv_sum;
+    out[out_base + lane + 96u] = acc3 * inv_sum;
+}
+
+
 
 // =============================================================================
 // cu38 Phase 4: attention prefill flash hd256 window — j batch=4 변형

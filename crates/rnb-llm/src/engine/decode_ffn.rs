@@ -47,6 +47,33 @@ pub(super) fn decode_ffn(
             || super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture));
 
     #[cfg(feature = "cuda")]
+    if super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+        && ffn_gate_up_fused.is_none()
+    {
+        let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
+        let post_norm_weight_data = post_ffw_norm_weight
+            .as_ref()
+            .map(kernels::tensor_as_f32_slice);
+        let t_chain = std::time::Instant::now();
+        if let Some(output) = backend_runtime::dense_q4k_gelu_ffn_norm_residual_if_supported(
+            ffn_gate_weight,
+            ffn_up_weight,
+            ffn_down_weight,
+            norm_weight_data,
+            post_norm_weight_data,
+            &scratch.hidden[..hidden_dim],
+            norm_eps,
+            post_norm_eps,
+            false,
+            false,
+        )? {
+            scratch.hidden[..hidden_dim].copy_from_slice(&output[..hidden_dim]);
+            prof!("ffn_resident_chain", t_chain);
+            return Ok(());
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     if use_gemma_block_semantics(architecture) {
         let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
         let post_norm_weight_data = post_ffw_norm_weight
@@ -63,6 +90,7 @@ pub(super) fn decode_ffn(
             norm_weight_data,
             post_norm_weight_data,
             &scratch.hidden[..hidden_dim],
+            norm_eps,
             norm_eps,
             unit_offset_norm,
             true,
@@ -92,6 +120,7 @@ pub(super) fn decode_ffn(
             norm_weight_data,
             None,
             &scratch.hidden[..hidden_dim],
+            norm_eps,
             norm_eps,
             false,
             false,

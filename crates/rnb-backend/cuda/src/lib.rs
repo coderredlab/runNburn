@@ -5,6 +5,7 @@ use rnb_backend_api::{
 
 pub mod runtime;
 pub mod tuning;
+pub use tuning::with_dflash_exact_verify;
 
 mod dynlib;
 
@@ -45,8 +46,9 @@ pub use runtime::{
     attention_decode_hd128, attention_decode_hd256, attention_decode_hd512,
     attention_decode_hd512_len_device, attention_decode_kvarn, attention_decode_kvarn_to_device,
     attention_prefill_flash_f32, attention_prefill_flash_f32_non_causal,
-    attention_prefill_flash_hd128, attention_prefill_flash_hd128_muse_dense_chain,
-    attention_prefill_flash_hd256, attention_prefill_flash_hd256_f16kv_window,
+    attention_prefill_flash_hd128, attention_prefill_flash_hd128_f16kv_muse_dense_chain,
+    attention_prefill_flash_hd128_muse_dense_chain, attention_prefill_flash_hd256,
+    attention_prefill_flash_hd256_f16kv_window,
     attention_prefill_flash_hd256_f16kv_window_dense_chain, attention_prefill_flash_hd512,
     attention_prefill_flash_hd512_f16kv, attention_prefill_flash_hd512_f16kv_dense_chain,
     attention_prefill_flash_hd512_f16kv_window,
@@ -62,18 +64,19 @@ pub use runtime::{
     dense_q4k_attention_qkv_rope_hd128_decode, dense_q4k_attention_qkv_rope_hd128_prefill,
     dense_q4k_gelu_ffn, dense_q4k_gelu_ffn_batch, dense_q4k_gelu_ffn_norm_residual,
     dense_q4k_silu_ffn_batch, dense_q4k_silu_ffn_batch_device_carrier,
-    derive_gdn_prefill_chain_dims, end_nemotron_prefill_workspace, f16_gemv, f16_gemv_batch,
-    f32_gemm_batch, f32_shared_expert, free_delta_state_snapshot, gdn_gated_norm_silu,
-    gdn_gated_norm_silu_f32_gemm, gdn_prefill_chain_conv_state_after_prefix_for_test,
-    gdn_prefill_chain_q4k, gdn_prepare_delta_gate_beta_f32, gemma4_moe_gelu_selected,
-    gemma4_ple_q4k_batch_norm_residual, gemma4_selected_moe_admitted,
-    glm_mla_prefill_attention_f16, glm_register_stream_region_sequence, glm_shared_expert_iq,
-    glm_sparse_experts_iq2xxs_iq3xxs, glm_sparse_experts_iq_by_token, hadamard_f32_inplace,
-    iq2_s_gemv, iq2_s_gemv_batch, iq2_xxs_gemv, iq2_xxs_gemv_batch, iq3_xxs_gemv,
-    iq3_xxs_gemv_batch, iq4_xs_gemv, iq4_xs_gemv_batch, l2_norm_rows_f32, moe_route_topk_f32,
-    mul_rows_f32_inplace, mxfp4_sparse_experts_by_token_clamped_swiglu,
-    nemotron_device_route_pack_expert_ids, nemotron_device_route_pack_from_logits,
-    nemotron_mamba2_decode_scan, nemotron_mamba2_prefill_device, nemotron_mamba2_prefill_scan,
+    derive_gdn_prefill_chain_dims, dflash_q4k_layer_chain, end_nemotron_prefill_workspace,
+    f16_gemv, f16_gemv_batch, f32_gemm_batch, f32_shared_expert, free_delta_state_snapshot,
+    gdn_gated_norm_silu, gdn_gated_norm_silu_f32_gemm,
+    gdn_prefill_chain_conv_state_after_prefix_for_test, gdn_prefill_chain_q4k,
+    gdn_prepare_delta_gate_beta_f32, gemma4_moe_gelu_selected, gemma4_ple_q4k_batch_norm_residual,
+    gemma4_selected_moe_admitted, glm_mla_prefill_attention_f16,
+    glm_register_stream_region_sequence, glm_shared_expert_iq, glm_sparse_experts_iq2xxs_iq3xxs,
+    glm_sparse_experts_iq_by_token, hadamard_f32_inplace, iq2_s_gemv, iq2_s_gemv_batch,
+    iq2_xxs_gemv, iq2_xxs_gemv_batch, iq3_xxs_gemv, iq3_xxs_gemv_batch, iq4_xs_gemv,
+    iq4_xs_gemv_batch, l2_norm_rows_f32, moe_route_topk_f32, mul_rows_f32_inplace,
+    mxfp4_sparse_experts_by_token_clamped_swiglu, nemotron_device_route_pack_expert_ids,
+    nemotron_device_route_pack_from_logits, nemotron_mamba2_decode_scan,
+    nemotron_mamba2_prefill_device, nemotron_mamba2_prefill_scan,
     nemotron_prefill_sparse_copy_prefetch, nemotron_q5_decode_moe_shared_sparse,
     nemotron_q5_q8_register_layer, nemotron_q5_q8_sparse_relu_sqr_by_token,
     nemotron_q5_q8_sparse_relu_sqr_cached_layer_by_token, nemotron_q5_register_layer,

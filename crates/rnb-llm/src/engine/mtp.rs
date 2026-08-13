@@ -99,6 +99,7 @@ pub(crate) enum EngineMtpRuntime {
     InModel(InModelMtpRuntime),
     External(crate::external_drafter::ExternalDrafterRuntime),
     Dspark(super::models::deepseek4::DsparkRuntime),
+    MuseDflash(super::models::muse_dflash::MuseDflashRuntime),
 }
 
 #[derive(Clone)]
@@ -107,6 +108,7 @@ pub(crate) enum EngineMtpCheckpoint {
     /// External drafter 는 decode 경계 간 stateless — checkpoint 불필요.
     External,
     Dspark(super::models::deepseek4::DsparkSequenceState),
+    MuseDflash(super::models::muse_dflash::MuseDflashCheckpoint),
 }
 
 #[derive(Clone)]
@@ -114,6 +116,7 @@ pub(crate) enum EngineMtpSequenceState {
     InModel(InModelMtpSequenceState),
     External(crate::external_drafter::ExternalDrafterSequenceState),
     Dspark(super::models::deepseek4::DsparkSequenceState),
+    MuseDflash(super::models::muse_dflash::MuseDflashSequenceState),
 }
 
 #[derive(Clone)]
@@ -131,6 +134,7 @@ impl EngineMtpSequenceState {
             Self::InModel(state) => state.heap_byte_size(),
             Self::External(state) => state.heap_byte_size(),
             Self::Dspark(state) => state.heap_byte_size(),
+            Self::MuseDflash(state) => state.heap_byte_size(),
         }
     }
 }
@@ -175,6 +179,7 @@ impl EngineMtpRuntime {
             EngineMtpRuntime::InModel(r) => EngineMtpCheckpoint::InModel(r.checkpoint()),
             EngineMtpRuntime::External(_) => EngineMtpCheckpoint::External,
             EngineMtpRuntime::Dspark(r) => EngineMtpCheckpoint::Dspark(r.capture_sequence_state()),
+            EngineMtpRuntime::MuseDflash(r) => EngineMtpCheckpoint::MuseDflash(r.checkpoint()),
         }
     }
 
@@ -185,6 +190,9 @@ impl EngineMtpRuntime {
             (EngineMtpRuntime::Dspark(r), EngineMtpCheckpoint::Dspark(c)) => r
                 .restore_sequence_state(c)
                 .expect("DSpark checkpoint must match its runtime"),
+            (EngineMtpRuntime::MuseDflash(r), EngineMtpCheckpoint::MuseDflash(c)) => r
+                .restore_checkpoint(c)
+                .expect("Muse DFlash checkpoint must match its runtime"),
             _ => panic!("EngineMtpRuntime / EngineMtpCheckpoint variant mismatch"),
         }
     }
@@ -194,7 +202,9 @@ impl EngineMtpRuntime {
             EngineMtpRuntime::InModel(runtime) => {
                 runtime.kv_cache.ssm_states.iter().all(Option::is_none)
             }
-            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => true,
+            EngineMtpRuntime::External(_)
+            | EngineMtpRuntime::Dspark(_)
+            | EngineMtpRuntime::MuseDflash(_) => true,
         }
     }
 
@@ -207,6 +217,9 @@ impl EngineMtpRuntime {
             ),
             EngineMtpRuntime::External(runtime) => runtime.sequence_state_heap_byte_size_estimate(),
             EngineMtpRuntime::Dspark(runtime) => runtime.sequence_state_heap_byte_size_estimate(),
+            EngineMtpRuntime::MuseDflash(runtime) => {
+                runtime.sequence_state_heap_byte_size_estimate()
+            }
         }
     }
 
@@ -220,6 +233,9 @@ impl EngineMtpRuntime {
             }
             EngineMtpRuntime::Dspark(runtime) => {
                 EngineMtpSequenceState::Dspark(runtime.capture_sequence_state())
+            }
+            EngineMtpRuntime::MuseDflash(runtime) => {
+                EngineMtpSequenceState::MuseDflash(runtime.capture_sequence_state())
             }
         }
     }
@@ -237,6 +253,9 @@ impl EngineMtpRuntime {
             (EngineMtpRuntime::Dspark(runtime), EngineMtpSequenceState::Dspark(state)) => {
                 runtime.restore_sequence_state(state)
             }
+            (EngineMtpRuntime::MuseDflash(runtime), EngineMtpSequenceState::MuseDflash(state)) => {
+                runtime.restore_sequence_state(state)
+            }
             _ => Err(LlmError::Forward(
                 "MTP sequence snapshot runtime variant mismatch".to_string(),
             )),
@@ -248,6 +267,7 @@ impl EngineMtpRuntime {
             EngineMtpRuntime::InModel(r) => r.clear_sequence_state(),
             EngineMtpRuntime::External(r) => r.shift_for_accept(0),
             EngineMtpRuntime::Dspark(r) => r.clear(),
+            EngineMtpRuntime::MuseDflash(r) => r.clear(),
         }
     }
 
@@ -255,7 +275,9 @@ impl EngineMtpRuntime {
     pub(super) fn in_model_weights(&self) -> Option<&MtpLayerWeights> {
         match self {
             EngineMtpRuntime::InModel(runtime) => Some(&runtime.weights),
-            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => None,
+            EngineMtpRuntime::External(_)
+            | EngineMtpRuntime::Dspark(_)
+            | EngineMtpRuntime::MuseDflash(_) => None,
         }
     }
 
@@ -265,7 +287,9 @@ impl EngineMtpRuntime {
     ) -> Option<&super::layer_weights::SharedExpertMoELayerWeights> {
         match self {
             EngineMtpRuntime::InModel(runtime) => runtime.weights.block.shared_expert_moe.as_ref(),
-            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => None,
+            EngineMtpRuntime::External(_)
+            | EngineMtpRuntime::Dspark(_)
+            | EngineMtpRuntime::MuseDflash(_) => None,
         }
     }
 
@@ -302,6 +326,23 @@ impl EngineMtpRuntime {
             None
         }
     }
+    pub(crate) fn as_muse_dflash_mut(
+        &mut self,
+    ) -> Option<&mut super::models::muse_dflash::MuseDflashRuntime> {
+        if let EngineMtpRuntime::MuseDflash(runtime) = self {
+            Some(runtime)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn as_muse_dflash(&self) -> Option<&super::models::muse_dflash::MuseDflashRuntime> {
+        if let EngineMtpRuntime::MuseDflash(runtime) = self {
+            Some(runtime)
+        } else {
+            None
+        }
+    }
 
     /// External Gemma drafter variant 여부.
     pub(crate) fn is_external(&self) -> bool {
@@ -310,6 +351,9 @@ impl EngineMtpRuntime {
 
     pub(crate) fn is_dspark(&self) -> bool {
         matches!(self, EngineMtpRuntime::Dspark(_))
+    }
+    pub(crate) fn is_muse_dflash(&self) -> bool {
+        matches!(self, EngineMtpRuntime::MuseDflash(_))
     }
 }
 
@@ -801,7 +845,11 @@ impl Engine {
     pub fn mtp_runtime_ready(&self) -> bool {
         match self.mtp_runtime.as_ref() {
             Some(EngineMtpRuntime::InModel(_)) => self.mtp.is_some(),
-            Some(EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_)) => true,
+            Some(
+                EngineMtpRuntime::External(_)
+                | EngineMtpRuntime::Dspark(_)
+                | EngineMtpRuntime::MuseDflash(_),
+            ) => true,
             None => false,
         }
     }
@@ -864,6 +912,16 @@ impl Engine {
         Ok(())
     }
 
+    pub(super) fn attach_muse_dflash_runtime(
+        &mut self,
+        runtime: super::models::muse_dflash::MuseDflashRuntime,
+    ) -> Result<()> {
+        runtime.validate_target(self.architecture, &self.metadata)?;
+        self.mtp_runtime = Some(EngineMtpRuntime::MuseDflash(runtime));
+        self.mtp_auto_requested_cache.take();
+        Ok(())
+    }
+
     fn mtp_vulkan_fullpath_verify_supported(&self) -> bool {
         #[cfg(feature = "vulkan")]
         {
@@ -896,6 +954,21 @@ impl Engine {
                 min_free_vram_mib: 0,
                 resource,
                 reason: "deepseek4-dspark-explicit-only",
+            };
+        }
+        if let Some(dflash) = self
+            .mtp_runtime
+            .as_ref()
+            .and_then(EngineMtpRuntime::as_muse_dflash)
+        {
+            let resource = current_mtp_auto_resource_hint();
+            return MtpAutoPolicy {
+                enabled: false,
+                spec_k: dflash.block_size().saturating_sub(1),
+                device_verify: false,
+                min_free_vram_mib: 0,
+                resource,
+                reason: "muse-dflash-explicit-only",
             };
         }
         let policy = mtp_auto_policy_for_model(
@@ -943,7 +1016,10 @@ impl Engine {
     /// Vulkan fullpath는 아직 argmax 전용이라 해당 backend 정책에서는 이 capability를
     /// 열지 않는다.
     pub(crate) fn mtp_sampled_verify_supported(&self) -> bool {
-        (cfg!(feature = "cuda") && self.mtp_device_verify_requested())
+        self.mtp_is_external_runtime()
+            || self.mtp_is_dspark_runtime()
+            || self.mtp_is_muse_dflash_runtime()
+            || (cfg!(feature = "cuda") && self.mtp_device_verify_requested())
             || (cfg!(all(feature = "metal", not(feature = "cuda"))) && self.mtp_runtime_ready())
     }
 
@@ -1030,6 +1106,92 @@ impl Engine {
         self.mtp_runtime
             .as_ref()
             .is_some_and(EngineMtpRuntime::is_dspark)
+    }
+
+    pub(crate) fn mtp_is_muse_dflash_runtime(&self) -> bool {
+        self.mtp_runtime
+            .as_ref()
+            .is_some_and(EngineMtpRuntime::is_muse_dflash)
+    }
+
+    pub(crate) fn mtp_dflash_target_layers(&self) -> Vec<usize> {
+        self.mtp_runtime
+            .as_ref()
+            .and_then(EngineMtpRuntime::as_muse_dflash)
+            .map(|runtime| runtime.target_layers().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn mtp_dflash_window_size(&self) -> Option<usize> {
+        self.mtp_runtime
+            .as_ref()
+            .and_then(EngineMtpRuntime::as_muse_dflash)
+            .map(|runtime| runtime.window_size())
+    }
+
+    pub(super) fn mtp_dflash_observe_target_batch(
+        &mut self,
+        features: &[f32],
+        token_count: usize,
+        start_position: usize,
+    ) -> Result<()> {
+        let Some(runtime) = self
+            .mtp_runtime
+            .as_mut()
+            .and_then(EngineMtpRuntime::as_muse_dflash_mut)
+        else {
+            return Ok(());
+        };
+        runtime.observe_target_batch(features, token_count, start_position)
+    }
+
+    pub(crate) fn mtp_dflash_retain_verified_prefix(
+        &mut self,
+        checkpoint: &EngineMtpCheckpoint,
+        features: &[f32],
+        token_count: usize,
+    ) -> Result<()> {
+        let Some(runtime) = self
+            .mtp_runtime
+            .as_mut()
+            .and_then(EngineMtpRuntime::as_muse_dflash_mut)
+        else {
+            return Ok(());
+        };
+        let EngineMtpCheckpoint::MuseDflash(checkpoint) = checkpoint else {
+            return Err(LlmError::Forward(
+                "Muse DFlash retain checkpoint type mismatch".to_string(),
+            ));
+        };
+        runtime.retain_verified_prefix(checkpoint, features, token_count)
+    }
+
+    pub(crate) fn mtp_dflash_draft(
+        &mut self,
+        anchor_token: u32,
+        max_draft_tokens: usize,
+    ) -> Result<super::models::muse_dflash::MuseDflashDraft> {
+        let mut runtime = self
+            .mtp_runtime
+            .take()
+            .ok_or_else(|| LlmError::Forward("Muse DFlash runtime is unavailable".to_string()))?;
+        let result = {
+            let dflash = runtime.as_muse_dflash_mut().ok_or_else(|| {
+                LlmError::Forward("loaded MTP runtime is not Muse DFlash".to_string())
+            })?;
+            let weights = self
+                .weights
+                .as_ref()
+                .ok_or_else(|| LlmError::Forward("target weights are unavailable".to_string()))?;
+            dflash.draft(
+                anchor_token,
+                max_draft_tokens,
+                &weights.token_embd,
+                &weights.output,
+            )
+        };
+        self.mtp_runtime = Some(runtime);
+        result
     }
 
     pub(super) fn mtp_dspark_target_layers(&self) -> Vec<usize> {
@@ -1237,7 +1399,9 @@ impl Engine {
             EngineMtpRuntime::InModel(inner) => inner.metadata.hidden_dim,
             // External drafter (mc78): retain is a no-op. External path
             // manages its own draft state in generate_with_external_drafter.
-            EngineMtpRuntime::External(_) | EngineMtpRuntime::Dspark(_) => return Ok(None),
+            EngineMtpRuntime::External(_)
+            | EngineMtpRuntime::Dspark(_)
+            | EngineMtpRuntime::MuseDflash(_) => return Ok(None),
         };
         let committed_len = committed_tokens.checked_mul(hidden_dim).ok_or_else(|| {
             LlmError::Forward("MTP retain hidden row length overflow".to_string())

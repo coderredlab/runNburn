@@ -1540,6 +1540,159 @@ impl CudaState {
         .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_prefill_flash_hd128_f16kv_muse_dense_chain(
+        &mut self,
+        q: &[f32],
+        k: &[u16],
+        v: &[u16],
+        attention_gate: &[f32],
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+        o_weights: &[u8],
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        post_attn_norm_weight: &[f32],
+        ffn_norm_weight: &[f32],
+        post_ffn_norm_weight: &[f32],
+        o_cols: usize,
+        n_ff: usize,
+        n_embd: usize,
+        hidden: &mut [f32],
+        norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Result<(), String> {
+        let q_bytes = std::mem::size_of_val(q);
+        let k_bytes = std::mem::size_of_val(k);
+        let v_bytes = std::mem::size_of_val(v);
+        let ffn_scratch_bytes = seq_len
+            .checked_mul(n_ff)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse FFN scratch byte overflow".to_string())?;
+        let attention_gate_bytes = std::mem::size_of_val(attention_gate);
+        let hidden_scratch_bytes = seq_len
+            .checked_mul(n_embd)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse hidden scratch byte overflow".to_string())?;
+        let mid_a_bytes = k_bytes.max(attention_gate_bytes).max(ffn_scratch_bytes);
+        let mid_b_bytes = v_bytes.max(ffn_scratch_bytes);
+        let output_bytes = seq_len
+            .checked_mul(num_heads)
+            .and_then(|len| len.checked_mul(128))
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA Muse attention output byte overflow".to_string())?;
+        let q_dev = self.compute_input_ptr(q_bytes.max(hidden_scratch_bytes))?;
+        let k_dev = self.compute_mid_a_ptr(mid_a_bytes)?;
+        let v_dev = self.compute_mid_b_ptr(mid_b_bytes)?;
+        let output_dev = self.compute_full_down_ptr(output_bytes)?;
+        unsafe {
+            self.api.memcpy_htod_async(
+                q_dev,
+                q.as_ptr().cast::<libc::c_void>(),
+                q_bytes,
+                self.stream,
+            )?;
+            self.api.memcpy_htod_async(
+                k_dev,
+                k.as_ptr().cast::<libc::c_void>(),
+                k_bytes,
+                self.stream,
+            )?;
+            self.api.memcpy_htod_async(
+                v_dev,
+                v.as_ptr().cast::<libc::c_void>(),
+                v_bytes,
+                self.stream,
+            )?;
+        }
+
+        let mut output_arg = output_dev;
+        let mut q_arg = q_dev;
+        let mut k_arg = k_dev;
+        let mut v_arg = v_dev;
+        let mut seq_arg = seq_len as u32;
+        let mut kv_len_arg = kv_len as u32;
+        let mut heads_arg = num_heads as u32;
+        let mut kv_heads_arg = num_kv_heads as u32;
+        let mut scale_arg = scale;
+        if let Some(window) = sliding_window {
+            let mut window_arg = window as u32;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128_f16kv_window",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut window_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (32, 1, 1),
+            )?;
+        } else {
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128_f16kv",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (32, 1, 1),
+            )?;
+        }
+
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            Some(post_attn_norm_weight),
+            ffn_norm_weight,
+            Some(post_ffn_norm_weight),
+            None,
+            None,
+            None,
+            None,
+            0,
+            o_cols,
+            n_ff,
+            n_embd,
+            seq_len,
+            hidden,
+            None,
+            output_dev,
+            Some(attention_gate),
+            None,
+            None,
+            norm_eps,
+            post_norm_eps,
+            false,
+            false,
+            false,
+            false,
+        )
+        .map(|_| ())
+    }
+
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(super) fn q4k_muse_prefill_hd128_dense_chain(
         &mut self,
@@ -1843,6 +1996,267 @@ impl CudaState {
         Ok(Some((k_bits, v_bits)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dflash_q4k_layer_chain(
+        &mut self,
+        q_weights: &[u8],
+        k_weights: &[u8],
+        v_weights: &[u8],
+        o_weights: &[u8],
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        q_rows: usize,
+        kv_rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        prior_k: &[u16],
+        prior_v: &[u16],
+        hidden: &mut [f32],
+        attn_norm_weight: &[f32],
+        q_norm: &[f32],
+        k_norm: &[f32],
+        ffn_norm_weight: &[f32],
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+        rope_theta: f32,
+        pos_start: usize,
+        window: usize,
+        n_ff: usize,
+        n_embd: usize,
+        norm_eps: f32,
+    ) -> Result<(), String> {
+        const HEAD_DIM: usize = 128;
+        let hidden_len = seq_len
+            .checked_mul(n_embd)
+            .ok_or_else(|| "CUDA DFlash hidden length overflow".to_string())?;
+        let hidden_bytes = hidden_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA DFlash hidden byte overflow".to_string())?;
+        let q_len = seq_len
+            .checked_mul(q_rows)
+            .ok_or_else(|| "CUDA DFlash Q length overflow".to_string())?;
+        let q_bytes = q_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA DFlash Q byte overflow".to_string())?;
+        let prior_values = prior_k.len();
+        let current_values = seq_len
+            .checked_mul(kv_rows)
+            .ok_or_else(|| "CUDA DFlash current KV length overflow".to_string())?;
+        let all_values = prior_values
+            .checked_add(current_values)
+            .ok_or_else(|| "CUDA DFlash total KV length overflow".to_string())?;
+        let all_kv_bytes = all_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA DFlash KV byte overflow".to_string())?;
+        let ffn_scratch_bytes = seq_len
+            .checked_mul(n_ff)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "CUDA DFlash FFN scratch byte overflow".to_string())?;
+        let prior_bits_bytes = prior_values
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| "CUDA DFlash prior KV byte overflow".to_string())?;
+
+        let hidden_dev = self.compute_full_gate_ptr(hidden_bytes)?;
+        let normed_dev = self.compute_full_up_ptr(hidden_bytes)?;
+        let q_raw_dev = self.compute_temp_slab_ptr(q_bytes.max(hidden_bytes))?;
+        let q_dev = self.compute_q_rope_out_ptr(q_bytes)?;
+        let all_k_dev = self.compute_mid_a_ptr(all_kv_bytes.max(ffn_scratch_bytes))?;
+        let all_v_dev = self.compute_mid_b_ptr(all_kv_bytes.max(ffn_scratch_bytes))?;
+        let current_k_bytes = current_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA DFlash current K byte overflow".to_string())?;
+        let current_k_raw_dev = self.compute_aux_output_ptr(current_k_bytes)?;
+        let prior_k_bits_dev = self.compute_k_bits_out_ptr(prior_bits_bytes.max(1))?;
+        let prior_v_bits_dev = self.compute_v_bits_out_ptr(prior_bits_bytes.max(1))?;
+        let attn_out_dev = self.compute_full_down_ptr(q_bytes)?;
+        self.compute_output_ptr(hidden_bytes)?;
+
+        unsafe {
+            self.api.memcpy_htod_async(
+                hidden_dev,
+                hidden.as_ptr().cast::<libc::c_void>(),
+                hidden_bytes,
+                self.stream,
+            )?;
+            if prior_values > 0 {
+                self.api.memcpy_htod_async(
+                    prior_k_bits_dev,
+                    prior_k.as_ptr().cast::<libc::c_void>(),
+                    prior_bits_bytes,
+                    self.stream,
+                )?;
+                self.api.memcpy_htod_async(
+                    prior_v_bits_dev,
+                    prior_v.as_ptr().cast::<libc::c_void>(),
+                    prior_bits_bytes,
+                    self.stream,
+                )?;
+            }
+        }
+        if prior_values > 0 {
+            self.launch_f16_to_f32(prior_k_bits_dev, all_k_dev, prior_values)?;
+            self.launch_f16_to_f32(prior_v_bits_dev, all_v_dev, prior_values)?;
+        }
+
+        let attn_norm_dev = self.resident_f32_ptr(attn_norm_weight)?;
+        self.launch_rms_norm_rows_f32(
+            hidden_dev,
+            attn_norm_dev,
+            normed_dev,
+            norm_eps,
+            seq_len,
+            n_embd,
+            false,
+        )?;
+        self.q4k_batch_dev_input_to_dev(
+            q_weights,
+            q_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            q_raw_dev,
+        )?;
+        let prior_f32_bytes = prior_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| "CUDA DFlash current KV offset overflow".to_string())?;
+        let current_k_dev = all_k_dev
+            .checked_add(prior_f32_bytes)
+            .ok_or_else(|| "CUDA DFlash current K pointer overflow".to_string())?;
+        let current_v_dev = all_v_dev
+            .checked_add(prior_f32_bytes)
+            .ok_or_else(|| "CUDA DFlash current V pointer overflow".to_string())?;
+        self.q4k_batch_dev_input_to_dev(
+            k_weights,
+            kv_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            current_k_raw_dev,
+        )?;
+        self.q6k_batch_dev_input_to_dev(
+            v_weights,
+            kv_rows,
+            blocks_per_row,
+            seq_len,
+            normed_dev,
+            current_v_dev,
+        )?;
+
+        let q_norm_dev = self.resident_f32_ptr(q_norm)?;
+        let k_norm_dev = self.resident_f32_ptr(k_norm)?;
+        self.launch_rms_norm_rows_f32(
+            q_raw_dev,
+            q_norm_dev,
+            q_dev,
+            norm_eps,
+            seq_len.saturating_mul(num_heads),
+            HEAD_DIM,
+            false,
+        )?;
+        self.launch_rms_norm_rows_f32(
+            current_k_raw_dev,
+            k_norm_dev,
+            current_k_dev,
+            norm_eps,
+            seq_len.saturating_mul(num_kv_heads),
+            HEAD_DIM,
+            false,
+        )?;
+        let q_pairs = seq_len
+            .checked_mul(num_heads)
+            .and_then(|heads| heads.checked_mul(HEAD_DIM / 2))
+            .ok_or_else(|| "CUDA DFlash Q RoPE pair count overflow".to_string())?;
+        let k_pairs = seq_len
+            .checked_mul(num_kv_heads)
+            .and_then(|heads| heads.checked_mul(HEAD_DIM / 2))
+            .ok_or_else(|| "CUDA DFlash K RoPE pair count overflow".to_string())?;
+        self.launch_rope_f32_inplace(
+            q_dev, 0, q_pairs, q_rows, HEAD_DIM, HEAD_DIM, pos_start, rope_theta, 1,
+        )?;
+        self.launch_rope_f32_inplace(
+            current_k_dev,
+            0,
+            k_pairs,
+            kv_rows,
+            HEAD_DIM,
+            HEAD_DIM,
+            pos_start,
+            rope_theta,
+            1,
+        )?;
+
+        let kv_tokens = all_values / kv_rows;
+        let mut output_arg = attn_out_dev;
+        let mut q_arg = q_dev;
+        let mut k_arg = all_k_dev;
+        let mut v_arg = all_v_dev;
+        let mut seq_arg = seq_len as u32;
+        let mut kv_len_arg = kv_tokens as u32;
+        let mut heads_arg = num_heads as u32;
+        let mut kv_heads_arg = num_kv_heads as u32;
+        let mut head_dim_arg = HEAD_DIM as u32;
+        let mut scale_arg = scale;
+        let mut window_arg = window as u32;
+        let mut softcap_arg = 0.0f32;
+        let mut causal_arg = 0u32;
+        self.launch_cached_gemv(
+            "rnb_attention_prefill_flash_hd256",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut head_dim_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut window_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut softcap_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut causal_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (seq_len as u32, num_heads as u32, 1),
+            (256, 1, 1),
+        )?;
+
+        self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            14,
+            None,
+            ffn_norm_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            q_rows,
+            n_ff,
+            n_embd,
+            seq_len,
+            hidden,
+            Some(hidden_dev),
+            attn_out_dev,
+            None,
+            None,
+            None,
+            norm_eps,
+            norm_eps,
+            false,
+            false,
+            false,
+            false,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn attention_decode_hd256(
         &mut self,
         q: &[f32],
@@ -2130,8 +2544,13 @@ impl CudaState {
         let mut heads_arg = num_heads as u32;
         let mut kv_heads_arg = num_kv_heads as u32;
         let mut scale_arg = scale;
+        let (kernel, block) = if crate::tuning::attention_decode_hd128_warp_enabled() {
+            ("rnb_attention_decode_hd128_warp", (32, 1, 1))
+        } else {
+            ("rnb_attention_decode_hd128", (128, 1, 1))
+        };
         self.launch_cached_gemv(
-            "rnb_attention_decode_hd128",
+            kernel,
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut q_arg as *mut u64).cast::<libc::c_void>(),
@@ -2143,7 +2562,7 @@ impl CudaState {
                 (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
             ],
             (num_heads as u32, 1, 1),
-            (128, 1, 1),
+            block,
         )?;
 
         let mut output = vec![0.0f32; output_len];
@@ -2390,6 +2809,7 @@ impl CudaState {
 
     fn cached_decode_split_preferred(head_dim: usize, window_len: usize) -> bool {
         match head_dim {
+            128 => window_len >= 256 && crate::tuning::decode_attention_hd128_split_enabled(),
             256 => window_len >= 512 && crate::tuning::decode_attention_hd256_split_enabled(),
             512 => window_len >= 256 && crate::tuning::decode_attention_hd512_split_enabled(),
             _ => false,
@@ -3164,6 +3584,7 @@ impl CudaState {
             }
         } else if prefer_split {
             let chunk_size = match head_dim {
+                128 => crate::tuning::decode_attention_hd128_split_chunk_size(),
                 256 => crate::tuning::decode_attention_hd256_split_chunk_size(),
                 512 => crate::tuning::decode_attention_hd512_split_chunk_size(),
                 _ => unreachable!("split preference validates head_dim"),
@@ -3194,6 +3615,7 @@ impl CudaState {
             let mut chunk_size_arg = chunk_size as u32;
             self.launch_cached_gemv(
                 match head_dim {
+                    128 => "rnb_attention_decode_hd128_split_partials",
                     256 => "rnb_attention_decode_hd256_split_partials",
                     512 => "rnb_attention_decode_hd512_split_partials",
                     _ => unreachable!("split preference validates head_dim"),
@@ -3211,11 +3633,12 @@ impl CudaState {
                     (&mut chunk_size_arg as *mut u32).cast::<libc::c_void>(),
                 ],
                 (num_heads as u32, num_chunks as u32, 1),
-                (head_dim as u32, 1, 1),
+                (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
             )?;
             let mut num_chunks_arg = num_chunks as u32;
             self.launch_cached_gemv(
                 match head_dim {
+                    128 => "rnb_attention_decode_hd128_split_reduce",
                     256 => "rnb_attention_decode_hd256_split_reduce",
                     512 => "rnb_attention_decode_hd512_split_reduce",
                     _ => unreachable!("split preference validates head_dim"),
@@ -3228,13 +3651,16 @@ impl CudaState {
                     (&mut num_chunks_arg as *mut u32).cast::<libc::c_void>(),
                 ],
                 (num_heads as u32, 1, 1),
-                (head_dim as u32, 1, 1),
+                (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
             )?;
         } else {
-            let kernel = match head_dim {
-                128 => "rnb_attention_decode_hd128",
-                256 => "rnb_attention_decode_hd256",
-                512 => "rnb_attention_decode_hd512",
+            let (kernel, block) = match head_dim {
+                128 if crate::tuning::attention_decode_hd128_warp_enabled() => {
+                    ("rnb_attention_decode_hd128_warp", (32, 1, 1))
+                }
+                128 => ("rnb_attention_decode_hd128", (128, 1, 1)),
+                256 => ("rnb_attention_decode_hd256", (256, 1, 1)),
+                512 => ("rnb_attention_decode_hd512", (512, 1, 1)),
                 _ => unreachable!("validated head_dim"),
             };
             self.launch_cached_gemv(
@@ -3250,7 +3676,7 @@ impl CudaState {
                     (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                 ],
                 (num_heads as u32, 1, 1),
-                (head_dim as u32, 1, 1),
+                block,
             )?;
         }
 
