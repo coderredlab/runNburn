@@ -238,6 +238,10 @@ pub fn prefill_attention_hd128_muse_dense_chain_if_supported(
     .map_err(|err| format!("CUDA Muse prefill attention dense chain failed: {err}"))
 }
 
+fn muse_hd128_window_is_invalid(sliding_window: Option<usize>) -> bool {
+    sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
     q: &[u8],
@@ -282,6 +286,7 @@ pub fn prefill_q4k_muse_hd128_dense_chain_if_supported(
         || kv_rows != num_kv_heads.saturating_mul(128)
         || q_norm.len() != 128
         || k_norm.len() != 128
+        || muse_hd128_window_is_invalid(sliding_window)
         || seq_len < backend::tuning::prefill_flash_attention_min_seq(128)
     {
         return Ok(None);
@@ -706,4 +711,20 @@ pub fn qwen35_gdn_decode_core_chain(call: QwenGdnDecodeChainCall<'_>) -> Result<
         norm_eps: call.norm_eps,
     })
     .map_err(|err| format!("CUDA Qwen GDN decode chain failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::muse_hd128_window_is_invalid;
+
+    #[test]
+    fn muse_hd128_window_rejects_zero_and_kernel_overflow() {
+        assert!(!muse_hd128_window_is_invalid(None));
+        assert!(!muse_hd128_window_is_invalid(Some(1)));
+        assert!(!muse_hd128_window_is_invalid(Some(u32::MAX as usize)));
+        assert!(muse_hd128_window_is_invalid(Some(0)));
+        if let Some(too_large) = (u32::MAX as usize).checked_add(1) {
+            assert!(muse_hd128_window_is_invalid(Some(too_large)));
+        }
+    }
 }
