@@ -1388,6 +1388,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.q_elems_buf,
         carrier.seq_len * carrier.q_dim,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.o_in_f16_dev]);
     encode_quant_gemm_v2(
         ctx,
         enc,
@@ -1402,6 +1403,7 @@ fn encode_muse_o_tail_ffn_ops(
         carrier.hidden_dim,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.o_proj_dev]);
     encode_rms_norm_batch(
         ctx,
         enc,
@@ -1412,6 +1414,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.post_norm_eps_buf,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
     crate::ffn_chain::encode_residual_add(
         ctx,
         enc,
@@ -1420,6 +1423,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.hidden_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
     );
+    compute::chain_barrier_resources(ctx, enc, [hidden_dev, &*carrier.ffn_normed_dev]);
     encode_rms_norm_batch(
         ctx,
         enc,
@@ -1430,6 +1434,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.norm_eps_buf,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
     encode_cast_f32_to_f16(
         ctx,
         enc,
@@ -1438,6 +1443,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.hidden_elems_buf,
         carrier.seq_len * carrier.hidden_dim,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_f16_dev]);
     encode_quant_gemm_v2(
         ctx,
         enc,
@@ -1466,6 +1472,7 @@ fn encode_muse_o_tail_ffn_ops(
         carrier.ffn_dim,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_gate_dev, &*carrier.ffn_up_dev]);
     encode_silu_mul_to_f16(
         ctx,
         enc,
@@ -1475,6 +1482,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.ffn_elems_buf,
         carrier.seq_len * carrier.ffn_dim,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_act_f16_dev]);
     encode_quant_gemm_v2(
         ctx,
         enc,
@@ -1489,6 +1497,7 @@ fn encode_muse_o_tail_ffn_ops(
         carrier.hidden_dim,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_down_dev]);
     encode_rms_norm_batch(
         ctx,
         enc,
@@ -1499,6 +1508,7 @@ fn encode_muse_o_tail_ffn_ops(
         &carrier.post_norm_eps_buf,
         carrier.seq_len,
     );
+    compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_dev]);
     crate::ffn_chain::encode_residual_add(
         ctx,
         enc,
@@ -1530,6 +1540,7 @@ fn encode_muse_full_layer_ops(
         req.norm_eps,
     )
     .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
+    compute::chain_barrier_resources(ctx, enc, [&*core.normed_dev]);
     encode_cast_f32_to_f16(
         ctx,
         &enc,

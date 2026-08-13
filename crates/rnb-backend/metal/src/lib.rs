@@ -1454,8 +1454,8 @@ struct MusePrefillOTailFfnCarrierKey {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MusePrefillFullLayerCarrierKey {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MusePrefillFullLayerCarrierShapeKey {
     seq_len: usize,
     num_heads: usize,
     num_kv_heads: usize,
@@ -1468,15 +1468,23 @@ struct MusePrefillFullLayerCarrierKey {
     scale_bits: u32,
     norm_eps_bits: u32,
     post_norm_eps_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MusePrefillFullLayerCarrierKey {
+    shape: MusePrefillFullLayerCarrierShapeKey,
     slot: u8,
-    q_quant: TensoropsQuant,
-    k_quant: TensoropsQuant,
-    v_quant: TensoropsQuant,
-    attention_gate_quant: TensoropsQuant,
-    o_quant: TensoropsQuant,
-    ffn_gate_quant: TensoropsQuant,
-    ffn_up_quant: TensoropsQuant,
-    ffn_down_quant: TensoropsQuant,
+}
+
+#[cfg(target_os = "macos")]
+fn retain_only_muse_prefill_full_layer_shape<V>(
+    carriers: &mut HashMap<MusePrefillFullLayerCarrierKey, V>,
+    shape: MusePrefillFullLayerCarrierShapeKey,
+) {
+    if carriers.keys().any(|cached| cached.shape != shape) {
+        carriers.clear();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1614,6 +1622,26 @@ pub struct MusePrefillFullLayerBackendRequest<'a> {
     pub post_norm_eps: f32,
     pub apply_rope: bool,
     pub sliding_window: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+impl MusePrefillFullLayerCarrierShapeKey {
+    fn from_request(req: MusePrefillFullLayerBackendRequest<'_>) -> Self {
+        Self {
+            seq_len: req.seq_len,
+            num_heads: req.num_heads,
+            num_kv_heads: req.num_kv_heads,
+            head_dim: req.head_dim,
+            hidden_dim: req.hidden_dim,
+            q_dim: req.q_dim,
+            kv_dim: req.kv_dim,
+            ffn_dim: req.ffn_dim,
+            rope_theta_bits: req.rope_theta.to_bits(),
+            scale_bits: req.scale.to_bits(),
+            norm_eps_bits: req.norm_eps.to_bits(),
+            post_norm_eps_bits: req.post_norm_eps.to_bits(),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2102,7 +2130,7 @@ pub struct MetalBackend {
             prefill_atn_core_chain::MusePrefillOTailFfnCarrier,
         )>,
     >,
-    /// Muse full-layer scratch keyed by prompt shape and layer semantics.
+    /// Two alternating Muse full-layer scratch slots for the active prompt shape.
     muse_prefill_full_layer_carriers: RefCell<
         HashMap<
             MusePrefillFullLayerCarrierKey,
@@ -4971,16 +4999,11 @@ impl MetalBackend {
         Ok(Some(output))
     }
 
-    /// Muse dense full layer: QKV+attention gate, causal attention, O projection,
-    /// both normalized residual branches, and SwiGLU FFN in one command buffer.
     #[cfg(target_os = "macos")]
-    pub fn prefill_muse_full_layer_if_supported(
-        &self,
+    fn muse_prefill_full_layer_preflight(
+        ctx: &compute::MetalContext,
         req: MusePrefillFullLayerBackendRequest<'_>,
-    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
-        let Some(ctx) = self.ctx.as_ref() else {
-            return Ok(None);
-        };
+    ) -> Result<bool, String> {
         if ctx.cast_f32_f16_pipeline.is_none()
             || !Self::atn_core_tensorops_v2_ready(ctx, req.q_weight.quant)
             || !Self::atn_core_tensorops_v2_ready(ctx, req.k_weight.quant)
@@ -4991,23 +5014,37 @@ impl MetalBackend {
             || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_up_weight.quant)
             || !Self::atn_core_tensorops_v2_ready(ctx, req.ffn_down_weight.quant)
         {
-            return Ok(None);
+            return Ok(false);
         }
         if req.seq_len == 0
+            || req.hidden_dim == 0
+            || req.ffn_dim == 0
             || req.num_heads == 0
             || req.num_kv_heads == 0
             || req.num_heads % req.num_kv_heads != 0
             || req.head_dim != 128
-            || req.q_dim != req.num_heads * req.head_dim
-            || req.kv_dim != req.num_kv_heads * req.head_dim
+            || req.sliding_window.is_some_and(|window| window == 0)
+            || !req.rope_theta.is_finite()
+            || req.rope_theta <= 0.0
             || !req.norm_eps.is_finite()
             || req.norm_eps <= 0.0
             || !req.post_norm_eps.is_finite()
             || req.post_norm_eps <= 0.0
             || !req.scale.is_finite()
+            || req.scale <= 0.0
         {
             return Err("Metal Muse prefill full layer contract mismatch".to_string());
         }
+        Self::atn_core_require_eq(
+            "q_dim",
+            req.q_dim,
+            Self::atn_core_checked_mul(req.num_heads, req.head_dim, "q_dim")?,
+        )?;
+        Self::atn_core_require_eq(
+            "kv_dim",
+            req.kv_dim,
+            Self::atn_core_checked_mul(req.num_kv_heads, req.head_dim, "kv_dim")?,
+        )?;
         Self::atn_core_require_eq(
             "hidden len",
             req.hidden.len(),
@@ -5041,6 +5078,22 @@ impl MetalBackend {
             Self::atn_core_require_eq(&format!("{role} rows"), weight.rows, rows)?;
             Self::atn_core_require_eq(&format!("{role} cols"), weight.cols, cols)?;
             Self::atn_core_validate_weight(role, weight)?;
+        }
+        Ok(true)
+    }
+
+    /// Muse dense full layer: QKV+attention gate, causal attention, O projection,
+    /// both normalized residual branches, and SwiGLU FFN in one command buffer.
+    #[cfg(target_os = "macos")]
+    pub fn prefill_muse_full_layer_if_supported(
+        &self,
+        req: MusePrefillFullLayerBackendRequest<'_>,
+    ) -> std::result::Result<Option<(Vec<f32>, Vec<u16>, Vec<u16>)>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if !Self::muse_prefill_full_layer_preflight(ctx, req)? {
+            return Ok(None);
         }
 
         let (
@@ -5081,30 +5134,10 @@ impl MetalBackend {
             )
         };
 
-        let key = MusePrefillFullLayerCarrierKey {
-            seq_len: req.seq_len,
-            num_heads: req.num_heads,
-            num_kv_heads: req.num_kv_heads,
-            head_dim: req.head_dim,
-            hidden_dim: req.hidden_dim,
-            q_dim: req.q_dim,
-            kv_dim: req.kv_dim,
-            ffn_dim: req.ffn_dim,
-            rope_theta_bits: req.rope_theta.to_bits(),
-            scale_bits: req.scale.to_bits(),
-            norm_eps_bits: req.norm_eps.to_bits(),
-            post_norm_eps_bits: req.post_norm_eps.to_bits(),
-            slot: 0,
-            q_quant: req.q_weight.quant,
-            k_quant: req.k_weight.quant,
-            v_quant: req.v_weight.quant,
-            attention_gate_quant: req.attention_gate_weight.quant,
-            o_quant: req.o_weight.quant,
-            ffn_gate_quant: req.ffn_gate_weight.quant,
-            ffn_up_quant: req.ffn_up_weight.quant,
-            ffn_down_quant: req.ffn_down_weight.quant,
-        };
+        let shape = MusePrefillFullLayerCarrierShapeKey::from_request(req);
+        let key = MusePrefillFullLayerCarrierKey { shape, slot: 0 };
         let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
+        retain_only_muse_prefill_full_layer_shape(&mut carriers, shape);
         let carrier = carriers.entry(key).or_insert_with(|| {
             prefill_atn_core_chain::MusePrefillFullLayerCarrier::new(
                 ctx,
@@ -5535,8 +5568,41 @@ impl MetalBackend {
         let Some(ctx) = self.ctx.as_ref() else {
             return Ok(None);
         };
-        if layers.is_empty() {
+        let Some(first) = layers.first().copied() else {
             return Ok(None);
+        };
+        for pair in layers.windows(2) {
+            if pair[1].layer_idx != pair[0].layer_idx + 1 {
+                return Err(format!(
+                    "Metal Muse prefill range: non-contiguous layer indices {} -> {}",
+                    pair[0].layer_idx, pair[1].layer_idx
+                ));
+            }
+        }
+        let shape = MusePrefillFullLayerCarrierShapeKey::from_request(first.request);
+        Self::atn_core_require_eq(
+            "hidden len",
+            hidden.len(),
+            Self::atn_core_checked_mul(
+                first.request.seq_len,
+                first.request.hidden_dim,
+                "hidden len",
+            )?,
+        )?;
+        for layer in layers.iter().copied() {
+            if MusePrefillFullLayerCarrierShapeKey::from_request(layer.request) != shape {
+                return Err(format!(
+                    "Metal Muse prefill range: carrier shape changed at layer {}",
+                    layer.layer_idx
+                ));
+            }
+            if !Self::muse_prefill_full_layer_preflight(ctx, layer.request)? {
+                return Ok(None);
+            }
+        }
+        {
+            let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
+            retain_only_muse_prefill_full_layer_shape(&mut carriers, shape);
         }
         let mut state = prefill_atn_core_chain::MusePrefillLayerRangeState::new(ctx, hidden);
         let mut pending: Option<prefill_atn_core_chain::MusePrefillLayerRangePending> = None;
@@ -5544,27 +5610,8 @@ impl MetalBackend {
         for (layer_offset, layer) in layers.iter().copied().enumerate() {
             let req = layer.request;
             let key = MusePrefillFullLayerCarrierKey {
-                seq_len: req.seq_len,
-                num_heads: req.num_heads,
-                num_kv_heads: req.num_kv_heads,
-                head_dim: req.head_dim,
-                hidden_dim: req.hidden_dim,
-                q_dim: req.q_dim,
-                kv_dim: req.kv_dim,
-                ffn_dim: req.ffn_dim,
-                rope_theta_bits: req.rope_theta.to_bits(),
-                scale_bits: req.scale.to_bits(),
-                norm_eps_bits: req.norm_eps.to_bits(),
-                post_norm_eps_bits: req.post_norm_eps.to_bits(),
+                shape,
                 slot: (layer_offset & 1) as u8,
-                q_quant: req.q_weight.quant,
-                k_quant: req.k_weight.quant,
-                v_quant: req.v_weight.quant,
-                attention_gate_quant: req.attention_gate_weight.quant,
-                o_quant: req.o_weight.quant,
-                ffn_gate_quant: req.ffn_gate_weight.quant,
-                ffn_up_quant: req.ffn_up_weight.quant,
-                ffn_down_quant: req.ffn_down_weight.quant,
             };
             let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
             let carrier = carriers.entry(key).or_insert_with(|| {
@@ -15701,6 +15748,56 @@ mod tests {
             out.extend(quantize_q4_k_vec(&vals[row * k..(row + 1) * k]));
         }
         out
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn muse_prefill_full_layer_cache_retains_only_two_active_shape_slots() {
+        let shape = MusePrefillFullLayerCarrierShapeKey {
+            seq_len: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 128,
+            hidden_dim: 256,
+            q_dim: 256,
+            kv_dim: 128,
+            ffn_dim: 256,
+            rope_theta_bits: 10_000.0f32.to_bits(),
+            scale_bits: (128.0f32).sqrt().recip().to_bits(),
+            norm_eps_bits: 1.0e-6f32.to_bits(),
+            post_norm_eps_bits: 1.0e-5f32.to_bits(),
+        };
+        let mut carriers = HashMap::from([
+            (MusePrefillFullLayerCarrierKey { shape, slot: 0 }, ()),
+            (MusePrefillFullLayerCarrierKey { shape, slot: 1 }, ()),
+        ]);
+
+        retain_only_muse_prefill_full_layer_shape(&mut carriers, shape);
+        assert_eq!(carriers.len(), 2);
+
+        let next_shape = MusePrefillFullLayerCarrierShapeKey {
+            seq_len: 2,
+            ..shape
+        };
+        retain_only_muse_prefill_full_layer_shape(&mut carriers, next_shape);
+        assert!(carriers.is_empty());
+
+        carriers.insert(
+            MusePrefillFullLayerCarrierKey {
+                shape: next_shape,
+                slot: 0,
+            },
+            (),
+        );
+        carriers.insert(
+            MusePrefillFullLayerCarrierKey {
+                shape: next_shape,
+                slot: 1,
+            },
+            (),
+        );
+        assert_eq!(carriers.len(), 2);
+        assert!(carriers.keys().all(|key| key.shape == next_shape));
     }
 
     #[cfg(target_os = "macos")]

@@ -363,4 +363,3 @@ kernel void attn_decode_f16_gqa16(
             (merged_s > 0.0f ? merged / merged_s : 0.0f) * sigmoid_gate;
     }
 }
-
