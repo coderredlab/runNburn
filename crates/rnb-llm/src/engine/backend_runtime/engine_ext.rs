@@ -182,6 +182,9 @@ impl Engine {
             scratch.cuda_decode_kv_authoritative = false;
         }
         self.sequence_cursor = None;
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.backend_argmax_token = None;
+        }
         if let Some(model) = self
             .weights
             .as_mut()

@@ -1205,17 +1205,41 @@ mod tests {
             ..GenerateParams::default()
         };
 
+        let mut rng = SmallRng::seed_from_u64(0);
+        let sampler = SamplerChain::from_params(&params);
         let mut emitted: Vec<String> = Vec::new();
-        let result = engine
-            .generate_stream("hi", &params, |piece| {
+        let result = finish_generation(
+            &mut engine,
+            vec![],
+            0,
+            &params,
+            Instant::now(),
+            &mut rng,
+            sampler,
+            None,
+            vec![0.0; 16],
+            Some(7),
+            |piece| {
                 emitted.push(piece.to_string());
                 true
-            })
-            .expect("generate_stream ok");
+            },
+        )
+        .expect("finish_generation ok");
 
         // bypass should have emitted token 7 ("t7") on every iteration.
         assert_eq!(result.tokens_generated, 3);
         assert_eq!(emitted, vec!["t7", "t7", "t7"]);
+    }
+
+    #[test]
+    fn clear_sequence_state_discards_stale_backend_argmax() {
+        let mut engine = make_engine_non_eos_greedy(9);
+        engine.force_backend_argmax_token_for_test(Some(7));
+        assert_eq!(engine.last_backend_argmax_token(), Some(7));
+
+        engine.clear_sequence_state().expect("clear sequence state");
+
+        assert_eq!(engine.last_backend_argmax_token(), None);
     }
 
     /// Bypass off (None) — sampler path is preserved unchanged. Equivalent to
