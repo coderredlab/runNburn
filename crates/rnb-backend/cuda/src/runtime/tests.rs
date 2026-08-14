@@ -10454,9 +10454,7 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
     let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
-    let _qkv_q8dot = EnvVarGuard::set("RNB_CUDA_FULL_DEVICE_DECODE_QKV_Q8DOT", "0");
-    let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "0");
-    let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "0");
+    let _qkv_q8dot = EnvVarGuard::set("RNB_CUDA_FULL_DEVICE_DECODE_QKV_Q8DOT", "1");
     let _q6_warp8 = EnvVarGuard::set("RNB_CUDA_Q6K_OUTPUT_WARP8", "0");
     let num_heads = 2usize;
     let num_kv_heads = 1usize;
@@ -10516,93 +10514,71 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
     let norm_eps = 1.0e-5;
     let post_norm_eps = 1.0e-6;
 
-    let mut expected = initial_hidden.clone();
-    q4k_muse_prefill_hd128_dense_chain(
-        &q,
-        &k,
-        &v,
-        14,
-        &attention_gate,
-        q_dim,
-        kv_dim,
-        n_embd,
-        &initial_hidden,
-        &attn_norm,
-        &q_norm,
-        &k_norm,
-        num_heads,
-        num_kv_heads,
-        scale,
-        rope_theta,
-        0,
-        true,
-        Some(2),
-        &o,
-        &gate,
-        &up,
-        &down,
-        12,
-        &post_attn_norm,
-        &ffn_norm,
-        &post_ffn_norm,
-        q_dim,
-        n_ff,
-        n_embd,
-        &mut expected,
-        norm_eps,
-        post_norm_eps,
-    )
-    .expect("fused Muse single-token layer")
-    .expect("fused Muse path");
-
     let hidden_dev = acquire_decode_hidden_carrier(n_embd * std::mem::size_of::<f32>()).unwrap();
+    let run_layer = |layer_idx| {
+        decode_full_layer_device_resident(
+            layer_idx,
+            &q,
+            &k,
+            &v,
+            &o,
+            Some(&attention_gate),
+            &gate,
+            &up,
+            &down,
+            &attn_norm,
+            Some(&post_attn_norm),
+            &ffn_norm,
+            Some(&post_ffn_norm),
+            n_embd,
+            n_ff,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_dim,
+            q_dim,
+            Some(&q_norm),
+            Some(&k_norm),
+            scale,
+            true,
+            false,
+            Some(2),
+            false,
+            1.0,
+            rope_theta,
+            0,
+            0,
+            norm_eps,
+            post_norm_eps,
+            hidden_dev,
+        )
+    };
+
     upload_to_decode_hidden_carrier(&initial_hidden, hidden_dev).unwrap();
-    decode_full_layer_device_resident(
-        9001,
-        &q,
-        &k,
-        &v,
-        &o,
-        Some(&attention_gate),
-        &gate,
-        &up,
-        &down,
-        &attn_norm,
-        Some(&post_attn_norm),
-        &ffn_norm,
-        Some(&post_ffn_norm),
-        n_embd,
-        n_ff,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        kv_dim,
-        q_dim,
-        Some(&q_norm),
-        Some(&k_norm),
-        scale,
-        true,
-        false,
-        Some(2),
-        false,
-        1.0,
-        rope_theta,
-        0,
-        0,
-        norm_eps,
-        post_norm_eps,
-        hidden_dev,
-    )
-    .expect("full device Muse layer");
+    {
+        let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "0");
+        let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "0");
+        run_layer(9000).expect("separate QKV Muse layer");
+    }
+    let mut expected = vec![0.0f32; n_embd];
+    download_from_decode_hidden_carrier(hidden_dev, &mut expected).unwrap();
+    sync_decode_stream().unwrap();
+
+    upload_to_decode_hidden_carrier(&initial_hidden, hidden_dev).unwrap();
+    {
+        let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "1");
+        let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "1");
+        run_layer(9001).expect("fused QKV Muse layer");
+    }
     let mut actual = vec![0.0f32; n_embd];
     download_from_decode_hidden_carrier(hidden_dev, &mut actual).unwrap();
     sync_decode_stream().unwrap();
     assert_close_rows_abs_rel(
-        "Muse full device single-token layer",
+        "Muse fused QKV full device single-token layer",
         &actual,
         &expected,
-        3e-3,
         3e-4,
+        3e-5,
     );
 }
 

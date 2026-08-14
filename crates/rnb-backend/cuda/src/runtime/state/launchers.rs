@@ -4839,6 +4839,64 @@ impl CudaState {
             block,
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_qkv_gate_gemv_q8dot_to_dev(
+        &mut self,
+        q_weights: &[u8],
+        k_weights: &[u8],
+        v_weights: &[u8],
+        gate_weights: &[u8],
+        q_rows: usize,
+        kv_rows: usize,
+        v_q6: bool,
+        blocks_per_row: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        q_out_dev: u64,
+        k_out_dev: u64,
+        v_out_dev: u64,
+        gate_out_dev: u64,
+    ) -> Result<(), String> {
+        let q_weights_dev = self.resident_q4k_weights_ptr(q_weights)?;
+        let k_weights_dev = self.resident_q4k_weights_ptr(k_weights)?;
+        let v_weights_dev = self.resident_q4k_weights_ptr(v_weights)?;
+        let gate_weights_dev = self.resident_q4k_weights_ptr(gate_weights)?;
+        let mut q_out_arg = q_out_dev;
+        let mut k_out_arg = k_out_dev;
+        let mut v_out_arg = v_out_dev;
+        let mut gate_out_arg = gate_out_dev;
+        let mut q_weights_arg = q_weights_dev;
+        let mut k_weights_arg = k_weights_dev;
+        let mut v_weights_arg = v_weights_dev;
+        let mut gate_weights_arg = gate_weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut q_rows_arg = q_rows as u32;
+        let mut kv_rows_arg = kv_rows as u32;
+        let mut v_q6_arg = u32::from(v_q6);
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        self.launch_cached_gemv(
+            "rnb_qkv_gate_gemv_q8dot_wide_row4",
+            &[
+                (&mut q_out_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut k_out_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut v_out_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut gate_out_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut q_weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut k_weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut v_weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut gate_weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut q_rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut kv_rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut v_q6_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            ((q_rows * 2 + kv_rows * 2) as u32, 1, 1),
+            (128, 1, 1),
+        )
+    }
 
     // cu203: GDN decode chain 의 Q5_K ssm_out q8dot device-input launch.
     // upload_and_launch_q5k_gemv 의 q8dot 분기와 같은 커널·grid 를 device 입력으로 쓴다.

@@ -1475,6 +1475,107 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_row4(
         out[row] = partial[0] + partial[1] + partial[2] + partial[3];
     }
 }
+extern "C" __global__ void rnb_qkv_gate_gemv_q8dot_wide_row4(
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float* __restrict__ gate_out,
+    const unsigned char* __restrict__ q_weights,
+    const unsigned char* __restrict__ k_weights,
+    const unsigned char* __restrict__ v_weights,
+    const unsigned char* __restrict__ gate_weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned q_rows,
+    unsigned kv_rows,
+    unsigned v_q6,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned global_row = blockIdx.x;
+    const unsigned k_start = q_rows;
+    const unsigned v_start = k_start + kv_rows;
+    const unsigned gate_start = v_start + kv_rows;
+    const unsigned total_rows = gate_start + q_rows;
+    if (global_row >= total_rows) {
+        return;
+    }
+
+    float* out;
+    const unsigned char* weights;
+    unsigned row;
+    bool q6;
+    if (global_row < k_start) {
+        out = q_out;
+        weights = q_weights;
+        row = global_row;
+        q6 = false;
+    } else if (global_row < v_start) {
+        out = k_out;
+        weights = k_weights;
+        row = global_row - k_start;
+        q6 = false;
+    } else if (global_row < gate_start) {
+        out = v_out;
+        weights = v_weights;
+        row = global_row - v_start;
+        q6 = v_q6 != 0u;
+    } else {
+        out = gate_out;
+        weights = gate_weights;
+        row = global_row - gate_start;
+        q6 = false;
+    }
+
+    float acc = 0.0f;
+    if (q6) {
+        const unsigned char* row_ptr = weights + row * blocks_per_row * 210u;
+        const unsigned elem = lane * 8u;
+        for (unsigned b = warp; b < blocks_per_row; b += 4u) {
+            const RnbQ6WideLane w =
+                rnb_q6k_wide_lane_decode(row_ptr + b * 210u, elem);
+            const int2 x_raw =
+                rnb_load_i32x2_aligned8(input_qs + b * 256u + elem);
+            const float x_d = input_ds[b * 8u + (elem >> 5)];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot0 - 32 * x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * (w.d * (float)w.sc) * (float)(dot1 - 32 * x_sum1);
+        }
+    } else {
+        const unsigned char* row_ptr = weights + row * blocks_per_row * 144u;
+        const unsigned j = lane >> 2;
+        const unsigned elem = (lane & 3u) * 8u;
+        for (unsigned b = warp; b < blocks_per_row; b += 4u) {
+            const RnbQ4WideLane w =
+                rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+            const unsigned x_off = b * 256u + j * 32u + elem;
+            const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+            const float x_d = input_ds[b * 8u + j];
+            const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+            const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+            const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+            const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+            acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+        }
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    __shared__ float partial[4];
+    if (lane == 0u) {
+        partial[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        out[row] = partial[0] + partial[1] + partial[2] + partial[3];
+    }
+}
+
 
 // cu219: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
 extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_wide_warp8(

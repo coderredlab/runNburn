@@ -165,7 +165,7 @@ pub fn mmq_tile32_min_seq() -> usize {
 }
 
 pub fn q4k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
-    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
+    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 128 && blocks_per_row >= 4;
     eligible && !dflash_exact_verify_active() && env_bool("RNB_CUDA_Q4K_MMQ_TILE32", true)
 }
 
@@ -224,7 +224,7 @@ pub fn q3k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize
     eligible && env_bool("RNB_CUDA_Q3K_MMQ_TILE32", true)
 }
 pub fn q6k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
-    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 1024 && blocks_per_row >= 4;
+    let eligible = seq_len >= mmq_tile32_min_seq() && rows >= 128 && blocks_per_row >= 4;
     eligible && env_bool("RNB_CUDA_Q6K_MMQ_TILE32", true)
 }
 /// cu222: Q5_K MMQ tile32 게이트 — Q4/Q6 과 같은 min_seq/shape 조건.
@@ -2443,6 +2443,7 @@ mod tests {
 
     #[test]
     fn q6k_output_warp8_defaults_on_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_OUTPUT_WARP8");
         }
@@ -2542,7 +2543,8 @@ mod tests {
         // −14.5% 근거). env 로 경계를 되돌릴 수 있다.
         assert!(q4k_mmq_tile32_enabled(8, 2560, 10));
         assert!(!q4k_mmq_tile32_enabled(7, 2560, 10));
-        assert!(!q4k_mmq_tile32_enabled(1115, 512, 10));
+        assert!(q4k_mmq_tile32_enabled(1115, 128, 10));
+        assert!(!q4k_mmq_tile32_enabled(1115, 127, 10));
         assert!(!q4k_mmq_tile32_enabled(1115, 2560, 3));
         unsafe {
             std::env::set_var("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "32");
@@ -2594,7 +2596,8 @@ mod tests {
         assert!(q6k_mmq_tile32_enabled(1115, 8192, 8));
         assert!(q6k_mmq_tile32_enabled(8, 8192, 8));
         assert!(!q6k_mmq_tile32_enabled(7, 8192, 8));
-        assert!(!q6k_mmq_tile32_enabled(1115, 512, 8));
+        assert!(q6k_mmq_tile32_enabled(1115, 128, 8));
+        assert!(!q6k_mmq_tile32_enabled(1115, 127, 8));
         assert!(!q6k_mmq_tile32_enabled(1115, 8192, 3));
 
         unsafe {

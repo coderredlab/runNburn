@@ -85,51 +85,84 @@ impl CudaState {
             let q8_qs_dev = norm_dev + norm_bytes as u64;
             let q8_ds_dev = q8_qs_dev + q8_qs_bytes as u64;
             self.launch_quantize_q8_1_by_32(norm_dev, q8_qs_dev, q8_ds_dev, input_blocks * 256)?;
-            self.launch_q4k_gemv_q8dot_to_dev(
-                q_weights,
-                q_rows,
-                input_blocks,
-                q8_qs_dev,
-                q8_ds_dev,
-                q_dev,
-            )?;
-            self.launch_q4k_gemv_q8dot_to_dev(
-                k_weights,
-                kv_dim,
-                input_blocks,
-                q8_qs_dev,
-                q8_ds_dev,
-                k_dev,
-            )?;
-            if v_weights.len() == expected_v_q4k_bytes {
-                self.launch_q4k_gemv_q8dot_to_dev(
-                    v_weights,
-                    kv_dim,
-                    input_blocks,
-                    q8_qs_dev,
-                    q8_ds_dev,
-                    v_dev,
-                )?;
-            } else {
-                self.launch_q6k_gemv_q8dot_to_dev(
-                    v_weights,
-                    kv_dim,
-                    input_blocks,
-                    q8_qs_dev,
-                    q8_ds_dev,
-                    v_dev,
-                )?;
-            }
-            if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev)
+            let v_q6 = v_weights.len() != expected_v_q4k_bytes;
+            let fused_qkv_gate = if tuning::q4k_q8dot_row4_enabled()
+                && (!v_q6 || tuning::q6k_q8dot_row4_enabled())
             {
+                if let (Some(gate_weights), Some(gate_dev)) =
+                    (attention_gate_weights, attention_gate_dev)
+                {
+                    self.launch_qkv_gate_gemv_q8dot_to_dev(
+                        q_weights,
+                        k_weights,
+                        v_weights,
+                        gate_weights,
+                        q_rows,
+                        kv_dim,
+                        v_q6,
+                        input_blocks,
+                        q8_qs_dev,
+                        q8_ds_dev,
+                        q_dev,
+                        k_dev,
+                        v_dev,
+                        gate_dev,
+                    )?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !fused_qkv_gate {
                 self.launch_q4k_gemv_q8dot_to_dev(
-                    weights,
+                    q_weights,
                     q_rows,
                     input_blocks,
                     q8_qs_dev,
                     q8_ds_dev,
-                    output_dev,
+                    q_dev,
                 )?;
+                self.launch_q4k_gemv_q8dot_to_dev(
+                    k_weights,
+                    kv_dim,
+                    input_blocks,
+                    q8_qs_dev,
+                    q8_ds_dev,
+                    k_dev,
+                )?;
+                if v_weights.len() == expected_v_q4k_bytes {
+                    self.launch_q4k_gemv_q8dot_to_dev(
+                        v_weights,
+                        kv_dim,
+                        input_blocks,
+                        q8_qs_dev,
+                        q8_ds_dev,
+                        v_dev,
+                    )?;
+                } else {
+                    self.launch_q6k_gemv_q8dot_to_dev(
+                        v_weights,
+                        kv_dim,
+                        input_blocks,
+                        q8_qs_dev,
+                        q8_ds_dev,
+                        v_dev,
+                    )?;
+                }
+                if let (Some(weights), Some(output_dev)) =
+                    (attention_gate_weights, attention_gate_dev)
+                {
+                    self.launch_q4k_gemv_q8dot_to_dev(
+                        weights,
+                        q_rows,
+                        input_blocks,
+                        q8_qs_dev,
+                        q8_ds_dev,
+                        output_dev,
+                    )?;
+                }
             }
         } else {
             self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
@@ -273,16 +306,7 @@ impl CudaState {
         eps: f32,
         output_dev: u64,
     ) -> Result<(), String> {
-        let weight_bytes = dim * std::mem::size_of::<f32>();
-        let weight_dev = self.decode_norm_buf_carrier_ptr(weight_bytes)?;
-        unsafe {
-            self.api.memcpy_htod_async(
-                weight_dev,
-                weight.as_ptr().cast::<libc::c_void>(),
-                weight_bytes,
-                self.stream,
-            )?;
-        }
+        let weight_dev = self.resident_f32_ptr_stable_source(weight)?;
         self.launch_rms_norm_f32(input_dev, weight_dev, output_dev, eps, dim, false)
     }
 
@@ -294,16 +318,7 @@ impl CudaState {
         head_dim: usize,
         eps: f32,
     ) -> Result<(), String> {
-        let weight_bytes = head_dim * std::mem::size_of::<f32>();
-        let weight_dev = self.decode_norm_buf_carrier_ptr(weight_bytes)?;
-        unsafe {
-            self.api.memcpy_htod_async(
-                weight_dev,
-                norm_weight.as_ptr().cast::<libc::c_void>(),
-                weight_bytes,
-                self.stream,
-            )?;
-        }
+        let weight_dev = self.resident_f32_ptr_stable_source(norm_weight)?;
         let mut input_arg = data_dev;
         let mut weight_arg = weight_dev;
         let mut output_arg = data_dev;
