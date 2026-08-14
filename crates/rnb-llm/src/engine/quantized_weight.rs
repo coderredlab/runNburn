@@ -689,4 +689,29 @@ impl QuantizedWeight {
         );
         Ok(())
     }
+    pub(super) fn gemv_into_host_quantized(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> crate::error::Result<()> {
+        let bytes = self
+            .data
+            .as_bytes()
+            .ok_or_else(|| crate::error::LlmError::Forward("quantized weight: no bytes".into()))?;
+        let required = self.rows;
+        assert!(
+            input.len() == self.cols && output.len() >= required,
+            "gemv_into_host_quantized: decode buffer size mismatch"
+        );
+        super::scalar_gemv::gemv_host_quantized(
+            bytes,
+            input,
+            &mut output[..required],
+            self.rows,
+            self.cols,
+            bytes.len() / self.rows,
+            self.ggml_type,
+        );
+        Ok(())
+    }
 }

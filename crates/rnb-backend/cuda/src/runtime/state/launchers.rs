@@ -5953,6 +5953,27 @@ impl CudaState {
         )
     }
 
+    pub(in crate::runtime) fn launch_q8_1_integer_sums_by_32(
+        &mut self,
+        qs_dev: u64,
+        sums_dev: u64,
+        chunks: usize,
+    ) -> Result<(), String> {
+        let mut qs_arg = qs_dev;
+        let mut sums_arg = sums_dev;
+        let mut chunks_arg = chunks as u32;
+        self.launch_cached_gemv(
+            "rnb_q8_1_integer_sums_by_32",
+            &[
+                (&mut qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut sums_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut chunks_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (chunks.div_ceil(8) as u32, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     // cu39: Q8_1 quantize (32-elem chunks) + per-chunk sum 저장. dp4a matmul 의
     // m-term (sum_q8 * mn) 계산에 필요. existing `launch_quantize_q8_1_by_32` 는
     // d 만 저장 — Q4_K m offset path 없는 곳에서 쓰임.
@@ -6102,6 +6123,7 @@ impl CudaState {
         seq_len: usize,
         input_qs_dev: u64,
         input_ds_dev: u64,
+        input_sums_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
@@ -6109,6 +6131,7 @@ impl CudaState {
         let mut weights_arg = weights_dev;
         let mut input_qs_arg = input_qs_dev;
         let mut input_ds_arg = input_ds_dev;
+        let mut input_sums_arg = input_sums_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let mut seq_len_arg = seq_len as u32;
@@ -6119,6 +6142,7 @@ impl CudaState {
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_sums_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
@@ -6437,6 +6461,40 @@ impl CudaState {
             ],
             (rows.div_ceil(64) as u32, seq_len.div_ceil(64) as u32, 1),
             (512, 1, 1),
+        )
+    }
+
+    pub(in crate::runtime) fn launch_q6k_q8_1_matmul_mmq_tile128_seq64(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut input_qs_arg = input_qs_dev;
+        let mut input_ds_arg = input_ds_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        self.launch_cached_gemv(
+            "rnb_q6k_q8_1_matmul_mmq_tile128_seq64",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_qs_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut input_ds_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (rows.div_ceil(128) as u32, seq_len.div_ceil(64) as u32, 1),
+            (256, 1, 1),
         )
     }
 

@@ -742,6 +742,7 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     const unsigned char* __restrict__ weights,
     const signed char* __restrict__ input_qs,
     const float* __restrict__ input_ds,
+    const float* __restrict__ input_sums,
     unsigned rows,
     unsigned blocks_per_row,
     unsigned seq_len) {
@@ -750,6 +751,7 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     (void)weights;
     (void)input_qs;
     (void)input_ds;
+    (void)input_sums;
     (void)rows;
     (void)blocks_per_row;
     (void)seq_len;
@@ -764,8 +766,6 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     const unsigned t_row_a = lane >> 2;
     const unsigned t_row_b = t_row_a + 8u;
 
-    // Complete Q4 tile plus a two-sub-block activation window stays below
-    // the CUDA 48-KiB static shared-memory limit.
     __shared__ signed char a_tile[8][128 * 32];
     __shared__ signed char b_tile[2][128 * 36];
     __shared__ float x_d[128];
@@ -775,15 +775,13 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     __shared__ float y_d[2][128];
     __shared__ float y_s[2][128];
 
-        const unsigned row_a = row_base + warp_row_off + t_row_a;
-        const unsigned row_b = row_base + warp_row_off + t_row_b;
-
+    const unsigned row_a = row_base + warp_row_off + t_row_a;
+    const unsigned row_b = row_base + warp_row_off + t_row_b;
     float acc[64];
 #pragma unroll
     for (unsigned i = 0; i < 64u; ++i) {
         acc[i] = 0.0f;
     }
-
     const unsigned row_bytes = blocks_per_row * 144u;
     for (unsigned block = 0; block < blocks_per_row; ++block) {
         if (tid < 128u) {
@@ -801,19 +799,15 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                     __half2float(__ushort_as_half(static_cast<unsigned short>(raw_dmin)));
 #pragma unroll
                 for (unsigned sub = 0; sub < 8u; ++sub) {
-                    unsigned scale;
-                    unsigned minimum;
                     if (sub < 4u) {
-                        scale = packed[4u + sub] & 63u;
-                        minimum = packed[8u + sub] & 63u;
+                        x_sc[sub][tid] = packed[4u + sub] & 63u;
+                        x_mn[sub][tid] = packed[8u + sub] & 63u;
                     } else {
-                        scale = (packed[8u + sub] & 0x0fu)
-                            | ((packed[sub] >> 6) << 4);
-                        minimum = (packed[8u + sub] >> 4)
-                            | ((packed[4u + sub] >> 6) << 4);
+                        x_sc[sub][tid] =
+                            (packed[8u + sub] & 0x0fu) | ((packed[sub] >> 6) << 4);
+                        x_mn[sub][tid] =
+                            (packed[8u + sub] >> 4) | ((packed[4u + sub] >> 6) << 4);
                     }
-                    x_sc[sub][tid] = static_cast<unsigned char>(scale);
-                    x_mn[sub][tid] = static_cast<unsigned char>(minimum);
                 }
             } else {
                 x_d[tid] = 0.0f;
@@ -847,12 +841,6 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                 (packed_qs >> 4) & 0x0f0f0f0fu;
         }
         __syncthreads();
-        const float d_a = x_d[warp_row_off + t_row_a];
-        const float d_b = x_d[warp_row_off + t_row_b];
-        const float dmin_a = x_dmin[warp_row_off + t_row_a];
-        const float dmin_b = x_dmin[warp_row_off + t_row_b];
-
-
 
 #pragma unroll
         for (unsigned pair = 0; pair < 4u; ++pair) {
@@ -871,21 +859,17 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                         + chunk * 32u + seq_off;
                     b_word = *reinterpret_cast<const int*>(b_src);
                     if (seq_off == 0u) {
-                        y_d[slot][load_seq] =
-                            input_ds[global_seq * blocks_per_row * 8u + chunk];
+                        const unsigned metadata =
+                            global_seq * blocks_per_row * 8u + chunk;
+                        y_d[slot][load_seq] = input_ds[metadata];
+                        y_s[slot][load_seq] = input_sums[metadata];
                     }
                 } else if (seq_off == 0u) {
                     y_d[slot][load_seq] = 0.0f;
+                    y_s[slot][load_seq] = 0.0f;
                 }
                 *reinterpret_cast<int*>(
                     &b_tile[slot][load_seq * 36u + seq_off]) = b_word;
-                int chunk_sum = __dp4a(0x01010101, b_word, 0);
-                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 4u, 8);
-                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 2u, 8);
-                chunk_sum += __shfl_down_sync(0xffffffffu, chunk_sum, 1u, 8);
-                if ((local & 7u) == 0u) {
-                    y_s[slot][load_seq] = static_cast<float>(chunk_sum);
-                }
             }
             __syncthreads();
 
@@ -902,6 +886,10 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                     &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_hi]);
                 const int a3 = *reinterpret_cast<const int*>(
                     &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_hi]);
+                const float d_a = x_d[warp_row_off + t_row_a];
+                const float d_b = x_d[warp_row_off + t_row_b];
+                const float dmin_a = x_dmin[warp_row_off + t_row_a];
+                const float dmin_b = x_dmin[warp_row_off + t_row_b];
                 const float scale_a =
                     static_cast<float>(x_sc[sub][warp_row_off + t_row_a]);
                 const float scale_b =
@@ -976,4 +964,3 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     }
 #endif
 }
-

@@ -213,6 +213,8 @@ impl CudaState {
             compute_output_capacity: 0,
             compute_aux_output: None,
             compute_aux_output_capacity: 0,
+            compute_q8_sums: None,
+            compute_q8_sums_capacity: 0,
             compute_mid_a: None,
             compute_mid_a_capacity: 0,
             compute_mid_b: None,
@@ -501,6 +503,9 @@ impl Drop for CudaState {
             let _ = unsafe { self.api.mem_free(ptr) };
         }
         if let Some(ptr) = self.compute_aux_output.take() {
+            let _ = unsafe { self.api.mem_free(ptr) };
+        }
+        if let Some(ptr) = self.compute_q8_sums.take() {
             let _ = unsafe { self.api.mem_free(ptr) };
         }
         if let Some(ptr) = self.compute_mid_a.take() {

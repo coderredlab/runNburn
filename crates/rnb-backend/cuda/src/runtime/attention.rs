@@ -1304,6 +1304,128 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_cublas_hd128_device(
+        &mut self,
+        output_dev: u64,
+        q_dev: u64,
+        k_dev: u64,
+        v_dev: u64,
+        seq_len: usize,
+        kv_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+        window: Option<usize>,
+    ) -> Result<(), String> {
+        const HEAD_DIM: usize = 128;
+        if seq_len == 0 || kv_len < seq_len || num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err("invalid CUDA hd128 cuBLAS attention geometry".to_string());
+        }
+        let scores_per_head = seq_len
+            .checked_mul(kv_len)
+            .ok_or_else(|| "CUDA hd128 attention score length overflow".to_string())?;
+        let heads_per_group = num_heads / num_kv_heads;
+        let scores_len = scores_per_head
+            .checked_mul(heads_per_group)
+            .ok_or_else(|| "CUDA hd128 batched score length overflow".to_string())?;
+        let scores_bytes = scores_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA hd128 attention score byte size overflow".to_string())?;
+        let scores_dev = self.compute_weights_ptr(scores_bytes)?;
+        let q_stride = num_heads
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| "CUDA hd128 Q stride overflow".to_string())?;
+        let kv_stride = num_kv_heads
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| "CUDA hd128 KV stride overflow".to_string())?;
+        let element_bytes = std::mem::size_of::<f32>() as u64;
+        let stream = self.stream;
+        let _ = self.cublas_state_mut()?;
+
+        for kv_head in 0..num_kv_heads {
+            let first_head = kv_head * heads_per_group;
+            let q_group_dev = q_dev + (first_head * HEAD_DIM) as u64 * element_bytes;
+            let k_head_dev = k_dev + (kv_head * HEAD_DIM) as u64 * element_bytes;
+            let v_head_dev = v_dev + (kv_head * HEAD_DIM) as u64 * element_bytes;
+            let output_group_dev = output_dev + (first_head * HEAD_DIM) as u64 * element_bytes;
+            {
+                let cublas = self.cublas_state_mut()?;
+                unsafe {
+                    cublas.api.set_stream(cublas.handle, stream)?;
+                    cublas.api.sgemm_strided_batched(
+                        cublas.handle,
+                        CUBLAS_OP_T,
+                        CUBLAS_OP_N,
+                        kv_len as i32,
+                        seq_len as i32,
+                        HEAD_DIM as i32,
+                        1.0,
+                        k_head_dev,
+                        kv_stride as i32,
+                        0,
+                        q_group_dev,
+                        q_stride as i32,
+                        HEAD_DIM as i64,
+                        0.0,
+                        scores_dev,
+                        kv_len as i32,
+                        scores_per_head as i64,
+                        heads_per_group as i32,
+                    )?;
+                }
+            }
+
+            let mut scores_arg = scores_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = kv_len as u32;
+            let mut scale_arg = scale;
+            let mut window_arg = window.unwrap_or(0) as u32;
+            let mut batch_arg = heads_per_group as u32;
+            self.launch_cached_gemv(
+                "rnb_attention_scores_softmax_causal",
+                &[
+                    (&mut scores_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut window_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut batch_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, heads_per_group as u32, 1),
+                (256, 1, 1),
+            )?;
+
+            {
+                let cublas = self.cublas_state_mut()?;
+                unsafe {
+                    cublas.api.set_stream(cublas.handle, stream)?;
+                    cublas.api.sgemm_strided_batched(
+                        cublas.handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        HEAD_DIM as i32,
+                        seq_len as i32,
+                        kv_len as i32,
+                        1.0,
+                        v_head_dev,
+                        kv_stride as i32,
+                        0,
+                        scores_dev,
+                        kv_len as i32,
+                        scores_per_head as i64,
+                        0.0,
+                        output_group_dev,
+                        q_stride as i32,
+                        HEAD_DIM as i64,
+                        heads_per_group as i32,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn attention_prefill_flash_hd128(
         &mut self,
         q: &[f32],
@@ -1345,31 +1467,51 @@ impl CudaState {
             )?;
         }
 
-        let mut output_arg = output_dev;
-        let mut q_arg = q_dev;
-        let mut k_arg = k_dev;
-        let mut v_arg = v_dev;
-        let mut seq_arg = seq_len as u32;
-        let mut kv_len_arg = kv_len as u32;
-        let mut heads_arg = num_heads as u32;
-        let mut kv_heads_arg = num_kv_heads as u32;
-        let mut scale_arg = scale;
-        self.launch_cached_gemv(
-            "rnb_attention_prefill_flash_hd128",
-            &[
-                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut q_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut k_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut v_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
-            ],
-            (seq_len as u32, num_heads as u32, 1),
-            (32, 1, 1),
-        )?;
+        if num_heads == num_kv_heads.saturating_mul(16)
+            && std::env::var("RNB_CUDA_PREFILL_CUBLAS_GQA16")
+                .ok()
+                .as_deref()
+                != Some("0")
+        {
+            self.attention_prefill_cublas_hd128_device(
+                output_dev,
+                q_dev,
+                k_dev,
+                v_dev,
+                seq_len,
+                kv_len,
+                num_heads,
+                num_kv_heads,
+                scale,
+                None,
+            )?;
+        } else {
+            let mut output_arg = output_dev;
+            let mut q_arg = q_dev;
+            let mut k_arg = k_dev;
+            let mut v_arg = v_dev;
+            let mut seq_arg = seq_len as u32;
+            let mut kv_len_arg = kv_len as u32;
+            let mut heads_arg = num_heads as u32;
+            let mut kv_heads_arg = num_kv_heads as u32;
+            let mut scale_arg = scale;
+            self.launch_cached_gemv(
+                "rnb_attention_prefill_flash_hd128",
+                &[
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut seq_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                ],
+                (seq_len as u32, num_heads as u32, 1),
+                (32, 1, 1),
+            )?;
+        }
 
         let mut output = vec![0.0f32; output_len];
         self.dtoh_f32_via_pinned(output_dev, &mut output)?;
@@ -1895,7 +2037,25 @@ impl CudaState {
         self.launch_f32_to_f16_pack(k_dev, k_bits_dev, kv_len)?;
         self.launch_f32_to_f16_pack(v_dev, v_bits_dev, kv_len)?;
 
-        if let Some(window) = sliding_window {
+        if num_heads == num_kv_heads.saturating_mul(16)
+            && std::env::var("RNB_CUDA_PREFILL_CUBLAS_GQA16")
+                .ok()
+                .as_deref()
+                != Some("0")
+        {
+            self.attention_prefill_cublas_hd128_device(
+                attn_out_dev,
+                q_post_dev,
+                k_dev,
+                v_dev,
+                seq_len,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                scale,
+                sliding_window,
+            )?;
+        } else if let Some(window) = sliding_window {
             let mut output_arg = attn_out_dev;
             let mut q_arg = q_post_dev;
             let mut k_arg = k_dev;
@@ -1969,7 +2129,6 @@ impl CudaState {
             )?;
         }
         self.stream_synchronize()?;
-
         let device_output = self.dense_q4k_attention_output_ffn_batch_norm_residual_from_attn_dev(
             o_weights,
             gate_weights,
@@ -2815,13 +2974,106 @@ impl CudaState {
         )
     }
 
-    fn cached_decode_split_preferred(head_dim: usize, window_len: usize) -> bool {
+    pub(super) fn cached_decode_split_preferred(head_dim: usize, window_len: usize) -> bool {
         match head_dim {
             128 => window_len >= 256 && crate::tuning::decode_attention_hd128_split_enabled(),
             256 => window_len >= 512 && crate::tuning::decode_attention_hd256_split_enabled(),
             512 => window_len >= 256 && crate::tuning::decode_attention_hd512_split_enabled(),
             _ => false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn launch_attention_decode_split_device(
+        &mut self,
+        output_dev: u64,
+        q_dev: u64,
+        k_dev: u64,
+        v_dev: u64,
+        head_dim: usize,
+        window_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        scale: f32,
+    ) -> Result<(), String> {
+        let chunk_size = match head_dim {
+            128 => crate::tuning::decode_attention_hd128_split_chunk_size(),
+            256 => crate::tuning::decode_attention_hd256_split_chunk_size(),
+            512 => crate::tuning::decode_attention_hd512_split_chunk_size(),
+            _ => {
+                return Err(format!(
+                    "CUDA split decode attention unsupported head_dim={head_dim}"
+                ));
+            }
+        };
+        let num_chunks = window_len.div_ceil(chunk_size);
+        let partial_values = num_heads
+            .checked_mul(num_chunks)
+            .and_then(|n| n.checked_mul(head_dim))
+            .ok_or_else(|| "CUDA split decode attention partial overflow".to_string())?;
+        let partial_bytes = partial_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA split decode attention partial byte overflow".to_string())?;
+        let meta_values = num_heads
+            .checked_mul(num_chunks)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| "CUDA split decode attention meta overflow".to_string())?;
+        let meta_bytes = meta_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "CUDA split decode attention meta byte overflow".to_string())?;
+        let partial_dev = self.compute_mid_a_ptr(partial_bytes)?;
+        let meta_dev = self.compute_mid_b_ptr(meta_bytes)?;
+        let mut partial_arg = partial_dev;
+        let mut meta_arg = meta_dev;
+        let mut q_arg = q_dev;
+        let mut k_arg = k_dev;
+        let mut v_arg = v_dev;
+        let mut kv_len_arg = window_len as u32;
+        let mut heads_arg = num_heads as u32;
+        let mut kv_heads_arg = num_kv_heads as u32;
+        let mut scale_arg = scale;
+        let mut chunk_size_arg = chunk_size as u32;
+        self.launch_cached_gemv(
+            match head_dim {
+                128 => "rnb_attention_decode_hd128_split_partials",
+                256 => "rnb_attention_decode_hd256_split_partials",
+                512 => "rnb_attention_decode_hd512_split_partials",
+                _ => unreachable!("validated head_dim"),
+            },
+            &[
+                (&mut partial_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut meta_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut q_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut k_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut v_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut chunk_size_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (num_heads as u32, num_chunks as u32, 1),
+            (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
+        )?;
+        let mut output_arg = output_dev;
+        let mut num_chunks_arg = num_chunks as u32;
+        self.launch_cached_gemv(
+            match head_dim {
+                128 => "rnb_attention_decode_hd128_split_reduce",
+                256 => "rnb_attention_decode_hd256_split_reduce",
+                512 => "rnb_attention_decode_hd512_split_reduce",
+                _ => unreachable!("validated head_dim"),
+            },
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut partial_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut meta_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut num_chunks_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (num_heads as u32, 1, 1),
+            (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
+        )
     }
 
     fn attention_kvarn_to_device_impl(
@@ -3591,75 +3843,16 @@ impl CudaState {
                 )?;
             }
         } else if prefer_split {
-            let chunk_size = match head_dim {
-                128 => crate::tuning::decode_attention_hd128_split_chunk_size(),
-                256 => crate::tuning::decode_attention_hd256_split_chunk_size(),
-                512 => crate::tuning::decode_attention_hd512_split_chunk_size(),
-                _ => unreachable!("split preference validates head_dim"),
-            };
-            let num_chunks = window_len.div_ceil(chunk_size);
-            let partial_values = num_heads
-                .checked_mul(num_chunks)
-                .and_then(|n| n.checked_mul(head_dim))
-                .ok_or_else(|| "CUDA cached decode attention split partial overflow".to_string())?;
-            let partial_bytes = partial_values
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| {
-                    "CUDA cached decode attention split partial byte overflow".to_string()
-                })?;
-            let meta_values = num_heads
-                .checked_mul(num_chunks)
-                .and_then(|n| n.checked_mul(2))
-                .ok_or_else(|| "CUDA cached decode attention split meta overflow".to_string())?;
-            let meta_bytes = meta_values
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| {
-                    "CUDA cached decode attention split meta byte overflow".to_string()
-                })?;
-            let partial_dev = self.compute_mid_a_ptr(partial_bytes)?;
-            let meta_dev = self.compute_mid_b_ptr(meta_bytes)?;
-            let mut partial_arg = partial_dev;
-            let mut meta_arg = meta_dev;
-            let mut chunk_size_arg = chunk_size as u32;
-            self.launch_cached_gemv(
-                match head_dim {
-                    128 => "rnb_attention_decode_hd128_split_partials",
-                    256 => "rnb_attention_decode_hd256_split_partials",
-                    512 => "rnb_attention_decode_hd512_split_partials",
-                    _ => unreachable!("split preference validates head_dim"),
-                },
-                &[
-                    (&mut partial_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut meta_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut q_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut k_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut v_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut kv_len_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut kv_heads_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
-                    (&mut chunk_size_arg as *mut u32).cast::<libc::c_void>(),
-                ],
-                (num_heads as u32, num_chunks as u32, 1),
-                (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
-            )?;
-            let mut num_chunks_arg = num_chunks as u32;
-            self.launch_cached_gemv(
-                match head_dim {
-                    128 => "rnb_attention_decode_hd128_split_reduce",
-                    256 => "rnb_attention_decode_hd256_split_reduce",
-                    512 => "rnb_attention_decode_hd512_split_reduce",
-                    _ => unreachable!("split preference validates head_dim"),
-                },
-                &[
-                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut partial_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut meta_arg as *mut u64).cast::<libc::c_void>(),
-                    (&mut heads_arg as *mut u32).cast::<libc::c_void>(),
-                    (&mut num_chunks_arg as *mut u32).cast::<libc::c_void>(),
-                ],
-                (num_heads as u32, 1, 1),
-                (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
+            self.launch_attention_decode_split_device(
+                output_arg,
+                q_arg,
+                k_arg,
+                v_arg,
+                head_dim,
+                window_len,
+                num_heads,
+                num_kv_heads,
+                scale_arg,
             )?;
         } else {
             let (kernel, block) = match head_dim {

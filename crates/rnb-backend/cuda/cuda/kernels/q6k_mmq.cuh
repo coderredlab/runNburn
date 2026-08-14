@@ -632,3 +632,245 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q6k_q8_1_matmul_mmq_til
     if (row_b_valid && seq_d < seq_len) out[seq_d * rows + row_b] = acc[7];
 #endif
 }
+
+// 128-row x 64-sequence Ampere MMQ tile. The quant layout and shape gate are
+// generic Q6_K contracts; model-specific admission stays above this kernel.
+// Eight warps each own one 16-row slab and reuse the fully unpacked Q6 block
+// across eight 8-column MMA fragments. The narrower sequence tile halves the
+// accumulator footprint so two CTAs can remain resident per SM.
+extern "C" __global__ void __launch_bounds__(256, 2)
+rnb_q6k_q8_1_matmul_mmq_tile128_seq64(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+#if __CUDA_ARCH__ < 800
+    (void)out;
+    (void)weights;
+    (void)input_qs;
+    (void)input_ds;
+    (void)rows;
+    (void)blocks_per_row;
+    (void)seq_len;
+    return;
+#else
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5;
+    const unsigned lane = tid & 31u;
+    const unsigned row_base = blockIdx.x * 128u;
+    const unsigned seq_base = blockIdx.y * 64u;
+    const unsigned warp_row_off = warp * 16u;
+    const unsigned t_row_a = lane >> 2;
+    const unsigned t_row_b = t_row_a + 8u;
+
+    __shared__ signed char a_tile[8][128 * 32];
+    __shared__ signed char b_tile[2][64 * 36];
+    __shared__ float x_d[128];
+    __shared__ signed char x_scale_lo[8][128];
+    __shared__ signed char x_scale_hi[8][128];
+    __shared__ float y_d[2][64];
+
+    const unsigned row_a = row_base + warp_row_off + t_row_a;
+    const unsigned row_b = row_base + warp_row_off + t_row_b;
+    float acc[32];
+#pragma unroll
+    for (unsigned i = 0; i < 32u; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    const unsigned row_bytes = blocks_per_row * 210u;
+    for (unsigned block = 0; block < blocks_per_row; ++block) {
+        if (tid < 128u) {
+            const unsigned global_row = row_base + tid;
+            if (global_row < rows) {
+                const unsigned char* packed =
+                    weights + global_row * row_bytes + block * 210u;
+                const unsigned raw_d = static_cast<unsigned>(packed[208])
+                    | (static_cast<unsigned>(packed[209]) << 8);
+                x_d[tid] =
+                    __half2float(__ushort_as_half(static_cast<unsigned short>(raw_d)));
+#pragma unroll
+                for (unsigned sub = 0; sub < 8u; ++sub) {
+                    x_scale_lo[sub][tid] =
+                        static_cast<signed char>(packed[192u + sub * 2u]);
+                    x_scale_hi[sub][tid] =
+                        static_cast<signed char>(packed[193u + sub * 2u]);
+                }
+            } else {
+                x_d[tid] = 0.0f;
+#pragma unroll
+                for (unsigned sub = 0; sub < 8u; ++sub) {
+                    x_scale_lo[sub][tid] = 0;
+                    x_scale_hi[sub][tid] = 0;
+                }
+            }
+        }
+
+        // Materialize all eight 32-value Q6 sub-blocks once. Each item writes
+        // four signed values; row strides stay naturally 32-bit aligned.
+        for (unsigned item = tid; item < 8192u; item += 256u) {
+            const unsigned load_row = item >> 6;
+            const unsigned packed_word = item & 63u;
+            const unsigned sub = packed_word >> 3;
+            const unsigned word_in_sub = packed_word & 7u;
+            const unsigned global_row = row_base + load_row;
+            unsigned q_word = 0u;
+            if (global_row < rows) {
+                const unsigned char* packed =
+                    weights + global_row * row_bytes + block * 210u;
+                const unsigned half = sub >> 2;
+                const unsigned quarter = sub & 3u;
+                const unsigned ql_offset =
+                    half * 64u + (quarter & 1u) * 32u + word_in_sub * 4u;
+                const unsigned qh_offset =
+                    128u + half * 32u + word_in_sub * 4u;
+                const unsigned short* ql16 =
+                    reinterpret_cast<const unsigned short*>(packed + ql_offset);
+                const unsigned short* qh16 =
+                    reinterpret_cast<const unsigned short*>(packed + qh_offset);
+                const unsigned ql = static_cast<unsigned>(ql16[0])
+                    | (static_cast<unsigned>(ql16[1]) << 16);
+                const unsigned qh = static_cast<unsigned>(qh16[0])
+                    | (static_cast<unsigned>(qh16[1]) << 16);
+                const unsigned ql_nibbles = quarter < 2u
+                    ? ql & 0x0f0f0f0fu
+                    : (ql >> 4) & 0x0f0f0f0fu;
+                const unsigned qh_bits =
+                    (qh >> (quarter * 2u)) & 0x03030303u;
+                q_word = static_cast<unsigned>(__vsubss4(
+                    static_cast<int>(ql_nibbles | (qh_bits << 4)),
+                    0x20202020));
+            }
+            *reinterpret_cast<unsigned*>(
+                &a_tile[sub][load_row * 32u + word_in_sub * 4u]) = q_word;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned pair = 0; pair < 4u; ++pair) {
+            for (unsigned item = tid; item < 1024u; item += 256u) {
+                const unsigned slot = item >> 9;
+                const unsigned local = item & 511u;
+                const unsigned load_seq = local >> 3;
+                const unsigned seq_off = (local & 7u) * 4u;
+                const unsigned sub = pair * 2u + slot;
+                const unsigned global_seq = seq_base + load_seq;
+                const unsigned chunk = block * 8u + sub;
+                int b_word = 0;
+                if (global_seq < seq_len) {
+                    const signed char* b_src = input_qs
+                        + global_seq * blocks_per_row * 256u
+                        + chunk * 32u + seq_off;
+                    b_word = *reinterpret_cast<const int*>(b_src);
+                    if (seq_off == 0u) {
+                        y_d[slot][load_seq] =
+                            input_ds[global_seq * blocks_per_row * 8u + chunk];
+                    }
+                } else if (seq_off == 0u) {
+                    y_d[slot][load_seq] = 0.0f;
+                }
+                *reinterpret_cast<int*>(
+                    &b_tile[slot][load_seq * 36u + seq_off]) = b_word;
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (unsigned slot = 0; slot < 2u; ++slot) {
+                const unsigned sub = pair * 2u + slot;
+                const unsigned a_col_lo = (lane & 3u) * 4u;
+                const unsigned a_col_hi = a_col_lo + 16u;
+                const int a0 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_lo]);
+                const int a1 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_lo]);
+                const int a2 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_hi]);
+                const int a3 = *reinterpret_cast<const int*>(
+                    &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_hi]);
+                const float d_a = x_d[warp_row_off + t_row_a];
+                const float d_b = x_d[warp_row_off + t_row_b];
+                const float scale_a_lo =
+                    static_cast<float>(x_scale_lo[sub][warp_row_off + t_row_a]);
+                const float scale_a_hi =
+                    static_cast<float>(x_scale_hi[sub][warp_row_off + t_row_a]);
+                const float scale_b_lo =
+                    static_cast<float>(x_scale_lo[sub][warp_row_off + t_row_b]);
+                const float scale_b_hi =
+                    static_cast<float>(x_scale_hi[sub][warp_row_off + t_row_b]);
+
+#pragma unroll
+                for (unsigned frag = 0; frag < 8u; ++frag) {
+                    const unsigned frag_base = frag * 8u;
+                    const unsigned b_seq = frag_base + (lane >> 2);
+                    const unsigned b_col_lo = (lane & 3u) * 4u;
+                    const unsigned b_col_hi = b_col_lo + 16u;
+                    const int b0 = *reinterpret_cast<const int*>(
+                        &b_tile[slot][b_seq * 36u + b_col_lo]);
+                    const int b1 = *reinterpret_cast<const int*>(
+                        &b_tile[slot][b_seq * 36u + b_col_hi]);
+
+                    int lo0 = 0;
+                    int lo1 = 0;
+                    int lo2 = 0;
+                    int lo3 = 0;
+                    rnb_mma_m16n8k32_s8(
+                        lo0, lo1, lo2, lo3,
+                        a0, a1, 0, 0,
+                        b0, 0,
+                        0, 0, 0, 0);
+                    int hi0 = 0;
+                    int hi1 = 0;
+                    int hi2 = 0;
+                    int hi3 = 0;
+                    rnb_mma_m16n8k32_s8(
+                        hi0, hi1, hi2, hi3,
+                        0, 0, a2, a3,
+                        0, b1,
+                        0, 0, 0, 0);
+
+                    const unsigned col_a = frag_base + ((lane & 3u) << 1);
+                    const unsigned col_b = col_a + 1u;
+                    const float dy_a = y_d[slot][col_a];
+                    const float dy_b = y_d[slot][col_b];
+                    acc[frag * 4u + 0u] += d_a * dy_a
+                        * (scale_a_lo * static_cast<float>(lo0)
+                            + scale_a_hi * static_cast<float>(hi0));
+                    acc[frag * 4u + 1u] += d_a * dy_b
+                        * (scale_a_lo * static_cast<float>(lo1)
+                            + scale_a_hi * static_cast<float>(hi1));
+                    acc[frag * 4u + 2u] += d_b * dy_a
+                        * (scale_b_lo * static_cast<float>(lo2)
+                            + scale_b_hi * static_cast<float>(hi2));
+                    acc[frag * 4u + 3u] += d_b * dy_b
+                        * (scale_b_lo * static_cast<float>(lo3)
+                            + scale_b_hi * static_cast<float>(hi3));
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (unsigned frag = 0; frag < 8u; ++frag) {
+        const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+        const unsigned col_b = col_a + 1u;
+        const unsigned seq_a = seq_base + col_a;
+        const unsigned seq_b = seq_base + col_b;
+        if (row_a < rows && seq_a < seq_len) {
+            out[seq_a * rows + row_a] = acc[frag * 4u + 0u];
+        }
+        if (row_a < rows && seq_b < seq_len) {
+            out[seq_b * rows + row_a] = acc[frag * 4u + 1u];
+        }
+        if (row_b < rows && seq_a < seq_len) {
+            out[seq_a * rows + row_b] = acc[frag * 4u + 2u];
+        }
+        if (row_b < rows && seq_b < seq_len) {
+            out[seq_b * rows + row_b] = acc[frag * 4u + 3u];
+        }
+    }
+#endif
+}

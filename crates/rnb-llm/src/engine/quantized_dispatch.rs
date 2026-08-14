@@ -1,4 +1,4 @@
-#[cfg(any(not(feature = "cuda"), target_arch = "aarch64", test))]
+#[cfg(any(not(feature = "cuda"), target_arch = "aarch64"))]
 use super::gemm_runtime;
 #[cfg(target_arch = "aarch64")]
 use super::gemm_runtime::neon_dot::{

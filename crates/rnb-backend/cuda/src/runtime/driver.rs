@@ -119,6 +119,28 @@ pub(super) struct CublasApi {
         u64,
         i32,
     ) -> i32,
+    cublas_sgemm_strided_batched: Option<
+        unsafe extern "C" fn(
+            *mut libc::c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            *const f32,
+            u64,
+            i32,
+            i64,
+            u64,
+            i32,
+            i64,
+            *const f32,
+            u64,
+            i32,
+            i64,
+            i32,
+        ) -> i32,
+    >,
     cublas_gemm_ex: Option<
         unsafe extern "C" fn(
             *mut libc::c_void,
@@ -152,6 +174,10 @@ impl CublasApi {
             cublas_set_stream: load_symbol(lib_handle, "cublasSetStream_v2")?,
             cublas_set_math_mode: load_symbol_optional(lib_handle, "cublasSetMathMode"),
             cublas_sgemm: load_symbol(lib_handle, "cublasSgemm_v2")?,
+            cublas_sgemm_strided_batched: load_symbol_optional(
+                lib_handle,
+                "cublasSgemmStridedBatched",
+            ),
             cublas_gemm_ex: load_symbol_optional(lib_handle, "cublasGemmEx"),
         })
     }
@@ -222,6 +248,56 @@ impl CublasApi {
                 ldc,
             ),
             "cublasSgemm_v2",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn sgemm_strided_batched(
+        &self,
+        handle: usize,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: u64,
+        lda: i32,
+        stride_a: i64,
+        b: u64,
+        ldb: i32,
+        stride_b: i64,
+        beta: f32,
+        c: u64,
+        ldc: i32,
+        stride_c: i64,
+        batch_count: i32,
+    ) -> Result<(), String> {
+        let Some(sgemm_strided_batched) = self.cublas_sgemm_strided_batched else {
+            return Err("cublasSgemmStridedBatched is unavailable".to_string());
+        };
+        check_cublas(
+            sgemm_strided_batched(
+                handle as *mut libc::c_void,
+                transa,
+                transb,
+                m,
+                n,
+                k,
+                &alpha as *const f32,
+                a,
+                lda,
+                stride_a,
+                b,
+                ldb,
+                stride_b,
+                &beta as *const f32,
+                c,
+                ldc,
+                stride_c,
+                batch_count,
+            ),
+            "cublasSgemmStridedBatched",
         )
     }
 

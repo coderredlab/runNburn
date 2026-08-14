@@ -51,6 +51,9 @@ impl CudaState {
     ) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_aux_output, compute_aux_output_capacity, bytes)
     }
+    pub(in crate::runtime) fn compute_q8_sums_ptr(&mut self, bytes: usize) -> Result<u64, String> {
+        ensure_with_oom_retry!(self, compute_q8_sums, compute_q8_sums_capacity, bytes)
+    }
 
     pub(in crate::runtime) fn compute_mid_a_ptr(&mut self, bytes: usize) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_mid_a, compute_mid_a_capacity, bytes)

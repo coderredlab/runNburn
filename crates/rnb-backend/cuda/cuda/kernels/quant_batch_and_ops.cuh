@@ -3821,6 +3821,7 @@ extern "C" __global__ void rnb_silu_mul_q8_1(
 }
 
 extern "C" __global__ void rnb_quantize_q8_1_by_32(
+
     const float* __restrict__ input,
     signed char* __restrict__ out_qs,
     float* __restrict__ out_ds,
@@ -3858,6 +3859,24 @@ extern "C" __global__ void rnb_quantize_q8_1_by_32(
     }
     out_qs[i] = (signed char)q;
 }
+extern "C" __global__ void rnb_q8_1_integer_sums_by_32(
+    const signed char* __restrict__ input_qs,
+    float* __restrict__ out_sums,
+    unsigned chunks) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned chunk = blockIdx.x * 8u + (threadIdx.x >> 5);
+    if (chunk >= chunks) {
+        return;
+    }
+    int sum = static_cast<int>(input_qs[chunk * 32u + lane]);
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0u) {
+        out_sums[chunk] = static_cast<float>(sum);
+    }
+}
+
 
 extern "C" __global__ void rnb_rms_norm_f32(
     const float* __restrict__ input,
@@ -5458,6 +5477,7 @@ __device__ __forceinline__ void rnb_mma_m16n8k32_s8(
           "r"(b0), "r"(b1),
           "r"(c0), "r"(c1), "r"(c2), "r"(c3));
 }
+
 #endif
 
 extern "C" __global__ void rnb_q4k_q8_1_matmul_mma(

@@ -15,7 +15,7 @@ mod quant_resident;
 #[cfg(test)]
 pub use quant_resident::quant_resident_budget_plan_for_test;
 pub(in crate::runtime) use quant_resident::{
-    quant_resident_budget_plan, quant_resident_policy_requested, quant_resident_reserve_mib,
+    pinned_prefix_reserve_mib, quant_resident_budget_plan, quant_resident_policy_requested,
 };
 mod q4_f16_cache;
 mod q4_f32_cache;

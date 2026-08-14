@@ -189,11 +189,13 @@ pub fn q4k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
     mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q4K_MMQ_TILE64", true)
 }
 
-/// 128x128 Q4_K MMQ diagnostic generation for Ampere. The kernel trades
-/// occupancy for fourfold Q4 tile reuse and is only eligible when both axes
-/// fill a complete tile. Keep opt-in until product A/B and output validation.
+/// 128x128 Q4_K MMQ generation for Ampere. The complete-tile gate amortizes
+/// Q4 and activation loads across both axes. The tail oracle, deterministic
+/// product output, and Muse 1144-token ABABAB prefill `2937.136→2325.353ms`
+/// (`-20.83%`, same-index 3/3) passed. `RNB_CUDA_Q4K_MMQ_TILE128=0` retains
+/// the 64x64 diagnostic baseline.
 pub fn q4k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
-    seq_len >= 128 && rows >= 128 && env_bool("RNB_CUDA_Q4K_MMQ_TILE128", false)
+    seq_len >= 128 && rows >= 128 && env_bool("RNB_CUDA_Q4K_MMQ_TILE128", true)
 }
 
 /// cu228: Q5_K/Q6_K 64x64 tile 게이트 — Q4 와 같은 b-side 상각 (rows >= 64
@@ -203,6 +205,14 @@ pub fn q5k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
 }
 pub fn q6k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
     mmq_tile_seq64_enabled(seq_len) && rows >= 64 && env_bool("RNB_CUDA_Q6K_MMQ_TILE64", true)
+}
+
+/// 128-row x 64-sequence Q6_K MMQ generation. The gate is structural and
+/// defaults on after the shared Q6_K tail contract, deterministic product
+/// output, kernel -25.3%, and 1144-token ABABAB prefill -3.76% all passed.
+/// `RNB_CUDA_Q6K_MMQ_TILE128=0` retains the 64x64 diagnostic baseline.
+pub fn q6k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
+    seq_len >= 64 && rows >= 128 && env_bool("RNB_CUDA_Q6K_MMQ_TILE128", true)
 }
 
 pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
@@ -2632,6 +2642,46 @@ mod tests {
         assert!(q5k_mmq_tile64_enabled(1139, 12288));
         unsafe {
             std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE64");
+        }
+    }
+
+    #[test]
+    fn q4k_mmq_tile128_defaults_on_for_complete_tiles_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE128");
+        }
+        assert!(q4k_mmq_tile128_enabled(128, 128));
+        assert!(q4k_mmq_tile128_enabled(1144, 6656));
+        assert!(!q4k_mmq_tile128_enabled(127, 6656));
+        assert!(!q4k_mmq_tile128_enabled(1144, 127));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q4K_MMQ_TILE128", "0");
+        }
+        assert!(!q4k_mmq_tile128_enabled(1144, 6656));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE128");
+        }
+    }
+
+    #[test]
+    fn q6k_mmq_tile128_defaults_on_for_full_row_tile_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE128");
+        }
+        assert!(q6k_mmq_tile128_enabled(64, 128));
+        assert!(q6k_mmq_tile128_enabled(1144, 6656));
+        assert!(!q6k_mmq_tile128_enabled(63, 6656));
+        assert!(!q6k_mmq_tile128_enabled(1144, 127));
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q6K_MMQ_TILE128", "0");
+        }
+        assert!(!q6k_mmq_tile128_enabled(1144, 6656));
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q6K_MMQ_TILE128");
         }
     }
 

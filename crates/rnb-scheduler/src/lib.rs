@@ -287,6 +287,15 @@ pub fn plan_slice1_boundary(
 pub fn should_attempt_slice1_gpu_prefill(token_count: usize, has_slice1_plan: bool) -> bool {
     token_count > 1 && has_slice1_plan
 }
+/// Converts a device-residency admission result into an all-or-nothing layer
+/// prefix. `layer_item_ends` contains the cumulative resident-item count after
+/// each layer. A partially admitted layer stays on the CPU.
+pub fn plan_gpu_layer_prefix(layer_item_ends: &[usize], admitted_items: usize) -> usize {
+    layer_item_ends
+        .iter()
+        .take_while(|&&end| end <= admitted_items)
+        .count()
+}
 
 /// `RNB_GPU_FULLPATH=1` 환경변수가 설정됐는지 검사.
 ///
@@ -341,6 +350,16 @@ pub fn plan_moe_jit_load_order(selected: &[usize], probabilities: &[f32]) -> Vec
 mod tests {
     use super::*;
     use rnb_model_ir::{LayerSpec, ModelKind};
+
+    #[test]
+    fn gpu_layer_prefix_excludes_partially_admitted_layer() {
+        let layer_item_ends = [8, 16, 23, 31];
+
+        assert_eq!(plan_gpu_layer_prefix(&layer_item_ends, 0), 0);
+        assert_eq!(plan_gpu_layer_prefix(&layer_item_ends, 15), 1);
+        assert_eq!(plan_gpu_layer_prefix(&layer_item_ends, 16), 2);
+        assert_eq!(plan_gpu_layer_prefix(&layer_item_ends, usize::MAX), 4);
+    }
 
     #[test]
     fn schedule_plan_records_backend_and_memory_placement() {

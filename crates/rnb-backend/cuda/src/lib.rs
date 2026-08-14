@@ -92,7 +92,7 @@ pub use runtime::{
     prewarm_q4k_f32_gate_up_weights, prewarm_q4k_f32_weights, prewarm_q4k_packed_gate_up_weights,
     prewarm_q4k_packed_weights, prewarm_q4k_prefill_f16_weights, prewarm_q4k_weights,
     prewarm_q4k_weights_pinned, prewarm_q4k_weights_pinned_prefix, prewarm_q6k_f32_weights,
-    prewarm_q6k_packed_weights, prewarm_q8_0_weight, prewarm_quant_resident_q4k_weights, q2k_gemv,
+    prewarm_q6k_packed_weights, prewarm_q8_0_weight, prewarm_quant_resident_weights, q2k_gemv,
     q2k_gemv_batch, q3k_gemv, q3k_gemv_batch, q4_0_gemv, q4_0_gemv_batch, q4_1_gemv,
     q4_1_gemv_batch, q4k_f16_gemm_batch,
     q4k_f16_q_prefill_attention_hd256_cached_f16kv_window_dense_chain,

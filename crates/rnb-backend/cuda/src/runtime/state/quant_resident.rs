@@ -92,6 +92,13 @@ pub(in crate::runtime) fn quant_resident_reserve_mib(total_mib: usize) -> usize 
     let floor = (total_mib / 4).clamp(1024, 4096);
     ratio.max(floor)
 }
+pub(in crate::runtime) fn pinned_prefix_reserve_mib(total_mib: usize) -> usize {
+    total_mib
+        .div_ceil(8)
+        .div_ceil(256)
+        .saturating_mul(256)
+        .clamp(1536, 3584)
+}
 
 #[cfg(test)]
 pub fn quant_resident_budget_plan_for_test(
@@ -131,5 +138,11 @@ mod tests {
         assert!(parse_quant_resident_env_value(Some("abc"))
             .expect_err("reject non-numeric MiB")
             .contains("RNB_CUDA_QUANT_RESIDENT_MB must be auto, off, or integer MiB"));
+    }
+    #[test]
+    fn pinned_prefix_reserve_scales_with_total_vram() {
+        assert_eq!(pinned_prefix_reserve_mib(8 * 1024), 1536);
+        assert_eq!(pinned_prefix_reserve_mib(12 * 1024), 1536);
+        assert_eq!(pinned_prefix_reserve_mib(24 * 1024), 3072);
     }
 }

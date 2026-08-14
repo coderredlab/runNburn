@@ -195,6 +195,8 @@ struct CudaProductPrewarmRequests<'a> {
     q4_single: Vec<Q4PackedSinglePrewarm<'a>>,
     q4_raw: Vec<Q4RawQuantPrewarm<'a>>,
     q6_down: Vec<Q6PackedDownPrewarm<'a>>,
+    q4_raw_attention_layer_ends: Vec<usize>,
+    q4_raw_ffn_layer_ends: Vec<usize>,
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -4887,18 +4889,25 @@ pub(in crate::engine) fn cuda_cache_snapshot() -> cuda_runtime::CudaCacheSnapsho
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn prewarm_dense_q4_packed_gate_up_weights(
     weights: &ModelWeights,
+    muse_model: bool,
     muse_low_vram: bool,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Option<(usize, usize)>> {
     #[cfg(feature = "cuda")]
     {
-        let requests = collect_cuda_product_prewarm_requests(weights, muse_low_vram);
-        execute_cuda_product_prewarm_requests(
+        let mut requests = collect_cuda_product_prewarm_requests(weights, muse_low_vram);
+        if muse_model && !muse_low_vram {
+            requests
+                .q4_raw
+                .extend(requests.q6_down.iter().map(|(raw, _, _)| *raw));
+        }
+        return execute_cuda_product_prewarm_requests(
             &requests,
             CudaProductPrewarmSelection::Q4Dense,
             muse_low_vram,
-        )?;
+        );
     }
-    Ok(())
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
@@ -4954,7 +4963,10 @@ fn push_raw_quant_candidate<'a>(
     let Some(view) = weight.backend_view() else {
         return;
     };
-    if !matches!(view.quant(), QuantFormat::Q4K | QuantFormat::Q6K) {
+    if !matches!(
+        view.quant(),
+        QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K
+    ) {
         return;
     }
     let raw = view.raw();
@@ -5003,32 +5015,38 @@ fn collect_cuda_product_prewarm_requests(
 ) -> CudaProductPrewarmRequests<'_> {
     let mut requests = CudaProductPrewarmRequests::default();
     let mut seen_q4_raw = std::collections::HashSet::new();
+    if muse_low_vram {
+        push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &weights.output);
+        for layer in &weights.layers {
+            if let LayerType::Attention(layer) = layer {
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.q_weight);
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.k_weight);
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.v_weight);
+                if let Some(attention_gate) = &layer.attn_gate_weight {
+                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, attention_gate);
+                }
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.o_weight);
+                requests
+                    .q4_raw_attention_layer_ends
+                    .push(requests.q4_raw.len());
+            }
+        }
+        for layer in &weights.layers {
+            if let LayerType::Attention(layer) = layer {
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_gate_weight);
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_up_weight);
+                push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_down_weight);
+                requests.q4_raw_ffn_layer_ends.push(requests.q4_raw.len());
+            }
+        }
+        return requests;
+    }
+
     for layer in &weights.layers {
         match layer {
             LayerType::Attention(layer)
                 if layer.moe.is_none() && layer.shared_expert_moe.is_none() =>
             {
-                if muse_low_vram {
-                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.q_weight);
-                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.k_weight);
-                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.v_weight);
-                    if let Some(attention_gate) = &layer.attn_gate_weight {
-                        push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, attention_gate);
-                    }
-                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.o_weight);
-                    push_raw_quant_candidate(
-                        &mut requests,
-                        &mut seen_q4_raw,
-                        &layer.ffn_gate_weight,
-                    );
-                    push_raw_quant_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_up_weight);
-                    push_raw_quant_candidate(
-                        &mut requests,
-                        &mut seen_q4_raw,
-                        &layer.ffn_down_weight,
-                    );
-                    continue;
-                }
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.o_weight);
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_gate_weight);
                 push_q4_raw_candidate(&mut requests, &mut seen_q4_raw, &layer.ffn_up_weight);
@@ -5065,37 +5083,47 @@ fn execute_cuda_product_prewarm_requests(
     requests: &CudaProductPrewarmRequests<'_>,
     selection: CudaProductPrewarmSelection,
     muse_low_vram: bool,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Option<(usize, usize)>> {
     match selection {
         CudaProductPrewarmSelection::Q4Dense => {
             if muse_low_vram {
                 let raw_warmed =
                     cuda_runtime::prewarm_q4k_weight_slices_pinned_prefix(&requests.q4_raw)
                         .map_err(cuda_error)?;
+                let gpu_attention_layers = crate::runtime::scheduler::plan_gpu_layer_prefix(
+                    &requests.q4_raw_attention_layer_ends,
+                    raw_warmed,
+                );
+                let gpu_ffn_layers = crate::runtime::scheduler::plan_gpu_layer_prefix(
+                    &requests.q4_raw_ffn_layer_ends,
+                    raw_warmed,
+                );
                 if raw_warmed > 0 {
                     eprintln!(
-                        "[INFO] CUDA Muse low-VRAM pinned raw quant weights prewarmed: {raw_warmed}"
+                        "[INFO] CUDA Muse low-VRAM pinned raw quant weights prewarmed: \
+                         {raw_warmed}, GPU attention layers: {gpu_attention_layers}, \
+                         GPU FFN layers: {gpu_ffn_layers}"
                     );
                 }
+                Ok(Some((gpu_attention_layers, gpu_ffn_layers)))
             } else {
                 cuda_runtime::prewarm_q4k_packed_gate_up_weights(&requests.q4_gate_up)
                     .map_err(cuda_error)?;
                 cuda_runtime::prewarm_q4k_packed_weights(&requests.q4_single)
                     .map_err(cuda_error)?;
-                let raw_warmed = cuda_runtime::prewarm_quant_resident_q4k_weights(&requests.q4_raw)
+                let raw_warmed = cuda_runtime::prewarm_quant_resident_weights(&requests.q4_raw)
                     .map_err(cuda_error)?;
                 if raw_warmed > 0 {
-                    eprintln!(
-                        "[INFO] CUDA Q4_K raw quant resident weights prewarmed: {raw_warmed}"
-                    );
+                    eprintln!("[INFO] CUDA raw quant resident weights prewarmed: {raw_warmed}");
                 }
+                Ok(None)
             }
         }
         CudaProductPrewarmSelection::Q6Dense => {
             cuda_runtime::prewarm_q6k_packed_weights(&requests.q6_down).map_err(cuda_error)?;
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -5148,7 +5176,7 @@ pub(in crate::engine) fn cuda_product_prewarm_quant_resident_executor_missing_fo
     ) else {
         return true;
     };
-    !body.contains("prewarm_quant_resident_q4k_weights")
+    !body.contains("prewarm_quant_resident_weights")
 }
 
 #[cfg(all(test, feature = "cuda"))]

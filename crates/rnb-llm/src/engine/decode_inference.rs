@@ -55,6 +55,101 @@ fn batched_decode_chain_position_supported(cursor: Option<SequenceCursor>) -> bo
     cursor.is_none()
 }
 
+#[cfg(feature = "cuda")]
+fn full_device_decode_weight_bytes<'a>(
+    weight: &'a QuantizedWeight,
+    layer_idx: usize,
+    name: &str,
+) -> crate::error::Result<&'a [u8]> {
+    weight.data.as_bytes().ok_or_else(|| {
+        crate::error::LlmError::Forward(format!(
+            "full device decode: layer {layer_idx} {name} bytes unavailable"
+        ))
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn muse_full_device_decode_supported(
+    metadata: &ModelMetadata,
+    architecture: ModelArchitecture,
+    weights: &ModelWeights,
+) -> bool {
+    if !matches!(architecture, ModelArchitecture::MuseGlimmer)
+        || metadata.hidden_dim == 0
+        || !metadata.hidden_dim.is_multiple_of(256)
+        || metadata.head_dim != 128
+        || metadata.num_heads == 0
+        || metadata.num_kv_heads == 0
+        || metadata.num_heads % metadata.num_kv_heads != 0
+        || resolve_attention_softcap(architecture).is_some()
+        || weights.layers.len() != metadata.num_layers
+    {
+        return false;
+    }
+    weights.layers.iter().enumerate().all(|(layer_idx, layer)| {
+        let LayerType::Attention(w) = layer else {
+            return false;
+        };
+        let (rope_dim, _, proportional_rope) =
+            resolve_rope_params(metadata, architecture, layer_idx, metadata.head_dim);
+        let q_dim = metadata.num_heads * metadata.head_dim;
+        let kv_dim = metadata.num_kv_heads * metadata.head_dim;
+        matches!(rope_dim, 0 | 128)
+            && !proportional_rope
+            && !uses_neox_rope(architecture)
+            && w.q_weight.ggml_type == rnb_loader::GGMLType::Q4_K
+            && w.k_weight.ggml_type == rnb_loader::GGMLType::Q4_K
+            && matches!(
+                w.v_weight.ggml_type,
+                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+            )
+            && w.o_weight.ggml_type == rnb_loader::GGMLType::Q4_K
+            && w.ffn_gate_weight.ggml_type == rnb_loader::GGMLType::Q4_K
+            && w.ffn_up_weight.ggml_type == rnb_loader::GGMLType::Q4_K
+            && matches!(
+                w.ffn_down_weight.ggml_type,
+                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+            )
+            && w.attn_gate_weight.as_ref().is_some_and(|weight| {
+                weight.ggml_type == rnb_loader::GGMLType::Q4_K
+                    && weight.rows == q_dim
+                    && weight.cols == metadata.hidden_dim
+            })
+            && w.q_norm
+                .as_ref()
+                .is_some_and(|norm| kernels::tensor_as_f32_slice(norm).len() == metadata.head_dim)
+            && w.k_norm
+                .as_ref()
+                .is_some_and(|norm| kernels::tensor_as_f32_slice(norm).len() == metadata.head_dim)
+            && w.post_attn_norm
+                .as_ref()
+                .is_some_and(|norm| kernels::tensor_as_f32_slice(norm).len() == metadata.hidden_dim)
+            && w.post_ffw_norm
+                .as_ref()
+                .is_some_and(|norm| kernels::tensor_as_f32_slice(norm).len() == metadata.hidden_dim)
+            && w.q_weight.rows == q_dim
+            && w.q_weight.cols == metadata.hidden_dim
+            && w.k_weight.rows == kv_dim
+            && w.k_weight.cols == metadata.hidden_dim
+            && w.v_weight.rows == kv_dim
+            && w.v_weight.cols == metadata.hidden_dim
+            && w.o_weight.rows == metadata.hidden_dim
+            && w.o_weight.cols == q_dim
+            && w.ffn_gate_weight.cols == metadata.hidden_dim
+            && w.ffn_up_weight.rows == w.ffn_gate_weight.rows
+            && w.ffn_up_weight.cols == metadata.hidden_dim
+            && w.ffn_down_weight.rows == metadata.hidden_dim
+            && w.ffn_down_weight.cols == w.ffn_gate_weight.rows
+            && w.q_bias.is_none()
+            && w.k_bias.is_none()
+            && w.v_bias.is_none()
+            && !w.v_proj_missing
+            && w.moe.is_none()
+            && w.shared_expert_moe.is_none()
+            && w.ffn_gate_up_fused.is_none()
+    })
+}
+
 impl Engine {
     pub(crate) fn scratch_checkpoint(&self) -> Option<crate::engine::ScratchBuffers> {
         self.scratch.clone()
@@ -1001,9 +1096,22 @@ impl Engine {
         {
             let embd = &weights.token_embd;
             #[cfg(feature = "cuda")]
-            {
+            if self.backend_runtime.decode_embedding_uses_gpu() {
                 let row = embd.embedding_gather_cuda(&[token])?;
                 scratch.hidden[..hidden_dim].copy_from_slice(&row[..hidden_dim]);
+            } else {
+                let embd_bytes = embd.data.as_bytes().expect("token_embd bytes");
+                let row_bytes = embd_bytes.len() / embd.rows;
+                let row_start = token as usize * row_bytes;
+                let row_data = &embd_bytes[row_start..row_start + row_bytes];
+                if !dequantize_row_to_slice_if_supported(
+                    row_data,
+                    embd.ggml_type,
+                    &mut scratch.hidden[..hidden_dim],
+                ) {
+                    let f32_row = dequantize_bytes_to_f32(row_data, embd.ggml_type);
+                    scratch.hidden[..hidden_dim].copy_from_slice(&f32_row[..hidden_dim]);
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -1085,13 +1193,32 @@ impl Engine {
         let backend_max_layer = self.decode_backend_max_layer();
         let use_backend_output_logits = backend_runtime::output_logits_enabled_for_runtime();
         let mtp_collect_hidden = self.mtp_spec_requested();
+        #[cfg(feature = "cuda")]
+        let all_decode_layers_on_gpu = self
+            .backend_runtime
+            .decode_all_layers_use_gpu(metadata.num_layers);
         let kv_cache = &mut self.kv_cache;
 
         let decode_result: crate::error::Result<Option<Vec<f32>>> = (|| {
-            // cu65: ensure the device KV cache matches the active sequence. A process-global
-            // one-shot flag cannot survive sequence clear/restore or multiple Engine instances.
             #[cfg(feature = "cuda")]
-            if cuda_runtime::cu65_device_qkv_enabled() && pos > 0 {
+            let full_device_decode_requested = {
+                let gemma_e2b = matches!(architecture, ModelArchitecture::Gemma4)
+                    && metadata.hidden_dim == 1536
+                    && metadata.head_dim == 512
+                    && metadata.num_heads == 8
+                    && metadata.num_kv_heads == 1
+                    && cuda_runtime::cu63_device_decode_enabled();
+                let muse = !mtp_collect_hidden
+                    && crate::engine::policy::cuda_decode_device_chain_enabled()
+                    && muse_full_device_decode_supported(metadata, architecture, weights);
+                (gemma_e2b || muse) && all_decode_layers_on_gpu
+            };
+
+            // Keep the device KV cache authoritative across decode steps. Re-upload host
+            // state only after a sequence reset/restore or when another path invalidated it.
+            #[cfg(feature = "cuda")]
+            if (cuda_runtime::cu65_device_qkv_enabled() || full_device_decode_requested) && pos > 0
+            {
                 let representative_layer = weights
                     .layers
                     .iter()
@@ -1127,138 +1254,148 @@ impl Engine {
                 }
             }
 
-            // cu63: device-resident decode — all 35 layers on GPU with 1 sync total.
             #[cfg(feature = "cuda")]
-            let cu63_device_decode_done = {
-                let cu63_enabled = cuda_runtime::cu63_device_decode_enabled();
-                let is_gemma4_e2b = matches!(architecture, ModelArchitecture::Gemma4)
-                    && metadata.hidden_dim == 1536
-                    && metadata.head_dim == 512
-                    && metadata.num_heads == 8
-                    && metadata.num_kv_heads == 1;
-                if is_gemma4_e2b && cu63_enabled {
-                    let hidden_bytes = hidden_dim * std::mem::size_of::<f32>();
-                    let hidden_dev = cuda_runtime::acquire_decode_hidden_carrier(hidden_bytes)
-                        .map_err(crate::error::LlmError::Forward)?;
-                    cuda_runtime::upload_to_decode_hidden_carrier(
-                        &scratch.hidden[..hidden_dim],
-                        hidden_dev,
-                    )
+            let full_device_decode_done = if full_device_decode_requested {
+                let hidden_bytes = hidden_dim * std::mem::size_of::<f32>();
+                let hidden_dev = cuda_runtime::acquire_decode_hidden_carrier(hidden_bytes)
                     .map_err(crate::error::LlmError::Forward)?;
+                cuda_runtime::upload_to_decode_hidden_carrier(
+                    &scratch.hidden[..hidden_dim],
+                    hidden_dev,
+                )
+                .map_err(crate::error::LlmError::Forward)?;
 
-                    for layer_idx in 0..metadata.num_layers {
-                        let cached = kv_cache.read_up_to(layer_idx, pos);
-                        let (k_bits, v_bits) = cached.as_slices();
-                        let kv_dim = if pos > 0 { k_bits.len() / pos } else { 0 };
-                        if kv_dim > 0 {
-                            cuda_runtime::populate_device_kv_cache_f16(
-                                layer_idx, k_bits, v_bits, kv_dim, pos,
-                            )
-                            .map_err(crate::error::LlmError::Forward)?;
-                        }
-                    }
-
-                    for layer_idx in 0..metadata.num_layers {
-                        let LayerType::Attention(w) = &weights.layers[layer_idx] else {
-                            return Err(crate::error::LlmError::Forward(format!(
-                                "cu63 device decode: layer {layer_idx} is not Attention"
-                            )));
-                        };
-                        let q_raw = w.q_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} q_weight bytes unavailable"
-                            ))
-                        })?;
-                        let k_raw = w.k_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} k_weight bytes unavailable"
-                            ))
-                        })?;
-                        let v_raw = w.v_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} v_weight bytes unavailable"
-                            ))
-                        })?;
-                        let o_raw = w.o_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} o_weight bytes unavailable"
-                            ))
-                        })?;
-                        let gate_raw = w.ffn_gate_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} ffn_gate_weight bytes unavailable"
-                            ))
-                        })?;
-                        let up_raw = w.ffn_up_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} ffn_up_weight bytes unavailable"
-                            ))
-                        })?;
-                        let down_raw = w.ffn_down_weight.data.as_bytes().ok_or_else(|| {
-                            crate::error::LlmError::Forward(format!(
-                                "cu63: layer {layer_idx} ffn_down_weight bytes unavailable"
-                            ))
-                        })?;
-                        let attn_norm_data = kernels::tensor_as_f32_slice(&w.attn_norm);
-                        let ffn_norm_data = kernels::tensor_as_f32_slice(&w.ffn_norm);
-                        let n_ff = w.ffn_gate_weight.rows;
-
-                        let layer_kv_dim = w.k_weight.rows;
-                        let layer_q_rows = w.q_weight.rows;
-                        let q_norm_data =
-                            w.q_norm.as_ref().map(|t| kernels::tensor_as_f32_slice(t));
-                        let k_norm_data =
-                            w.k_norm.as_ref().map(|t| kernels::tensor_as_f32_slice(t));
-                        let layer_out_scale = w
-                            .out_scale
-                            .as_ref()
-                            .map(|t| kernels::tensor_as_f32_slice(t))
-                            .and_then(|s| s.first().copied())
-                            .unwrap_or(1.0);
-                        cuda_runtime::decode_full_layer_device_resident(
+                let muse = matches!(architecture, ModelArchitecture::MuseGlimmer);
+                for layer_idx in 0..metadata.num_layers {
+                    let LayerType::Attention(w) = &weights.layers[layer_idx] else {
+                        return Err(crate::error::LlmError::Forward(format!(
+                            "full device decode: layer {layer_idx} is not Attention"
+                        )));
+                    };
+                    let q_raw =
+                        full_device_decode_weight_bytes(&w.q_weight, layer_idx, "q_weight")?;
+                    let k_raw =
+                        full_device_decode_weight_bytes(&w.k_weight, layer_idx, "k_weight")?;
+                    let v_raw =
+                        full_device_decode_weight_bytes(&w.v_weight, layer_idx, "v_weight")?;
+                    let o_raw =
+                        full_device_decode_weight_bytes(&w.o_weight, layer_idx, "o_weight")?;
+                    let gate_raw = full_device_decode_weight_bytes(
+                        &w.ffn_gate_weight,
+                        layer_idx,
+                        "ffn_gate_weight",
+                    )?;
+                    let up_raw = full_device_decode_weight_bytes(
+                        &w.ffn_up_weight,
+                        layer_idx,
+                        "ffn_up_weight",
+                    )?;
+                    let down_raw = full_device_decode_weight_bytes(
+                        &w.ffn_down_weight,
+                        layer_idx,
+                        "ffn_down_weight",
+                    )?;
+                    let attention_gate_raw = if muse {
+                        Some(full_device_decode_weight_bytes(
+                            w.attn_gate_weight.as_ref().ok_or_else(|| {
+                                crate::error::LlmError::Forward(format!(
+                                    "full device decode: layer {layer_idx} attention gate missing"
+                                ))
+                            })?,
                             layer_idx,
-                            q_raw,
-                            k_raw,
-                            v_raw,
-                            o_raw,
-                            gate_raw,
-                            up_raw,
-                            down_raw,
-                            attn_norm_data,
-                            ffn_norm_data,
-                            metadata.hidden_dim,
-                            n_ff,
-                            metadata.num_heads,
-                            metadata.num_kv_heads,
-                            metadata.head_dim,
-                            layer_kv_dim,
-                            layer_q_rows,
-                            q_norm_data,
-                            k_norm_data,
-                            layer_out_scale,
-                            metadata.rope_theta,
-                            pos,
-                            pos,
-                            metadata.norm_eps,
-                            hidden_dev,
-                        )
-                        .map_err(crate::error::LlmError::Forward)?;
-                    }
-
-                    cuda_runtime::download_from_decode_hidden_carrier(
+                            "attn_gate_weight",
+                        )?)
+                    } else {
+                        None
+                    };
+                    let post_attn_norm = w
+                        .post_attn_norm
+                        .as_ref()
+                        .map(kernels::tensor_as_f32_slice)
+                        .filter(|_| muse);
+                    let post_ffn_norm = w
+                        .post_ffw_norm
+                        .as_ref()
+                        .map(kernels::tensor_as_f32_slice)
+                        .filter(|_| muse);
+                    let ffn_norm =
+                        kernels::tensor_as_f32_slice(select_ffn_pre_norm_weight(w, architecture));
+                    let q_norm = w.q_norm.as_ref().map(kernels::tensor_as_f32_slice);
+                    let k_norm = w.k_norm.as_ref().map(kernels::tensor_as_f32_slice);
+                    let (_, layer_rope_theta, _) =
+                        resolve_rope_params(metadata, architecture, layer_idx, metadata.head_dim);
+                    let sliding_window = muse
+                        .then(|| active_sliding_window(metadata, architecture, layer_idx))
+                        .flatten();
+                    let layer_out_scale = w
+                        .out_scale
+                        .as_ref()
+                        .map(kernels::tensor_as_f32_slice)
+                        .and_then(|values| values.first().copied())
+                        .unwrap_or(1.0);
+                    cuda_runtime::decode_full_layer_device_resident(
+                        layer_idx,
+                        q_raw,
+                        k_raw,
+                        v_raw,
+                        o_raw,
+                        attention_gate_raw,
+                        gate_raw,
+                        up_raw,
+                        down_raw,
+                        kernels::tensor_as_f32_slice(&w.attn_norm),
+                        post_attn_norm,
+                        ffn_norm,
+                        post_ffn_norm,
+                        metadata.hidden_dim,
+                        w.ffn_gate_weight.rows,
+                        metadata.num_heads,
+                        metadata.num_kv_heads,
+                        metadata.head_dim,
+                        w.k_weight.rows,
+                        w.q_weight.rows,
+                        q_norm,
+                        k_norm,
+                        if muse {
+                            resolve_attention_scale(metadata, architecture)
+                        } else {
+                            1.0
+                        },
+                        !muse || sliding_window.is_some(),
+                        !muse,
+                        sliding_window,
+                        !muse,
+                        layer_out_scale,
+                        if muse {
+                            layer_rope_theta
+                        } else {
+                            metadata.rope_theta
+                        },
+                        pos,
+                        pos,
+                        metadata.norm_eps,
+                        if muse {
+                            metadata.post_norm_eps
+                        } else {
+                            metadata.norm_eps
+                        },
                         hidden_dev,
-                        &mut scratch.hidden[..hidden_dim],
                     )
                     .map_err(crate::error::LlmError::Forward)?;
-                    cuda_runtime::sync_decode_stream().map_err(crate::error::LlmError::Forward)?;
-                    eprintln!("[cu63-final] hidden[0..8]: {:?}", &scratch.hidden[..8]);
-                    true
-                } else {
-                    false
                 }
+
+                cuda_runtime::download_from_decode_hidden_carrier(
+                    hidden_dev,
+                    &mut scratch.hidden[..hidden_dim],
+                )
+                .map_err(crate::error::LlmError::Forward)?;
+                cuda_runtime::sync_decode_stream().map_err(crate::error::LlmError::Forward)?;
+                true
+            } else {
+                false
             };
             #[cfg(not(feature = "cuda"))]
-            let cu63_device_decode_done = false;
+            let full_device_decode_done = false;
 
             // cu75: persistent decode가 성공하면 layer loop + finalize_decode_logits
             // 둘 다 skip 해야 한다. cu74 까진 argmax 만 저장하고 eager 가 그대로
@@ -1275,7 +1412,7 @@ impl Engine {
             let backend_output_done = false;
             #[cfg(feature = "cuda")]
             if !force_qwen_imrope
-                && !cu63_device_decode_done
+                && !full_device_decode_done
                 && !mtp_collect_hidden
                 && (!backend_argmax_only || scratch.backend_argmax_excluded_token.is_none())
             {
@@ -1311,7 +1448,7 @@ impl Engine {
                 }
             }
 
-            if !cu63_device_decode_done && !persistent_decode_done {
+            if !full_device_decode_done && !persistent_decode_done {
                 #[cfg(feature = "cuda")]
                 let mut cu72_hidden_persistence_trace =
                     if cuda_runtime::cu71_layer_segment_graph_trace_enabled() {
@@ -1766,6 +1903,9 @@ impl Engine {
                                     cu72_hidden_persistence_trace.as_mut(),
                                     qkv_precomputed,
                                     metal_lookahead,
+                                    self.backend_runtime
+                                        .decode_attention_layer_uses_gpu(layer_idx),
+                                    self.backend_runtime.decode_ffn_layer_uses_gpu(layer_idx),
                                     #[cfg(feature = "vulkan")]
                                     if backend_layers && layer_idx < backend_max_layer {
                                         gpu_runtime.as_mut()
@@ -1981,7 +2121,7 @@ impl Engine {
                     );
                     }
                 }
-            } // end if !cu63_device_decode_done
+            } // end if !full_device_decode_done
 
             report_decode_layer_profile(
                 weights,

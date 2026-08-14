@@ -305,6 +305,8 @@ fn forward_attention_layer_impl(
                 None,
                 false,
                 None,
+                true,
+                true,
                 #[cfg(feature = "vulkan")]
                 None,
             )?;

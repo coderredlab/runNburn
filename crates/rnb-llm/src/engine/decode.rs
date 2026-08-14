@@ -79,6 +79,8 @@ pub(super) fn decode_attention_layer(
         cu72_trace,
         false,
         None,
+        true,
+        true,
         #[cfg(feature = "vulkan")]
         vulkan_backend.as_deref_mut(),
     )?
@@ -212,6 +214,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     cu72_trace: Option<&mut super::decode_layer_graph::Cu72HiddenPersistenceTrace>,
     qkv_precomputed: bool,
     metal_lookahead: Option<GemmaMetalDecodeLookahead<'_>>,
+    use_accelerator: bool,
+    use_ffn_accelerator: bool,
     #[cfg(feature = "vulkan")] mut vulkan_backend: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<DecodeAttentionLayerReport> {
     let prof_level = super::policy::profiling_level();
@@ -278,7 +282,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         // n_rot 으로 전달. has_gated_attn 요구(non-gated 는 split 미지원이라 host fallback).
         let (carrier_rope_dim, carrier_rope_theta, _) =
             resolve_rope_params(metadata, architecture, layer_idx, head_dim);
-        if !force_qwen_imrope
+        if use_accelerator
+            && !force_qwen_imrope
             && !kv_cache.layer_uses_kvarn(kv_cache_layer)
             && attn_carrier_eligible(
                 w,
@@ -449,7 +454,10 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // cu203: W1 은 carrier 연속성(chain_hidden_carrier_continuous)까지 요구한다 —
     // Qwen35 는 chain function 은 타지만 GDN 층이 사이에 껴 carrier 가 stale 이라
     // W1 만 비활성.
-    let rms_used_cuda = if !qkv_precomputed && chain_carrier_continuous && qkv_consumes_device_norm
+    let rms_used_cuda = if use_accelerator
+        && !qkv_precomputed
+        && chain_carrier_continuous
+        && qkv_consumes_device_norm
     {
         backend_runtime::try_rms_norm_into_decode_carrier_if_supported(
             layer_idx,
@@ -522,7 +530,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     let used_fused_hd128 = {
         let (rope_dim, rope_theta, proportional_rope) =
             resolve_rope_params(metadata, architecture, layer_idx, head_dim);
-        if !qkv_precomputed
+        if use_accelerator
+            && !qkv_precomputed
             && !rms_used_cuda
             && !force_qwen_imrope
             && head_dim == 128
@@ -588,7 +597,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     let cu68_attention_device_len = false;
 
     #[cfg(feature = "cuda")]
-    let (used_device_qkv, cu66_q_dev): (bool, Option<u64>) = if !qkv_precomputed
+    let (used_device_qkv, cu66_q_dev): (bool, Option<u64>) = if use_accelerator
+        && !qkv_precomputed
         && !used_fused_hd128
         && chain_emits_hidden_carrier
         && rms_used_cuda
@@ -688,6 +698,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             use_gemma_block_semantics(architecture),
             verbose,
             rms_used_cuda,
+            use_accelerator,
             #[cfg(feature = "vulkan")]
             &mut vulkan_backend,
             |label, t| prof!(label, t),
@@ -695,13 +706,14 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     }
     if !qkv_precomputed {
         if let Some(gate_weight) = &w.attn_gate_weight {
-            let gate_ok = gpu_gemv_into_if_supported(
-                gate_weight,
-                &scratch.norm_buf[..hidden_dim],
-                &mut scratch.gate_split[..q_dim],
-                "attention gate",
-                false,
-            )?;
+            let gate_ok = use_accelerator
+                && gpu_gemv_into_if_supported(
+                    gate_weight,
+                    &scratch.norm_buf[..hidden_dim],
+                    &mut scratch.gate_split[..q_dim],
+                    "attention gate",
+                    false,
+                )?;
             if !gate_ok {
                 gate_weight.gemv_into(
                     &scratch.norm_buf[..hidden_dim],
@@ -818,7 +830,11 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         gemma4_should_apply_attn_rotation(architecture, w.v_weight.ggml_type, head_dim);
     #[cfg(feature = "cuda")]
     let attn_out_carrier_dev: Option<u64> = {
-        if chain_emits_hidden_carrier && !has_gated_attn && !gemma4_attn_rot_active {
+        if use_accelerator
+            && chain_emits_hidden_carrier
+            && !has_gated_attn
+            && !gemma4_attn_rot_active
+        {
             let bytes = q_dim * std::mem::size_of::<f32>();
             backend_runtime::acquire_decode_attn_out_carrier(bytes).ok()
         } else {
@@ -841,7 +857,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // 와 동일 신호로 W4 도 gating. Gemma4 동작 동등, 그 외 arch wire 비활성.
     #[cfg(feature = "cuda")]
     let (last_token_k_dev, last_token_v_dev): (Option<u64>, Option<u64>) = {
-        if used_device_qkv
+        if use_accelerator
+            && used_device_qkv
             && chain_emits_hidden_carrier
             && crate::engine::policy::cuda_decode_device_kv_cache_enabled()
             && !has_gated_attn
@@ -856,7 +873,8 @@ pub(super) fn decode_attention_layer_with_rope_pos(
                 (Some(k), Some(v)) => (Some(k), Some(v)),
                 _ => (None, None),
             }
-        } else if !used_device_qkv
+        } else if use_accelerator
+            && !used_device_qkv
             && chain_emits_hidden_carrier
             && crate::engine::policy::cuda_decode_device_kv_cache_enabled()
             && !has_gated_attn
@@ -950,7 +968,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
     // 일반화. Gemma family path 만 helper 안에 이동 (산술 변경 0). 다음 step 에서
     // Llama / Qwen / Phi dense path 도 helper 의 분기로 진입.
     #[cfg(feature = "cuda")]
-    {
+    if use_accelerator && use_ffn_accelerator {
         let ctx = super::forward::chain_args::ChainCallerCtx {
             architecture,
             layer_idx,
@@ -1241,6 +1259,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
             layer_idx,
             q_dim,
             hidden_dim,
+            use_accelerator,
             #[cfg(feature = "vulkan")]
             vulkan_backend.as_deref_mut(),
         )?;
@@ -1290,6 +1309,7 @@ pub(super) fn decode_attention_layer_with_rope_pos(
         norm_eps,
         metadata.post_norm_eps,
         layer_idx,
+        use_ffn_accelerator,
         #[cfg(feature = "vulkan")]
         vulkan_backend.as_mut().map(|v| &mut **v),
     )?;

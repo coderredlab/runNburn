@@ -118,6 +118,16 @@ pub(in crate::runtime) struct PersistentDecodeParamsHost {
     pub(in crate::runtime) attn_normed_dev: u64,
 }
 
+fn persistent_decode_kv_capacity_tokens(required_tokens: u32, max_seq_len: u32) -> u32 {
+    let max_seq_len = max_seq_len.max(1);
+    let required_tokens = required_tokens.max(1).min(max_seq_len);
+    required_tokens
+        .checked_next_power_of_two()
+        .unwrap_or(max_seq_len)
+        .min(max_seq_len)
+        .max(required_tokens)
+}
+
 impl CudaState {
     /// Load (or fetch cached) the persistent decode module and return its raw handle.
     pub(in crate::runtime) fn ensure_persistent_decode_module(&mut self) -> Result<usize, String> {
@@ -204,14 +214,14 @@ impl CudaState {
     }
 
     /// Ensure the persistent decode reusable buffer context is allocated and
-    /// large enough for the requested shapes.  Per-layer KV slots are allocated
-    /// once at `max_seq_len * kv_dim_max * 2` bytes; scratch / output buffers
-    /// are allocated once and reused.  Returns a mutable reference to the
-    /// reusable buffer set.
+    /// large enough for the requested shapes. Per-layer KV slots start at the
+    /// smallest power-of-two token capacity covering the active sequence and
+    /// grow without changing the configured maximum context.
     pub(in crate::runtime) fn ensure_persistent_decode_ctx(
         &mut self,
         num_layers: usize,
         max_seq_len: u32,
+        required_kv_tokens: u32,
         batch_seq_cap: u32,
         hidden_dim: u32,
         q_dim_max: u32,
@@ -222,6 +232,8 @@ impl CudaState {
         owns_kv: &[bool],
     ) -> Result<(), String> {
         self.set_current()?;
+        let target_kv_seq_cap =
+            persistent_decode_kv_capacity_tokens(required_kv_tokens, max_seq_len);
         let needs_realloc = match &self.persistent_decode_ctx {
             None => true,
             Some(ctx) => {
@@ -237,6 +249,14 @@ impl CudaState {
             }
         };
         if !needs_realloc {
+            let needs_kv_growth = self.persistent_decode_ctx.as_ref().is_some_and(|ctx| {
+                owns_kv.iter().enumerate().any(|(idx, owns)| {
+                    *owns && ctx.kv_seq_caps.get(idx).copied().unwrap_or(0) < target_kv_seq_cap
+                })
+            });
+            if needs_kv_growth {
+                self.grow_persistent_decode_kv(target_kv_seq_cap, owns_kv)?;
+            }
             return Ok(());
         }
         // Free any previous allocation first (shape grew).
@@ -270,16 +290,19 @@ impl CudaState {
                 }
             }
         }
-        let kv_bytes = (max_seq_len as usize) * (kv_dim_max as usize) * std::mem::size_of::<u16>();
+        let kv_bytes =
+            (target_kv_seq_cap as usize) * (kv_dim_max as usize) * std::mem::size_of::<u16>();
         let bytes_f32 = |n: usize| n * std::mem::size_of::<f32>();
         let layers_bytes = num_layers * std::mem::size_of::<PersistentLayerParamsHost>();
 
         let mut k_cache_devs = vec![0u64; num_layers];
         let mut v_cache_devs = vec![0u64; num_layers];
+        let mut kv_seq_caps = vec![0u32; num_layers];
         for idx in 0..num_layers {
             if owns_kv[idx] {
                 k_cache_devs[idx] = unsafe { self.api.mem_alloc(kv_bytes)? };
                 v_cache_devs[idx] = unsafe { self.api.mem_alloc(kv_bytes)? };
+                kv_seq_caps[idx] = target_kv_seq_cap;
             }
         }
         let layers_dev = unsafe { self.api.mem_alloc(layers_bytes)? };
@@ -366,6 +389,7 @@ impl CudaState {
             ple_dim,
             k_cache_devs,
             v_cache_devs,
+            kv_seq_caps,
             last_rope_pos: None,
             resident_kv_tokens: 0,
             layers_dev,
@@ -385,6 +409,76 @@ impl CudaState {
             argmax_dev,
         });
         Ok(())
+    }
+    fn grow_persistent_decode_kv(
+        &mut self,
+        target_kv_seq_cap: u32,
+        owns_kv: &[bool],
+    ) -> Result<(), String> {
+        let Some(mut ctx) = self.persistent_decode_ctx.take() else {
+            return Err("persistent decode KV growth requires an initialized context".to_string());
+        };
+        let result = (|| {
+            let new_bytes = (target_kv_seq_cap as usize)
+                .checked_mul(ctx.kv_dim_max as usize)
+                .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+                .ok_or_else(|| "persistent decode KV growth byte size overflow".to_string())?;
+            for idx in 0..ctx.num_layers {
+                if !owns_kv.get(idx).copied().unwrap_or(false)
+                    || ctx.kv_seq_caps.get(idx).copied().unwrap_or(0) >= target_kv_seq_cap
+                {
+                    continue;
+                }
+                let old_cap = ctx.kv_seq_caps[idx] as usize;
+                let copy_tokens = ctx.resident_kv_tokens.min(old_cap);
+                let copy_bytes = copy_tokens
+                    .checked_mul(ctx.kv_dim_max as usize)
+                    .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+                    .ok_or_else(|| "persistent decode KV copy byte size overflow".to_string())?;
+                let new_k = unsafe { self.api.mem_alloc(new_bytes)? };
+                let new_v = match unsafe { self.api.mem_alloc(new_bytes) } {
+                    Ok(ptr) => ptr,
+                    Err(err) => {
+                        let _ = unsafe { self.api.mem_free(new_k) };
+                        return Err(err);
+                    }
+                };
+                let migrate = (|| {
+                    if copy_bytes != 0 {
+                        unsafe {
+                            self.api.memcpy_dtod_async(
+                                new_k,
+                                ctx.k_cache_devs[idx],
+                                copy_bytes,
+                                self.stream,
+                            )?;
+                            self.api.memcpy_dtod_async(
+                                new_v,
+                                ctx.v_cache_devs[idx],
+                                copy_bytes,
+                                self.stream,
+                            )?;
+                        }
+                    }
+                    self.stream_synchronize()
+                })();
+                if let Err(err) = migrate {
+                    let _ = unsafe { self.api.mem_free(new_k) };
+                    let _ = unsafe { self.api.mem_free(new_v) };
+                    return Err(err);
+                }
+                let old_k = ctx.k_cache_devs[idx];
+                let old_v = ctx.v_cache_devs[idx];
+                ctx.k_cache_devs[idx] = new_k;
+                ctx.v_cache_devs[idx] = new_v;
+                ctx.kv_seq_caps[idx] = target_kv_seq_cap;
+                let _ = unsafe { self.api.mem_free(old_k) };
+                let _ = unsafe { self.api.mem_free(old_v) };
+            }
+            Ok(())
+        })();
+        self.persistent_decode_ctx = Some(ctx);
+        result
     }
 
     /// One-shot persistent decode dispatch.  Populates per-layer device weight
@@ -446,6 +540,10 @@ impl CudaState {
         self.ensure_persistent_decode_ctx(
             num_layers,
             request.max_seq_len,
+            request
+                .kv_len
+                .saturating_add(request.seq_len.max(1))
+                .max(request.rope_pos.saturating_add(request.seq_len.max(1))),
             // cu104: batch scratch sized to this request's seq_len (decode=1,
             // prefill batch=N), not max_ctx — avoids 4096-slot over-alloc OOM.
             request.seq_len.max(1),
@@ -1427,6 +1525,15 @@ pub(crate) fn persistent_decode_cooperative_smoke(
 mod tests {
     use super::*;
     use std::mem::{align_of, size_of};
+
+    #[test]
+    fn persistent_kv_capacity_grows_geometrically_within_max_context() {
+        assert_eq!(persistent_decode_kv_capacity_tokens(0, 4096), 1);
+        assert_eq!(persistent_decode_kv_capacity_tokens(1144, 4096), 2048);
+        assert_eq!(persistent_decode_kv_capacity_tokens(2048, 4096), 2048);
+        assert_eq!(persistent_decode_kv_capacity_tokens(2049, 4096), 4096);
+        assert_eq!(persistent_decode_kv_capacity_tokens(5000, 4096), 4096);
+    }
 
     #[test]
     fn cooperative_smoke_launches_without_deadlock() {

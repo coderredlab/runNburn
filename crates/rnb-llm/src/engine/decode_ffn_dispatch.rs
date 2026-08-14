@@ -10,6 +10,7 @@ pub(super) fn decode_ffn_layer(
     norm_eps: f32,
     post_norm_eps: f32,
     layer_idx: usize,
+    use_accelerator: bool,
     #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<()> {
     let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
@@ -51,6 +52,7 @@ pub(super) fn decode_ffn_layer(
             norm_eps,
             post_norm_eps,
             layer_idx,
+            use_accelerator,
             #[cfg(feature = "vulkan")]
             gpu_runtime,
         )?;

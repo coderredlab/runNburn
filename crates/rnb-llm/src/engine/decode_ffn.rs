@@ -22,6 +22,7 @@ pub(super) fn decode_ffn(
     norm_eps: f32,
     post_norm_eps: f32,
     layer_idx: usize,
+    use_accelerator: bool,
     #[cfg(feature = "vulkan")] gpu_runtime: Option<&mut backend_runtime::GpuRuntime>,
 ) -> crate::error::Result<()> {
     let prof_level = super::policy::profiling_level();
@@ -47,7 +48,8 @@ pub(super) fn decode_ffn(
             || super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture));
 
     #[cfg(feature = "cuda")]
-    if super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+    if use_accelerator
+        && super::models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
         && ffn_gate_up_fused.is_none()
     {
         let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
@@ -74,7 +76,7 @@ pub(super) fn decode_ffn(
     }
 
     #[cfg(feature = "cuda")]
-    if use_gemma_block_semantics(architecture) {
+    if use_accelerator && use_gemma_block_semantics(architecture) {
         let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
         let post_norm_weight_data = post_ffw_norm_weight
             .as_ref()
@@ -106,7 +108,8 @@ pub(super) fn decode_ffn(
     // 다발)이라 토큰당 수천 memcpy가 GPU idle 44%의 주범이었다. gate/up Q4_K + down
     // Q4/Q5/Q6_K 만 진입하고, 그 밖은 기존 개별 GEMV 경로로 폴백한다.
     #[cfg(feature = "cuda")]
-    if matches!(architecture, ModelArchitecture::Qwen35)
+    if use_accelerator
+        && matches!(architecture, ModelArchitecture::Qwen35)
         && post_ffw_norm_weight.is_none()
         && ffn_gate_up_fused.is_none()
         && super::policy::qwen35_dense_ffn_chain_enabled()
@@ -140,7 +143,8 @@ pub(super) fn decode_ffn(
             && (super::policy::gemma_unit_offset_attn_ffn_norm_enabled()
                 || super::policy::gemma_unit_offset_norm_enabled()
                 || super::policy::gemma_unit_offset_main_norm_enabled());
-        if shared_epsilon_metal_ffn_chain_supports(architecture)
+        if use_accelerator
+            && shared_epsilon_metal_ffn_chain_supports(architecture)
             && ffn_gate_up_fused.is_none()
             && !unit_offset_norm
         {
@@ -169,7 +173,7 @@ pub(super) fn decode_ffn(
         }
     }
 
-    if !needs_post_ffw_norm {
+    if use_accelerator && !needs_post_ffw_norm {
         let norm_weight_data = kernels::tensor_as_f32_slice(ffn_norm_weight);
         let gpu_chain_ok = backend_runtime::try_decode_ffn_chain_if_supported(
             #[cfg(feature = "vulkan")]
@@ -212,22 +216,24 @@ pub(super) fn decode_ffn(
     let mut gpu_ffn_ok = false;
 
     #[cfg(feature = "mediatek")]
-    if let Some(output) = super::mediatek_ffn::try_mediatek_gemma_ffn_down(
-        architecture,
-        layer_idx,
-        hidden_dim,
-        norm_data,
-        ffn_gate_weight,
-        ffn_up_weight,
-        ffn_down_weight,
-        ffn_gate_up_fused.is_some(),
-    )? {
-        scratch.ffn_down[..hidden_dim].copy_from_slice(&output[..hidden_dim]);
-        gpu_ffn_ok = true;
-        gpu_down_done = true;
+    if use_accelerator {
+        if let Some(output) = super::mediatek_ffn::try_mediatek_gemma_ffn_down(
+            architecture,
+            layer_idx,
+            hidden_dim,
+            norm_data,
+            ffn_gate_weight,
+            ffn_up_weight,
+            ffn_down_weight,
+            ffn_gate_up_fused.is_some(),
+        )? {
+            scratch.ffn_down[..hidden_dim].copy_from_slice(&output[..hidden_dim]);
+            gpu_ffn_ok = true;
+            gpu_down_done = true;
+        }
     }
 
-    if !gpu_ffn_ok && !needs_post_ffw_norm {
+    if use_accelerator && !gpu_ffn_ok && !needs_post_ffw_norm {
         let gate_rows = ffn_gate_weight.rows;
         let gpu_gate_dispatched = backend_runtime::try_decode_ffn_gate_async_if_supported(
             #[cfg(feature = "vulkan")]
@@ -268,7 +274,7 @@ pub(super) fn decode_ffn(
     }
 
     #[cfg(feature = "cuda")]
-    if !gpu_ffn_ok {
+    if use_accelerator && !gpu_ffn_ok {
         if use_gemma_block_semantics(architecture) {
             let t_chain = std::time::Instant::now();
             if let Some(output) = backend_runtime::dense_q4k_gelu_ffn_if_supported(
@@ -286,7 +292,7 @@ pub(super) fn decode_ffn(
     }
 
     #[cfg(feature = "cuda")]
-    if !gpu_ffn_ok {
+    if use_accelerator && !gpu_ffn_ok {
         let gate_rows = ffn_gate_weight.rows;
         let t_gate = std::time::Instant::now();
         let gate_ok = backend_runtime::decode_gemv_into_if_supported(
@@ -328,30 +334,39 @@ pub(super) fn decode_ffn(
             ffn_up_weight,
             ffn_gate_up_fused.as_ref(),
             hidden_dim,
+            !use_accelerator,
             |label, t| prof!(label, t),
         )?;
     }
 
     let gate_rows = ffn_gate_weight.rows;
-    let gpu_down_ok = gpu_down_done
-        || backend_runtime::try_decode_gemv_if_supported(
-            #[cfg(feature = "vulkan")]
-            gpu_runtime.as_deref_mut(),
-            layer_idx,
-            backend_runtime::DecodeProjectionKind::FfnDown,
-            ffn_down_weight,
-            hidden_dim,
-            &scratch.ffn_gate[..gate_rows],
-            &mut scratch.ffn_down[..hidden_dim],
-            "FFN down",
-        );
+    let gpu_down_ok = use_accelerator
+        && (gpu_down_done
+            || backend_runtime::try_decode_gemv_if_supported(
+                #[cfg(feature = "vulkan")]
+                gpu_runtime.as_deref_mut(),
+                layer_idx,
+                backend_runtime::DecodeProjectionKind::FfnDown,
+                ffn_down_weight,
+                hidden_dim,
+                &scratch.ffn_gate[..gate_rows],
+                &mut scratch.ffn_down[..hidden_dim],
+                "FFN down",
+            ));
 
     let t_down = std::time::Instant::now();
     if !gpu_down_ok {
-        ffn_down_weight.gemv_into(
-            &scratch.ffn_gate[..gate_rows],
-            &mut scratch.ffn_down[..hidden_dim],
-        )?;
+        if use_accelerator {
+            ffn_down_weight.gemv_into(
+                &scratch.ffn_gate[..gate_rows],
+                &mut scratch.ffn_down[..hidden_dim],
+            )?;
+        } else {
+            ffn_down_weight.gemv_into_host_quantized(
+                &scratch.ffn_gate[..gate_rows],
+                &mut scratch.ffn_down[..hidden_dim],
+            )?;
+        }
     }
     prof!("down_gemv", t_down);
 

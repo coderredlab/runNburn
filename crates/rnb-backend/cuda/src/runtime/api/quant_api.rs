@@ -974,7 +974,7 @@ fn div_ceil_usize(value: usize, divisor: usize) -> usize {
     value.saturating_add(divisor.saturating_sub(1)) / divisor
 }
 
-pub fn prewarm_quant_resident_q4k_weights(weights: &[&[u8]]) -> Result<usize, String> {
+pub fn prewarm_quant_resident_weights(weights: &[&[u8]]) -> Result<usize, String> {
     if !super::super::state::quant_resident_policy_requested()? {
         return Ok(0);
     }
@@ -1069,9 +1069,9 @@ pub fn prewarm_q4k_weights_pinned_prefix(weights: &[&[u8]]) -> Result<usize, Str
         let mib = 1024 * 1024;
         let total_mib = total_bytes / mib;
         let free_mib = free_bytes / mib;
-        let reserve_mib = super::super::state::quant_resident_reserve_mib(total_mib);
-        let target_bytes = free_mib.saturating_sub(reserve_mib).saturating_mul(mib);
-        state.resident_q4k_limit = state.resident_q4k_limit.max(target_bytes);
+        let reserve_mib = super::super::state::pinned_prefix_reserve_mib(total_mib);
+        let additional_bytes = free_mib.saturating_sub(reserve_mib).saturating_mul(mib);
+        state.resident_q4k_limit = state.resident_q4k_bytes.saturating_add(additional_bytes);
     }
     let mut warmed = 0usize;
     for weight in weights {

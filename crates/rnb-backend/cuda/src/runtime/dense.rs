@@ -136,7 +136,7 @@ fn f32_to_f16_bits(input: &[f32]) -> Vec<u16> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DensePleWeightKind {
+pub(in crate::runtime) enum DensePleWeightKind {
     Q4K,
     F32,
 }
@@ -881,6 +881,9 @@ impl CudaState {
             // 이 절반이 된다 (bitwise 동일 산술, RNB_CUDA_MMQ_TILE_SEQ64=0 대조).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
                 if tuning::q4k_mmq_tile128_enabled(seq_len, rows) {
+                    let chunks = seq_len * blocks_per_row * 8;
+                    let sums_dev = self.compute_q8_sums_ptr(chunks * std::mem::size_of::<f32>())?;
+                    self.launch_q8_1_integer_sums_by_32(input_qs_dev, sums_dev, chunks)?;
                     return self.launch_q4k_q8_1_matmul_mmq_tile128_seq128(
                         weights,
                         rows,
@@ -888,6 +891,7 @@ impl CudaState {
                         seq_len,
                         input_qs_dev,
                         input_ds_dev,
+                        sums_dev,
                         output_dev,
                     );
                 }
@@ -1162,6 +1166,17 @@ impl CudaState {
             // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
                 // cu228: rows >= 64 는 64x64 tile — b-side 상각 (bitwise 동일).
+                if tuning::q6k_mmq_tile128_enabled(seq_len, rows) {
+                    return self.launch_q6k_q8_1_matmul_mmq_tile128_seq64(
+                        weights,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        qs_dev,
+                        ds_dev,
+                        output_dev,
+                    );
+                }
                 if tuning::q6k_mmq_tile64_enabled(seq_len, rows) {
                     return self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
                         weights,
@@ -2267,6 +2282,17 @@ impl CudaState {
                         // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise
                         // 동일 산술).
                         if tuning::mmq_tile_seq64_enabled(seq_len) {
+                            if tuning::q6k_mmq_tile128_enabled(seq_len, n_embd) {
+                                return self.launch_q6k_q8_1_matmul_mmq_tile128_seq64(
+                                    down_weights,
+                                    n_embd,
+                                    down_blocks,
+                                    seq_len,
+                                    qs_dev,
+                                    ds_dev,
+                                    output_dev,
+                                );
+                            }
                             // cu228: n_embd >= 64 는 64x64 tile (bitwise 동일).
                             if tuning::q6k_mmq_tile64_enabled(seq_len, n_embd) {
                                 self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
@@ -3748,7 +3774,7 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn launch_dense_chain_graph_ops(
+    pub(in crate::runtime) fn launch_dense_chain_graph_ops(
         &mut self,
         o_weights: &[u8],
         gate_weights: &[u8],

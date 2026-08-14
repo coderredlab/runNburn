@@ -334,6 +334,7 @@ fn decode_gdn_layer_qwen_impl(
                     norm_eps,
                     norm_eps,
                     layer_idx,
+                    true,
                     #[cfg(feature = "vulkan")]
                     gpu_runtime.as_mut().map(|v| &mut **v),
                 )?;
@@ -799,6 +800,7 @@ fn decode_gdn_layer_qwen_impl(
             norm_eps,
             norm_eps,
             layer_idx,
+            true,
             #[cfg(feature = "vulkan")]
             gpu_runtime.as_mut().map(|v| &mut **v),
         )?;

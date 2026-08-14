@@ -24,6 +24,7 @@ pub(in crate::engine) type GpuQuant = RuntimeQuant;
 pub(in crate::engine) struct EngineBackendRuntime {
     #[cfg(feature = "vulkan")]
     gpu_layer_runtime: Option<GpuRuntime>,
+    decode_gpu_layer_prefixes: Option<(usize, usize)>,
 }
 
 impl EngineBackendRuntime {
@@ -33,7 +34,10 @@ impl EngineBackendRuntime {
 
     #[cfg(feature = "vulkan")]
     pub(in crate::engine) fn from_gpu_runtime(gpu_layer_runtime: Option<GpuRuntime>) -> Self {
-        Self { gpu_layer_runtime }
+        Self {
+            gpu_layer_runtime,
+            decode_gpu_layer_prefixes: None,
+        }
     }
 
     #[cfg(feature = "vulkan")]
@@ -45,7 +49,32 @@ impl EngineBackendRuntime {
     pub(in crate::engine) fn restore_gpu_runtime(&mut self, gpu_layer_runtime: Option<GpuRuntime>) {
         self.gpu_layer_runtime = gpu_layer_runtime;
     }
+    pub(in crate::engine) fn set_decode_gpu_layer_prefixes(
+        &mut self,
+        layers: Option<(usize, usize)>,
+    ) {
+        self.decode_gpu_layer_prefixes = layers;
+    }
 
+    pub(in crate::engine) fn decode_attention_layer_uses_gpu(&self, layer_idx: usize) -> bool {
+        self.decode_gpu_layer_prefixes
+            .is_none_or(|(attention_layers, _)| layer_idx < attention_layers)
+    }
+
+    pub(in crate::engine) fn decode_ffn_layer_uses_gpu(&self, layer_idx: usize) -> bool {
+        self.decode_gpu_layer_prefixes
+            .is_none_or(|(_, ffn_layers)| layer_idx < ffn_layers)
+    }
+    pub(in crate::engine) fn decode_all_layers_use_gpu(&self, num_layers: usize) -> bool {
+        self.decode_gpu_layer_prefixes
+            .is_none_or(|(attention_layers, ffn_layers)| {
+                attention_layers >= num_layers && ffn_layers >= num_layers
+            })
+    }
+
+    pub(in crate::engine) fn decode_embedding_uses_gpu(&self) -> bool {
+        self.decode_gpu_layer_prefixes.is_none()
+    }
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(in crate::engine) fn has_active_gpu_prefill_path(&self) -> bool {
         #[cfg(feature = "vulkan")]
@@ -140,4 +169,21 @@ pub(in crate::engine) fn is_attention_layer(
         return true;
     }
     layer_idx % full_attention_interval == (full_attention_interval - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineBackendRuntime;
+
+    #[test]
+    fn full_device_decode_requires_every_attention_and_ffn_layer_on_gpu() {
+        let mut runtime = EngineBackendRuntime::new();
+        assert!(runtime.decode_all_layers_use_gpu(52));
+
+        runtime.set_decode_gpu_layer_prefixes(Some((52, 30)));
+        assert!(!runtime.decode_all_layers_use_gpu(52));
+
+        runtime.set_decode_gpu_layer_prefixes(Some((52, 52)));
+        assert!(runtime.decode_all_layers_use_gpu(52));
+    }
 }

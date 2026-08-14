@@ -44,6 +44,15 @@ fn tokenizer_contract_matches(
         && target.add_space_prefix == draft.add_space_prefix
 }
 
+fn mtp_env_disables_auto_drafter(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 fn validate_primary_model_architecture(
     architecture: ModelArchitecture,
 ) -> crate::error::Result<()> {
@@ -389,8 +398,12 @@ impl Engine {
             );
         }
 
+        let mtp_explicitly_disabled =
+            mtp_env_disables_auto_drafter(crate::engine::policy::env_string("RNB_MTP").as_deref());
         let drafter_paths = load_stage!("external_drafter_candidates", {
-            if crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none() {
+            if !mtp_explicitly_disabled
+                && crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none()
+            {
                 crate::engine::policy::env_string("RNB_DRAFTER_MODEL")
                     .map(|path| vec![std::path::PathBuf::from(path)])
                     .unwrap_or_else(|| crate::auto_drafter::find_sibling_drafter_candidates(path))
@@ -682,19 +695,26 @@ impl Engine {
                 .all(|l| matches!(l, LayerType::Attention(_)));
         maybe_enable_q4k_prefill_f16_gemm_for_dense_attention(all_layers_attention);
 
-        let backend_runtime = load_stage!("backend_runtime_init", {
+        let mut backend_runtime = load_stage!("backend_runtime_init", {
             init_engine_backend_runtime(&metadata, &weights, ffn_inner_dim)
         });
         #[cfg(feature = "cuda")]
-        let muse_low_vram = matches!(model.metadata.architecture, ModelArchitecture::MuseGlimmer)
+        let muse_model = matches!(model.metadata.architecture, ModelArchitecture::MuseGlimmer);
+        #[cfg(feature = "cuda")]
+        let muse_low_vram = muse_model
             && detected_cuda_memory_bytes()
-                .is_some_and(|(_, total)| total <= 12 * 1024 * 1024 * 1024);
+                .is_some_and(|(_, total)| gguf_mapped_weight_bytes > total);
         #[cfg(not(feature = "cuda"))]
-        let muse_low_vram = false;
-        load_stage!("backend_prewarm_q4_gate_up", {
-            super::backend_runtime::prewarm_dense_q4_packed_gate_up_weights(&weights, muse_low_vram)
+        let (muse_model, muse_low_vram) = (false, false);
+        let decode_gpu_layer_prefixes = load_stage!("backend_prewarm_q4_gate_up", {
+            super::backend_runtime::prewarm_dense_q4_packed_gate_up_weights(
+                &weights,
+                muse_model,
+                muse_low_vram,
+            )
         })?;
-        if !muse_low_vram {
+        backend_runtime.set_decode_gpu_layer_prefixes(decode_gpu_layer_prefixes);
+        if !muse_low_vram && !muse_model {
             load_stage!("backend_prewarm_q6_down", {
                 super::backend_runtime::prewarm_dense_q6_packed_down_weights(&weights)
             })?;
@@ -746,7 +766,8 @@ impl Engine {
         // no in-model nextn runtime was already attached (in-model takes precedence).
         // Honors RNB_DRAFTER_MODEL override and RNB_MTP_DISABLE_AUTO_DRAFTER opt-out.
         load_stage!("external_drafter_probe", {
-            if !engine.mtp_runtime_ready()
+            if !mtp_explicitly_disabled
+                && !engine.mtp_runtime_ready()
                 && crate::engine::policy::env_string("RNB_MTP_DISABLE_AUTO_DRAFTER").is_none()
             {
                 for drafter_path in &drafter_paths {
@@ -1248,6 +1269,17 @@ mod kv_cache_default_tests {
     fn deepseek4_target_is_accepted_as_primary_model() {
         validate_primary_model_architecture(ModelArchitecture::DeepSeek4)
             .expect("DeepSeek4 target model");
+    }
+
+    #[test]
+    fn explicit_mtp_disable_skips_auto_drafter() {
+        for value in ["0", "false", "OFF", " no "] {
+            assert!(mtp_env_disables_auto_drafter(Some(value)));
+        }
+        for value in ["", "1", "true", "auto"] {
+            assert!(!mtp_env_disables_auto_drafter(Some(value)));
+        }
+        assert!(!mtp_env_disables_auto_drafter(None));
     }
 
     #[test]

@@ -89,7 +89,6 @@ use decode_ffn::decode_ffn;
 use decode_ffn_dispatch::decode_ffn_layer;
 use decode_gdn::decode_gdn_layer;
 use decode_gpu::gpu_gemv_into_if_supported;
-#[cfg(any(not(feature = "cuda"), test))]
 use dequant::{dequantize_bytes_to_f32, dequantize_row_to_slice_if_supported};
 pub use gemv_profile::{gemv_profile_report, reset_gemv_profile};
 pub use init::EngineLoadConfig;

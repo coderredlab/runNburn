@@ -56,12 +56,15 @@ pub(in crate::engine) fn decode_ffn_gate_up_cpu_into<F>(
     up_weight: &QuantizedWeight,
     fused_gate_up: Option<&QuantizedWeight>,
     hidden_dim: usize,
+    host_quant_only: bool,
     mut profile: F,
 ) -> crate::error::Result<()>
 where
     F: FnMut(&'static str, Instant),
 {
     let input = &scratch.norm_buf[..hidden_dim];
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = fused_gate_up;
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -130,14 +133,19 @@ where
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = fused_gate_up;
-
     let t_gate = Instant::now();
-    gate_weight.gemv_into(input, &mut scratch.ffn_gate)?;
+    if host_quant_only {
+        gate_weight.gemv_into_host_quantized(input, &mut scratch.ffn_gate)?;
+    } else {
+        gate_weight.gemv_into(input, &mut scratch.ffn_gate)?;
+    }
     profile("gate_gemv", t_gate);
     let t_up = Instant::now();
-    up_weight.gemv_into(input, &mut scratch.ffn_up)?;
+    if host_quant_only {
+        up_weight.gemv_into_host_quantized(input, &mut scratch.ffn_up)?;
+    } else {
+        up_weight.gemv_into(input, &mut scratch.ffn_up)?;
+    }
     profile("up_gemv", t_up);
     let t_act = Instant::now();
     apply_model_gate_mul_inplace(&mut scratch.ffn_gate, &scratch.ffn_up, architecture);
@@ -153,6 +161,7 @@ pub(in crate::engine) fn decode_attention_qkv_cpu_into<F>(
     hidden_dim: usize,
     q_out_dim: usize,
     kv_dim: usize,
+    host_quant_only: bool,
     verbose: bool,
     mut profile: F,
 ) -> crate::error::Result<()>
@@ -178,7 +187,11 @@ where
             q_weight.gemv_into(norm, &mut scratch.q_buf[..q_out_dim])?;
         }
         #[cfg(not(target_arch = "aarch64"))]
-        q_weight.gemv_into(norm, &mut scratch.q_buf[..q_out_dim])?;
+        if host_quant_only {
+            q_weight.gemv_into_host_quantized(norm, &mut scratch.q_buf[..q_out_dim])?;
+        } else {
+            q_weight.gemv_into(norm, &mut scratch.q_buf[..q_out_dim])?;
+        }
         profile("q_weight", t_q);
 
         let t_k = Instant::now();
@@ -189,7 +202,11 @@ where
             k_weight.gemv_into(norm, &mut scratch.k_buf[..kv_dim])?;
         }
         #[cfg(not(target_arch = "aarch64"))]
-        k_weight.gemv_into(norm, &mut scratch.k_buf[..kv_dim])?;
+        if host_quant_only {
+            k_weight.gemv_into_host_quantized(norm, &mut scratch.k_buf[..kv_dim])?;
+        } else {
+            k_weight.gemv_into(norm, &mut scratch.k_buf[..kv_dim])?;
+        }
         profile("k_weight", t_k);
 
         let t_v = Instant::now();
@@ -200,7 +217,11 @@ where
             v_weight.gemv_into(norm, &mut scratch.v_buf[..kv_dim])?;
         }
         #[cfg(not(target_arch = "aarch64"))]
-        v_weight.gemv_into(norm, &mut scratch.v_buf[..kv_dim])?;
+        if host_quant_only {
+            v_weight.gemv_into_host_quantized(norm, &mut scratch.v_buf[..kv_dim])?;
+        } else {
+            v_weight.gemv_into(norm, &mut scratch.v_buf[..kv_dim])?;
+        }
         profile("v_weight", t_v);
         return Ok(());
     }
@@ -250,18 +271,24 @@ where
     #[cfg(not(target_arch = "aarch64"))]
     {
         let (r1, r2) = rayon::join(
-            || {
-                q_weight.gemv_into(norm, unsafe {
-                    std::slice::from_raw_parts_mut(q_ptr as *mut f32, q_out_dim)
-                })
+            || unsafe {
+                let output = std::slice::from_raw_parts_mut(q_ptr as *mut f32, q_out_dim);
+                if host_quant_only {
+                    q_weight.gemv_into_host_quantized(norm, output)
+                } else {
+                    q_weight.gemv_into(norm, output)
+                }
             },
-            || {
-                k_weight.gemv_into(norm, unsafe {
-                    std::slice::from_raw_parts_mut(k_ptr as *mut f32, kv_dim)
-                })?;
-                v_weight.gemv_into(norm, unsafe {
-                    std::slice::from_raw_parts_mut(v_ptr as *mut f32, kv_dim)
-                })
+            || unsafe {
+                let k_output = std::slice::from_raw_parts_mut(k_ptr as *mut f32, kv_dim);
+                let v_output = std::slice::from_raw_parts_mut(v_ptr as *mut f32, kv_dim);
+                if host_quant_only {
+                    k_weight.gemv_into_host_quantized(norm, k_output)?;
+                    v_weight.gemv_into_host_quantized(norm, v_output)
+                } else {
+                    k_weight.gemv_into(norm, k_output)?;
+                    v_weight.gemv_into(norm, v_output)
+                }
             },
         );
         r1?;

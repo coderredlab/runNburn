@@ -9,238 +9,188 @@ impl CudaState {
         k_weights: &[u8],
         v_weights: &[u8],
         o_weights: &[u8],
+        attention_gate_weights: Option<&[u8]>,
         gate_weights: &[u8],
         up_weights: &[u8],
         down_weights: &[u8],
         attn_norm: &[f32],
+        post_attn_norm: Option<&[f32]>,
         ffn_norm: &[f32],
+        post_ffn_norm: Option<&[f32]>,
         n_embd: usize,
         n_ff: usize,
         num_heads: usize,
         num_kv_heads: usize,
-        _head_dim: usize,
+        head_dim: usize,
         kv_dim: usize,
         q_rows: usize,
         q_norm_weight: Option<&[f32]>,
         k_norm_weight: Option<&[f32]>,
+        attention_scale: f32,
+        apply_rope: bool,
+        rope_neox: bool,
+        sliding_window: Option<usize>,
+        ffn_uses_gelu: bool,
         out_scale: f32,
         rope_theta: f32,
         rope_pos: usize,
         kv_len: usize,
         norm_eps: f32,
+        post_norm_eps: f32,
         hidden_dev: u64,
     ) -> Result<(), String> {
         self.set_current()?;
-        if layer_idx <= 4 && crate::tuning::cu63_sync_diag() {
-            eprintln!(
-                "[cu63-entry] L{layer_idx} q_rows={q_rows} kv={kv_dim} v_w={} k_w={}",
-                v_weights.len(),
-                k_weights.len()
-            );
+        if n_embd == 0
+            || n_ff == 0
+            || !n_embd.is_multiple_of(256)
+            || !n_ff.is_multiple_of(256)
+            || num_heads == 0
+            || num_kv_heads == 0
+            || num_heads % num_kv_heads != 0
+            || q_rows != num_heads.saturating_mul(head_dim)
+            || kv_dim != num_kv_heads.saturating_mul(head_dim)
+            || sliding_window == Some(0)
+        {
+            return Err(format!(
+                "device decode layer geometry mismatch: hidden={n_embd} ff={n_ff} q_rows={q_rows} kv_dim={kv_dim} heads={num_heads}/{num_kv_heads} head_dim={head_dim} sliding_window={sliding_window:?}"
+            ));
         }
-        let q_blocks = n_embd / 256;
-        let kv_blocks = kv_dim / 256;
-        let ff_blocks = n_embd / 256;
-        let down_blocks = n_ff / 256;
-        let kv_rows = kv_dim;
+        let input_blocks = n_embd / 256;
         let f32_size = std::mem::size_of::<f32>();
 
-        // Allocate intermediate buffers. Each compute_*_ptr returns a single
-        // reusable buffer — calling it twice with different sizes can realloc and
-        // invalidate the first pointer. Use max(all sizes) per buffer slot.
+        // Reserve every shared scratch slab at its largest use before the first
+        // asynchronous launch. Later stages reuse K storage only after attention.
         let norm_dev = self.decode_rms_input_ptr(n_embd * f32_size)?;
         let q_dev = self.compute_input_ptr(q_rows * f32_size)?;
-        let mid_a_size = std::cmp::max(kv_rows, n_embd) * f32_size;
-        let mid_a_dev = self.compute_mid_a_ptr(mid_a_size)?;
+        let mid_a_dev = self.compute_mid_a_ptr(kv_dim.max(n_embd) * f32_size)?;
         let k_dev = mid_a_dev;
-        let v_dev = self.compute_mid_b_ptr(kv_rows * f32_size)?;
+        let v_dev = self.compute_mid_b_ptr(kv_dim * f32_size)?;
         let attn_out_dev = self.compute_output_ptr(q_rows * f32_size)?;
-        let gate_dev = self.compute_gate_ptrs_ptr(n_ff * f32_size)?;
-        let up_dev = self.compute_up_ptrs_ptr(n_ff * f32_size)?;
+        let attention_gate_dev = attention_gate_weights
+            .map(|_| self.compute_aux_output_ptr(q_rows * f32_size))
+            .transpose()?;
         let down_dev = mid_a_dev;
 
-        // 1. Attention norm: hidden → norm_dev
         self.launch_rms_norm_device(hidden_dev, attn_norm, n_embd, norm_eps, norm_dev)?;
-
-        if layer_idx == 0 && crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut dbg = vec![0.0f32; n_embd.min(8)];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    dbg.as_mut_ptr().cast::<libc::c_void>(),
-                    hidden_dev,
-                    dbg.len() * 4,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-dbg] L0 hidden_dev[0..8]: {:?}", dbg);
-            let mut dbg2 = vec![0.0f32; n_embd.min(8)];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    dbg2.as_mut_ptr().cast::<libc::c_void>(),
-                    norm_dev,
-                    dbg2.len() * 4,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-dbg] L0 norm_dev[0..8]: {:?}", dbg2);
-        }
-
-        // 2. QKV GEMV (device→device, no sync)
-        self.q4k_gemv_device_to_device(q_weights, q_rows, q_blocks, norm_dev, q_dev)?;
-        self.q4k_gemv_device_to_device(k_weights, kv_rows, kv_blocks, norm_dev, k_dev)?;
-        let expected_v_q4k_bytes = kv_rows * kv_blocks * 144;
+        self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
+        self.q4k_gemv_device_to_device(k_weights, kv_dim, input_blocks, norm_dev, k_dev)?;
+        let expected_v_q4k_bytes = kv_dim * input_blocks * 144;
         if v_weights.len() == expected_v_q4k_bytes {
-            self.q4k_gemv_device_to_device(v_weights, kv_rows, kv_blocks, norm_dev, v_dev)?;
+            self.q4k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
         } else {
-            self.q6k_gemv_device_to_device(v_weights, kv_rows, kv_blocks, norm_dev, v_dev)?;
+            self.q6k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
+        }
+        if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev) {
+            self.q4k_gemv_device_to_device(weights, q_rows, input_blocks, norm_dev, output_dev)?;
         }
 
-        if layer_idx == 0 && crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut q_dbg = vec![0.0f32; 8];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    q_dbg.as_mut_ptr().cast::<libc::c_void>(),
-                    q_dev,
-                    q_dbg.len() * 4,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-dbg] L0 q_dev[0..8]: {:?}", q_dbg);
-        }
-
-        // 2b. QK norm (per-head RMS norm) — required for Gemma4 to stabilize attention
-        let actual_head_dim = kv_dim / num_kv_heads.max(1);
         if let Some(qn) = q_norm_weight {
-            self.launch_qk_norm_device(q_dev, qn, num_heads, actual_head_dim, norm_eps)?;
+            self.launch_qk_norm_device(q_dev, qn, num_heads, head_dim, norm_eps)?;
         }
         if let Some(kn) = k_norm_weight {
-            self.launch_qk_norm_device(k_dev, kn, num_kv_heads, actual_head_dim, norm_eps)?;
+            self.launch_qk_norm_device(k_dev, kn, num_kv_heads, head_dim, norm_eps)?;
+        }
+        if apply_rope {
+            if rope_neox {
+                self.launch_rope_decode(
+                    q_dev,
+                    k_dev,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rope_theta,
+                    rope_pos,
+                )?;
+            } else {
+                self.launch_rope_f32_inplace(
+                    q_dev,
+                    0,
+                    num_heads * head_dim / 2,
+                    q_rows,
+                    head_dim,
+                    head_dim,
+                    rope_pos,
+                    rope_theta,
+                    0,
+                )?;
+                self.launch_rope_f32_inplace(
+                    k_dev,
+                    0,
+                    num_kv_heads * head_dim / 2,
+                    kv_dim,
+                    head_dim,
+                    head_dim,
+                    rope_pos,
+                    rope_theta,
+                    0,
+                )?;
+            }
         }
 
-        // 3. RoPE in-place
-        self.launch_rope_decode(
-            q_dev,
-            k_dev,
-            num_heads,
-            num_kv_heads,
-            actual_head_dim,
-            rope_theta,
-            rope_pos,
-        )?;
-
-        // 4. KV cache f16 write
         self.launch_kv_f16_write(layer_idx, k_dev, v_dev, kv_dim, kv_len)?;
-
-        // 5. Attention decode (device Q + device KV cache → attn_out_dev)
-        self.launch_attention_decode_device(
+        self.launch_attention_decode_device_with_policy(
             layer_idx,
             q_dev,
             attn_out_dev,
             num_heads,
             num_kv_heads,
-            actual_head_dim,
+            head_dim,
             kv_len,
+            attention_scale,
+            sliding_window,
         )?;
-
-        // 6. Output projection + residual
-        self.q4k_gemv_device_to_device(o_weights, n_embd, q_rows / 256, attn_out_dev, down_dev)?;
-        self.launch_add_f32_inplace(hidden_dev, down_dev, n_embd)?;
-
-        if layer_idx <= 4 && crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut chk = vec![0.0f32; 4];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    chk.as_mut_ptr().cast::<libc::c_void>(),
-                    hidden_dev,
-                    16,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-step6] L{layer_idx} after attn+res: {:?}", chk);
+        if let Some(gate_dev) = attention_gate_dev {
+            self.launch_sigmoid_mul_inplace(attn_out_dev, gate_dev, q_rows)?;
         }
 
-        // 7. FFN norm: hidden → norm_dev
-        self.launch_rms_norm_device(hidden_dev, ffn_norm, n_embd, norm_eps, norm_dev)?;
-
-        // 8. FFN gate + up (device→device)
-        self.q4k_gemv_device_to_device(gate_weights, n_ff, ff_blocks, norm_dev, gate_dev)?;
-        self.q4k_gemv_device_to_device(up_weights, n_ff, ff_blocks, norm_dev, up_dev)?;
-
-        if layer_idx == 0 && crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut chk = vec![0.0f32; 4];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    chk.as_mut_ptr().cast::<libc::c_void>(),
-                    gate_dev,
-                    16,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-step8] L0 gate[0..4]: {:?}", chk);
-        }
-
-        // 9. GELU(gate) × up → gate_dev in-place (Gemma4 uses GELU, not SiLU)
-        self.launch_gelu_mul(gate_dev, up_dev, n_ff)?;
-
-        if layer_idx == 0 && crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut chk = vec![0.0f32; 4];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    chk.as_mut_ptr().cast::<libc::c_void>(),
-                    gate_dev,
-                    16,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            eprintln!("[cu63-step9] L0 silu_mul[0..4]: {:?}", chk);
-        }
-
-        // 10. FFN down + residual. Quant type varies per layer (Q6K for sliding window,
-        // Q4K for full attention in Gemma4 E2B Q4_K_M). Detect from byte size.
-        let expected_q4k_down_bytes = n_embd * down_blocks * 144;
-        if down_weights.len() == expected_q4k_down_bytes {
-            self.q4k_gemv_device_to_device(down_weights, n_embd, down_blocks, gate_dev, down_dev)?;
+        let expected_q4k_down_bytes = n_embd * (n_ff / 256) * 144;
+        let expected_q6k_down_bytes = n_embd * (n_ff / 256) * 210;
+        let down_quant = if down_weights.len() == expected_q4k_down_bytes {
+            12
+        } else if down_weights.len() == expected_q6k_down_bytes {
+            14
         } else {
-            self.q6k_gemv_device_to_device(down_weights, n_embd, down_blocks, gate_dev, down_dev)?;
-        }
-        self.launch_add_f32_inplace(hidden_dev, down_dev, n_embd)?;
-
-        // 11. Layer output scale (Gemma4: dampens residual accumulation)
-        if out_scale != 1.0 && out_scale != 0.0 {
-            self.launch_scale_f32_inplace(hidden_dev, out_scale, n_embd)?;
-        }
-        if layer_idx <= 4 && crate::tuning::cu63_sync_diag() {
-            eprintln!("[cu63-scale] L{layer_idx} out_scale={out_scale}");
-        }
-
-        if crate::tuning::cu63_sync_diag() {
-            self.stream_synchronize()?;
-            let mut chk = vec![0.0f32; 4];
-            unsafe {
-                self.api.memcpy_dtoh_async(
-                    chk.as_mut_ptr().cast::<libc::c_void>(),
-                    hidden_dev,
-                    chk.len() * 4,
-                    self.stream,
-                )?;
-            }
-            self.stream_synchronize()?;
-            if chk.iter().any(|v| v.is_nan() || v.is_infinite()) {
-                eprintln!("[cu63-nan] NaN/Inf at layer {layer_idx} end: {:?}", chk);
-            }
-        }
-
+            return Err(format!(
+                "device decode unsupported down weight bytes: got {}, expected Q4_K {expected_q4k_down_bytes} or Q6_K {expected_q6k_down_bytes}",
+                down_weights.len()
+            ));
+        };
+        let mut trace_stage = std::time::Instant::now();
+        self.launch_dense_chain_graph_ops(
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+            down_quant,
+            post_attn_norm,
+            ffn_norm,
+            post_ffn_norm,
+            q_rows,
+            n_ff,
+            n_embd,
+            norm_eps,
+            post_norm_eps,
+            false,
+            false,
+            hidden_dev,
+            attn_out_dev,
+            norm_dev,
+            down_dev,
+            ffn_uses_gelu,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            false,
+            (out_scale != 1.0 && out_scale != 0.0).then_some(out_scale),
+            None,
+            &mut trace_stage,
+        )?;
         Ok(())
     }
 
@@ -532,31 +482,95 @@ impl CudaState {
         head_dim: usize,
         kv_len: usize,
     ) -> Result<(), String> {
+        self.launch_attention_decode_device_with_policy(
+            layer_idx,
+            q_dev,
+            output_dev,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            1.0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_attention_decode_device_with_policy(
+        &mut self,
+        layer_idx: usize,
+        q_dev: u64,
+        output_dev: u64,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        scale: f32,
+        sliding_window: Option<usize>,
+    ) -> Result<(), String> {
         if !matches!(head_dim, 128 | 256 | 512) {
             return Err(format!(
-                "cu63 attention_decode_device: unsupported head_dim={head_dim}"
+                "device attention decode: unsupported head_dim={head_dim}"
             ));
         }
-        // kv_len here is the write position of the current token. The attention
-        // kernel needs to attend over all tokens including the one just written,
-        // so the actual sequence length is kv_len + 1.
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("device attention decode: invalid scale={scale}"));
+        }
+        if sliding_window.is_some() && head_dim != 128 {
+            return Err(format!(
+                "device attention decode: sliding window requires head_dim=128, got {head_dim}"
+            ));
+        }
         let attn_kv_len = kv_len + 1;
-
-        let cache = self.decode_attention_kv.get(&layer_idx).ok_or_else(|| {
-            format!("cu63 attention_decode_device: no KV cache for layer {layer_idx}")
-        })?;
+        let window_len = sliding_window
+            .map(|window| window.min(attn_kv_len))
+            .unwrap_or(attn_kv_len);
+        if window_len == 0 {
+            return Err("device attention decode: sliding window must be non-zero".to_string());
+        }
+        let window_start = attn_kv_len - window_len;
+        let cache = self
+            .decode_attention_kv
+            .get(&layer_idx)
+            .ok_or_else(|| format!("device attention decode: no KV cache for layer {layer_idx}"))?;
         let k_cache_dev = cache
             .k_bits_dev
-            .ok_or_else(|| "cu63 attention_decode_device: missing K buffer".to_string())?;
+            .ok_or_else(|| "device attention decode: missing K buffer".to_string())?;
         let v_cache_dev = cache
             .v_bits_dev
-            .ok_or_else(|| "cu63 attention_decode_device: missing V buffer".to_string())?;
+            .ok_or_else(|| "device attention decode: missing V buffer".to_string())?;
+        let kv_rows = num_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "device attention decode: KV row width overflow".to_string())?;
+        let window_offset_bytes = window_start
+            .checked_mul(kv_rows)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "device attention decode: window offset overflow".to_string())?;
+        let k_window_dev = k_cache_dev + window_offset_bytes as u64;
+        let v_window_dev = v_cache_dev + window_offset_bytes as u64;
 
-        // Gemma4: attention scale = 1.0 (Q is pre-scaled by query_pre_attn_scalar
-        // during projection, not during attention score computation).
-        // TODO: pass attn_scale as parameter for non-Gemma4 models.
-        let scale = 1.0f32;
+        if Self::cached_decode_split_preferred(head_dim, window_len) {
+            return self.launch_attention_decode_split_device(
+                output_dev,
+                q_dev,
+                k_window_dev,
+                v_window_dev,
+                head_dim,
+                window_len,
+                num_heads,
+                num_kv_heads,
+                scale,
+            );
+        }
 
+        let mut output_arg = output_dev;
+        let mut q_arg = q_dev;
+        let mut k_arg = k_window_dev;
+        let mut v_arg = v_window_dev;
+        let mut kv_len_arg = window_len as u32;
+        let mut heads_arg = num_heads as u32;
+        let mut kv_heads_arg = num_kv_heads as u32;
+        let mut scale_arg = scale;
         let (kernel, block) = match head_dim {
             128 if crate::tuning::attention_decode_hd128_warp_enabled() => {
                 ("rnb_attention_decode_hd128_warp", (32, 1, 1))
@@ -566,14 +580,6 @@ impl CudaState {
             512 => ("rnb_attention_decode_hd512", (512, 1, 1)),
             _ => unreachable!("validated head_dim"),
         };
-        let mut output_arg = output_dev;
-        let mut q_arg = q_dev;
-        let mut k_arg = k_cache_dev;
-        let mut v_arg = v_cache_dev;
-        let mut kv_len_arg = attn_kv_len as u32;
-        let mut heads_arg = num_heads as u32;
-        let mut kv_heads_arg = num_kv_heads as u32;
-        let mut scale_arg = scale;
         self.launch_cached_gemv(
             kernel,
             &[

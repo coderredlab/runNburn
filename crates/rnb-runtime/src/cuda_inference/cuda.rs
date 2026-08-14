@@ -231,11 +231,14 @@ pub fn decode_full_layer_device_resident(
     k_weights: &[u8],
     v_weights: &[u8],
     o_weights: &[u8],
+    attention_gate_weights: Option<&[u8]>,
     gate_weights: &[u8],
     up_weights: &[u8],
     down_weights: &[u8],
     attn_norm: &[f32],
+    post_attn_norm: Option<&[f32]>,
     ffn_norm: &[f32],
+    post_ffn_norm: Option<&[f32]>,
     n_embd: usize,
     n_ff: usize,
     num_heads: usize,
@@ -245,11 +248,17 @@ pub fn decode_full_layer_device_resident(
     q_rows: usize,
     q_norm_weight: Option<&[f32]>,
     k_norm_weight: Option<&[f32]>,
+    attention_scale: f32,
+    apply_rope: bool,
+    rope_neox: bool,
+    sliding_window: Option<usize>,
+    ffn_uses_gelu: bool,
     out_scale: f32,
     rope_theta: f32,
     rope_pos: usize,
     kv_len: usize,
     norm_eps: f32,
+    post_norm_eps: f32,
     hidden_dev: u64,
 ) -> Result<()> {
     backend::decode_full_layer_device_resident(
@@ -258,11 +267,14 @@ pub fn decode_full_layer_device_resident(
         k_weights,
         v_weights,
         o_weights,
+        attention_gate_weights,
         gate_weights,
         up_weights,
         down_weights,
         attn_norm,
+        post_attn_norm,
         ffn_norm,
+        post_ffn_norm,
         n_embd,
         n_ff,
         num_heads,
@@ -272,11 +284,17 @@ pub fn decode_full_layer_device_resident(
         q_rows,
         q_norm_weight,
         k_norm_weight,
+        attention_scale,
+        apply_rope,
+        rope_neox,
+        sliding_window,
+        ffn_uses_gelu,
         out_scale,
         rope_theta,
         rope_pos,
         kv_len,
         norm_eps,
+        post_norm_eps,
         hidden_dev,
     )
     .map_err(|err| format!("CUDA decode_full_layer_device_resident failed: {err}"))
@@ -965,8 +983,8 @@ pub fn prewarm_q4k_weight_slices_pinned_prefix(weights: &[&[u8]]) -> Result<usiz
     backend::prewarm_q4k_weights_pinned_prefix(weights)
 }
 
-pub fn prewarm_quant_resident_q4k_weights(weights: &[&[u8]]) -> Result<usize> {
-    backend::prewarm_quant_resident_q4k_weights(weights)
+pub fn prewarm_quant_resident_weights(weights: &[&[u8]]) -> Result<usize> {
+    backend::prewarm_quant_resident_weights(weights)
 }
 
 pub fn prewarm_q4k_packed_gate_up_weights(

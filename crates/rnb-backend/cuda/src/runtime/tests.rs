@@ -234,7 +234,7 @@ fn cuda_quant_resident_q4_prewarm_off_does_not_open_cuda() {
     let weights = make_test_q4k_weights(2, 4, 1, 31);
     let refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-    let warmed = crate::runtime::prewarm_quant_resident_q4k_weights(&refs)
+    let warmed = crate::runtime::prewarm_quant_resident_weights(&refs)
         .expect("prewarm should be a no-op when quant resident is explicitly off");
 
     assert_eq!(warmed, 0);
@@ -255,7 +255,7 @@ fn cuda_quant_resident_q4_prewarm_invalid_env_errors_before_cuda_open() {
     let weights = make_test_q4k_weights(2, 4, 1, 31);
     let refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-    let err = crate::runtime::prewarm_quant_resident_q4k_weights(&refs)
+    let err = crate::runtime::prewarm_quant_resident_weights(&refs)
         .expect_err("invalid quant resident env should fail before CUDA open");
 
     assert!(err.contains("RNB_CUDA_QUANT_RESIDENT_MB must be auto, off, or integer MiB"));
@@ -274,7 +274,7 @@ fn cuda_quant_resident_q4_prewarm_empty_candidates_still_validate_env() {
     let _env = EnvVarGuard::set("RNB_CUDA_QUANT_RESIDENT_MB", "invalid");
     reset_default_cuda_compute_for_test();
 
-    let err = crate::runtime::prewarm_quant_resident_q4k_weights(&[])
+    let err = crate::runtime::prewarm_quant_resident_weights(&[])
         .expect_err("invalid quant resident env should fail even with no candidates");
 
     assert!(err.contains("RNB_CUDA_QUANT_RESIDENT_MB must be auto, off, or integer MiB"));
@@ -297,8 +297,7 @@ fn cuda_quant_resident_q4_prewarm_default_records_raw_quant() {
     let expected_bytes = weights.iter().map(Vec::len).sum::<usize>() as u64;
     let refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-    let warmed =
-        crate::runtime::prewarm_quant_resident_q4k_weights(&refs).expect("prewarm default");
+    let warmed = crate::runtime::prewarm_quant_resident_weights(&refs).expect("prewarm default");
 
     assert_eq!(warmed, refs.len());
     let counters = lock_default_cuda_compute_for_test()
@@ -319,7 +318,7 @@ fn cuda_quant_resident_q4_prewarm_respects_fixed_budget_without_temp_upload() {
     let refs = weights.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
     let warmed =
-        crate::runtime::prewarm_quant_resident_q4k_weights(&refs).expect("fixed budget prewarm");
+        crate::runtime::prewarm_quant_resident_weights(&refs).expect("fixed budget prewarm");
 
     assert_eq!(warmed, 1);
     let counters = lock_default_cuda_compute_for_test()
@@ -9963,11 +9962,13 @@ fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
     let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
-    let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
+    let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "1");
+    let _tile128 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "1");
+    let cublas_off = EnvVarGuard::set("RNB_CUDA_PREFILL_CUBLAS_GQA16", "0");
 
-    let seq_len = 3usize;
-    let kv_len = 3usize;
-    let num_heads = 2usize;
+    let seq_len = 128usize;
+    let kv_len = 128usize;
+    let num_heads = 16usize;
     let num_kv_heads = 1usize;
     let head_dim = 128usize;
     let q_dim = num_heads * head_dim;
@@ -10061,6 +10062,8 @@ fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
     )
     .expect("separate CUDA post-FFN norm");
     add_f32_inplace(&mut expected_hidden, &post_ffn).expect("separate CUDA FFN residual");
+    drop(cublas_off);
+    let _cublas_on = EnvVarGuard::set("RNB_CUDA_PREFILL_CUBLAS_GQA16", "1");
 
     let mut actual = initial_hidden;
     attention_prefill_flash_hd128_muse_dense_chain(
@@ -10443,6 +10446,159 @@ fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
         &expected_hidden,
         2e-4,
         2e-5,
+    );
+}
+
+#[test]
+fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
+    let _guard = runtime_test_lock();
+    let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
+    let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 128usize;
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let n_embd = 256usize;
+    let n_ff = 256usize;
+    let blocks_per_row = 1usize;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let rope_theta = 10_000.0f32;
+    let q = make_test_q4k_weights(1, q_dim, blocks_per_row, 1701)
+        .pop()
+        .unwrap();
+    let k = make_test_q4k_weights(1, kv_dim, blocks_per_row, 1703)
+        .pop()
+        .unwrap();
+    let v = make_test_q6k_weights(1, kv_dim, blocks_per_row, 1709)
+        .pop()
+        .unwrap();
+    let attention_gate = make_test_q4k_weights(1, q_dim, blocks_per_row, 1721)
+        .pop()
+        .unwrap();
+    let o = make_test_q4k_weights(1, n_embd, q_dim / 256, 1723)
+        .pop()
+        .unwrap();
+    let gate = make_test_q4k_weights(1, n_ff, blocks_per_row, 1733)
+        .pop()
+        .unwrap();
+    let up = make_test_q4k_weights(1, n_ff, blocks_per_row, 1741)
+        .pop()
+        .unwrap();
+    let down = make_test_q4k_weights(1, n_embd, n_ff / 256, 1747)
+        .pop()
+        .unwrap();
+    let initial_hidden = (0..n_embd)
+        .map(|i| ((i % 41) as f32 - 20.0) * 0.003)
+        .collect::<Vec<_>>();
+    let attn_norm = (0..n_embd)
+        .map(|i| 0.77 + (i % 13) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let q_norm = (0..head_dim)
+        .map(|i| 0.81 + (i % 11) as f32 * 0.004)
+        .collect::<Vec<_>>();
+    let k_norm = (0..head_dim)
+        .map(|i| 0.79 + (i % 17) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let post_attn_norm = (0..n_embd)
+        .map(|i| 0.75 + (i % 17) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let ffn_norm = (0..n_embd)
+        .map(|i| 0.82 + (i % 19) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let post_ffn_norm = (0..n_embd)
+        .map(|i| 0.91 + (i % 23) as f32 * 0.0015)
+        .collect::<Vec<_>>();
+    let norm_eps = 1.0e-5;
+    let post_norm_eps = 1.0e-6;
+
+    let mut expected = initial_hidden.clone();
+    q4k_muse_prefill_hd128_dense_chain(
+        &q,
+        &k,
+        &v,
+        14,
+        &attention_gate,
+        q_dim,
+        kv_dim,
+        n_embd,
+        &initial_hidden,
+        &attn_norm,
+        &q_norm,
+        &k_norm,
+        num_heads,
+        num_kv_heads,
+        scale,
+        rope_theta,
+        0,
+        true,
+        Some(2),
+        &o,
+        &gate,
+        &up,
+        &down,
+        12,
+        &post_attn_norm,
+        &ffn_norm,
+        &post_ffn_norm,
+        q_dim,
+        n_ff,
+        n_embd,
+        &mut expected,
+        norm_eps,
+        post_norm_eps,
+    )
+    .expect("fused Muse single-token layer")
+    .expect("fused Muse path");
+
+    let hidden_dev = acquire_decode_hidden_carrier(n_embd * std::mem::size_of::<f32>()).unwrap();
+    upload_to_decode_hidden_carrier(&initial_hidden, hidden_dev).unwrap();
+    decode_full_layer_device_resident(
+        9001,
+        &q,
+        &k,
+        &v,
+        &o,
+        Some(&attention_gate),
+        &gate,
+        &up,
+        &down,
+        &attn_norm,
+        Some(&post_attn_norm),
+        &ffn_norm,
+        Some(&post_ffn_norm),
+        n_embd,
+        n_ff,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_dim,
+        q_dim,
+        Some(&q_norm),
+        Some(&k_norm),
+        scale,
+        true,
+        false,
+        Some(2),
+        false,
+        1.0,
+        rope_theta,
+        0,
+        0,
+        norm_eps,
+        post_norm_eps,
+        hidden_dev,
+    )
+    .expect("full device Muse layer");
+    let mut actual = vec![0.0f32; n_embd];
+    download_from_decode_hidden_carrier(hidden_dev, &mut actual).unwrap();
+    sync_decode_stream().unwrap();
+    assert_close_rows_abs_rel(
+        "Muse full device single-token layer",
+        &actual,
+        &expected,
+        3e-3,
+        3e-4,
     );
 }
 
@@ -14335,6 +14491,7 @@ fn cuda_q6k_mmq_tile_seq64_matches_tile32_bitwise_with_tails() {
     let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     // cu228: 기본값은 64x64 로 라우팅되므로 32x64 커널을 명시적으로 pin.
     let _tile64_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "0");
+    let _tile128_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE128", "0");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
@@ -14386,6 +14543,7 @@ fn cuda_q6k_mmq_tile64_matches_tile32_bitwise_with_tails() {
     let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
     let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     let _tile64_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
+    let _tile128_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE128", "0");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;
@@ -14424,6 +14582,54 @@ fn cuda_q6k_mmq_tile64_matches_tile32_bitwise_with_tails() {
             );
         } else {
             first_actual = Some(actual.clone());
+        }
+    }
+}
+
+#[test]
+fn cuda_q6k_mmq_tile128_matches_tile64_with_tails() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE32", "1");
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile64 = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
+    let rows = 1057usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 141usize;
+    let weights = make_test_q6k_weights(1, rows, blocks_per_row, 101)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 47.0) - 23.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let tile64 = {
+        let _tile128_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE128", "0");
+        q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K tile64 baseline")
+    };
+    let _tile128_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE128", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..3 {
+        let actual = q6k_gemv_batch(&weights, rows, cols, &input).expect("CUDA Q6_K MMQ tile128");
+        assert_close_rows_abs_rel(
+            &format!("Q6_K MMQ tile128 run {run}"),
+            &actual,
+            &tile64,
+            3e-3,
+            2e-4,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "Q6_K MMQ tile128 run {run} is not bitwise deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual);
         }
     }
 }

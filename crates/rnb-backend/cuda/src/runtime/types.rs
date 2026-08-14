@@ -237,6 +237,7 @@ pub(super) struct PersistentDecodeReusable {
     pub(super) ple_dim: u32,
     pub(super) k_cache_devs: Vec<u64>,
     pub(super) v_cache_devs: Vec<u64>,
+    pub(super) kv_seq_caps: Vec<u32>,
     /// cu76: track last dispatch's rope_pos to detect new prompt.
     /// If next rope_pos != last_rope_pos + 1, re-upload host KV (new sequence).
     /// `None` = first dispatch (must upload).
@@ -421,6 +422,8 @@ pub(super) struct CudaState {
     pub(super) compute_output_capacity: usize,
     pub(super) compute_aux_output: Option<u64>,
     pub(super) compute_aux_output_capacity: usize,
+    pub(super) compute_q8_sums: Option<u64>,
+    pub(super) compute_q8_sums_capacity: usize,
     pub(super) compute_mid_a: Option<u64>,
     pub(super) compute_mid_a_capacity: usize,
     pub(super) compute_mid_b: Option<u64>,

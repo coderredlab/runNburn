@@ -974,6 +974,89 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd512_window_w256(
     out[out_base + tid + 256u] = acc1 * inv_sum;
 }
 
+
+extern "C" __global__ void rnb_attention_scores_softmax_causal(
+    float* __restrict__ scores,
+    unsigned seq_len,
+    unsigned kv_len,
+    float scale,
+    unsigned window,
+    unsigned batch_count) {
+    const unsigned query = blockIdx.x;
+    const unsigned batch = blockIdx.y;
+    const unsigned tid = threadIdx.x;
+    if (query >= seq_len || batch >= batch_count || kv_len < seq_len) {
+        return;
+    }
+
+    const unsigned global_pos = kv_len - seq_len + query;
+    const unsigned start =
+        window != 0u && global_pos + 1u > window ? global_pos + 1u - window : 0u;
+    float* row = scores + (batch * seq_len + query) * kv_len;
+    float local_max = -3.4028234663852886e38f;
+    for (unsigned key = start + tid; key <= global_pos; key += blockDim.x) {
+        local_max = fmaxf(local_max, row[key] * scale);
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        local_max = fmaxf(
+            local_max,
+            __shfl_down_sync(0xffffffffu, local_max, offset));
+    }
+    __shared__ float partial[8];
+    if ((tid & 31u) == 0u) {
+        partial[tid >> 5] = local_max;
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float block_max = tid < 8u ? partial[tid] : -3.4028234663852886e38f;
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            block_max = fmaxf(
+                block_max,
+                __shfl_down_sync(0xffffffffu, block_max, offset));
+        }
+        if (tid == 0u) {
+            partial[0] = block_max;
+        }
+    }
+    __syncthreads();
+    const float block_max = partial[0];
+
+    float local_sum = 0.0f;
+    for (unsigned key = start + tid; key <= global_pos; key += blockDim.x) {
+        const float probability = expf(row[key] * scale - block_max);
+        row[key] = probability;
+        local_sum += probability;
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        local_sum += __shfl_down_sync(0xffffffffu, local_sum, offset);
+    }
+    if ((tid & 31u) == 0u) {
+        partial[tid >> 5] = local_sum;
+    }
+    __syncthreads();
+    if (tid < 32u) {
+        float block_sum = tid < 8u ? partial[tid] : 0.0f;
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            block_sum += __shfl_down_sync(0xffffffffu, block_sum, offset);
+        }
+        if (tid == 0u) {
+            partial[0] = block_sum;
+        }
+    }
+    __syncthreads();
+    const float inv_sum = partial[0] > 0.0f ? 1.0f / partial[0] : 0.0f;
+
+    for (unsigned key = tid; key < start; key += blockDim.x) {
+        row[key] = 0.0f;
+    }
+    for (unsigned key = start + tid; key <= global_pos; key += blockDim.x) {
+        row[key] *= inv_sum;
+    }
+    for (unsigned key = global_pos + 1u + tid; key < kv_len; key += blockDim.x) {
+        row[key] = 0.0f;
+    }
+}
+
 extern "C" __global__ void rnb_attention_prefill_flash_hd128(
     float* __restrict__ out,
     const float* __restrict__ q,
@@ -1044,6 +1127,7 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd128(
 }
 
 extern "C" __global__ void rnb_attention_prefill_flash_hd128_window(
+
     float* __restrict__ out,
     const float* __restrict__ q,
     const float* __restrict__ k,
