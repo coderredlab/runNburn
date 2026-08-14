@@ -13569,6 +13569,158 @@ fn cuda_q4k_mmq_tile128_matches_tile64_with_tails() {
 }
 
 #[test]
+fn cuda_q4k_mmq_transposed_matches_legacy_for_contracting_matrix() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
+    let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile128 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "1");
+    let rows = 769usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 141usize;
+    let weights = make_test_q4k_weights(1, rows, blocks_per_row, 311)
+        .pop()
+        .unwrap();
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 61.0) - 30.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let legacy = {
+        let _transposed_off = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TRANSPOSED", "0");
+        q4k_gemv_batch(&weights, rows, cols, &input).expect("legacy Q4_K contracting MMQ")
+    };
+    let _transposed_on = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TRANSPOSED", "1");
+    let mut first_actual: Option<Vec<f32>> = None;
+    for run in 0..3 {
+        let actual =
+            q4k_gemv_batch(&weights, rows, cols, &input).expect("transposed Q4_K contracting MMQ");
+        assert_close_rows_abs_rel(
+            &format!("transposed Q4_K contracting MMQ run {run}"),
+            &actual,
+            &legacy,
+            2e-3,
+            2e-4,
+        );
+        if let Some(first) = first_actual.as_ref() {
+            let mismatch = actual
+                .iter()
+                .zip(first)
+                .position(|(actual, first)| actual.to_bits() != first.to_bits());
+            assert!(
+                mismatch.is_none(),
+                "transposed Q4_K contracting MMQ run {run} is not deterministic at {mismatch:?}"
+            );
+        } else {
+            first_actual = Some(actual);
+        }
+    }
+}
+
+#[test]
+fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
+    let _guard = runtime_test_lock();
+    let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");
+    let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
+    let _tile128 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "1");
+    let _transposed = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TRANSPOSED", "1");
+    let rows = 769usize;
+    let cols = 1024usize;
+    let blocks_per_row = cols / 256;
+    let seq_len = 141usize;
+    let weights = make_test_q4k_weights(2, rows, blocks_per_row, 313);
+    let input = (0..seq_len * cols)
+        .map(|i| ((i as f32 % 67.0) - 33.0) * 0.00390625)
+        .collect::<Vec<_>>();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let input_dev = state
+        .compute_input_ptr(std::mem::size_of_val(input.as_slice()))
+        .expect("allocate parallel gate-up input");
+    let chunks = seq_len * blocks_per_row * 8;
+    let qs_dev = state
+        .compute_gate_ptrs_ptr(chunks * 32)
+        .expect("allocate parallel gate-up qs");
+    let ds_dev = state
+        .compute_up_ptrs_ptr(chunks * std::mem::size_of::<(f32, f32)>())
+        .expect("allocate parallel gate-up metadata");
+    let output_len = seq_len * rows;
+    let output_bytes = output_len * std::mem::size_of::<f32>();
+    let gate_dev = state
+        .compute_mid_a_ptr(output_bytes)
+        .expect("allocate parallel gate output");
+    let up_dev = state
+        .compute_mid_b_ptr(output_bytes)
+        .expect("allocate parallel up output");
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                input_dev,
+                input.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(input.as_slice()),
+                state.stream,
+            )
+            .expect("copy parallel gate-up input");
+    }
+    state
+        .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, chunks * 32)
+        .expect("quantize parallel gate-up input");
+
+    let mut run_pair = |parallel: &str| {
+        let _parallel = EnvVarGuard::set("RNB_CUDA_Q4K_PARALLEL_GATE_UP", parallel);
+        state
+            .q4k_pair_batch_q8dot_to_dev(
+                &weights[0],
+                &weights[1],
+                rows,
+                blocks_per_row,
+                seq_len,
+                qs_dev,
+                ds_dev,
+                gate_dev,
+                up_dev,
+            )
+            .expect("launch gate-up pair");
+        let mut gate = vec![0.0f32; output_len];
+        let mut up = vec![0.0f32; output_len];
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    gate.as_mut_ptr().cast::<libc::c_void>(),
+                    gate_dev,
+                    output_bytes,
+                    state.stream,
+                )
+                .expect("copy parallel gate output");
+            state
+                .api
+                .memcpy_dtoh_async(
+                    up.as_mut_ptr().cast::<libc::c_void>(),
+                    up_dev,
+                    output_bytes,
+                    state.stream,
+                )
+                .expect("copy parallel up output");
+        }
+        state
+            .stream_synchronize()
+            .expect("synchronize gate-up pair");
+        (gate, up)
+    };
+
+    let serial = run_pair("0");
+    let parallel_first = run_pair("1");
+    let parallel_second = run_pair("1");
+    drop(run_pair);
+    assert!(state.dense_parallel_events.is_some());
+    assert_eq!(parallel_first.0, serial.0);
+    assert_eq!(parallel_first.1, serial.1);
+    assert_eq!(parallel_second.0, serial.0);
+    assert_eq!(parallel_second.1, serial.1);
+}
+
+#[test]
 fn cuda_q4k_mmq_tile128_persistent_grid_matches_tile64() {
     let _guard = runtime_test_lock();
     let _mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE32", "1");

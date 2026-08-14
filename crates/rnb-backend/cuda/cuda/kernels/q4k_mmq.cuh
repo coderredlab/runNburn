@@ -951,3 +951,262 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     }
 #endif
 }
+
+// Q8_1 activation transpose for the llama-style MMQ load contract. The
+// source is token-major [seq][chunk][32]; the destination is
+// chunk-major [chunk][seq][32], so a CTA can load one K slice for 64
+// sequences with fully coalesced transactions. float2 stores the original
+// f32 scale and the exact scale*integer-sum correction used by the current
+// Q4_K arithmetic.
+extern "C" __global__ void rnb_q8_1_transpose_chunks_by_seq(
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    signed char* __restrict__ output_qs,
+    float2* __restrict__ output_meta,
+    unsigned chunks_per_seq,
+    unsigned seq_len) {
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned chunk = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const unsigned seq = blockIdx.y;
+    if (chunk >= chunks_per_seq || seq >= seq_len) {
+        return;
+    }
+
+    const unsigned source_chunk = seq * chunks_per_seq + chunk;
+    const signed char value = input_qs[source_chunk * 32u + lane];
+    const unsigned destination_chunk = chunk * seq_len + seq;
+    output_qs[destination_chunk * 32u + lane] = value;
+
+    int sum = static_cast<int>(value);
+#pragma unroll
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0u) {
+        const float d = input_ds[source_chunk];
+        output_meta[destination_chunk] = make_float2(d, d * static_cast<float>(sum));
+    }
+}
+
+// 128-row x 64-sequence Q4_K MMQ using the chunk-major Q8_1 layout above.
+// Q4 words for all 128 rows are unpacked into shared memory with contiguous
+// 128-byte global transactions. Q8 values are loaded in two 128-value halves,
+// matching llama.cpp's load-tile structure while retaining runNburn's f32
+// metadata and per-output accumulation order.
+extern "C" __global__ void __launch_bounds__(256, 2)
+rnb_q4k_q8_1_matmul_mmq_transposed_seq128(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float2* __restrict__ input_meta,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+#if __CUDA_ARCH__ < 800
+    (void)out;
+    (void)weights;
+    (void)input_qs;
+    (void)input_meta;
+    (void)rows;
+    (void)blocks_per_row;
+    (void)seq_len;
+    return;
+#else
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5;
+    const unsigned lane = tid & 31u;
+    const unsigned warp_row_off = warp * 16u;
+    const unsigned t_row_a = lane >> 2;
+    const unsigned t_row_b = t_row_a + 8u;
+
+    __shared__ unsigned x_packed[128][32];
+    __shared__ float2 x_dm[4][128];
+    __shared__ int y_qs[4][16][8][8];
+    __shared__ float2 y_meta[4][128];
+
+    const unsigned row_tiles = (rows + 127u) / 128u;
+    const unsigned seq_tiles = (seq_len + 127u) / 128u;
+    const unsigned tile_count = row_tiles * seq_tiles;
+    const unsigned row_bytes = blocks_per_row * 144u;
+
+    for (unsigned tile = blockIdx.x; tile < tile_count; tile += gridDim.x) {
+        const unsigned row_tile = tile / seq_tiles;
+        const unsigned seq_tile = tile - row_tile * seq_tiles;
+        const unsigned row_base = row_tile * 128u;
+        const unsigned seq_base = seq_tile * 128u;
+        const unsigned row_a = row_base + warp_row_off + t_row_a;
+        const unsigned row_b = row_base + warp_row_off + t_row_b;
+        float acc[64];
+#pragma unroll
+        for (unsigned i = 0; i < 64u; ++i) {
+            acc[i] = 0.0f;
+        }
+
+        for (unsigned block = 0; block < blocks_per_row; ++block) {
+            // Each warp loads one contiguous 128-byte qs payload at a time.
+            // Sixteen passes cover the 128 output rows.
+#pragma unroll
+            for (unsigned pass = 0; pass < 16u; ++pass) {
+                const unsigned local_row = warp + pass * 8u;
+                const unsigned global_row = row_base + local_row;
+                const unsigned word = lane;
+                unsigned packed_qs = 0u;
+                if (global_row < rows) {
+                    const unsigned char* packed =
+                        weights + global_row * row_bytes + block * 144u;
+                    packed_qs = *reinterpret_cast<const unsigned*>(
+                        packed + 16u + word * 4u);
+                }
+                x_packed[local_row][word] = packed_qs;
+            }
+
+#pragma unroll
+            for (unsigned half = 0; half < 2u; ++half) {
+                if (tid < 128u) {
+                    const unsigned global_row = row_base + tid;
+                    if (global_row < rows) {
+                        const unsigned char* packed =
+                            weights + global_row * row_bytes + block * 144u;
+                        const unsigned raw_d = static_cast<unsigned>(packed[0])
+                            | (static_cast<unsigned>(packed[1]) << 8);
+                        const unsigned raw_dmin = static_cast<unsigned>(packed[2])
+                            | (static_cast<unsigned>(packed[3]) << 8);
+                        const float d = __half2float(
+                            __ushort_as_half(static_cast<unsigned short>(raw_d)));
+                        const float dmin = __half2float(
+                            __ushort_as_half(static_cast<unsigned short>(raw_dmin)));
+#pragma unroll
+                        for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
+                            const unsigned sub = half * 4u + local_sub;
+                            unsigned scale;
+                            unsigned min_scale;
+                            if (sub < 4u) {
+                                scale = packed[4u + sub] & 63u;
+                                min_scale = packed[8u + sub] & 63u;
+                            } else {
+                                scale = (packed[8u + sub] & 0x0fu)
+                                    | ((packed[sub] >> 6) << 4);
+                                min_scale = (packed[8u + sub] >> 4)
+                                    | ((packed[4u + sub] >> 6) << 4);
+                            }
+                            x_dm[local_sub][tid] = make_float2(
+                                d * static_cast<float>(scale),
+                                -dmin * static_cast<float>(min_scale));
+                        }
+                    } else {
+#pragma unroll
+                        for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
+                            x_dm[local_sub][tid] = make_float2(0.0f, 0.0f);
+                        }
+                    }
+                }
+
+                // Four 32-value sub-blocks x 128 sequences.
+                for (unsigned item = tid; item < 4096u; item += 256u) {
+                    const unsigned local_sub = item >> 10;
+                    const unsigned local = item & 1023u;
+                    const unsigned local_seq = local >> 3;
+                    const unsigned word = local & 7u;
+                    const unsigned global_seq = seq_base + local_seq;
+                    int qword = 0;
+                    if (global_seq < seq_len) {
+                        const unsigned chunk = block * 8u + half * 4u + local_sub;
+                        qword = *reinterpret_cast<const int*>(
+                            input_qs + (chunk * seq_len + global_seq) * 32u + word * 4u);
+                    }
+                    y_qs[local_sub][local_seq >> 3][word][local_seq & 7u] = qword;
+                }
+                for (unsigned item = tid; item < 512u; item += 256u) {
+                    const unsigned local_sub = item >> 7;
+                    const unsigned local_seq = item & 127u;
+                    const unsigned global_seq = seq_base + local_seq;
+                    float2 meta = make_float2(0.0f, 0.0f);
+                    if (global_seq < seq_len) {
+                        const unsigned chunk = block * 8u + half * 4u + local_sub;
+                        meta = input_meta[chunk * seq_len + global_seq];
+                    }
+                    y_meta[local_sub][local_seq] = meta;
+                }
+                __syncthreads();
+
+#pragma unroll
+                for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
+                    const unsigned sub = half * 4u + local_sub;
+                    const unsigned pair = sub >> 1;
+                    const unsigned shift = (sub & 1u) * 4u;
+                    const unsigned word_lo = lane & 3u;
+                    const unsigned word_base = pair * 8u + word_lo;
+                    const int a0 = static_cast<int>(
+                        (x_packed[warp_row_off + t_row_a][word_base] >> shift)
+                        & 0x0f0f0f0fu);
+                    const int a1 = static_cast<int>(
+                        (x_packed[warp_row_off + t_row_b][word_base] >> shift)
+                        & 0x0f0f0f0fu);
+                    const int a2 = static_cast<int>(
+                        (x_packed[warp_row_off + t_row_a][word_base + 4u] >> shift)
+                        & 0x0f0f0f0fu);
+                    const int a3 = static_cast<int>(
+                        (x_packed[warp_row_off + t_row_b][word_base + 4u] >> shift)
+                        & 0x0f0f0f0fu);
+                    const float2 dm_a = x_dm[local_sub][warp_row_off + t_row_a];
+                    const float2 dm_b = x_dm[local_sub][warp_row_off + t_row_b];
+
+#pragma unroll
+                    for (unsigned frag = 0; frag < 16u; ++frag) {
+                        const unsigned seq_in_group = lane >> 2;
+                        const int b0 = y_qs[local_sub][frag][word_lo][seq_in_group];
+                        const int b1 =
+                            y_qs[local_sub][frag][word_lo + 4u][seq_in_group];
+                        int dot0 = 0;
+                        int dot1 = 0;
+                        int dot2 = 0;
+                        int dot3 = 0;
+                        rnb_mma_m16n8k32_s8(
+                            dot0, dot1, dot2, dot3,
+                            a0, a1, a2, a3, b0, b1,
+                            0, 0, 0, 0);
+
+                        const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+                        const unsigned col_b = col_a + 1u;
+                        const float2 meta_a = y_meta[local_sub][col_a];
+                        const float2 meta_b = y_meta[local_sub][col_b];
+                        acc[frag * 4u + 0u] +=
+                            dm_a.x * meta_a.x * static_cast<float>(dot0);
+                        acc[frag * 4u + 0u] += dm_a.y * meta_a.y;
+                        acc[frag * 4u + 1u] +=
+                            dm_a.x * meta_b.x * static_cast<float>(dot1);
+                        acc[frag * 4u + 1u] += dm_a.y * meta_b.y;
+                        acc[frag * 4u + 2u] +=
+                            dm_b.x * meta_a.x * static_cast<float>(dot2);
+                        acc[frag * 4u + 2u] += dm_b.y * meta_a.y;
+                        acc[frag * 4u + 3u] +=
+                            dm_b.x * meta_b.x * static_cast<float>(dot3);
+                        acc[frag * 4u + 3u] += dm_b.y * meta_b.y;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+#pragma unroll
+        for (unsigned frag = 0; frag < 16u; ++frag) {
+            const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+            const unsigned col_b = col_a + 1u;
+            const unsigned seq_a = seq_base + col_a;
+            const unsigned seq_b = seq_base + col_b;
+            if (row_a < rows && seq_a < seq_len) {
+                out[seq_a * rows + row_a] = acc[frag * 4u + 0u];
+            }
+            if (row_a < rows && seq_b < seq_len) {
+                out[seq_b * rows + row_a] = acc[frag * 4u + 1u];
+            }
+            if (row_b < rows && seq_a < seq_len) {
+                out[seq_a * rows + row_b] = acc[frag * 4u + 2u];
+            }
+            if (row_b < rows && seq_b < seq_len) {
+                out[seq_b * rows + row_b] = acc[frag * 4u + 3u];
+            }
+        }
+    }
+#endif
+}

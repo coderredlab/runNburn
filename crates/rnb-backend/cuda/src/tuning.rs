@@ -198,6 +198,34 @@ pub fn q4k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
     seq_len >= 128 && rows >= 128 && env_bool("RNB_CUDA_Q4K_MMQ_TILE128", true)
 }
 
+/// cu278: Q4_K MMQ의 Q8_1 입력을 chunk-major로 전치하고 packed Q4_K와
+/// 함께 shared-memory tile에 올리는 Ampere 경로. 128x128 출력 tile은 기존
+/// f32 metadata/누산 순서를 유지하면서 coalesced load를 사용한다. Muse
+/// 1144/100 ABABAB에서 prefill `1794.281→1700.062ms` (`-5.25%`,
+/// same-index 3/3), 100-token 출력 exact를 통과했다. 전치 scratch는 현재
+/// shape에 비례하며 `RNB_CUDA_Q4K_MMQ_TRANSPOSED=0`으로 대조한다.
+pub fn q4k_mmq_transposed_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_MMQ_TRANSPOSED", true)
+}
+
+/// cu278: Muse Q/K/V/attention-gate가 같은 normalized activation의 Q8_1을
+/// 재사용하고, attention-gate 및 FFN up projection을 보조 stream에서
+/// 실행한다. RTX 3090 1144/100에서 공유-Q8 단독 prefill -1.64%, 병렬화
+/// 증분 -3.25%, transposed-MMQ 기준 대비 -4.70%, cu278 시작점 대비 누적
+/// -9.87% (모두 same-index 3/3), 100-token 출력 exact였다. 세 env는 회귀
+/// 진단용 독립 opt-out이다.
+pub fn muse_qkv_shared_q8_enabled() -> bool {
+    env_bool("RNB_CUDA_MUSE_QKV_SHARED_Q8", true)
+}
+
+pub fn muse_qkv_parallel_enabled() -> bool {
+    env_bool("RNB_CUDA_MUSE_QKV_PARALLEL", true)
+}
+
+pub fn q4k_parallel_gate_up_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_PARALLEL_GATE_UP", true)
+}
+
 /// cu228: Q5_K/Q6_K 64x64 tile 게이트 — Q4 와 같은 b-side 상각 (rows >= 64
 /// 는 tile 높이의 구조적 최소치). 진단 대조는 각 env `=0`.
 pub fn q5k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
@@ -2685,6 +2713,58 @@ mod tests {
         assert!(!q4k_mmq_tile128_enabled(1144, 6656));
         unsafe {
             std::env::remove_var("RNB_CUDA_Q4K_MMQ_TILE128");
+        }
+    }
+
+    #[test]
+    fn q4k_mmq_transposed_defaults_on_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TRANSPOSED");
+        }
+        assert!(q4k_mmq_transposed_enabled());
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_Q4K_MMQ_TRANSPOSED", "0");
+        }
+        assert!(!q4k_mmq_transposed_enabled());
+        unsafe {
+            std::env::remove_var("RNB_CUDA_Q4K_MMQ_TRANSPOSED");
+        }
+    }
+
+    #[test]
+    fn muse_q4_projection_reuse_and_parallelism_default_on_with_opt_outs() {
+        let _guard = crate::runtime::cuda_test_env_lock();
+        for key in [
+            "RNB_CUDA_MUSE_QKV_SHARED_Q8",
+            "RNB_CUDA_MUSE_QKV_PARALLEL",
+            "RNB_CUDA_Q4K_PARALLEL_GATE_UP",
+        ] {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        assert!(muse_qkv_shared_q8_enabled());
+        assert!(muse_qkv_parallel_enabled());
+        assert!(q4k_parallel_gate_up_enabled());
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_MUSE_QKV_SHARED_Q8", "0");
+            std::env::set_var("RNB_CUDA_MUSE_QKV_PARALLEL", "0");
+            std::env::set_var("RNB_CUDA_Q4K_PARALLEL_GATE_UP", "0");
+        }
+        assert!(!muse_qkv_shared_q8_enabled());
+        assert!(!muse_qkv_parallel_enabled());
+        assert!(!q4k_parallel_gate_up_enabled());
+        for key in [
+            "RNB_CUDA_MUSE_QKV_SHARED_Q8",
+            "RNB_CUDA_MUSE_QKV_PARALLEL",
+            "RNB_CUDA_Q4K_PARALLEL_GATE_UP",
+        ] {
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
     }
 

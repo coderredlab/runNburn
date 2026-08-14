@@ -1926,13 +1926,13 @@ impl CudaState {
         let q_full_dev = self.compute_temp_slab_ptr(q_storage_bytes)?;
         let k_dev = self.compute_mid_a_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
         let v_dev = self.compute_mid_b_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
-        self.compute_input_ptr(hidden_bytes)?;
+        let qkv_secondary_qs_dev = self.compute_input_ptr(hidden_bytes)?;
         let attention_gate_dev = self.compute_aux_output_ptr(q_storage_bytes)?;
         let q_post_dev = self.compute_q_rope_out_ptr(q_bytes)?;
         let k_bits_dev = self.compute_k_bits_out_ptr(kv_f16_bytes)?;
         let v_bits_dev = self.compute_v_bits_out_ptr(kv_f16_bytes)?;
         let attn_out_dev = self.compute_full_down_ptr(q_bytes)?;
-        self.compute_output_ptr(hidden_bytes)?;
+        let qkv_secondary_meta_dev = self.compute_output_ptr(hidden_bytes)?;
 
         if let Some(hidden_input) = hidden_input {
             unsafe {
@@ -1954,49 +1954,173 @@ impl CudaState {
             n_embd,
             false,
         )?;
-        self.q4k_batch_dev_input_to_dev(
-            q_weights,
-            q_rows,
-            blocks_per_row,
-            seq_len,
-            normed_dev,
-            q_full_dev,
-        )?;
-        self.q4k_batch_dev_input_to_dev(
-            k_weights,
-            kv_rows,
-            blocks_per_row,
-            seq_len,
-            normed_dev,
-            k_dev,
-        )?;
-        match v_quant {
-            12 => self.q4k_batch_dev_input_to_dev(
-                v_weights,
+        let shared_q8 = seq_len >= 64 && tuning::muse_qkv_shared_q8_enabled();
+        if shared_q8 {
+            let chunks = seq_len
+                .checked_mul(blocks_per_row)
+                .ok_or_else(|| "CUDA Muse QKV Q8 chunk count overflow".to_string())?;
+            let qs_dev = self.compute_gate_ptrs_ptr(chunks * 256)?;
+            let ds_dev = self.compute_up_ptrs_ptr(chunks * 8 * std::mem::size_of::<f32>())?;
+            self.launch_quantize_q8_1_by_32(normed_dev, qs_dev, ds_dev, chunks * 256)?;
+
+            let launch_v = |state: &mut Self| match v_quant {
+                12 => state.q4k_batch_q8dot_to_dev(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    v_dev,
+                ),
+                14 => state.q6k_batch_q8dot_to_dev(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    v_dev,
+                ),
+                other => Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+            };
+
+            if tuning::muse_qkv_parallel_enabled()
+                && tuning::q4k_mmq_transposed_enabled()
+                && tuning::q4k_mmq_tile32_enabled(seq_len, q_rows, blocks_per_row)
+                && tuning::mmq_tile_seq64_enabled(seq_len)
+                && tuning::q4k_mmq_tile128_enabled(seq_len, q_rows)
+            {
+                let (ready, done) = self.dense_parallel_events()?;
+                let main_stream = self.stream;
+                let secondary = (|| -> Result<(), String> {
+                    unsafe {
+                        self.api.event_record(ready, main_stream)?;
+                        self.api.stream_wait_event(self.copy_stream, ready)?;
+                    }
+                    self.stream = self.copy_stream;
+                    self.launch_q8_1_transpose_chunks_by_seq(
+                        qs_dev,
+                        ds_dev,
+                        qkv_secondary_qs_dev,
+                        qkv_secondary_meta_dev,
+                        blocks_per_row * 8,
+                        seq_len,
+                    )?;
+                    self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
+                        attention_gate_weights,
+                        q_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qkv_secondary_qs_dev,
+                        qkv_secondary_meta_dev,
+                        attention_gate_dev,
+                    )?;
+                    unsafe { self.api.event_record(done, self.copy_stream) }
+                })();
+                self.stream = main_stream;
+                let primary = (|| -> Result<(), String> {
+                    self.q4k_batch_q8dot_to_dev(
+                        q_weights,
+                        q_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qs_dev,
+                        ds_dev,
+                        q_full_dev,
+                    )?;
+                    self.q4k_batch_q8dot_to_dev(
+                        k_weights,
+                        kv_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qs_dev,
+                        ds_dev,
+                        k_dev,
+                    )?;
+                    launch_v(self)?;
+                    if secondary.is_ok() {
+                        unsafe { self.api.stream_wait_event(main_stream, done)? };
+                    }
+                    Ok(())
+                })();
+                secondary?;
+                primary?;
+            } else {
+                self.q4k_batch_q8dot_to_dev(
+                    q_weights,
+                    q_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    q_full_dev,
+                )?;
+                self.q4k_batch_q8dot_to_dev(
+                    k_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    k_dev,
+                )?;
+                launch_v(self)?;
+                self.q4k_batch_q8dot_to_dev(
+                    attention_gate_weights,
+                    q_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    attention_gate_dev,
+                )?;
+            }
+        } else {
+            self.q4k_batch_dev_input_to_dev(
+                q_weights,
+                q_rows,
+                blocks_per_row,
+                seq_len,
+                normed_dev,
+                q_full_dev,
+            )?;
+            self.q4k_batch_dev_input_to_dev(
+                k_weights,
                 kv_rows,
                 blocks_per_row,
                 seq_len,
                 normed_dev,
-                v_dev,
-            )?,
-            14 => self.q6k_batch_dev_input_to_dev(
-                v_weights,
-                kv_rows,
+                k_dev,
+            )?;
+            match v_quant {
+                12 => self.q4k_batch_dev_input_to_dev(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    normed_dev,
+                    v_dev,
+                )?,
+                14 => self.q6k_batch_dev_input_to_dev(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    normed_dev,
+                    v_dev,
+                )?,
+                other => return Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+            }
+            self.q4k_batch_dev_input_to_dev(
+                attention_gate_weights,
+                q_rows,
                 blocks_per_row,
                 seq_len,
                 normed_dev,
-                v_dev,
-            )?,
-            other => return Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+                attention_gate_dev,
+            )?;
         }
-        self.q4k_batch_dev_input_to_dev(
-            attention_gate_weights,
-            q_rows,
-            blocks_per_row,
-            seq_len,
-            normed_dev,
-            attention_gate_dev,
-        )?;
 
         let q_norm_dev = self.resident_f32_ptr(q_norm)?;
         let k_norm_dev = self.resident_f32_ptr(k_norm)?;

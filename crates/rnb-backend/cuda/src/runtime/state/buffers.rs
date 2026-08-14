@@ -33,6 +33,23 @@ macro_rules! ensure_with_oom_retry {
 }
 
 impl CudaState {
+    pub(in crate::runtime) fn dense_parallel_events(&mut self) -> Result<(usize, usize), String> {
+        if let Some(events) = self.dense_parallel_events {
+            return Ok(events);
+        }
+        const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
+        let ready = unsafe { self.api.event_create(CUDA_EVENT_DISABLE_TIMING)? };
+        let done = match unsafe { self.api.event_create(CUDA_EVENT_DISABLE_TIMING) } {
+            Ok(done) => done,
+            Err(error) => {
+                let _ = unsafe { self.api.event_destroy(ready) };
+                return Err(error);
+            }
+        };
+        self.dense_parallel_events = Some((ready, done));
+        Ok((ready, done))
+    }
+
     pub(in crate::runtime) fn compute_weights_ptr(&mut self, bytes: usize) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_weights, compute_weights_capacity, bytes)
     }
@@ -53,6 +70,30 @@ impl CudaState {
     }
     pub(in crate::runtime) fn compute_q8_sums_ptr(&mut self, bytes: usize) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_q8_sums, compute_q8_sums_capacity, bytes)
+    }
+
+    pub(in crate::runtime) fn compute_q8_transposed_ptr(
+        &mut self,
+        bytes: usize,
+    ) -> Result<u64, String> {
+        ensure_with_oom_retry!(
+            self,
+            compute_q8_transposed,
+            compute_q8_transposed_capacity,
+            bytes
+        )
+    }
+
+    pub(in crate::runtime) fn compute_q8_transposed_meta_ptr(
+        &mut self,
+        bytes: usize,
+    ) -> Result<u64, String> {
+        ensure_with_oom_retry!(
+            self,
+            compute_q8_transposed_meta,
+            compute_q8_transposed_meta_capacity,
+            bytes
+        )
     }
 
     pub(in crate::runtime) fn compute_mid_a_ptr(&mut self, bytes: usize) -> Result<u64, String> {

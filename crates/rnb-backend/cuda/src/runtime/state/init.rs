@@ -144,6 +144,7 @@ impl CudaState {
             stream,
             copy_stream,
             expert_admission_fence: None,
+            dense_parallel_events: None,
             api,
             device_residency_plan,
             cublas: None,
@@ -215,6 +216,10 @@ impl CudaState {
             compute_aux_output_capacity: 0,
             compute_q8_sums: None,
             compute_q8_sums_capacity: 0,
+            compute_q8_transposed: None,
+            compute_q8_transposed_capacity: 0,
+            compute_q8_transposed_meta: None,
+            compute_q8_transposed_meta_capacity: 0,
             compute_mid_a: None,
             compute_mid_a_capacity: 0,
             compute_mid_b: None,
@@ -449,6 +454,10 @@ impl Drop for CudaState {
         if let Some(event) = self.expert_admission_fence.take() {
             let _ = unsafe { self.api.event_destroy(event) };
         }
+        if let Some((ready, done)) = self.dense_parallel_events.take() {
+            let _ = unsafe { self.api.event_destroy(ready) };
+            let _ = unsafe { self.api.event_destroy(done) };
+        }
         cache_stats()
             .remove_expert_bundle_resident_payload(self.qwen35_q2q3_resident_payload_bytes);
         self.qwen35_q2q3_resident_payload_bytes = 0;
@@ -507,6 +516,12 @@ impl Drop for CudaState {
             let _ = unsafe { self.api.mem_free(ptr) };
         }
         if let Some(ptr) = self.compute_q8_sums.take() {
+            let _ = unsafe { self.api.mem_free(ptr) };
+        }
+        if let Some(ptr) = self.compute_q8_transposed.take() {
+            let _ = unsafe { self.api.mem_free(ptr) };
+        }
+        if let Some(ptr) = self.compute_q8_transposed_meta.take() {
             let _ = unsafe { self.api.mem_free(ptr) };
         }
         if let Some(ptr) = self.compute_mid_a.take() {

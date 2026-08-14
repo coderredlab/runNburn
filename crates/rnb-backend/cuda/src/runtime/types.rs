@@ -352,6 +352,7 @@ pub(super) struct CudaState {
     /// `copy_stream`. Kernels on `stream` that may read freshly admitted
     /// expert weights wait on this event device-side before launching.
     pub(super) expert_admission_fence: Option<usize>,
+    pub(super) dense_parallel_events: Option<(usize, usize)>,
     pub(super) api: CudaApi,
     pub(super) device_residency_plan: rnb_memory::DeviceResidencyPlan,
     pub(super) cublas: Option<CublasState>,
@@ -424,6 +425,10 @@ pub(super) struct CudaState {
     pub(super) compute_aux_output_capacity: usize,
     pub(super) compute_q8_sums: Option<u64>,
     pub(super) compute_q8_sums_capacity: usize,
+    pub(super) compute_q8_transposed: Option<u64>,
+    pub(super) compute_q8_transposed_capacity: usize,
+    pub(super) compute_q8_transposed_meta: Option<u64>,
+    pub(super) compute_q8_transposed_meta_capacity: usize,
     pub(super) compute_mid_a: Option<u64>,
     pub(super) compute_mid_a_capacity: usize,
     pub(super) compute_mid_b: Option<u64>,

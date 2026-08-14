@@ -866,7 +866,7 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn q4k_batch_q8dot_to_dev(
+    pub(in crate::runtime) fn q4k_batch_q8dot_to_dev(
         &mut self,
         weights: &[u8],
         rows: usize,
@@ -881,7 +881,37 @@ impl CudaState {
             // 이 절반이 된다 (bitwise 동일 산술, RNB_CUDA_MMQ_TILE_SEQ64=0 대조).
             if tuning::mmq_tile_seq64_enabled(seq_len) {
                 if tuning::q4k_mmq_tile128_enabled(seq_len, rows) {
-                    let chunks = seq_len * blocks_per_row * 8;
+                    let chunks_per_seq = blocks_per_row * 8;
+                    let chunks = seq_len * chunks_per_seq;
+                    if tuning::q4k_mmq_transposed_enabled() {
+                        let transposed_qs_dev = self.compute_q8_transposed_ptr(chunks * 32)?;
+                        let transposed_meta_dev = self.compute_q8_transposed_meta_ptr(
+                            chunks * std::mem::size_of::<(f32, f32)>(),
+                        )?;
+                        if input_qs_dev != transposed_qs_dev
+                            && input_qs_dev != transposed_meta_dev
+                            && output_dev != transposed_qs_dev
+                            && output_dev != transposed_meta_dev
+                        {
+                            self.launch_q8_1_transpose_chunks_by_seq(
+                                input_qs_dev,
+                                input_ds_dev,
+                                transposed_qs_dev,
+                                transposed_meta_dev,
+                                chunks_per_seq,
+                                seq_len,
+                            )?;
+                            return self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
+                                weights,
+                                rows,
+                                blocks_per_row,
+                                seq_len,
+                                transposed_qs_dev,
+                                transposed_meta_dev,
+                                output_dev,
+                            );
+                        }
+                    }
                     let sums_dev = self.compute_q8_sums_ptr(chunks * std::mem::size_of::<f32>())?;
                     self.launch_q8_1_integer_sums_by_32(input_qs_dev, sums_dev, chunks)?;
                     return self.launch_q4k_q8_1_matmul_mmq_tile128_seq128(
@@ -1018,6 +1048,101 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn q4k_pair_batch_q8dot_to_dev(
+        &mut self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_qs_dev: u64,
+        input_ds_dev: u64,
+        gate_output_dev: u64,
+        up_output_dev: u64,
+    ) -> Result<(), String> {
+        let parallel = tuning::q4k_parallel_gate_up_enabled()
+            && tuning::q4k_mmq_transposed_enabled()
+            && tuning::q4k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
+            && tuning::mmq_tile_seq64_enabled(seq_len)
+            && tuning::q4k_mmq_tile128_enabled(seq_len, rows);
+        if !parallel {
+            self.q4k_batch_q8dot_to_dev(
+                gate_weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_qs_dev,
+                input_ds_dev,
+                gate_output_dev,
+            )?;
+            return self.q4k_batch_q8dot_to_dev(
+                up_weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_qs_dev,
+                input_ds_dev,
+                up_output_dev,
+            );
+        }
+
+        let chunks_per_seq = blocks_per_row * 8;
+        let chunks = seq_len * chunks_per_seq;
+        let transposed_qs_dev = self.compute_q8_transposed_ptr(chunks * 32)?;
+        let transposed_meta_dev =
+            self.compute_q8_transposed_meta_ptr(chunks * std::mem::size_of::<(f32, f32)>())?;
+        let _ = self.resident_q4k_weights_ptr(gate_weights)?;
+        let _ = self.resident_q4k_weights_ptr(up_weights)?;
+        self.launch_q8_1_transpose_chunks_by_seq(
+            input_qs_dev,
+            input_ds_dev,
+            transposed_qs_dev,
+            transposed_meta_dev,
+            chunks_per_seq,
+            seq_len,
+        )?;
+
+        let (ready, done) = self.dense_parallel_events()?;
+        let main_stream = self.stream;
+        let parallel_stream = self.copy_stream;
+        let result = (|| {
+            unsafe {
+                self.api.event_record(ready, main_stream)?;
+                self.api.stream_wait_event(parallel_stream, ready)?;
+            }
+            self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
+                gate_weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                transposed_qs_dev,
+                transposed_meta_dev,
+                gate_output_dev,
+            )?;
+
+            self.stream = parallel_stream;
+            let up_result = self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
+                up_weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                transposed_qs_dev,
+                transposed_meta_dev,
+                up_output_dev,
+            );
+            self.stream = main_stream;
+            up_result?;
+            unsafe {
+                self.api.event_record(done, parallel_stream)?;
+                self.api.stream_wait_event(main_stream, done)?;
+            }
+            Ok(())
+        })();
+        self.stream = main_stream;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn q5k_batch_dev_input_to_dev(
         &mut self,
         weights: &[u8],
@@ -1144,6 +1269,61 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn q6k_batch_q8dot_to_dev(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        qs_dev: u64,
+        ds_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        if tuning::mmq_tile_seq64_enabled(seq_len) {
+            if tuning::q6k_mmq_tile128_enabled(seq_len, rows) {
+                return self.launch_q6k_q8_1_matmul_mmq_tile128_seq64(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    output_dev,
+                );
+            }
+            if tuning::q6k_mmq_tile64_enabled(seq_len, rows) {
+                return self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
+                    weights,
+                    rows,
+                    blocks_per_row,
+                    seq_len,
+                    qs_dev,
+                    ds_dev,
+                    output_dev,
+                );
+            }
+            return self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                qs_dev,
+                ds_dev,
+                output_dev,
+            );
+        }
+        self.launch_q6k_q8_1_matmul_mmq_tile32(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            qs_dev,
+            ds_dev,
+            output_dev,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn q6k_batch_dev_input_to_dev(
         &mut self,
         weights: &[u8],
@@ -1163,42 +1343,7 @@ impl CudaState {
                 ds_dev,
                 seq_len * blocks_per_row * 256,
             )?;
-            // cu226: seq >= 64 는 CTA seq 폭 64 tile 로 (bitwise 동일 산술).
-            if tuning::mmq_tile_seq64_enabled(seq_len) {
-                // cu228: rows >= 64 는 64x64 tile — b-side 상각 (bitwise 동일).
-                if tuning::q6k_mmq_tile128_enabled(seq_len, rows) {
-                    return self.launch_q6k_q8_1_matmul_mmq_tile128_seq64(
-                        weights,
-                        rows,
-                        blocks_per_row,
-                        seq_len,
-                        qs_dev,
-                        ds_dev,
-                        output_dev,
-                    );
-                }
-                if tuning::q6k_mmq_tile64_enabled(seq_len, rows) {
-                    return self.launch_q6k_q8_1_matmul_mmq_tile64_seq64(
-                        weights,
-                        rows,
-                        blocks_per_row,
-                        seq_len,
-                        qs_dev,
-                        ds_dev,
-                        output_dev,
-                    );
-                }
-                return self.launch_q6k_q8_1_matmul_mmq_tile32_seq64(
-                    weights,
-                    rows,
-                    blocks_per_row,
-                    seq_len,
-                    qs_dev,
-                    ds_dev,
-                    output_dev,
-                );
-            }
-            return self.launch_q6k_q8_1_matmul_mmq_tile32(
+            return self.q6k_batch_q8dot_to_dev(
                 weights,
                 rows,
                 blocks_per_row,
@@ -1598,22 +1743,15 @@ impl CudaState {
                     up_dev,
                 )?;
             } else {
-                self.q4k_batch_q8dot_to_dev(
+                self.q4k_pair_batch_q8dot_to_dev(
                     gate_weights,
-                    n_ff,
-                    gate_blocks,
-                    seq_len,
-                    qs_dev,
-                    ds_dev,
-                    gate_dev,
-                )?;
-                self.q4k_batch_q8dot_to_dev(
                     up_weights,
                     n_ff,
                     gate_blocks,
                     seq_len,
                     qs_dev,
                     ds_dev,
+                    gate_dev,
                     up_dev,
                 )?;
             }
@@ -2098,22 +2236,15 @@ impl CudaState {
                     up_dev,
                 )?;
             } else {
-                self.q4k_batch_q8dot_to_dev(
+                self.q4k_pair_batch_q8dot_to_dev(
                     gate_weights,
-                    n_ff,
-                    gate_blocks,
-                    seq_len,
-                    qs_dev,
-                    ds_dev,
-                    gate_dev,
-                )?;
-                self.q4k_batch_q8dot_to_dev(
                     up_weights,
                     n_ff,
                     gate_blocks,
                     seq_len,
                     qs_dev,
                     ds_dev,
+                    gate_dev,
                     up_dev,
                 )?;
             }
