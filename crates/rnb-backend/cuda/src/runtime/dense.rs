@@ -3816,7 +3816,7 @@ impl CudaState {
         let mut prequantized_q8 = None;
         if let Some(weight) = post_attn_norm_weight {
             let norm_weight_dev = self.resident_f32_ptr(weight)?;
-            if dense_combined_norms_enabled(true) && post_norm_eps.to_bits() == norm_eps.to_bits() {
+            if dense_combined_norms_enabled(true) {
                 if dense_q8dot_gate_up_enabled(ffn_uses_gelu) {
                     let q8_qs_dev = self.compute_gate_ptrs_ptr(n_embd)?;
                     let q8_ds_dev =
@@ -3829,6 +3829,7 @@ impl CudaState {
                         normed_dev,
                         q8_qs_dev,
                         q8_ds_dev,
+                        post_norm_eps,
                         norm_eps,
                         n_embd,
                         unit_offset_post_attn_norm,
@@ -3848,6 +3849,7 @@ impl CudaState {
                         hidden_dev,
                         ffn_norm_dev,
                         normed_dev,
+                        post_norm_eps,
                         norm_eps,
                         n_embd,
                         unit_offset_post_attn_norm,
@@ -7129,9 +7131,7 @@ impl CudaState {
             let mut prequantized_q8 = None;
             if let Some(weight) = post_attn_norm_weight {
                 let norm_weight_dev = self.resident_f32_ptr(weight)?;
-                if dense_combined_norms_enabled(true)
-                    && post_norm_eps.to_bits() == norm_eps.to_bits()
-                {
+                if dense_combined_norms_enabled(true) {
                     if dense_q8dot_gate_up_enabled(ffn_uses_gelu) {
                         let q8_qs_dev = self.compute_gate_ptrs_ptr(n_embd)?;
                         let q8_ds_dev =
@@ -7144,6 +7144,7 @@ impl CudaState {
                             normed_dev,
                             q8_qs_dev,
                             q8_ds_dev,
+                            post_norm_eps,
                             norm_eps,
                             n_embd,
                             unit_offset_post_attn_norm,
@@ -7163,6 +7164,7 @@ impl CudaState {
                             hidden_dev,
                             ffn_norm_dev,
                             normed_dev,
+                            post_norm_eps,
                             norm_eps,
                             n_embd,
                             unit_offset_post_attn_norm,

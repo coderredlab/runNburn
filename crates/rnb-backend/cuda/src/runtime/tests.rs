@@ -10454,6 +10454,10 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
     let _guard = runtime_test_lock();
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
     let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
+    let _qkv_q8dot = EnvVarGuard::set("RNB_CUDA_FULL_DEVICE_DECODE_QKV_Q8DOT", "0");
+    let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "0");
+    let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "0");
+    let _q6_warp8 = EnvVarGuard::set("RNB_CUDA_Q6K_OUTPUT_WARP8", "0");
     let num_heads = 2usize;
     let num_kv_heads = 1usize;
     let head_dim = 128usize;
@@ -10843,8 +10847,8 @@ fn attention_decode_hd128_matches_cpu_reference() {
 fn attention_decode_cached_hd128_matches_cpu_reference_after_append() {
     let _guard = runtime_test_lock();
     let kv_len = 300usize;
-    let num_heads = 2usize;
-    let num_kv_heads = 1usize;
+    let num_heads = 8usize;
+    let num_kv_heads = 2usize;
     let head_dim = 128usize;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut q = vec![0.0f32; num_heads * head_dim];
@@ -12591,16 +12595,17 @@ fn cuda_rms_norm_add_then_rms_norm_matches_two_step_reference() {
     let pre_weight = (0..len)
         .map(|i| ((i % 19) as f32 - 9.0) * 0.002)
         .collect::<Vec<_>>();
-    let eps = 1e-6f32;
+    let post_eps = 1e-5f32;
+    let pre_eps = 1e-6f32;
 
-    let post_inv = (input.iter().map(|v| v * v).sum::<f32>() / len as f32 + eps)
+    let post_inv = (input.iter().map(|v| v * v).sum::<f32>() / len as f32 + post_eps)
         .sqrt()
         .recip();
     let mut expected_updated = residual.clone();
     for i in 0..len {
         expected_updated[i] += input[i] * post_inv * (1.0 + post_weight[i]);
     }
-    let pre_inv = (expected_updated.iter().map(|v| v * v).sum::<f32>() / len as f32 + eps)
+    let pre_inv = (expected_updated.iter().map(|v| v * v).sum::<f32>() / len as f32 + pre_eps)
         .sqrt()
         .recip();
     let expected_output = expected_updated
@@ -12614,7 +12619,8 @@ fn cuda_rms_norm_add_then_rms_norm_matches_two_step_reference() {
         &post_weight,
         &residual,
         &pre_weight,
-        eps,
+        post_eps,
+        pre_eps,
         true,
         true,
     )
@@ -12706,16 +12712,17 @@ fn cuda_rms_norm_add_then_rms_norm_q8_matches_two_step_reference() {
     let pre_weight = (0..len)
         .map(|i| ((i % 29) as f32 - 14.0) * 0.00175)
         .collect::<Vec<_>>();
-    let eps = 1e-6f32;
+    let post_eps = 1e-5f32;
+    let pre_eps = 1e-6f32;
 
-    let post_inv = (input.iter().map(|v| v * v).sum::<f32>() / len as f32 + eps)
+    let post_inv = (input.iter().map(|v| v * v).sum::<f32>() / len as f32 + post_eps)
         .sqrt()
         .recip();
     let mut expected_updated = residual.clone();
     for i in 0..len {
         expected_updated[i] += input[i] * post_inv * (1.0 + post_weight[i]);
     }
-    let pre_inv = (expected_updated.iter().map(|v| v * v).sum::<f32>() / len as f32 + eps)
+    let pre_inv = (expected_updated.iter().map(|v| v * v).sum::<f32>() / len as f32 + pre_eps)
         .sqrt()
         .recip();
     let expected_output = expected_updated
@@ -12729,7 +12736,8 @@ fn cuda_rms_norm_add_then_rms_norm_q8_matches_two_step_reference() {
         &post_weight,
         &residual,
         &pre_weight,
-        eps,
+        post_eps,
+        pre_eps,
         true,
         true,
     )
@@ -14172,6 +14180,7 @@ fn cuda_q5k_batch_dev_input_q8dot_matches_cpu_and_single_kernel() {
 #[test]
 fn cuda_q6k_batch_dev_input_q8dot_matches_cpu_and_single_kernel() {
     let _guard = runtime_test_lock();
+    let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "0");
     let prev = std::env::var("RNB_CUDA_Q6K_BATCH_Q8DOT").ok();
     std::env::set_var("RNB_CUDA_Q6K_BATCH_Q8DOT", "1");
     let rows = 1024usize;

@@ -4148,12 +4148,27 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
+        let (kernel, grid, block) = if tuning::q4k_q8dot_row4_enabled() {
+            (
+                "rnb_q4k_gemv_q8dot_wide_row4",
+                (rows as u32, 1, 1),
+                (128, 1, 1),
+            )
+        } else if tuning::q4k_q8dot_wide_enabled() {
+            (
+                "rnb_q4k_gemv_q8dot_wide_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        } else {
+            (
+                "rnb_q4k_gemv_q8dot_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        };
         self.launch_cached_gemv(
-            if tuning::q4k_q8dot_wide_enabled() {
-                "rnb_q4k_gemv_q8dot_wide_warp8"
-            } else {
-                "rnb_q4k_gemv_q8dot_warp8"
-            },
+            kernel,
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -4162,8 +4177,8 @@ impl CudaState {
                 (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (rows.div_ceil(8) as u32, 1, 1),
-            (256, 1, 1),
+            grid,
+            block,
         )
     }
 
@@ -4286,12 +4301,27 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
+        let (kernel, grid, block) = if tuning::q4k_q8dot_row4_enabled() {
+            (
+                "rnb_q4k_gate_up_gemv_q8dot_wide_row4",
+                (rows as u32, 1, 1),
+                (128, 1, 1),
+            )
+        } else if tuning::q4k_q8dot_wide_enabled() {
+            (
+                "rnb_q4k_gate_up_gemv_q8dot_wide_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        } else {
+            (
+                "rnb_q4k_gate_up_gemv_q8dot_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        };
         self.launch_cached_gemv(
-            if tuning::q4k_q8dot_wide_enabled() {
-                "rnb_q4k_gate_up_gemv_q8dot_wide_warp8"
-            } else {
-                "rnb_q4k_gate_up_gemv_q8dot_warp8"
-            },
+            kernel,
             &[
                 (&mut gate_out_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut up_out_arg as *mut u64).cast::<libc::c_void>(),
@@ -4302,8 +4332,8 @@ impl CudaState {
                 (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (rows.div_ceil(8) as u32, 1, 1),
-            (256, 1, 1),
+            grid,
+            block,
         )
     }
 
@@ -4770,12 +4800,30 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
-        let kernel = if tuning::q6k_q8dot_wide_enabled() {
-            "rnb_q6k_gemv_q8dot_wide_warp8"
+        let (kernel, grid, block) = if tuning::q6k_q8dot_row4_enabled() {
+            (
+                "rnb_q6k_gemv_q8dot_wide_row4",
+                (rows as u32, 1, 1),
+                (128, 1, 1),
+            )
+        } else if tuning::q6k_q8dot_wide_enabled() {
+            (
+                "rnb_q6k_gemv_q8dot_wide_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
         } else if tuning::q6k_q8dot_half2_enabled() {
-            "rnb_q6k_gemv_q8dot_half2_warp8"
+            (
+                "rnb_q6k_gemv_q8dot_half2_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
         } else {
-            "rnb_q6k_gemv_q8dot_warp8"
+            (
+                "rnb_q6k_gemv_q8dot_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
         };
         self.launch_cached_gemv(
             kernel,
@@ -4787,8 +4835,8 @@ impl CudaState {
                 (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (rows.div_ceil(8) as u32, 1, 1),
-            (256, 1, 1),
+            grid,
+            block,
         )
     }
 
@@ -4810,12 +4858,21 @@ impl CudaState {
         let mut input_ds_arg = input_ds_dev;
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
+        let (kernel, grid, block) = if tuning::q5k_q8dot_wide_enabled() {
+            (
+                "rnb_q5k_gemv_q8dot_wide_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        } else {
+            (
+                "rnb_q5k_gemv_q8dot_warp8",
+                (rows.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+            )
+        };
         self.launch_cached_gemv(
-            if tuning::q5k_q8dot_wide_enabled() {
-                "rnb_q5k_gemv_q8dot_wide_warp8"
-            } else {
-                "rnb_q5k_gemv_q8dot_warp8"
-            },
+            kernel,
             &[
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
@@ -4824,8 +4881,8 @@ impl CudaState {
                 (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (rows.div_ceil(8) as u32, 1, 1),
-            (256, 1, 1),
+            grid,
+            block,
         )
     }
 
@@ -6839,7 +6896,8 @@ impl CudaState {
         residual_dev: u64,
         pre_weight_dev: u64,
         output_dev: u64,
-        eps: f32,
+        post_eps: f32,
+        pre_eps: f32,
         len: usize,
         post_unit_offset: bool,
         pre_unit_offset: bool,
@@ -6849,7 +6907,8 @@ impl CudaState {
         let mut residual_arg = residual_dev;
         let mut pre_weight_arg = pre_weight_dev;
         let mut output_arg = output_dev;
-        let mut eps_arg = eps;
+        let mut post_eps_arg = post_eps;
+        let mut pre_eps_arg = pre_eps;
         let mut len_arg = len as u32;
         let mut post_unit_offset_arg = u32::from(post_unit_offset);
         let mut pre_unit_offset_arg = u32::from(pre_unit_offset);
@@ -6861,7 +6920,8 @@ impl CudaState {
                 (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut pre_weight_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut post_eps_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut pre_eps_arg as *mut f32).cast::<libc::c_void>(),
                 (&mut len_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut post_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut pre_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
@@ -6881,7 +6941,8 @@ impl CudaState {
         output_dev: u64,
         qs_dev: u64,
         ds_dev: u64,
-        eps: f32,
+        post_eps: f32,
+        pre_eps: f32,
         len: usize,
         post_unit_offset: bool,
         pre_unit_offset: bool,
@@ -6898,7 +6959,8 @@ impl CudaState {
         let mut output_arg = output_dev;
         let mut qs_arg = qs_dev;
         let mut ds_arg = ds_dev;
-        let mut eps_arg = eps;
+        let mut post_eps_arg = post_eps;
+        let mut pre_eps_arg = pre_eps;
         let mut len_arg = len as u32;
         let mut post_unit_offset_arg = u32::from(post_unit_offset);
         let mut pre_unit_offset_arg = u32::from(pre_unit_offset);
@@ -6912,7 +6974,8 @@ impl CudaState {
                 (&mut output_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut qs_arg as *mut u64).cast::<libc::c_void>(),
                 (&mut ds_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut post_eps_arg as *mut f32).cast::<libc::c_void>(),
+                (&mut pre_eps_arg as *mut f32).cast::<libc::c_void>(),
                 (&mut len_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut post_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut pre_unit_offset_arg as *mut u32).cast::<libc::c_void>(),

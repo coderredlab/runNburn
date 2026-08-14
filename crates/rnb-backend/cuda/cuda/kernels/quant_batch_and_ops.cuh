@@ -1431,6 +1431,51 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_warp8(
     }
 }
 
+extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_row4(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 210u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned elem = lane * 8u;
+    for (unsigned b = warp; b < blocks_per_row; b += 4u) {
+        const RnbQ6WideLane w =
+            rnb_q6k_wide_lane_decode(row_ptr + b * 210u, elem);
+        const int2 x_raw =
+            rnb_load_i32x2_aligned8(input_qs + b * 256u + elem);
+        const float x_d = input_ds[b * 8u + (elem >> 5)];
+        const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+        const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+        acc += x_d * (w.d * (float)w.sc) * (float)(dot0 - 32 * x_sum0);
+        const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+        const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+        acc += x_d * (w.d * (float)w.sc) * (float)(dot1 - 32 * x_sum1);
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    __shared__ float partial[4];
+    if (lane == 0u) {
+        partial[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        out[row] = partial[0] + partial[1] + partial[2] + partial[3];
+    }
+}
+
 // cu219: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
 extern "C" __global__ void rnb_q6k_gemv_batch_q8dot_wide_warp8(
     float* __restrict__ out,
@@ -1872,6 +1917,7 @@ extern "C" __global__ void rnb_q5k_gemv_q8dot_wide_warp8(
         out[row] = acc;
     }
 }
+
 
 // cu219: wide-lane batch 변형 — 단일 wide 커널과 토큰별 산술 순서 동일.
 extern "C" __global__ void rnb_q5k_gemv_batch_q8dot_wide_warp8(
@@ -3942,7 +3988,8 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_f32(
     float* __restrict__ residual,
     const float* __restrict__ pre_weight,
     float* __restrict__ output,
-    float eps,
+    float post_eps,
+    float pre_eps,
     unsigned len,
     unsigned post_unit_offset,
     unsigned pre_unit_offset) {
@@ -3961,7 +4008,7 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_f32(
         }
         __syncthreads();
     }
-    const float post_inv_rms = rsqrtf(partial[0] / (float)len + eps);
+    const float post_inv_rms = rsqrtf(partial[0] / (float)len + post_eps);
     for (unsigned i = tid; i < len; i += blockDim.x) {
         const float scale =
             post_unit_offset != 0u ? (1.0f + post_weight[i]) : post_weight[i];
@@ -3982,7 +4029,7 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_f32(
         }
         __syncthreads();
     }
-    const float pre_inv_rms = rsqrtf(partial[0] / (float)len + eps);
+    const float pre_inv_rms = rsqrtf(partial[0] / (float)len + pre_eps);
     for (unsigned i = tid; i < len; i += blockDim.x) {
         const float scale = pre_unit_offset != 0u ? (1.0f + pre_weight[i]) : pre_weight[i];
         output[i] = residual[i] * pre_inv_rms * scale;
@@ -3997,7 +4044,8 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_q8_1_f32(
     float* __restrict__ output,
     signed char* __restrict__ out_qs,
     float* __restrict__ out_ds,
-    float eps,
+    float post_eps,
+    float pre_eps,
     unsigned len,
     unsigned post_unit_offset,
     unsigned pre_unit_offset) {
@@ -4016,7 +4064,7 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_q8_1_f32(
         }
         __syncthreads();
     }
-    const float post_inv_rms = rsqrtf(partial[0] / (float)len + eps);
+    const float post_inv_rms = rsqrtf(partial[0] / (float)len + post_eps);
     for (unsigned i = tid; i < len; i += blockDim.x) {
         const float scale =
             post_unit_offset != 0u ? (1.0f + post_weight[i]) : post_weight[i];
@@ -4037,7 +4085,7 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_q8_1_f32(
         }
         __syncthreads();
     }
-    const float pre_inv_rms = rsqrtf(partial[0] / (float)len + eps);
+    const float pre_inv_rms = rsqrtf(partial[0] / (float)len + pre_eps);
     for (unsigned i = tid; i < len; i += blockDim.x) {
         const float scale = pre_unit_offset != 0u ? (1.0f + pre_weight[i]) : pre_weight[i];
         output[i] = residual[i] * pre_inv_rms * scale;

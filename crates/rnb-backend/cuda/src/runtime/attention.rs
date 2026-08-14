@@ -3006,6 +3006,15 @@ impl CudaState {
                 ));
             }
         };
+        let heads_per_group = if num_kv_heads > 0 {
+            num_heads / num_kv_heads
+        } else {
+            0
+        };
+        let hd128_gqa4 = head_dim == 128
+            && heads_per_group >= 4
+            && heads_per_group.is_multiple_of(4)
+            && crate::tuning::decode_attention_hd128_gqa4_enabled();
         let num_chunks = window_len.div_ceil(chunk_size);
         let partial_values = num_heads
             .checked_mul(num_chunks)
@@ -3034,11 +3043,15 @@ impl CudaState {
         let mut scale_arg = scale;
         let mut chunk_size_arg = chunk_size as u32;
         self.launch_cached_gemv(
-            match head_dim {
-                128 => "rnb_attention_decode_hd128_split_partials",
-                256 => "rnb_attention_decode_hd256_split_partials",
-                512 => "rnb_attention_decode_hd512_split_partials",
-                _ => unreachable!("validated head_dim"),
+            if hd128_gqa4 {
+                "rnb_attention_decode_hd128_split_gqa4_partials"
+            } else {
+                match head_dim {
+                    128 => "rnb_attention_decode_hd128_split_partials",
+                    256 => "rnb_attention_decode_hd256_split_partials",
+                    512 => "rnb_attention_decode_hd512_split_partials",
+                    _ => unreachable!("validated head_dim"),
+                }
             },
             &[
                 (&mut partial_arg as *mut u64).cast::<libc::c_void>(),
@@ -3052,8 +3065,26 @@ impl CudaState {
                 (&mut scale_arg as *mut f32).cast::<libc::c_void>(),
                 (&mut chunk_size_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (num_heads as u32, num_chunks as u32, 1),
-            (if head_dim == 128 { 32 } else { head_dim } as u32, 1, 1),
+            (
+                if hd128_gqa4 {
+                    (num_heads / 4) as u32
+                } else {
+                    num_heads as u32
+                },
+                num_chunks as u32,
+                1,
+            ),
+            (
+                if hd128_gqa4 {
+                    128
+                } else if head_dim == 128 {
+                    32
+                } else {
+                    head_dim
+                } as u32,
+                1,
+                1,
+            ),
         )?;
         let mut output_arg = output_dev;
         let mut num_chunks_arg = num_chunks as u32;

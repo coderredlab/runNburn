@@ -580,6 +580,54 @@ extern "C" __global__ void rnb_q4k_gemv_q8dot_wide_warp8(
     }
 }
 
+// cu274: llama.cpp MMVQ와 같은 single-token Ampere mapping. CTA의 4 warp가
+// 한 output row의 K block을 나눠 읽고 shared partial을 합친다.
+extern "C" __global__ void rnb_q4k_gemv_q8dot_wide_row4(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* row_ptr = weights + row * row_bytes;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+    for (unsigned b = warp; b < blocks_per_row; b += 4u) {
+        const RnbQ4WideLane w =
+            rnb_q4k_wide_lane_decode(row_ptr + b * 144u, j, elem);
+        const unsigned x_off = b * 256u + j * 32u + elem;
+        const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+        const float x_d = input_ds[b * 8u + j];
+        const int dot0 = __dp4a(w.q_pack0, x_raw.x, 0);
+        const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+        acc += x_d * ((w.d * w.sc) * (float)dot0 - w.dmin * w.mn * (float)x_sum0);
+        const int dot1 = __dp4a(w.q_pack1, x_raw.y, 0);
+        const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+        acc += x_d * ((w.d * w.sc) * (float)dot1 - w.dmin * w.mn * (float)x_sum1);
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    __shared__ float partial[4];
+    if (lane == 0u) {
+        partial[warp] = acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        out[row] = partial[0] + partial[1] + partial[2] + partial[3];
+    }
+}
+
 extern "C" __global__ void rnb_q4k_gemv_gelu_mul_warp8(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -970,6 +1018,71 @@ extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_warp8(
     if (valid && lane == 0u) {
         gate_out[row] = gate_acc;
         up_out[row] = up_acc;
+    }
+}
+
+extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_row4(
+    float* __restrict__ gate_out,
+    float* __restrict__ up_out,
+    const unsigned char* __restrict__ gate_weights,
+    const unsigned char* __restrict__ up_weights,
+    const signed char* __restrict__ input_qs,
+    const float* __restrict__ input_ds,
+    unsigned rows,
+    unsigned blocks_per_row) {
+    const unsigned warp = threadIdx.x >> 5;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    const unsigned row_bytes = blocks_per_row * 144u;
+    const unsigned char* gate_row_ptr = gate_weights + row * row_bytes;
+    const unsigned char* up_row_ptr = up_weights + row * row_bytes;
+    const unsigned j = lane >> 2;
+    const unsigned elem = (lane & 3u) * 8u;
+    for (unsigned b = warp; b < blocks_per_row; b += 4u) {
+        const RnbQ4WideLane g =
+            rnb_q4k_wide_lane_decode(gate_row_ptr + b * 144u, j, elem);
+        const RnbQ4WideLane u =
+            rnb_q4k_wide_lane_decode(up_row_ptr + b * 144u, j, elem);
+        const unsigned x_off = b * 256u + j * 32u + elem;
+        const int2 x_raw = rnb_load_i32x2_aligned8(input_qs + x_off);
+        const float x_d = input_ds[b * 8u + j];
+        const int x_sum0 = __dp4a(0x01010101, x_raw.x, 0);
+        const int x_sum1 = __dp4a(0x01010101, x_raw.y, 0);
+        const int gate_dot0 = __dp4a(g.q_pack0, x_raw.x, 0);
+        gate_acc += x_d
+            * ((g.d * g.sc) * (float)gate_dot0 - g.dmin * g.mn * (float)x_sum0);
+        const int gate_dot1 = __dp4a(g.q_pack1, x_raw.y, 0);
+        gate_acc += x_d
+            * ((g.d * g.sc) * (float)gate_dot1 - g.dmin * g.mn * (float)x_sum1);
+        const int up_dot0 = __dp4a(u.q_pack0, x_raw.x, 0);
+        up_acc += x_d
+            * ((u.d * u.sc) * (float)up_dot0 - u.dmin * u.mn * (float)x_sum0);
+        const int up_dot1 = __dp4a(u.q_pack1, x_raw.y, 0);
+        up_acc += x_d
+            * ((u.d * u.sc) * (float)up_dot1 - u.dmin * u.mn * (float)x_sum1);
+    }
+    for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+        gate_acc += __shfl_down_sync(0xffffffffu, gate_acc, offset);
+        up_acc += __shfl_down_sync(0xffffffffu, up_acc, offset);
+    }
+
+    __shared__ float gate_partial[4];
+    __shared__ float up_partial[4];
+    if (lane == 0u) {
+        gate_partial[warp] = gate_acc;
+        up_partial[warp] = up_acc;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        gate_out[row] =
+            gate_partial[0] + gate_partial[1] + gate_partial[2] + gate_partial[3];
+        up_out[row] = up_partial[0] + up_partial[1] + up_partial[2] + up_partial[3];
     }
 }
 

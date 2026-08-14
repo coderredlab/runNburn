@@ -286,12 +286,12 @@ pub fn q4k_gate_up_batch_seq2_q8dot_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_GATE_UP_BATCH_SEQ2_Q8DOT", false)
 }
 
-/// Q4_K dense gate/up decode는 같은 Q8_1 activation을 두 단일 projection launch가
-/// 재사용한다. cu206 RTX 3090 Qwen3.6 27B에서 fused 2-accumulator kernel보다
-/// register/live-state가 작아 100-token generation이 5.38% 빨랐고 출력은 exact였다.
-/// 진단 비교는 `RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT=0`으로 기존 fused kernel을 되켠다.
+/// cu206의 구세대 Q4 gate/up kernel에서는 두 단일 projection으로 나누는 편이
+/// 빨랐다. cu216 wide-lane 세대 이후에는 fused kernel이 shared Q8_1 activation
+/// load와 x-sum을 재사용해 cu274 RTX 3090의 Muse 30B와 Qwen3.6 27B decode를
+/// 각각 3.35%, 2.38% 줄였다. `=1`은 구 split 진단 경로다.
 pub fn q4k_gate_up_q8dot_split_enabled() -> bool {
-    env_bool("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", true)
+    env_bool("RNB_CUDA_Q4K_GATE_UP_Q8DOT_SPLIT", false)
 }
 
 /// Q6_K blocks are 210 bytes, so ql/qh pointers are always 2-byte aligned but
@@ -355,6 +355,14 @@ pub fn q5k_q8dot_wide_enabled() -> bool {
 /// `RNB_CUDA_Q6K_Q8DOT_WIDE=0` 은 기존 half2/byte 세대로 되돌리는 진단 opt-out.
 pub fn q6k_q8dot_wide_enabled() -> bool {
     env_bool("RNB_CUDA_Q6K_Q8DOT_WIDE", true)
+}
+
+pub fn q4k_q8dot_row4_enabled() -> bool {
+    env_bool("RNB_CUDA_Q4K_Q8DOT_ROW4", true)
+}
+
+pub fn q6k_q8dot_row4_enabled() -> bool {
+    env_bool("RNB_CUDA_Q6K_Q8DOT_ROW4", true)
 }
 
 pub fn q4k_prefill_f32_gemm_enabled() -> bool {
@@ -844,6 +852,10 @@ pub fn decode_attention_enabled() -> bool {
     env_is_one("RNB_CUDA_DECODE_ATTN")
 }
 
+pub fn full_device_decode_qkv_q8dot_enabled() -> bool {
+    env_bool("RNB_CUDA_FULL_DEVICE_DECODE_QKV_Q8DOT", true)
+}
+
 pub fn decode_attention_kv_cache_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_KV_CACHE", true)
 }
@@ -854,6 +866,10 @@ pub fn decode_attention_sliding_window_enabled() -> bool {
 
 pub fn decode_attention_hd512_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_HD512", true)
+}
+
+pub fn decode_attention_hd128_gqa4_enabled() -> bool {
+    env_bool("RNB_CUDA_DECODE_ATTN_HD128_GQA4", true)
 }
 
 pub fn decode_attention_hd128_split_enabled() -> bool {
@@ -1397,6 +1413,8 @@ mod tests {
             std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_WIDE");
             std::env::remove_var("RNB_CUDA_Q5K_Q8DOT_WIDE");
             std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_WIDE");
+            std::env::remove_var("RNB_CUDA_Q4K_Q8DOT_ROW4");
+            std::env::remove_var("RNB_CUDA_Q6K_Q8DOT_ROW4");
         }
         assert!(output_logits_enabled());
         assert!(prefill_output_logits_requested());
@@ -1416,7 +1434,7 @@ mod tests {
         assert!(q6k_packed_batch_warp4_enabled(14));
         assert!(!q6k_packed_batch_warp4_enabled(7));
         assert!(q6k_gemv_batch_warp8_enabled());
-        assert!(q4k_gate_up_q8dot_split_enabled());
+        assert!(!q4k_gate_up_q8dot_split_enabled());
         assert!(q6k_q8dot_half2_enabled());
         assert!(gdn_delta_warp128_enabled());
         assert!(q4k_q8dot_pair2_enabled());
@@ -1425,6 +1443,8 @@ mod tests {
         assert!(q4k_q8dot_wide_enabled());
         assert!(q5k_q8dot_wide_enabled());
         assert!(q6k_q8dot_wide_enabled());
+        assert!(q4k_q8dot_row4_enabled());
+        assert!(q6k_q8dot_row4_enabled());
         assert!(!resident_q4k_touch_hits_enabled());
         assert!(!resident_q4k_arena_enabled());
         assert!(!resident_q4k_batch_pinned_staging_enabled(1024 * 1024, 2));

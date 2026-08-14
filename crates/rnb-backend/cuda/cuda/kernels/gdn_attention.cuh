@@ -1895,6 +1895,99 @@ extern "C" __global__ void rnb_attention_decode_hd128_split_partials(
     }
 }
 
+extern "C" __global__ void rnb_attention_decode_hd128_split_gqa4_partials(
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_meta,
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale,
+    unsigned chunk_size) {
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31u;
+    const unsigned head_in_block = tid >> 5u;
+    const unsigned h = blockIdx.x * 4u + head_in_block;
+    const unsigned chunk = blockIdx.y;
+    if (num_kv_heads == 0u || chunk_size == 0u || h >= num_heads) {
+        return;
+    }
+
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned num_chunks = (kv_len + chunk_size - 1u) / chunk_size;
+    const unsigned start = chunk * chunk_size;
+    unsigned end = start + chunk_size;
+    if (end > kv_len) {
+        end = kv_len;
+    }
+    const unsigned q_base = h * 128u;
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+    const float q2 = q[q_base + lane + 64u];
+    const float q3 = q[q_base + lane + 96u];
+    __shared__ float k_tile[8][128];
+    __shared__ float v_tile[8][128];
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (unsigned tile_start = start; tile_start < end; tile_start += 8u) {
+#pragma unroll
+        for (unsigned item = 0u; item < 8u; ++item) {
+            const unsigned j = tile_start + item;
+            if (j < end && tid < 128u) {
+                const unsigned kv_base = j * num_kv_heads * 128u + kv_h * 128u;
+                k_tile[item][tid] = __half2float(__ushort_as_half(k[kv_base + tid]));
+                v_tile[item][tid] = __half2float(__ushort_as_half(v[kv_base + tid]));
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned item = 0u; item < 8u; ++item) {
+            if (tile_start + item >= end) {
+                break;
+            }
+            float dot = (q0 * k_tile[item][lane] + q2 * k_tile[item][lane + 64u])
+                + (q1 * k_tile[item][lane + 32u] + q3 * k_tile[item][lane + 96u]);
+            for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+            dot = __shfl_sync(0xffffffffu, dot, 0);
+            const float score = dot * scale;
+            const float new_max = fmaxf(row_max, score);
+            const float old_scale = row_max == -3.4028234663852886e38f
+                ? 0.0f
+                : expf(row_max - new_max);
+            const float p = expf(score - new_max);
+            acc0 = acc0 * old_scale + p * v_tile[item][lane];
+            acc1 = acc1 * old_scale + p * v_tile[item][lane + 32u];
+            acc2 = acc2 * old_scale + p * v_tile[item][lane + 64u];
+            acc3 = acc3 * old_scale + p * v_tile[item][lane + 96u];
+            row_sum = row_sum * old_scale + p;
+            row_max = new_max;
+        }
+        __syncthreads();
+    }
+
+    const unsigned chunk_base = h * num_chunks + chunk;
+    const unsigned acc_base = chunk_base * 128u;
+    partial_acc[acc_base + lane] = acc0;
+    partial_acc[acc_base + lane + 32u] = acc1;
+    partial_acc[acc_base + lane + 64u] = acc2;
+    partial_acc[acc_base + lane + 96u] = acc3;
+    if (lane == 0u) {
+        partial_meta[chunk_base * 2u] = row_max;
+        partial_meta[chunk_base * 2u + 1u] = row_sum;
+    }
+}
+
 extern "C" __global__ void rnb_attention_decode_hd128_split_reduce(
     float* __restrict__ out,
     const float* __restrict__ partial_acc,

@@ -57,10 +57,18 @@ impl CudaState {
         }
         let input_blocks = n_embd / 256;
         let f32_size = std::mem::size_of::<f32>();
-
-        // Reserve every shared scratch slab at its largest use before the first
-        // asynchronous launch. Later stages reuse K storage only after attention.
-        let norm_dev = self.decode_rms_input_ptr(n_embd * f32_size)?;
+        let qkv_q8dot = tuning::full_device_decode_qkv_q8dot_enabled();
+        let q8_qs_bytes = input_blocks * 256;
+        let q8_ds_bytes = input_blocks * 8 * f32_size;
+        let norm_bytes = n_embd * f32_size;
+        let norm_dev = self.decode_rms_input_ptr(
+            norm_bytes
+                + if qkv_q8dot {
+                    q8_qs_bytes + q8_ds_bytes
+                } else {
+                    0
+                },
+        )?;
         let q_dev = self.compute_input_ptr(q_rows * f32_size)?;
         let mid_a_dev = self.compute_mid_a_ptr(kv_dim.max(n_embd) * f32_size)?;
         let k_dev = mid_a_dev;
@@ -72,16 +80,75 @@ impl CudaState {
         let down_dev = mid_a_dev;
 
         self.launch_rms_norm_device(hidden_dev, attn_norm, n_embd, norm_eps, norm_dev)?;
-        self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
-        self.q4k_gemv_device_to_device(k_weights, kv_dim, input_blocks, norm_dev, k_dev)?;
         let expected_v_q4k_bytes = kv_dim * input_blocks * 144;
-        if v_weights.len() == expected_v_q4k_bytes {
-            self.q4k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
+        if qkv_q8dot {
+            let q8_qs_dev = norm_dev + norm_bytes as u64;
+            let q8_ds_dev = q8_qs_dev + q8_qs_bytes as u64;
+            self.launch_quantize_q8_1_by_32(norm_dev, q8_qs_dev, q8_ds_dev, input_blocks * 256)?;
+            self.launch_q4k_gemv_q8dot_to_dev(
+                q_weights,
+                q_rows,
+                input_blocks,
+                q8_qs_dev,
+                q8_ds_dev,
+                q_dev,
+            )?;
+            self.launch_q4k_gemv_q8dot_to_dev(
+                k_weights,
+                kv_dim,
+                input_blocks,
+                q8_qs_dev,
+                q8_ds_dev,
+                k_dev,
+            )?;
+            if v_weights.len() == expected_v_q4k_bytes {
+                self.launch_q4k_gemv_q8dot_to_dev(
+                    v_weights,
+                    kv_dim,
+                    input_blocks,
+                    q8_qs_dev,
+                    q8_ds_dev,
+                    v_dev,
+                )?;
+            } else {
+                self.launch_q6k_gemv_q8dot_to_dev(
+                    v_weights,
+                    kv_dim,
+                    input_blocks,
+                    q8_qs_dev,
+                    q8_ds_dev,
+                    v_dev,
+                )?;
+            }
+            if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev)
+            {
+                self.launch_q4k_gemv_q8dot_to_dev(
+                    weights,
+                    q_rows,
+                    input_blocks,
+                    q8_qs_dev,
+                    q8_ds_dev,
+                    output_dev,
+                )?;
+            }
         } else {
-            self.q6k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
-        }
-        if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev) {
-            self.q4k_gemv_device_to_device(weights, q_rows, input_blocks, norm_dev, output_dev)?;
+            self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
+            self.q4k_gemv_device_to_device(k_weights, kv_dim, input_blocks, norm_dev, k_dev)?;
+            if v_weights.len() == expected_v_q4k_bytes {
+                self.q4k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
+            } else {
+                self.q6k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
+            }
+            if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev)
+            {
+                self.q4k_gemv_device_to_device(
+                    weights,
+                    q_rows,
+                    input_blocks,
+                    norm_dev,
+                    output_dev,
+                )?;
+            }
         }
 
         if let Some(qn) = q_norm_weight {
