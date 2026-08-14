@@ -1070,6 +1070,7 @@ pub struct DecodeOutputArgmaxSpecRef<'a> {
 #[cfg(target_os = "macos")]
 struct BatchedOutputTailBuffers {
     normed: Retained<ProtocolObject<dyn MTLBuffer>>,
+    _normed_f16: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     token_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
@@ -1627,6 +1628,14 @@ pub struct MusePrefillFullLayerBackendRequest<'a> {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
+pub struct DflashFullLayerOutputTop1BackendRequest<'a> {
+    pub output_norm_w: &'a [f32],
+    pub output_weight: PrefillAtnCoreWeightView<'a>,
+    pub batch: usize,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
 pub struct DflashFullLayerBackendRequest<'a> {
     pub hidden: &'a [f32],
     pub attn_norm_w: &'a [f32],
@@ -1657,6 +1666,20 @@ pub struct DflashFullLayerBackendRequest<'a> {
     pub sliding_window: usize,
     pub layer_index: usize,
     pub layer_count: usize,
+    pub output_top1: Option<DflashFullLayerOutputTop1BackendRequest<'a>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct DflashOutputTop1 {
+    pub tokens: Vec<u32>,
+    pub probabilities: Vec<f32>,
+}
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct DflashFullLayerBackendOut {
+    pub hidden: Vec<f32>,
+    pub output_top1: Option<DflashOutputTop1>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2174,6 +2197,12 @@ pub struct MetalBackend {
         >,
     >,
     dflash_full_layer_range_state: RefCell<Option<DflashFullLayerRangeState>>,
+    dflash_output_top1_carrier: RefCell<
+        Option<(
+            (usize, usize, usize, u32),
+            prefill_atn_core_chain::DflashOutputTop1Carrier,
+        )>,
+    >,
     dflash_cache_seed_carrier: RefCell<
         Option<(
             (usize, usize, usize, usize, usize, usize, usize),
@@ -2465,6 +2494,7 @@ impl MetalBackend {
                 dflash_attention_carriers: RefCell::new(HashMap::new()),
                 dflash_full_layer_carriers: RefCell::new(HashMap::new()),
                 dflash_full_layer_range_state: RefCell::new(None),
+                dflash_output_top1_carrier: RefCell::new(None),
                 dflash_cache_seed_carrier: RefCell::new(None),
                 muse_target_attention_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_core_carriers: RefCell::new(HashMap::new()),
@@ -2709,6 +2739,7 @@ impl MetalBackend {
             dflash_attention_carriers: RefCell::new(HashMap::new()),
             dflash_full_layer_carriers: RefCell::new(HashMap::new()),
             dflash_full_layer_range_state: RefCell::new(None),
+            dflash_output_top1_carrier: RefCell::new(None),
             dflash_cache_seed_carrier: RefCell::new(None),
             muse_target_attention_carriers: RefCell::new(HashMap::new()),
             prefill_atn_core_carriers: RefCell::new(HashMap::new()),
@@ -5373,7 +5404,7 @@ impl MetalBackend {
     pub fn dflash_full_layer_if_supported(
         &self,
         req: DflashFullLayerBackendRequest<'_>,
-    ) -> std::result::Result<Option<Vec<f32>>, String> {
+    ) -> std::result::Result<Option<DflashFullLayerBackendOut>, String> {
         let result = self.dflash_full_layer_if_supported_impl(req);
         let interrupted = result.is_err() || result.as_ref().is_ok_and(Option::is_none);
         let had_active_range = interrupted
@@ -5402,7 +5433,7 @@ impl MetalBackend {
     fn dflash_full_layer_if_supported_impl(
         &self,
         req: DflashFullLayerBackendRequest<'_>,
-    ) -> std::result::Result<Option<Vec<f32>>, String> {
+    ) -> std::result::Result<Option<DflashFullLayerBackendOut>, String> {
         let Some(ctx) = self.ctx.as_ref() else {
             return Ok(None);
         };
@@ -5453,6 +5484,24 @@ impl MetalBackend {
             Self::atn_core_require_eq(&format!("{role} cols"), weight.cols, cols)?;
             Self::atn_core_validate_weight(role, weight)?;
         }
+        let output_top1 = req
+            .output_top1
+            .filter(|_| std::env::var("RNB_METAL_DFLASH_OUTPUT_TOP1").as_deref() == Ok("1"));
+        if let Some(output) = output_top1 {
+            if req.layer_index + 1 != req.layer_count
+                || output.batch == 0
+                || output.batch > 16
+                || output.batch + 1 > req.seq_len
+                || output.output_norm_w.len() != req.hidden_dim
+                || output.output_weight.quant != TensoropsQuant::Q5K
+                || output.output_weight.rows == 0
+                || output.output_weight.cols != req.hidden_dim
+                || !Self::atn_core_tensorops_v2_ready(ctx, output.output_weight.quant)
+            {
+                return Err("Metal DFlash integrated output tail contract mismatch".to_string());
+            }
+            Self::atn_core_validate_weight("output", output.output_weight)?;
+        }
 
         let (
             q_w_buf,
@@ -5488,6 +5537,13 @@ impl MetalBackend {
                 q, qo, k, ko, v, vo, o, oo, gate, gate_o, up, up_o, down, down_o,
             )
         };
+        let output_weight_resident = output_top1.map(|output| {
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
+                .entry(resident_key(output.output_weight.raw))
+                .or_insert_with(|| resident_cache_entry(ctx, output.output_weight.raw));
+            (entry.0.clone(), entry.1)
+        });
         let key = (
             req.seq_len,
             req.num_heads,
@@ -5540,12 +5596,52 @@ impl MetalBackend {
                 req.sliding_window,
             )
         });
-        let hidden = prefill_atn_core_chain::dflash_full_layer_dispatch(
+        let mut output_slot = self.dflash_output_top1_carrier.borrow_mut();
+        if let Some(output) = output_top1 {
+            let output_key = (
+                output.batch,
+                req.hidden_dim,
+                output.output_weight.rows,
+                req.norm_eps.to_bits(),
+            );
+            if output_slot
+                .as_ref()
+                .is_none_or(|(cached_key, _)| *cached_key != output_key)
+            {
+                *output_slot = Some((
+                    output_key,
+                    prefill_atn_core_chain::DflashOutputTop1Carrier::new(
+                        ctx,
+                        output.batch,
+                        req.hidden_dim,
+                        output.output_weight.rows,
+                        req.norm_eps,
+                    ),
+                ));
+            }
+        }
+        let output_dispatch = match (
+            output_top1,
+            output_weight_resident.as_ref(),
+            output_slot.as_ref(),
+        ) {
+            (Some(output), Some((weight_buf, weight_off)), Some((_, output_carrier))) => {
+                Some(prefill_atn_core_chain::DflashOutputTop1DispatchRequest {
+                    carrier: output_carrier,
+                    output_norm_w: output.output_norm_w,
+                    output_w_buf: weight_buf,
+                    output_w_off: *weight_off,
+                    output_quant: output.output_weight.quant,
+                })
+            }
+            _ => None,
+        };
+        let output = prefill_atn_core_chain::dflash_full_layer_dispatch(
             ctx,
             carrier,
             &hidden_dev,
             false,
-            final_layer,
+            final_layer && output_dispatch.is_none(),
             prefill_atn_core_chain::DflashFullLayerDispatchRequest {
                 layer: prefill_atn_core_chain::PrefillAtnFullLayerDispatchRequest {
                     core: prefill_atn_core_chain::PrefillAtnCoreDispatchRequest {
@@ -5583,13 +5679,142 @@ impl MetalBackend {
                 rope_theta: req.rope_theta,
                 norm_eps: req.norm_eps,
             },
+            output_dispatch,
         );
+        drop(output_slot);
         drop(carriers);
         if final_layer {
             self.dflash_full_layer_range_state.borrow_mut().take();
         }
-        Ok(Some(hidden?))
+        let output = output?;
+        Ok(Some(DflashFullLayerBackendOut {
+            hidden: output.hidden,
+            output_top1: output
+                .output_top1
+                .map(|(tokens, probabilities)| DflashOutputTop1 {
+                    tokens,
+                    probabilities,
+                }),
+        }))
     }
+    #[cfg(target_os = "macos")]
+    pub fn dflash_output_top1_if_supported(
+        &self,
+        normalized: &[f32],
+        output_weight: PrefillAtnCoreWeightView<'_>,
+    ) -> std::result::Result<Option<DflashOutputTop1>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if !ctx.tensorops_capable
+            || output_weight.quant != TensoropsQuant::Q5K
+            || output_weight.rows == 0
+            || output_weight.cols == 0
+            || normalized.is_empty()
+            || !normalized.len().is_multiple_of(output_weight.cols)
+        {
+            return Ok(None);
+        }
+        let batch = normalized.len() / output_weight.cols;
+        if batch > 16 {
+            return Ok(None);
+        }
+
+        let (weight_buf, weight_off) = {
+            let mut resident = self.resident.borrow_mut();
+            let entry = resident
+                .entry(resident_key(output_weight.raw))
+                .or_insert_with(|| resident_cache_entry(ctx, output_weight.raw));
+            (entry.0.clone(), entry.1)
+        };
+        let input_buf = ffn_chain::shared_f32_buf(ctx, normalized);
+        let input_f16_buf = ffn_chain::empty_f16_buf(ctx, normalized.len());
+        let logits_buf = ffn_chain::empty_f32_buf(ctx, batch.saturating_mul(output_weight.rows));
+        let token_buf = ffn_chain::shared_u32_buf(ctx, &vec![0u32; batch]);
+        let probability_buf = ffn_chain::empty_f32_buf(ctx, batch);
+        let input_elems_buf = ffn_chain::u32_buf(
+            ctx,
+            u32::try_from(normalized.len())
+                .map_err(|_| "Metal DFlash output input is too large".to_string())?,
+        );
+        let rows_buf = ffn_chain::u32_buf(
+            ctx,
+            u32::try_from(output_weight.rows)
+                .map_err(|_| "Metal DFlash output rows exceed u32".to_string())?,
+        );
+        let cols_buf = ffn_chain::u32_buf(
+            ctx,
+            u32::try_from(output_weight.cols)
+                .map_err(|_| "Metal DFlash output cols exceed u32".to_string())?,
+        );
+        let batch_buf = ffn_chain::u32_buf(
+            ctx,
+            u32::try_from(batch)
+                .map_err(|_| "Metal DFlash output batch exceeds u32".to_string())?,
+        );
+
+        let command = ctx
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| "Metal DFlash output command buffer creation failed".to_string())?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or_else(|| "Metal DFlash output encoder creation failed".to_string())?;
+        compute::encode_cast_f32_to_f16(
+            ctx,
+            &encoder,
+            &input_buf,
+            &input_f16_buf,
+            &input_elems_buf,
+            normalized.len(),
+        );
+        compute::chain_barrier_resources(ctx, &encoder, [&*input_f16_buf]);
+        prefill_atn_core_chain::encode_quant_gemm_v2(
+            ctx,
+            &encoder,
+            output_weight.quant,
+            &weight_buf,
+            weight_off,
+            &input_f16_buf,
+            &logits_buf,
+            &rows_buf,
+            &cols_buf,
+            &batch_buf,
+            output_weight.rows,
+            batch,
+        );
+        compute::chain_barrier_resources(ctx, &encoder, [&*logits_buf]);
+        for row in 0..batch {
+            compute::encode_top1_probability_f32_at(
+                ctx,
+                &encoder,
+                &logits_buf,
+                row * output_weight.rows * std::mem::size_of::<f32>(),
+                &token_buf,
+                row * std::mem::size_of::<u32>(),
+                &probability_buf,
+                row * std::mem::size_of::<f32>(),
+                &rows_buf,
+            );
+        }
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        prefill_atn_core_chain::ensure_command_completed(&command)?;
+
+        let tokens = unsafe {
+            std::slice::from_raw_parts(token_buf.contents().as_ptr() as *const u32, batch).to_vec()
+        };
+        let probabilities = unsafe {
+            std::slice::from_raw_parts(probability_buf.contents().as_ptr() as *const f32, batch)
+                .to_vec()
+        };
+        Ok(Some(DflashOutputTop1 {
+            tokens,
+            probabilities,
+        }))
+    }
+
     #[cfg(target_os = "macos")]
     pub fn dflash_cache_seed_if_supported(
         &self,
@@ -14925,6 +15150,9 @@ impl MetalBackend {
             (entry.0.clone(), entry.1)
         };
         let normed = ffn_chain::empty_f32_buf(ctx, batch * hidden_dim);
+        let output_tensorops = tail.output_quant == 1 && batch <= 16;
+        let normed_f16 =
+            output_tensorops.then(|| ffn_chain::empty_f16_buf(ctx, batch * hidden_dim));
         let logits = ffn_chain::empty_f32_buf(ctx, batch * tail.rows);
         let norm_w_buf = ffn_chain::shared_f32_buf(ctx, tail.norm_weight);
         let dim_buf = ffn_chain::u32_buf(ctx, hidden_dim as u32);
@@ -14933,6 +15161,7 @@ impl MetalBackend {
         let cols_buf = ffn_chain::u32_buf(ctx, tail.cols as u32);
         let out_off_buf = ffn_chain::u32_buf(ctx, out_off);
         let b_buf = ffn_chain::u32_buf(ctx, batch as u32);
+        let normed_elems_buf = ffn_chain::u32_buf(ctx, (batch * hidden_dim) as u32);
         let token_bufs = (0..batch)
             .map(|_| {
                 ctx.device
@@ -14958,19 +15187,35 @@ impl MetalBackend {
             );
         }
         enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        compute::encode_gemv_quant_bcol(
-            ctx,
-            enc,
-            tail.output_quant,
-            &out_w,
-            &normed,
-            &logits,
-            &rows_buf,
-            &cols_buf,
-            &out_off_buf,
-            &b_buf,
-            tail.rows,
-        );
+        if let Some(normed_f16) = normed_f16.as_ref() {
+            compute::encode_cast_f32_to_f16(
+                ctx,
+                enc,
+                &normed,
+                normed_f16,
+                &normed_elems_buf,
+                batch * hidden_dim,
+            );
+            compute::chain_barrier_resources(ctx, enc, [&**normed_f16]);
+            compute::encode_gemm_q5k_tensorops_v2_64x8_packed(
+                ctx, enc, &out_w, out_off, normed_f16, &logits, &rows_buf, &cols_buf, &b_buf,
+                tail.rows, batch,
+            );
+        } else {
+            compute::encode_gemv_quant_bcol(
+                ctx,
+                enc,
+                tail.output_quant,
+                &out_w,
+                &normed,
+                &logits,
+                &rows_buf,
+                &cols_buf,
+                &out_off_buf,
+                &b_buf,
+                tail.rows,
+            );
+        }
         enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         for (lane, token_buf) in token_bufs.iter().enumerate() {
             compute::encode_argmax_f32_at(
@@ -14984,6 +15229,7 @@ impl MetalBackend {
         }
 
         BatchedOutputTailBuffers {
+            _normed_f16: normed_f16,
             normed,
             logits,
             token_bufs,
@@ -19931,6 +20177,93 @@ kernel void coop_right_direct_fill_probe(
                 global_rel < 1e-2,
                 "q5k v2 (N={n},K={k},M={m}) mismatch: global_rel={global_rel}"
             );
+        }
+    }
+
+    /// DFlash target verify의 M<=16 packed Q4_K/Q5_K 경로는 CPU dequant dot와
+    /// production tensorops의 F16 staging 오차 범위 안에서 일치해야 한다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires M5 Metal device"]
+    fn tensorops_dflash_packed_tiles_match_cpu_reference() {
+        let ctx = crate::compute::build_metal_context().expect("metal ctx");
+        if !ctx.tensorops_capable {
+            eprintln!("[dflash] not tensorops-capable; skipping packed tiles");
+            return;
+        }
+        for m in [7usize, 13, 16] {
+            let n = 96usize;
+            let k = 1024usize;
+            let input = det_vals(m * k, 0.05);
+
+            let q4 = quantize_rows_q4k(&det_vals(n * k, 0.02), n, k);
+            let q4_want = cpu_q4k_gemm_reference(&q4, n, k, &input, m);
+            let q4_got = crate::compute::run_q4k_tensorops_v2_variant(
+                &ctx,
+                &q4,
+                &input,
+                n,
+                k,
+                m,
+                "gemm_q4k_tensorops_v2_64x8_packed",
+                64,
+                8,
+            );
+            let q4_max_abs = q4_got
+                .iter()
+                .zip(&q4_want)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            let q4_max_w = q4_want.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            assert!(
+                q4_max_abs / q4_max_w.max(1e-3) < 1e-2,
+                "packed Q4_K mismatch at M={m}"
+            );
+
+            let q5 = build_q5k_rows(n, k);
+            let q5_want = cpu_q5k_gemm_reference(&q5, n, k, &input, m);
+            let q5_got = crate::compute::run_q5k_tensorops_v2_variant(
+                &ctx,
+                &q5,
+                &input,
+                n,
+                k,
+                m,
+                "gemm_q5k_tensorops_v2_64x8_packed",
+                64,
+                8,
+            );
+            let q5_max_abs = q5_got
+                .iter()
+                .zip(&q5_want)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0.0f32, f32::max);
+            let q5_max_w = q5_want.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            assert!(
+                q5_max_abs / q5_max_w.max(1e-3) < 1e-2,
+                "packed Q5_K mismatch at M={m}"
+            );
+
+            let q6 = build_q6k_rows(n, k);
+            let q6_want = cpu_q6k_gemm_reference(&q6, n, k, &input, m);
+            let q6_max_w = q6_want.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            for kernel in [
+                "gemm_q6k_tensorops_v2_64x8_parallel2",
+                "gemm_q6k_tensorops_v2_64x8_parallel4",
+            ] {
+                let q6_got = crate::compute::run_q6k_tensorops_v2_variant(
+                    &ctx, &q6, &input, n, k, m, kernel, 64, 8,
+                );
+                let q6_max_abs = q6_got
+                    .iter()
+                    .zip(&q6_want)
+                    .map(|(got, want)| (got - want).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    q6_max_abs / q6_max_w.max(1e-3) < 1e-2,
+                    "{kernel} mismatch at M={m}"
+                );
+            }
         }
     }
 

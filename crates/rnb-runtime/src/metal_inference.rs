@@ -220,6 +220,15 @@ pub struct MetalMusePrefillFullLayerOut {
     pub v_bits: Vec<u16>,
 }
 
+pub struct MetalDflashFullLayerOutputTop1Request<'a> {
+    pub output_norm_w: &'a [f32],
+    pub output_weight_ggml: GGMLType,
+    pub output_weight_raw: &'a [u8],
+    pub output_weight_rows: usize,
+    pub output_weight_cols: usize,
+    pub batch: usize,
+}
+
 pub struct MetalDflashFullLayerRequest<'a> {
     pub hidden: &'a [f32],
     pub attn_norm_w: &'a [f32],
@@ -271,6 +280,24 @@ pub struct MetalDflashFullLayerRequest<'a> {
     pub sliding_window: usize,
     pub layer_index: usize,
     pub layer_count: usize,
+    pub output_top1: Option<MetalDflashFullLayerOutputTop1Request<'a>>,
+}
+
+pub struct MetalDflashOutputTop1Request<'a> {
+    pub normalized: &'a [f32],
+    pub output_weight_ggml: GGMLType,
+    pub output_weight_raw: &'a [u8],
+    pub output_weight_rows: usize,
+    pub output_weight_cols: usize,
+}
+
+pub struct MetalDflashOutputTop1 {
+    pub tokens: Vec<u32>,
+    pub probabilities: Vec<f32>,
+}
+pub struct MetalDflashFullLayerOut {
+    pub hidden: Vec<f32>,
+    pub output_top1: Option<MetalDflashOutputTop1>,
 }
 pub struct MetalDflashCacheSeedLayer<'a> {
     pub k_norm_w: &'a [f32],
@@ -6296,7 +6323,7 @@ pub fn metal_muse_prefill_full_layer_if_supported(
 }
 pub fn metal_dflash_full_layer_if_supported(
     req: MetalDflashFullLayerRequest<'_>,
-) -> Result<Option<Vec<f32>>> {
+) -> Result<Option<MetalDflashFullLayerOut>> {
     let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
         return Ok(None);
     };
@@ -6318,75 +6345,129 @@ pub fn metal_dflash_full_layer_if_supported(
     let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight_ggml) else {
         return Ok(None);
     };
-    METAL.with(|backend| {
-        backend.dflash_full_layer_if_supported(rnb_backend_metal::DflashFullLayerBackendRequest {
-            hidden: req.hidden,
-            attn_norm_w: req.attn_norm_w,
-            q_norm_w: req.q_norm_w,
-            k_norm_w: req.k_norm_w,
-            ffn_norm_w: req.ffn_norm_w,
-            q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.q_weight_raw,
-                quant: q_quant,
-                rows: req.q_weight_rows,
-                cols: req.q_weight_cols,
+    let output_top1 = if let Some(output) = req.output_top1.as_ref() {
+        let Some(output_quant) = tensorops_quant_from_ggml(output.output_weight_ggml) else {
+            return Ok(None);
+        };
+        Some(rnb_backend_metal::DflashFullLayerOutputTop1BackendRequest {
+            output_norm_w: output.output_norm_w,
+            output_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: output.output_weight_raw,
+                quant: output_quant,
+                rows: output.output_weight_rows,
+                cols: output.output_weight_cols,
             },
-            k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.k_weight_raw,
-                quant: k_quant,
-                rows: req.k_weight_rows,
-                cols: req.k_weight_cols,
-            },
-            v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.v_weight_raw,
-                quant: v_quant,
-                rows: req.v_weight_rows,
-                cols: req.v_weight_cols,
-            },
-            o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.o_weight_raw,
-                quant: o_quant,
-                rows: req.o_weight_rows,
-                cols: req.o_weight_cols,
-            },
-            ffn_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.ffn_gate_weight_raw,
-                quant: ffn_gate_quant,
-                rows: req.ffn_gate_weight_rows,
-                cols: req.ffn_gate_weight_cols,
-            },
-            ffn_up_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.ffn_up_weight_raw,
-                quant: ffn_up_quant,
-                rows: req.ffn_up_weight_rows,
-                cols: req.ffn_up_weight_cols,
-            },
-            ffn_down_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
-                raw: req.ffn_down_weight_raw,
-                quant: ffn_down_quant,
-                rows: req.ffn_down_weight_rows,
-                cols: req.ffn_down_weight_cols,
-            },
-            prior_k: req.prior_k,
-            prior_v: req.prior_v,
-            seq_len: req.seq_len,
-            num_heads: req.num_heads,
-            num_kv_heads: req.num_kv_heads,
-            head_dim: req.head_dim,
-            hidden_dim: req.hidden_dim,
-            q_dim: req.q_dim,
-            kv_dim: req.kv_dim,
-            ffn_dim: req.ffn_dim,
-            rope_theta: req.rope_theta,
-            scale: req.scale,
-            norm_eps: req.norm_eps,
-            position: req.position,
-            sliding_window: req.sliding_window,
-            layer_index: req.layer_index,
-            layer_count: req.layer_count,
+            batch: output.batch,
         })
+    } else {
+        None
+    };
+    METAL.with(|backend| {
+        backend
+            .dflash_full_layer_if_supported(rnb_backend_metal::DflashFullLayerBackendRequest {
+                hidden: req.hidden,
+                attn_norm_w: req.attn_norm_w,
+                q_norm_w: req.q_norm_w,
+                k_norm_w: req.k_norm_w,
+                ffn_norm_w: req.ffn_norm_w,
+                q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.q_weight_raw,
+                    quant: q_quant,
+                    rows: req.q_weight_rows,
+                    cols: req.q_weight_cols,
+                },
+                k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.k_weight_raw,
+                    quant: k_quant,
+                    rows: req.k_weight_rows,
+                    cols: req.k_weight_cols,
+                },
+                v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.v_weight_raw,
+                    quant: v_quant,
+                    rows: req.v_weight_rows,
+                    cols: req.v_weight_cols,
+                },
+                o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.o_weight_raw,
+                    quant: o_quant,
+                    rows: req.o_weight_rows,
+                    cols: req.o_weight_cols,
+                },
+                ffn_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_gate_weight_raw,
+                    quant: ffn_gate_quant,
+                    rows: req.ffn_gate_weight_rows,
+                    cols: req.ffn_gate_weight_cols,
+                },
+                ffn_up_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_up_weight_raw,
+                    quant: ffn_up_quant,
+                    rows: req.ffn_up_weight_rows,
+                    cols: req.ffn_up_weight_cols,
+                },
+                ffn_down_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.ffn_down_weight_raw,
+                    quant: ffn_down_quant,
+                    rows: req.ffn_down_weight_rows,
+                    cols: req.ffn_down_weight_cols,
+                },
+                prior_k: req.prior_k,
+                prior_v: req.prior_v,
+                seq_len: req.seq_len,
+                num_heads: req.num_heads,
+                num_kv_heads: req.num_kv_heads,
+                head_dim: req.head_dim,
+                hidden_dim: req.hidden_dim,
+                q_dim: req.q_dim,
+                kv_dim: req.kv_dim,
+                ffn_dim: req.ffn_dim,
+                rope_theta: req.rope_theta,
+                scale: req.scale,
+                norm_eps: req.norm_eps,
+                position: req.position,
+                sliding_window: req.sliding_window,
+                layer_index: req.layer_index,
+                layer_count: req.layer_count,
+                output_top1,
+            })
+            .map(|result| {
+                result.map(|output| MetalDflashFullLayerOut {
+                    hidden: output.hidden,
+                    output_top1: output.output_top1.map(|output| MetalDflashOutputTop1 {
+                        tokens: output.tokens,
+                        probabilities: output.probabilities,
+                    }),
+                })
+            })
     })
 }
+pub fn metal_dflash_output_top1_if_supported(
+    req: MetalDflashOutputTop1Request<'_>,
+) -> Result<Option<MetalDflashOutputTop1>> {
+    let Some(quant) = tensorops_quant_from_ggml(req.output_weight_ggml) else {
+        return Ok(None);
+    };
+    METAL.with(|backend| {
+        backend
+            .dflash_output_top1_if_supported(
+                req.normalized,
+                rnb_backend_metal::PrefillAtnCoreWeightView {
+                    raw: req.output_weight_raw,
+                    quant,
+                    rows: req.output_weight_rows,
+                    cols: req.output_weight_cols,
+                },
+            )
+            .map(|output| {
+                output.map(|output| MetalDflashOutputTop1 {
+                    tokens: output.tokens,
+                    probabilities: output.probabilities,
+                })
+            })
+    })
+}
+
 pub fn metal_dflash_cache_seed_if_supported(
     req: MetalDflashCacheSeedRequest<'_>,
 ) -> Result<Option<Vec<(Vec<u16>, Vec<u16>)>>> {

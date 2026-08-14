@@ -412,6 +412,7 @@ impl MuseDflashRuntime {
         let mut hidden = kernels::tensor_as_f32_slice(&hidden).to_vec();
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
+        let mut integrated_output_top1 = None;
 
         for (layer_index, layer) in self.layers.iter().enumerate() {
             let cache = &self.layer_cache[layer_index];
@@ -460,6 +461,11 @@ impl MuseDflashRuntime {
                 layer.ffn_gate_weight.rows,
                 self.hidden_dim,
                 self.norm_eps,
+                (layer_index + 1 == self.layers.len())
+                    .then(|| kernels::tensor_as_f32_slice(&self.output_norm)),
+                (layer_index + 1 == self.layers.len()).then_some(target_output),
+                max_draft_tokens,
+                &mut integrated_output_top1,
             )? {
                 continue;
             }
@@ -571,43 +577,80 @@ impl MuseDflashRuntime {
             add_inplace(&mut hidden, &ffn)?;
         }
 
-        let normalized = rms_norm_rows(&hidden, self.hidden_dim, &self.output_norm, self.norm_eps);
-        let logits = target_output
-            .gemv_vec(&normalized[self.hidden_dim..(max_draft_tokens + 1) * self.hidden_dim])?;
-        let expected_logits = max_draft_tokens * self.vocab_size;
-        if logits.len() != expected_logits {
-            return Err(LlmError::Forward(format!(
-                "Muse DFlash logits length {} != {}",
-                logits.len(),
-                expected_logits
-            )));
-        }
         let collect_probabilities =
             confidence_cutoff.is_some() || crate::runtime::mtp_trace_enabled();
-        let mut result_tokens = Vec::with_capacity(max_draft_tokens);
-        let mut probabilities = Vec::with_capacity(
-            collect_probabilities
-                .then_some(max_draft_tokens)
-                .unwrap_or_default(),
-        );
-        for row in logits.chunks_exact(self.vocab_size) {
-            let (token, max_logit) = row
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|left, right| left.1.total_cmp(&right.1))
-                .unwrap_or((0, f32::NEG_INFINITY));
-            result_tokens.push(token as u32);
-            if collect_probabilities {
-                let sum = row
-                    .iter()
-                    .map(|value| (*value - max_logit).exp())
-                    .sum::<f32>();
-                let probability = sum.recip();
-                probabilities.push(probability);
-                if confidence_cutoff.is_some_and(|cutoff| probability < cutoff) {
-                    break;
+        let (candidate_tokens, candidate_probabilities) = if let Some(output) =
+            integrated_output_top1
+        {
+            output
+        } else {
+            let normalized =
+                rms_norm_rows(&hidden, self.hidden_dim, &self.output_norm, self.norm_eps);
+            let normalized_rows =
+                &normalized[self.hidden_dim..(max_draft_tokens + 1) * self.hidden_dim];
+            if let Some(output) = crate::engine::backend_runtime::dflash_output_top1_if_supported(
+                target_output,
+                normalized_rows,
+            )? {
+                output
+            } else {
+                let logits = target_output.gemv_vec(normalized_rows)?;
+                let expected_logits = max_draft_tokens * self.vocab_size;
+                if logits.len() != expected_logits {
+                    return Err(LlmError::Forward(format!(
+                        "Muse DFlash logits length {} != {}",
+                        logits.len(),
+                        expected_logits
+                    )));
                 }
+                let mut tokens = Vec::with_capacity(max_draft_tokens);
+                let mut probabilities = Vec::with_capacity(
+                    collect_probabilities
+                        .then_some(max_draft_tokens)
+                        .unwrap_or_default(),
+                );
+                for row in logits.chunks_exact(self.vocab_size) {
+                    let (token, max_logit) = row
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .max_by(|left, right| left.1.total_cmp(&right.1))
+                        .unwrap_or((0, f32::NEG_INFINITY));
+                    tokens.push(token as u32);
+                    if collect_probabilities {
+                        probabilities.push(
+                            row.iter()
+                                .map(|value| (*value - max_logit).exp())
+                                .sum::<f32>()
+                                .recip(),
+                        );
+                    }
+                }
+                (tokens, probabilities)
+            }
+        };
+        if candidate_tokens.len() != max_draft_tokens
+            || (collect_probabilities && candidate_probabilities.len() != max_draft_tokens)
+        {
+            return Err(LlmError::Forward(format!(
+                "Muse DFlash output rows mismatch: tokens={} probabilities={} expected={max_draft_tokens}",
+                candidate_tokens.len(),
+                candidate_probabilities.len()
+            )));
+        }
+        if !collect_probabilities {
+            return Ok(MuseDflashDraft {
+                tokens: candidate_tokens,
+                probabilities: Vec::new(),
+            });
+        }
+        let mut result_tokens = Vec::with_capacity(max_draft_tokens);
+        let mut probabilities = Vec::with_capacity(max_draft_tokens);
+        for (token, probability) in candidate_tokens.into_iter().zip(candidate_probabilities) {
+            result_tokens.push(token);
+            probabilities.push(probability);
+            if confidence_cutoff.is_some_and(|cutoff| probability < cutoff) {
+                break;
             }
         }
         Ok(MuseDflashDraft {

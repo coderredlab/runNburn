@@ -18,7 +18,7 @@ use crate::compute::{
 };
 use crate::ffn_chain::{
     empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, private_f16_buf,
-    private_f32_buf, readback, shared_f32_buf, u32_buf, QwenMoeLlamaIdStage,
+    private_f32_buf, readback, shared_f32_buf, shared_u32_buf, u32_buf, QwenMoeLlamaIdStage,
     QwenMoeLlamaIdStageSampler,
 };
 use crate::{PrefillAtnOTailBackendSpecRef, TensoropsQuant};
@@ -87,6 +87,22 @@ pub(crate) struct PrefillAtnFullLayerCarrier {
 pub(crate) struct DflashFullLayerCarrier {
     layer: PrefillAtnFullLayerCarrier,
     attention: crate::dflash_attention::DflashAttentionCarrier,
+}
+pub(crate) struct DflashOutputTop1Carrier {
+    pub batch: usize,
+    pub hidden_dim: usize,
+    pub vocab_size: usize,
+    output_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    normalized_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    normalized_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    logits_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    token_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    probability_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    normalized_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    vocab_size_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    batch_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 pub(crate) struct DflashCacheSeedCarrier {
     pub capacity: usize,
@@ -562,6 +578,52 @@ impl DflashFullLayerCarrier {
         }
     }
 }
+impl DflashOutputTop1Carrier {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        batch: usize,
+        hidden_dim: usize,
+        vocab_size: usize,
+        norm_eps: f32,
+    ) -> Self {
+        Self {
+            batch,
+            hidden_dim,
+            vocab_size,
+            output_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
+            normalized_dev: empty_f32_buf(ctx, batch * hidden_dim),
+            normalized_f16_dev: empty_f16_buf(ctx, batch * hidden_dim),
+            logits_dev: empty_f32_buf(ctx, batch * vocab_size),
+            token_dev: shared_u32_buf(ctx, &vec![0; batch]),
+            probability_dev: empty_f32_buf(ctx, batch),
+            hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            normalized_elems_buf: u32_buf(ctx, (batch * hidden_dim) as u32),
+            vocab_size_buf: u32_buf(ctx, vocab_size as u32),
+            batch_buf: u32_buf(ctx, batch as u32),
+            eps_buf: f32_buf(ctx, norm_eps),
+        }
+    }
+
+    fn upload_output_norm(&self, output_norm_w: &[f32]) {
+        assert_eq!(output_norm_w.len(), self.hidden_dim);
+        copy_f32(output_norm_w, &self.output_norm_w_dev);
+    }
+
+    fn read_output(&self) -> (Vec<u32>, Vec<f32>) {
+        let tokens = unsafe {
+            std::slice::from_raw_parts(self.token_dev.contents().as_ptr().cast::<u32>(), self.batch)
+                .to_vec()
+        };
+        let probabilities = unsafe {
+            std::slice::from_raw_parts(
+                self.probability_dev.contents().as_ptr().cast::<f32>(),
+                self.batch,
+            )
+            .to_vec()
+        };
+        (tokens, probabilities)
+    }
+}
 impl DflashCacheSeedCarrier {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -862,32 +924,32 @@ pub(crate) fn encode_quant_gemm_v2(
     n: usize,
     m: usize,
 ) {
-    match (quant, m <= 8) {
-        (TensoropsQuant::Q4K, true) => compute::encode_gemm_q4k_tensorops_v2_64x32(
+    match quant {
+        TensoropsQuant::Q4K if m <= 16 => compute::encode_gemm_q4k_tensorops_v2_64x8_packed(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q5K, true) => compute::encode_gemm_q5k_tensorops_v2_64x32(
+        TensoropsQuant::Q5K if m <= 16 => compute::encode_gemm_q5k_tensorops_v2_64x8_packed(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q6K, true) => compute::encode_gemm_q6k_tensorops_v2_64x32(
+        TensoropsQuant::Q6K if m <= 8 => compute::encode_gemm_q6k_tensorops_v2_64x32(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q4K, false) => compute::encode_gemm_q4k_tensorops_v2(
+        TensoropsQuant::Q4K => compute::encode_gemm_q4k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q5K, false) => compute::encode_gemm_q5k_tensorops_v2(
+        TensoropsQuant::Q5K => compute::encode_gemm_q5k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q6K, false) => compute::encode_gemm_q6k_tensorops_v2(
+        TensoropsQuant::Q6K => compute::encode_gemm_q6k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q8_0, _) => compute::encode_gemm_q8_0_tensorops_v2(
+        TensoropsQuant::Q8_0 => compute::encode_gemm_q8_0_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q2K, _) => compute::encode_gemm_q2k_tensorops_v2(
+        TensoropsQuant::Q2K => compute::encode_gemm_q2k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        (TensoropsQuant::Q3K, _) => compute::encode_gemm_q3k_tensorops_v2(
+        TensoropsQuant::Q3K => compute::encode_gemm_q3k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
     }
@@ -935,6 +997,18 @@ pub(crate) struct DflashFullLayerDispatchRequest<'a> {
     pub position: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
+}
+pub(crate) struct DflashOutputTop1DispatchRequest<'a> {
+    pub carrier: &'a DflashOutputTop1Carrier,
+    pub output_norm_w: &'a [f32],
+    pub output_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub output_w_off: u32,
+    pub output_quant: TensoropsQuant,
+}
+
+pub(crate) struct DflashFullLayerDispatchOutput {
+    pub hidden: Vec<f32>,
+    pub output_top1: Option<(Vec<u32>, Vec<f32>)>,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct DflashCacheSeedLayerDispatchRequest<'a> {
@@ -1846,241 +1920,251 @@ fn encode_muse_full_layer_ops(
     req: &MusePrefillFullLayerDispatchRequest<'_>,
 ) -> Result<(), String> {
     let core = &carrier.core;
+    let diagnostic_skip = (core.seq_len <= 8)
+        .then(|| std::env::var("RNB_METAL_MUSE_SKIP_SEGMENT").ok())
+        .flatten();
 
-    if req.target_kv.is_some() {
-        encode_rms_norm_batch(
+    if diagnostic_skip.as_deref() != Some("a") {
+        if req.target_kv.is_some() {
+            encode_rms_norm_batch(
+                ctx,
+                enc,
+                hidden_dev,
+                &core.attn_norm_w_dev,
+                &core.normed_dev,
+                &core.hidden_cols_buf,
+                &core.eps_buf,
+                core.seq_len,
+            );
+        } else {
+            crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+                ctx,
+                enc,
+                hidden_dev,
+                &core.attn_norm_w_dev,
+                &core.normed_dev,
+                core.seq_len,
+                core.hidden_dim,
+                req.norm_eps,
+            )
+            .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
+        }
+        compute::chain_barrier_resources(ctx, enc, [&*core.normed_dev]);
+        encode_cast_f32_to_f16(
             ctx,
-            enc,
-            hidden_dev,
-            &core.attn_norm_w_dev,
+            &enc,
             &core.normed_dev,
+            &core.normed_f16_dev,
+            &core.hidden_elems_buf,
+            core.seq_len * core.hidden_dim,
+        );
+        compute::chain_barrier(ctx, &enc);
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            req.q_quant,
+            req.q_w_buf,
+            req.q_w_off,
+            &core.normed_f16_dev,
+            &core.q_dev,
+            &core.q_n_buf,
             &core.hidden_cols_buf,
-            &core.eps_buf,
-            core.seq_len,
-        );
-    } else {
-        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-            ctx,
-            enc,
-            hidden_dev,
-            &core.attn_norm_w_dev,
-            &core.normed_dev,
-            core.seq_len,
-            core.hidden_dim,
-            req.norm_eps,
-        )
-        .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
-    }
-    compute::chain_barrier_resources(ctx, enc, [&*core.normed_dev]);
-    encode_cast_f32_to_f16(
-        ctx,
-        &enc,
-        &core.normed_dev,
-        &core.normed_f16_dev,
-        &core.hidden_elems_buf,
-        core.seq_len * core.hidden_dim,
-    );
-    compute::chain_barrier(ctx, &enc);
-    encode_quant_gemm_v2(
-        ctx,
-        &enc,
-        req.q_quant,
-        req.q_w_buf,
-        req.q_w_off,
-        &core.normed_f16_dev,
-        &core.q_dev,
-        &core.q_n_buf,
-        &core.hidden_cols_buf,
-        &core.seq_buf,
-        core.q_dim,
-        core.seq_len,
-    );
-    encode_quant_gemm_v2(
-        ctx,
-        &enc,
-        req.k_quant,
-        req.k_w_buf,
-        req.k_w_off,
-        &core.normed_f16_dev,
-        &core.k_dev,
-        &core.kv_n_buf,
-        &core.hidden_cols_buf,
-        &core.seq_buf,
-        core.kv_dim,
-        core.seq_len,
-    );
-    encode_quant_gemm_v2(
-        ctx,
-        &enc,
-        req.v_quant,
-        req.v_w_buf,
-        req.v_w_off,
-        &core.normed_f16_dev,
-        &core.v_dev,
-        &core.kv_n_buf,
-        &core.hidden_cols_buf,
-        &core.seq_buf,
-        core.kv_dim,
-        core.seq_len,
-    );
-    encode_quant_gemm_v2(
-        ctx,
-        &enc,
-        req.attention_gate_quant,
-        req.attention_gate_w_buf,
-        req.attention_gate_w_off,
-        &core.normed_f16_dev,
-        &carrier.attention_gate_dev,
-        &core.q_n_buf,
-        &core.hidden_cols_buf,
-        &core.seq_buf,
-        core.q_dim,
-        core.seq_len,
-    );
-    compute::chain_barrier(ctx, &enc);
-
-    if req.target_kv.is_some() {
-        encode_rms_norm_batch(
-            ctx,
-            enc,
-            &core.q_dev,
-            &core.q_norm_w_dev,
-            &core.q_normed_dev,
-            &core.hd_buf,
-            &core.eps_buf,
-            core.seq_len * core.num_heads,
-        );
-        encode_rms_norm_batch(
-            ctx,
-            enc,
-            &core.k_dev,
-            &core.k_norm_w_dev,
-            &core.k_normed_dev,
-            &core.hd_buf,
-            &core.eps_buf,
-            core.seq_len * core.num_kv_heads,
-        );
-    } else {
-        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-            ctx,
-            enc,
-            &core.q_dev,
-            &core.q_norm_w_dev,
-            &core.q_normed_dev,
-            core.seq_len * core.num_heads,
-            core.head_dim,
-            req.norm_eps,
-        )
-        .map_err(|error| format!("Metal Muse prefill Q RMS norm failed: {error:?}"))?;
-        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-            ctx,
-            enc,
-            &core.k_dev,
-            &core.k_norm_w_dev,
-            &core.k_normed_dev,
-            core.seq_len * core.num_kv_heads,
-            core.head_dim,
-            req.norm_eps,
-        )
-        .map_err(|error| format!("Metal Muse prefill K RMS norm failed: {error:?}"))?;
-    }
-    compute::chain_barrier(ctx, &enc);
-    if req.apply_rope {
-        compute::encode_prefill_rope_only(
-            ctx,
-            &enc,
-            &core.q_normed_dev,
-            &core.q_normed_dev,
-            &core.rope_cos_sin_dev,
-            core.num_heads,
-            core.head_dim,
-            core.head_dim,
-            core.seq_len,
-        )
-        .map_err(|error| format!("Metal Muse prefill Q RoPE failed: {error:?}"))?;
-        compute::encode_prefill_rope_only(
-            ctx,
-            &enc,
-            &core.k_normed_dev,
-            &core.k_normed_dev,
-            &core.rope_cos_sin_dev,
-            core.num_kv_heads,
-            core.head_dim,
-            core.head_dim,
-            core.seq_len,
-        )
-        .map_err(|error| format!("Metal Muse prefill K RoPE failed: {error:?}"))?;
-    }
-    compute::chain_barrier(ctx, &enc);
-    encode_cast_f32_to_f16(
-        ctx,
-        &enc,
-        &core.k_normed_dev,
-        &core.k_f16_dev,
-        &core.kv_elems_buf,
-        core.seq_len * core.kv_dim,
-    );
-    encode_cast_f32_to_f16(
-        ctx,
-        &enc,
-        &core.v_dev,
-        &core.v_f16_dev,
-        &core.kv_elems_buf,
-        core.seq_len * core.kv_dim,
-    );
-    let (attention_key, attention_value, attention_kv_len) = if let Some(target) = req.target_kv {
-        let pos_start_buf = u32_buf(ctx, target.pos_start as u32);
-        compute::encode_kv_append_batch(
-            ctx,
-            enc,
-            &core.k_normed_dev,
-            &core.v_dev,
-            target.key,
-            target.value,
-            &core.kv_n_buf,
-            &pos_start_buf,
             &core.seq_buf,
+            core.q_dim,
+            core.seq_len,
+        );
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            req.k_quant,
+            req.k_w_buf,
+            req.k_w_off,
+            &core.normed_f16_dev,
+            &core.k_dev,
+            &core.kv_n_buf,
+            &core.hidden_cols_buf,
+            &core.seq_buf,
+            core.kv_dim,
+            core.seq_len,
+        );
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            req.v_quant,
+            req.v_w_buf,
+            req.v_w_off,
+            &core.normed_f16_dev,
+            &core.v_dev,
+            &core.kv_n_buf,
+            &core.hidden_cols_buf,
+            &core.seq_buf,
+            core.kv_dim,
+            core.seq_len,
+        );
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            req.attention_gate_quant,
+            req.attention_gate_w_buf,
+            req.attention_gate_w_off,
+            &core.normed_f16_dev,
+            &carrier.attention_gate_dev,
+            &core.q_n_buf,
+            &core.hidden_cols_buf,
+            &core.seq_buf,
+            core.q_dim,
+            core.seq_len,
+        );
+        compute::chain_barrier(ctx, &enc);
+    }
+
+    if diagnostic_skip.as_deref() != Some("b") {
+        if req.target_kv.is_some() {
+            encode_rms_norm_batch(
+                ctx,
+                enc,
+                &core.q_dev,
+                &core.q_norm_w_dev,
+                &core.q_normed_dev,
+                &core.hd_buf,
+                &core.eps_buf,
+                core.seq_len * core.num_heads,
+            );
+            encode_rms_norm_batch(
+                ctx,
+                enc,
+                &core.k_dev,
+                &core.k_norm_w_dev,
+                &core.k_normed_dev,
+                &core.hd_buf,
+                &core.eps_buf,
+                core.seq_len * core.num_kv_heads,
+            );
+        } else {
+            crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+                ctx,
+                enc,
+                &core.q_dev,
+                &core.q_norm_w_dev,
+                &core.q_normed_dev,
+                core.seq_len * core.num_heads,
+                core.head_dim,
+                req.norm_eps,
+            )
+            .map_err(|error| format!("Metal Muse prefill Q RMS norm failed: {error:?}"))?;
+            crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+                ctx,
+                enc,
+                &core.k_dev,
+                &core.k_norm_w_dev,
+                &core.k_normed_dev,
+                core.seq_len * core.num_kv_heads,
+                core.head_dim,
+                req.norm_eps,
+            )
+            .map_err(|error| format!("Metal Muse prefill K RMS norm failed: {error:?}"))?;
+        }
+        compute::chain_barrier(ctx, &enc);
+        if req.apply_rope {
+            compute::encode_prefill_rope_only(
+                ctx,
+                &enc,
+                &core.q_normed_dev,
+                &core.q_normed_dev,
+                &core.rope_cos_sin_dev,
+                core.num_heads,
+                core.head_dim,
+                core.head_dim,
+                core.seq_len,
+            )
+            .map_err(|error| format!("Metal Muse prefill Q RoPE failed: {error:?}"))?;
+            compute::encode_prefill_rope_only(
+                ctx,
+                &enc,
+                &core.k_normed_dev,
+                &core.k_normed_dev,
+                &core.rope_cos_sin_dev,
+                core.num_kv_heads,
+                core.head_dim,
+                core.head_dim,
+                core.seq_len,
+            )
+            .map_err(|error| format!("Metal Muse prefill K RoPE failed: {error:?}"))?;
+        }
+        compute::chain_barrier(ctx, &enc);
+        encode_cast_f32_to_f16(
+            ctx,
+            &enc,
+            &core.k_normed_dev,
+            &core.k_f16_dev,
+            &core.kv_elems_buf,
             core.seq_len * core.kv_dim,
         );
-        compute::chain_barrier_resources(ctx, enc, [target.key, target.value]);
-        (target.key, target.value, target.kv_len)
-    } else {
-        (&*core.k_f16_dev, &*core.v_f16_dev, core.seq_len)
-    };
-    compute::chain_barrier(ctx, &enc);
-    crate::dflash_attention::encode_muse_target_attention_f16_hd128(
-        ctx,
-        &enc,
-        &core.q_normed_dev,
-        attention_key,
-        attention_value,
-        &core.attn_out_dev,
-        core.seq_len,
-        attention_kv_len,
-        core.num_heads,
-        core.num_kv_heads,
-        req.sliding_window,
-        req.scale,
-    )?;
-    compute::chain_barrier(ctx, &enc);
-    encode_prefill_gate_apply(
-        ctx,
-        &enc,
-        &core.attn_out_dev,
-        &carrier.attention_gate_dev,
-        &core.attn_gated_dev,
-        &core.q_elems_buf,
-        core.seq_len * core.q_dim,
-    );
-    compute::chain_barrier(ctx, &enc);
-    encode_muse_o_tail_ffn_ops(
-        ctx,
-        enc,
-        &carrier.tail,
-        hidden_dev,
-        &core.attn_gated_dev,
-        req.ops,
-    );
+        encode_cast_f32_to_f16(
+            ctx,
+            &enc,
+            &core.v_dev,
+            &core.v_f16_dev,
+            &core.kv_elems_buf,
+            core.seq_len * core.kv_dim,
+        );
+        let (attention_key, attention_value, attention_kv_len) = if let Some(target) = req.target_kv
+        {
+            let pos_start_buf = u32_buf(ctx, target.pos_start as u32);
+            compute::encode_kv_append_batch(
+                ctx,
+                enc,
+                &core.k_normed_dev,
+                &core.v_dev,
+                target.key,
+                target.value,
+                &core.kv_n_buf,
+                &pos_start_buf,
+                &core.seq_buf,
+                core.seq_len * core.kv_dim,
+            );
+            compute::chain_barrier_resources(ctx, enc, [target.key, target.value]);
+            (target.key, target.value, target.kv_len)
+        } else {
+            (&*core.k_f16_dev, &*core.v_f16_dev, core.seq_len)
+        };
+        compute::chain_barrier(ctx, &enc);
+        crate::dflash_attention::encode_muse_target_attention_f16_hd128(
+            ctx,
+            &enc,
+            &core.q_normed_dev,
+            attention_key,
+            attention_value,
+            &core.attn_out_dev,
+            core.seq_len,
+            attention_kv_len,
+            core.num_heads,
+            core.num_kv_heads,
+            req.sliding_window,
+            req.scale,
+        )?;
+        compute::chain_barrier(ctx, &enc);
+        encode_prefill_gate_apply(
+            ctx,
+            &enc,
+            &core.attn_out_dev,
+            &carrier.attention_gate_dev,
+            &core.attn_gated_dev,
+            &core.q_elems_buf,
+            core.seq_len * core.q_dim,
+        );
+        compute::chain_barrier(ctx, &enc);
+    }
+    if diagnostic_skip.as_deref() != Some("c") {
+        encode_muse_o_tail_ffn_ops(
+            ctx,
+            enc,
+            &carrier.tail,
+            hidden_dev,
+            &core.attn_gated_dev,
+            req.ops,
+        );
+    }
     compute::chain_barrier(ctx, &enc);
     Ok(())
 }
@@ -2246,6 +2330,13 @@ pub(crate) fn prefill_muse_layer_range_complete(
     pending.command.waitUntilCompleted();
     pending.completed = true;
     ensure_command_completed(&pending.command)?;
+    if std::env::var("RNB_METAL_MUSE_LAYER_GPU").as_deref() == Ok("1") {
+        eprintln!(
+            "[muse-layer-gpu] layer={} gpu_ms={:.3}",
+            pending.layer_idx,
+            (pending.command.GPUEndTime() - pending.command.GPUStartTime()) * 1000.0,
+        );
+    }
     if let Some((q_raw, qrn, k_raw, krn, q, qn, k, kn, v, vn, attn, an, gated, gn, o, on)) =
         pending.stage_trace.as_ref()
     {
@@ -2373,7 +2464,8 @@ pub(crate) fn dflash_full_layer_dispatch(
     upload_hidden: bool,
     wait_readback: bool,
     req: DflashFullLayerDispatchRequest<'_>,
-) -> Result<Vec<f32>, String> {
+    output_top1: Option<DflashOutputTop1DispatchRequest<'_>>,
+) -> Result<DflashFullLayerDispatchOutput, String> {
     let layer = &carrier.layer;
     let core = &layer.core;
     let base = &req.layer;
@@ -2390,7 +2482,15 @@ pub(crate) fn dflash_full_layer_dispatch(
     let context_len = carrier
         .attention
         .upload_context(req.prior_k, req.prior_v, req.position)?;
-
+    if let Some(output) = output_top1.as_ref() {
+        if output.carrier.hidden_dim != core.hidden_dim
+            || output.carrier.batch == 0
+            || output.carrier.batch + 1 > core.seq_len
+        {
+            return Err("Metal DFlash output tail shape mismatch".to_string());
+        }
+        output.carrier.upload_output_norm(output.output_norm_w);
+    }
     let cmd = ctx
         .queue
         .commandBuffer()
@@ -2619,16 +2719,77 @@ pub(crate) fn dflash_full_layer_dispatch(
         &core.hidden_elems_buf,
         core.seq_len * core.hidden_dim,
     );
-
+    if let Some(output) = output_top1.as_ref() {
+        let tail = output.carrier;
+        compute::chain_barrier_resources(ctx, &enc, [hidden_dev]);
+        for row in 0..tail.batch {
+            crate::ffn_chain::encode_rms_norm_io_offset(
+                ctx,
+                &enc,
+                hidden_dev,
+                (row + 1) * core.hidden_dim * std::mem::size_of::<f32>(),
+                &tail.output_norm_w_dev,
+                &tail.normalized_dev,
+                row * core.hidden_dim * std::mem::size_of::<f32>(),
+                &tail.hidden_dim_buf,
+                &tail.eps_buf,
+            );
+        }
+        compute::chain_barrier_resources(ctx, &enc, [&*tail.normalized_dev]);
+        encode_cast_f32_to_f16(
+            ctx,
+            &enc,
+            &tail.normalized_dev,
+            &tail.normalized_f16_dev,
+            &tail.normalized_elems_buf,
+            tail.batch * tail.hidden_dim,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*tail.normalized_f16_dev]);
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            output.output_quant,
+            output.output_w_buf,
+            output.output_w_off,
+            &tail.normalized_f16_dev,
+            &tail.logits_dev,
+            &tail.vocab_size_buf,
+            &tail.hidden_dim_buf,
+            &tail.batch_buf,
+            tail.vocab_size,
+            tail.batch,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*tail.logits_dev]);
+        for row in 0..tail.batch {
+            compute::encode_top1_probability_f32_at(
+                ctx,
+                &enc,
+                &tail.logits_dev,
+                row * tail.vocab_size * std::mem::size_of::<f32>(),
+                &tail.token_dev,
+                row * std::mem::size_of::<u32>(),
+                &tail.probability_dev,
+                row * std::mem::size_of::<f32>(),
+                &tail.vocab_size_buf,
+            );
+        }
+    }
     enc.endEncoding();
     cmd.commit();
-    if wait_readback {
+    if wait_readback || output_top1.is_some() {
         cmd.waitUntilCompleted();
         ensure_command_completed(&cmd)?;
-        Ok(readback(hidden_dev, core.seq_len * core.hidden_dim))
-    } else {
-        Ok(Vec::new())
     }
+    let hidden = if wait_readback {
+        readback(hidden_dev, core.seq_len * core.hidden_dim)
+    } else {
+        Vec::new()
+    };
+    let output_top1 = output_top1.map(|output| output.carrier.read_output());
+    Ok(DflashFullLayerDispatchOutput {
+        hidden,
+        output_top1,
+    })
 }
 pub(crate) fn dflash_cache_seed_dispatch(
     ctx: &MetalContext,

@@ -511,6 +511,7 @@ pub struct MetalContext {
     /// host reads back one u32 instead of the full logits vector.
     pub output_argmax_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub output_argmax_excluding_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub dflash_top1_probability_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// pm26: chain 용 F32 GEMV(gemv_f32_chain). 27B GDN 의 F32 ssm_alpha/beta 무손실 device 화.
     pub f32_chain_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// Router 전용 F32 GEMV. output row당 SIMD-group 하나가 K를 coalesced load한다.
@@ -742,7 +743,15 @@ pub struct MetalContext {
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q5k_tensorops_v2_64x32_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q4k_tensorops_v2_64x8_packed_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q5k_tensorops_v2_64x8_packed_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q6k_tensorops_v2_64x32_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q6k_tensorops_v2_64x8_parallel2_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q6k_tensorops_v2_64x8_parallel4_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q3k_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -1599,10 +1608,11 @@ fn build_library_v4(
     src: &str,
     source_name: &str,
 ) -> Retained<ProtocolObject<dyn MTLLibrary>> {
-    use objc2_metal::{MTLCompileOptions, MTLMathMode};
+    use objc2_metal::{MTLCompileOptions, MTLLanguageVersion, MTLMathMode};
 
     let source = NSString::from_str(src);
     let options = MTLCompileOptions::new();
+    options.setLanguageVersion(MTLLanguageVersion((4 << 16) + 1));
     options.setMathMode(MTLMathMode::Safe);
     device
         .newLibraryWithSource_options_error(&source, Some(&options))
@@ -1811,6 +1821,15 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let gemm_q4k_tensorops_v2_64x8_packed_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q4k_tensorops_v2_64x8_packed",
+        ))
+    } else {
+        None
+    };
     let gemm_q8_0_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     > = if tensorops_capable {
@@ -1862,6 +1881,15 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let gemm_q5k_tensorops_v2_64x8_packed_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q5k_tensorops_v2_64x8_packed",
+        ))
+    } else {
+        None
+    };
     let gemm_q6k_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     > = if tensorops_capable {
@@ -1878,6 +1906,24 @@ pub fn build_metal_context_with_opts(
             &device,
             GEMM_TENSOROPS_POC_SRC,
             "gemm_q6k_tensorops_v2_64x32",
+        ))
+    } else {
+        None
+    };
+    let gemm_q6k_tensorops_v2_64x8_parallel2_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q6k_tensorops_v2_64x8_parallel2",
+        ))
+    } else {
+        None
+    };
+    let gemm_q6k_tensorops_v2_64x8_parallel4_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q6k_tensorops_v2_64x8_parallel4",
         ))
     } else {
         None
@@ -2207,6 +2253,8 @@ pub fn build_metal_context_with_opts(
     let output_argmax_pipeline = build_pipeline(&device, OUTPUT_ARGMAX_SRC, "argmax_f32");
     let output_argmax_excluding_pipeline =
         build_pipeline(&device, OUTPUT_ARGMAX_SRC, "argmax_f32_excluding");
+    let dflash_top1_probability_pipeline =
+        build_pipeline_safe_math(&device, OUTPUT_ARGMAX_SRC, "top1_probability_f32");
     let f32_chain_pipeline = build_pipeline(&device, GEMV_F32_SRC, "gemv_f32_chain");
     let f32_chain_simd_pipeline = build_pipeline(&device, GEMV_F32_SRC, "gemv_f32_chain_simd");
     let prefill_f32_proj_pipeline = build_pipeline(&device, GEMV_F32_SRC, "prefill_f32_proj");
@@ -2591,6 +2639,7 @@ pub fn build_metal_context_with_opts(
         glm_mla_qpe_rope_pipeline,
         output_argmax_pipeline,
         output_argmax_excluding_pipeline,
+        dflash_top1_probability_pipeline,
         f32_chain_pipeline,
         f32_chain_simd_pipeline,
         prefill_f32_proj_pipeline,
@@ -2712,7 +2761,11 @@ pub fn build_metal_context_with_opts(
         gemm_q6k_tensorops_v2_pipeline,
         gemm_q4k_tensorops_v2_64x32_pipeline,
         gemm_q5k_tensorops_v2_64x32_pipeline,
+        gemm_q4k_tensorops_v2_64x8_packed_pipeline,
+        gemm_q5k_tensorops_v2_64x8_packed_pipeline,
         gemm_q6k_tensorops_v2_64x32_pipeline,
+        gemm_q6k_tensorops_v2_64x8_parallel2_pipeline,
+        gemm_q6k_tensorops_v2_64x8_parallel4_pipeline,
         gemm_q3k_tensorops_v2_pipeline,
         gemm_q2k_tensorops_v2_pipeline,
         gemm_q8_0_tensorops_library,
@@ -5787,6 +5840,24 @@ pub fn run_q5k_tensorops_v2(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_q5k_tensorops_v2_variant(
+    ctx: &MetalContext,
+    wb: &[u8],
+    input: &[f32],
+    n_out: usize,
+    k: usize,
+    m_tok: usize,
+    fn_name: &str,
+    nra: usize,
+    nrb: usize,
+) -> Vec<f32> {
+    run_tensorops_v2_inner(
+        ctx, wb, input, n_out, k, m_tok, fn_name, nra, nrb, 256, 176, 64,
+    )
+}
+
 /// pm42 M3 step1: Q6_K v2 GEMM(64×128 winner 타일). FFN down(Q6_K) + GDN in_proj(Q6_K).
 /// dequant Q6_K(210B/super, NK=128=superblock 절반). standalone correctness/runner.
 pub fn run_q6k_tensorops_v2(
@@ -5810,6 +5881,24 @@ pub fn run_q6k_tensorops_v2(
         256,
         210,
         128,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_q6k_tensorops_v2_variant(
+    ctx: &MetalContext,
+    wb: &[u8],
+    input: &[f32],
+    n_out: usize,
+    k: usize,
+    m_tok: usize,
+    fn_name: &str,
+    nra: usize,
+    nrb: usize,
+) -> Vec<f32> {
+    run_tensorops_v2_inner(
+        ctx, wb, input, n_out, k, m_tok, fn_name, nra, nrb, 256, 210, 128,
     )
 }
 
@@ -7459,6 +7548,41 @@ pub(crate) fn encode_gemm_q4k_tensorops_v2_64x32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q4k_tensorops_v2_64x8_packed(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q4k_tensorops_v2_64x8_packed_pipeline
+        .as_ref()
+        .expect("gemm_q4k_tensorops_v2_64x8_packed_pipeline missing");
+    encode_tensorops_v2_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_f16_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        8,
+        64,
+    );
+}
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gemm_q4k_tensorops_v2_offset(
     ctx: &MetalContext,
     enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -7608,6 +7732,42 @@ pub(crate) fn encode_gemm_q5k_tensorops_v2_64x32(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q5k_tensorops_v2_64x8_packed(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q5k_tensorops_v2_64x8_packed_pipeline
+        .as_ref()
+        .expect("gemm_q5k_tensorops_v2_64x8_packed_pipeline missing");
+    encode_tensorops_v2_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_f16_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        8,
+        64,
+    );
+}
+
 /// pm42 M3: Q6_K v2 GEMM encode(chain down Q6_K + GDN in_proj Q6_K). NRA=64,NRB=128,NK=128,4sg.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gemm_q6k_tensorops_v2(
@@ -7658,10 +7818,20 @@ pub(crate) fn encode_gemm_q6k_tensorops_v2_64x32(
     n: usize,
     m: usize,
 ) {
-    let pipeline = ctx
-        .gemm_q6k_tensorops_v2_64x32_pipeline
-        .as_ref()
-        .expect("gemm_q6k_tensorops_v2_64x32_pipeline missing");
+    let pipeline = match std::env::var("RNB_METAL_DFLASH_Q6_LANES").as_deref() {
+        Ok("2") => ctx
+            .gemm_q6k_tensorops_v2_64x8_parallel2_pipeline
+            .as_ref()
+            .expect("gemm_q6k_tensorops_v2_64x8_parallel2_pipeline missing"),
+        Ok("4") => ctx
+            .gemm_q6k_tensorops_v2_64x8_parallel4_pipeline
+            .as_ref()
+            .expect("gemm_q6k_tensorops_v2_64x8_parallel4_pipeline missing"),
+        _ => ctx
+            .gemm_q6k_tensorops_v2_64x32_pipeline
+            .as_ref()
+            .expect("gemm_q6k_tensorops_v2_64x32_pipeline missing"),
+    };
     encode_tensorops_v2_dispatch(
         pipeline,
         enc,
@@ -10358,6 +10528,38 @@ pub(crate) fn encode_argmax_f32_at(
         depth: 1,
     };
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+}
+
+pub(crate) fn encode_top1_probability_f32_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    logits_buf: &ProtocolObject<dyn MTLBuffer>,
+    logits_off_bytes: usize,
+    token_buf: &ProtocolObject<dyn MTLBuffer>,
+    token_off_bytes: usize,
+    probability_buf: &ProtocolObject<dyn MTLBuffer>,
+    probability_off_bytes: usize,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+) {
+    enc.setComputePipelineState(&ctx.dflash_top1_probability_pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(logits_buf), logits_off_bytes, 0);
+        enc.setBuffer_offset_atIndex(Some(token_buf), token_off_bytes, 1);
+        enc.setBuffer_offset_atIndex(Some(probability_buf), probability_off_bytes, 2);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 3);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 pub(crate) fn gemv_quant_simd_argmax_dispatch_reuse(

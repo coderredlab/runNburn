@@ -14,6 +14,24 @@ use rnb_loader::GGMLType;
 fn cuda_error(err: String) -> crate::error::LlmError {
     crate::error::LlmError::Forward(err)
 }
+fn dflash_output_top1_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::to_ascii_lowercase)
+        .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
+}
+
+#[cfg(test)]
+mod dflash_output_policy_tests {
+    #[test]
+    fn integrated_output_top1_defaults_on_with_falsey_opt_out() {
+        assert!(super::dflash_output_top1_enabled(None));
+        assert!(super::dflash_output_top1_enabled(Some("1")));
+        assert!(super::dflash_output_top1_enabled(Some("yes")));
+        for value in ["0", "false", "FALSE", "off", "no"] {
+            assert!(!super::dflash_output_top1_enabled(Some(value)));
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
@@ -43,6 +61,10 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
     n_ff: usize,
     n_embd: usize,
     norm_eps: f32,
+    output_norm: Option<&[f32]>,
+    output_weight: Option<&QuantizedWeight>,
+    output_rows: usize,
+    output_top1: &mut Option<(Vec<u32>, Vec<f32>)>,
 ) -> crate::error::Result<bool> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
@@ -64,6 +86,28 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
             down_weight.backend_view(),
         ) else {
             return Ok(false);
+        };
+        let output_tail = if dflash_output_top1_enabled(
+            crate::engine::policy::env_string("RNB_METAL_DFLASH_OUTPUT_TOP1").as_deref(),
+        ) {
+            match (
+                output_norm,
+                output_weight.and_then(QuantizedWeight::backend_view),
+            ) {
+                (Some(output_norm_w), Some(output)) => Some(
+                    crate::engine::metal_runtime::MetalDflashFullLayerOutputTop1Request {
+                        output_norm_w,
+                        output_weight_ggml: backend_ggml_type(output.quant()),
+                        output_weight_raw: output.raw(),
+                        output_weight_rows: output.rows(),
+                        output_weight_cols: output.cols(),
+                        batch: output_rows,
+                    },
+                ),
+                _ => None,
+            }
+        } else {
+            None
         };
         let Some(output) = crate::engine::metal_runtime::metal_dflash_full_layer_if_supported(
             crate::engine::metal_runtime::MetalDflashFullLayerRequest {
@@ -117,14 +161,18 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
                 sliding_window: window,
                 layer_index,
                 layer_count,
+                output_top1: output_tail,
             },
         )
         .map_err(crate::error::LlmError::Forward)?
         else {
             return Ok(false);
         };
-        if !output.is_empty() {
-            hidden.copy_from_slice(&output);
+        if !output.hidden.is_empty() {
+            hidden.copy_from_slice(&output.hidden);
+        }
+        if let Some(output) = output.output_top1 {
+            *output_top1 = Some((output.tokens, output.probabilities));
         }
         return Ok(true);
     }
@@ -192,6 +240,39 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
     }
     #[cfg(not(feature = "cuda"))]
     Ok(false)
+}
+
+pub(in crate::engine) fn dflash_output_top1_if_supported(
+    output_weight: &QuantizedWeight,
+    normalized: &[f32],
+) -> crate::error::Result<Option<(Vec<u32>, Vec<f32>)>> {
+    if !dflash_output_top1_enabled(
+        crate::engine::policy::env_string("RNB_METAL_DFLASH_OUTPUT_TOP1").as_deref(),
+    ) {
+        return Ok(None);
+    }
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        let Some(output) = output_weight.backend_view() else {
+            return Ok(None);
+        };
+        let result = crate::engine::metal_runtime::metal_dflash_output_top1_if_supported(
+            crate::engine::metal_runtime::MetalDflashOutputTop1Request {
+                normalized,
+                output_weight_ggml: backend_ggml_type(output.quant()),
+                output_weight_raw: output.raw(),
+                output_weight_rows: output.rows(),
+                output_weight_cols: output.cols(),
+            },
+        )
+        .map_err(crate::error::LlmError::Forward)?;
+        return Ok(result.map(|output| (output.tokens, output.probabilities)));
+    }
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    {
+        let _ = (output_weight, normalized);
+        Ok(None)
+    }
 }
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine) fn dflash_cache_seed_if_supported(

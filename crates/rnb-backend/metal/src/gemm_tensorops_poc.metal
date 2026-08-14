@@ -5,6 +5,7 @@
 // host 는 f32 buffer 를 그대로 올리고(half 변환은 staging 에서) C f32 를 readback 한다.
 #include <metal_stdlib>
 #include <metal_tensor>
+#include <metal_packed_numeric>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp::tensor_ops;
@@ -305,7 +306,8 @@ kernel void gemm_q4k_tensorops(
 //   stride{1,M}과 동일). A=weight[N_out,K] dequant→threadgroup, B=activation[K,M_tok] device f16,
 //   C(M=N_out,N=M_tok) cooperative. activation 은 wrapper 가 f32→f16 device 변환해 넘긴다(matmul2d f16 강제).
 //   grid=(ceil(M_tok/NRB), ceil(N_out/NRA)), tg=128. dequant 산식은 gemm_q4k_tensorops 1:1.
-template<uint NRA, uint NRB, uint NSG, uint NK>
+template<uint NRA, uint NRB, uint NSG, uint NK, uint DEQUANT_LANES = 1u,
+         bool PACKED_UNPACK = false, bool PACKED_VECTOR8 = false>
 static void gemm_q4k_v2_tmpl(
     device const uchar *weight_bytes,
     device const half  *input_f16,
@@ -319,6 +321,9 @@ static void gemm_q4k_v2_tmpl(
 {
     const uint NUM_THREADS = NSG * 32u;
     const uint GROUPS_PER_CHUNK = NK / 64u;
+    const uint dequant_row = tid / DEQUANT_LANES;
+    const uint dequant_lane = tid % DEQUANT_LANES;
+    const uint dequant_row_step = NUM_THREADS / DEQUANT_LANES;
     uint ra = tgid.y * NRA;
     uint rb = tgid.x * NRB;
     uint nb_super = K / 256u;
@@ -339,7 +344,7 @@ static void gemm_q4k_v2_tmpl(
         uint group_base = c * GROUPS_PER_CHUNK;
         uint sb = group_base / 4u;
         uint g_base = group_base % 4u;
-        for (uint w = tid; w < NRA; w += NUM_THREADS) {
+        for (uint w = dequant_row; w < NRA; w += dequant_row_step) {
             uint row = ra + w;
             if (row < N_out) {
                 uint block_base = (row * nb_super + sb) * 144u;
@@ -377,14 +382,37 @@ static void gemm_q4k_v2_tmpl(
                     float mm2 = dmin * (float)m1;
                     uint quant_base = block_base + 16u + g * 32u;
                     uint dst_base = w * NK + local_group * 64u;
-                    for (uint l = 0; l < 32u; l++) {
-                        uchar q = weight_bytes[quant_base + l];
-                        sa[dst_base + l] = (half)(d1 * (float)(q & 0x0Fu) - mm1);
-                        sa[dst_base + 32u + l] = (half)(d2 * (float)(q >> 4u) - mm2);
+                    if constexpr (PACKED_UNPACK) {
+                        using packed8 = packed_numeric_type<uint4b_format, 8>;
+                        using storage8 = packed8::storage_type;
+                        for (uint l = dequant_lane * 4u; l < 32u;
+                             l += DEQUANT_LANES * 4u) {
+                            storage8 raw =
+                                *((device const storage8 *)(weight_bytes + quant_base + l));
+                            vec<half, 8> values = unpack<half>(packed8(raw));
+                            if constexpr (PACKED_VECTOR8) {
+                                vec<half, 4> low;
+                                vec<half, 4> high;
+                                for (uint i = 0; i < 4u; ++i) {
+                                    low[i] = values[i * 2u];
+                                    high[i] = values[i * 2u + 1u];
+                                }
+                                *((threadgroup vec<half, 4> *)(sa + dst_base + l)) =
+                                    vec<half, 4>(vec<float, 4>(low) * d1 - mm1);
+                                *((threadgroup vec<half, 4> *)(sa + dst_base + 32u + l)) =
+                                    vec<half, 4>(vec<float, 4>(high) * d2 - mm2);
+                            }
+                        }
+                    } else {
+                        for (uint l = dequant_lane; l < 32u; l += DEQUANT_LANES) {
+                            uchar q = weight_bytes[quant_base + l];
+                            sa[dst_base + l] = (half)(d1 * (float)(q & 0x0Fu) - mm1);
+                            sa[dst_base + 32u + l] = (half)(d2 * (float)(q >> 4u) - mm2);
+                        }
                     }
                 }
             } else {
-                for (uint k = 0; k < NK; k++) {
+                for (uint k = dequant_lane; k < NK; k += DEQUANT_LANES) {
                     sa[w * NK + k] = (half)0;
                 }
             }
@@ -424,7 +452,22 @@ static void gemm_q4k_v2_tmpl(
 GEMM_Q4K_V2_ENTRY(gemm_q4k_tensorops_v2, 64u, 8u, 4u, 64u)
 GEMM_Q4K_V2_ENTRY(gemm_q4k_tensorops_v2_64x128, 64u, 128u, 4u, 64u) // M2 winner(4.10x), M3 production 타일
 
-
+// M<=16 target verify: Metal 4.1 packed uint4 unpack halves the Q4_K nibble
+// conversion work while preserving the production 64x8 cooperative matmul tile.
+kernel void gemm_q4k_tensorops_v2_64x8_packed(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const half  *input_f16    [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N_out        [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M_tok        [[buffer(5)]],
+    threadgroup char   *shmem        [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]])
+{
+    gemm_q4k_v2_tmpl<64u, 8u, 4u, 64u, 1u, true, true>(
+        weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
+}
 // Qwen MoE prefill gate/up pair: 같은 activation tile을 읽는 Q4_K gate/up GEMM 두 dispatch를
 // 한 dispatch 안에서 순차 실행한다. weight는 raw Q4_K 그대로 받고, 각 호출 내부 threadgroup
 // half tile에서만 transient dequant한다. full gate/up scratch 크기는 기존 경로와 동일하다.
@@ -583,7 +626,8 @@ kernel void gemm_q4k_tensorops_v2_scatter_accum_64x64(
 // pm42 M3 step1: Q5_K v2 — gemm_q4k_v2_tmpl 구조(cooperative C, device-direct B) + Q5_K dequant.
 //   NK=64(Q4_K 와 동일 group), 176B/superblock. dequant 은 gemm_q5k_tensorops 1:1(qh high-bit +16).
 //   chunk c → superblock c/4, group g=c%4. GDN ssm_out(Q5_K) + 9B GDN projection.
-template<uint NRA, uint NRB, uint NSG>
+template<uint NRA, uint NRB, uint NSG, uint DEQUANT_LANES = 1u,
+         bool PACKED_UNPACK = false>
 static void gemm_q5k_v2_tmpl(
     device const uchar *weight_bytes,
     device const half  *input_f16,
@@ -597,6 +641,9 @@ static void gemm_q5k_v2_tmpl(
 {
     const uint NK  = 64u;  // K chunk = 1 Q5_K group (= Q4_K)
     const uint NUM_THREADS = NSG * 32u;
+    const uint dequant_row = tid / DEQUANT_LANES;
+    const uint dequant_lane = tid % DEQUANT_LANES;
+    const uint dequant_row_step = NUM_THREADS / DEQUANT_LANES;
     uint ra = tgid.y * NRA;
     uint rb = tgid.x * NRB;
     uint nb_super = K / 256u;
@@ -616,7 +663,7 @@ static void gemm_q5k_v2_tmpl(
     for (uint c = 0; c < nchunk; c++) {
         uint sb = c / 4u;
         uint g  = c % 4u;
-        for (uint w = tid; w < NRA; w += NUM_THREADS) {
+        for (uint w = dequant_row; w < NRA; w += dequant_row_step) {
             uint row = ra + w;
             if (row < N_out) {
                 device const uchar *blk = weight_bytes + (row * nb_super + sb) * 176u;
@@ -640,16 +687,36 @@ static void gemm_q5k_v2_tmpl(
                 device const uchar *ql = blk + 48 + g * 32u;
                 uchar u1 = (uchar)(1u << (2u * g));
                 uchar u2 = (uchar)(2u << (2u * g));
-                for (uint l = 0; l < 32u; l++) {
-                    float high1 = (qh[l] & u1) ? 16.0f : 0.0f;
-                    float qlow  = (float)(ql[l] & 0x0Fu) + high1;
-                    sa[w * NK + l] = (half)(d1 * qlow - mm1);
-                    float high2 = (qh[l] & u2) ? 16.0f : 0.0f;
-                    float qhigh = (float)(ql[l] >> 4u) + high2;
-                    sa[w * NK + 32u + l] = (half)(d2 * qhigh - mm2);
+                if constexpr (PACKED_UNPACK) {
+                    using packed16 = packed_numeric_type<uint4b_format, 16>;
+                    using storage16 = packed16::storage_type;
+                    for (uint l = dequant_lane * 8u; l < 32u;
+                         l += DEQUANT_LANES * 8u) {
+                        storage16 raw = *((device const storage16 *)(ql + l));
+                        vec<half, 16> values = unpack<half>(packed16(raw));
+                        for (uint i = 0; i < 8u; ++i) {
+                            float high1 = (qh[l + i] & u1) ? 16.0f : 0.0f;
+                            float qlow = (float)values[i * 2u] + high1;
+                            sa[w * NK + l + i] = (half)(d1 * qlow - mm1);
+                            float high2 = (qh[l + i] & u2) ? 16.0f : 0.0f;
+                            float qhigh = (float)values[i * 2u + 1u] + high2;
+                            sa[w * NK + 32u + l + i] = (half)(d2 * qhigh - mm2);
+                        }
+                    }
+                } else {
+                    for (uint l = dequant_lane; l < 32u; l += DEQUANT_LANES) {
+                        float high1 = (qh[l] & u1) ? 16.0f : 0.0f;
+                        float qlow  = (float)(ql[l] & 0x0Fu) + high1;
+                        sa[w * NK + l] = (half)(d1 * qlow - mm1);
+                        float high2 = (qh[l] & u2) ? 16.0f : 0.0f;
+                        float qhigh = (float)(ql[l] >> 4u) + high2;
+                        sa[w * NK + 32u + l] = (half)(d2 * qhigh - mm2);
+                    }
                 }
             } else {
-                for (uint k = 0; k < NK; k++) { sa[w * NK + k] = (half)0; }
+                for (uint k = dequant_lane; k < NK; k += DEQUANT_LANES) {
+                    sa[w * NK + k] = (half)0;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -666,7 +733,7 @@ static void gemm_q5k_v2_tmpl(
 // pm42 M3 step1: Q6_K v2 — gemm_q4k_v2_tmpl 구조 + Q6_K dequant. NK=128(Q6_K superblock 절반),
 //   210B/superblock. dequant 은 gemm_q6k_tensorops 1:1. chunk c → superblock c/2, half n=c%2(128-half).
 //   sa = NRA*128 half = 16KB(NRA=64). FFN down(Q6_K) + GDN in_proj(Q6_K).
-template<uint NRA, uint NRB, uint NSG, uint NK>
+template<uint NRA, uint NRB, uint NSG, uint NK, uint DEQUANT_LANES = 1u>
 static void gemm_q6k_v2_tmpl(
     device const uchar *weight_bytes,
     device const half  *input_f16,
@@ -680,6 +747,9 @@ static void gemm_q6k_v2_tmpl(
 {
     const uint NUM_THREADS = NSG * 32u;
     const uint HALVES_PER_CHUNK = NK / 128u;
+    const uint dequant_row = tid / DEQUANT_LANES;
+    const uint dequant_lane = tid % DEQUANT_LANES;
+    const uint dequant_row_step = NUM_THREADS / DEQUANT_LANES;
     uint ra = tgid.y * NRA;
     uint rb = tgid.x * NRB;
     uint nb_super = K / 256u;
@@ -700,7 +770,7 @@ static void gemm_q6k_v2_tmpl(
         uint half_base = c * HALVES_PER_CHUNK;
         uint sb = half_base / 2u;
         uint n_base = half_base % 2u;
-        for (uint w = tid; w < NRA; w += NUM_THREADS) {
+        for (uint w = dequant_row; w < NRA; w += dequant_row_step) {
             uint row = ra + w;
             if (row < N_out) {
                 device const uchar *blk = weight_bytes + (row * nb_super + sb) * 210u;
@@ -715,7 +785,7 @@ static void gemm_q6k_v2_tmpl(
                     uint qh_base = n * 32u;
                     uint sc_base = n * 8u;
                     uint dst_base = w * NK + local_half * 128u;
-                    for (uint l = 0; l < 32u; l++) {
+                    for (uint l = dequant_lane; l < 32u; l += DEQUANT_LANES) {
                         uint is = l / 16u;
                         int q1 = (int)((ql[ql_base + l] & 0x0Fu)
                             | (((qh[qh_base + l] >> 0u) & 3u) << 4u));
@@ -736,7 +806,7 @@ static void gemm_q6k_v2_tmpl(
                     }
                 }
             } else {
-                for (uint k = 0; k < NK; k++) {
+                for (uint k = dequant_lane; k < NK; k += DEQUANT_LANES) {
                     sa[w * NK + k] = (half)0;
                 }
             }
@@ -769,6 +839,21 @@ kernel void gemm_q5k_tensorops_v2_64x32(
     gemm_q5k_v2_tmpl<64u, 8u, 4u>(weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
 }
 
+kernel void gemm_q5k_tensorops_v2_64x8_packed(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const half  *input_f16    [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N_out        [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M_tok        [[buffer(5)]],
+    threadgroup char   *shmem        [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]])
+{
+    gemm_q5k_v2_tmpl<64u, 8u, 4u, 2u, true>(
+        weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
+}
+
 kernel void gemm_q6k_tensorops_v2_64x32(
     device const uchar *weight_bytes [[buffer(0)]],
     device const half  *input_f16    [[buffer(1)]],
@@ -780,7 +865,38 @@ kernel void gemm_q6k_tensorops_v2_64x32(
     uint2 tgid [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]])
 {
-    gemm_q6k_v2_tmpl<64u, 8u, 4u, 128u>(weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
+    gemm_q6k_v2_tmpl<64u, 8u, 4u, 128u>(
+        weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
+}
+
+kernel void gemm_q6k_tensorops_v2_64x8_parallel2(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const half  *input_f16    [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N_out        [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M_tok        [[buffer(5)]],
+    threadgroup char   *shmem        [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]])
+{
+    gemm_q6k_v2_tmpl<64u, 8u, 4u, 128u, 2u>(
+        weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
+}
+
+kernel void gemm_q6k_tensorops_v2_64x8_parallel4(
+    device const uchar *weight_bytes [[buffer(0)]],
+    device const half  *input_f16    [[buffer(1)]],
+    device float       *out          [[buffer(2)]],
+    constant uint      &N_out        [[buffer(3)]],
+    constant uint      &K            [[buffer(4)]],
+    constant uint      &M_tok        [[buffer(5)]],
+    threadgroup char   *shmem        [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]])
+{
+    gemm_q6k_v2_tmpl<64u, 8u, 4u, 128u, 4u>(
+        weight_bytes, input_f16, out, N_out, K, M_tok, shmem, tgid, tid);
 }
 
 kernel void gemm_q5k_tensorops_v2_64x128(
