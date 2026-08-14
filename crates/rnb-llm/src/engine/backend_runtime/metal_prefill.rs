@@ -40,8 +40,17 @@ pub(in crate::engine) struct GemmaPrefillLayerRangeSpec<'a> {
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[derive(Clone, Copy)]
+pub(in crate::engine) struct MusePrefillLayerRangeTarget {
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub pos_start: usize,
+    pub kv_len: usize,
+}
+
 pub(in crate::engine) struct MusePrefillLayerRangeSpec<'a> {
     pub layer_idx: usize,
+    pub target: Option<MusePrefillLayerRangeTarget>,
     pub hidden: &'a [f32],
     pub attn_norm_w: Vec<f32>,
     pub q_norm_w: Vec<f32>,
@@ -406,9 +415,36 @@ pub(in crate::engine) fn metal_gemma_prefill_full_layer_if_supported(
     .map_err(crate::error::LlmError::Forward)
 }
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn metal_muse_prepare_target_kv_resident_if_supported(
+    cached_k_f16: &[u16],
+    cached_v_f16: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+    capacity_len: usize,
+) -> crate::error::Result<bool> {
+    metal_runtime::metal_muse_prepare_target_kv_resident_if_supported(
+        cached_k_f16,
+        cached_v_f16,
+        sequence_epoch,
+        cache_layer,
+        num_kv_heads,
+        head_dim,
+        pos_start,
+        capacity_len,
+    )
+    .map_err(crate::error::LlmError::Forward)
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(in crate::engine) fn metal_muse_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[MusePrefillLayerRangeSpec<'_>],
+    feature_layers: &[usize],
+    output_argmax: Option<super::metal_decode_chain::MetalDecodeOutputArgmax<'_>>,
     mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<(), String>,
 ) -> crate::error::Result<Option<metal_runtime::MetalMusePrefillLayerRangeOut>> {
     fn view(weight: &QuantizedWeight) -> Option<(rnb_loader::GGMLType, &[u8], usize, usize)> {
@@ -457,6 +493,14 @@ pub(in crate::engine) fn metal_muse_prefill_layer_range_if_supported(
         };
         runtime_layers.push(metal_runtime::MetalMusePrefillLayerRangeLayer {
             layer_idx: layer.layer_idx,
+            target: layer
+                .target
+                .map(|target| metal_runtime::MetalMusePrefillLayerRangeTarget {
+                    sequence_epoch: target.sequence_epoch,
+                    cache_layer: target.cache_layer,
+                    pos_start: target.pos_start,
+                    kv_len: target.kv_len,
+                }),
             request: metal_runtime::MetalMusePrefillFullLayerRequest {
                 hidden: layer.hidden,
                 attn_norm_w: &layer.attn_norm_w,
@@ -514,9 +558,28 @@ pub(in crate::engine) fn metal_muse_prefill_layer_range_if_supported(
             },
         });
     }
+    let output_argmax = match output_argmax {
+        Some(tail) => {
+            let Some(view) = tail.output_weight.backend_view() else {
+                return Ok(None);
+            };
+            Some(metal_runtime::MetalDecodeOutputArgmax {
+                norm_weight: tail.norm_weight,
+                output_ggml: backend_ggml_type(view.quant()),
+                output_raw: view.raw(),
+                rows: tail.rows,
+                cols: tail.cols,
+                eps: tail.eps,
+                excluded_token: tail.excluded_token,
+            })
+        }
+        None => None,
+    };
     metal_runtime::metal_muse_prefill_layer_range_if_supported(
         hidden,
         &runtime_layers,
+        feature_layers,
+        output_argmax,
         |layer, k, v| on_kv(layer, k, v),
     )
     .map_err(crate::error::LlmError::Forward)

@@ -290,6 +290,45 @@ impl MuseDflashRuntime {
             ));
         }
 
+        let encoder_norm = kernels::tensor_as_f32_slice(&self.encoder_norm);
+        if let Some(layer_kv) = crate::engine::backend_runtime::dflash_cache_seed_if_supported(
+            &self.encoder_projection,
+            encoder_norm,
+            &self.layers,
+            features,
+            token_count,
+            start_position,
+            self.hidden_dim,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rope_theta,
+            self.norm_eps,
+        )? {
+            let kv_dim = self.num_kv_heads * self.head_dim;
+            if layer_kv.len() != self.layer_cache.len()
+                || layer_kv.iter().any(|(keys, values)| {
+                    keys.len() != token_count * kv_dim || values.len() != token_count * kv_dim
+                })
+            {
+                return Err(LlmError::Forward(
+                    "Metal DFlash cache seed returned an invalid shape".to_string(),
+                ));
+            }
+            for (cache, (keys, values)) in self.layer_cache.iter_mut().zip(layer_kv) {
+                for token in 0..token_count {
+                    let row = token * kv_dim;
+                    cache.keys.push_back(keys[row..row + kv_dim].to_vec());
+                    cache.values.push_back(values[row..row + kv_dim].to_vec());
+                    if cache.keys.len() > self.window_size {
+                        cache.keys.pop_front();
+                        cache.values.pop_front();
+                    }
+                }
+            }
+            self.position = start_position + token_count;
+            return Ok(());
+        }
+
         let projected = self.encoder_projection.gemv_vec(features)?;
         let fused = rms_norm_rows(
             &projected,
@@ -356,6 +395,7 @@ impl MuseDflashRuntime {
         &mut self,
         anchor_token: u32,
         max_draft_tokens: usize,
+        confidence_cutoff: Option<f32>,
         target_embedding: &QuantizedWeight,
         target_output: &QuantizedWeight,
     ) -> Result<MuseDflashDraft> {
@@ -365,7 +405,7 @@ impl MuseDflashRuntime {
                 self.block_size
             )));
         }
-        let seq_len = max_draft_tokens + 1;
+        let seq_len = self.block_size;
         let mut tokens = vec![self.mask_token_id; seq_len];
         tokens[0] = anchor_token;
         let hidden = target_embedding.gather(&tokens)?;
@@ -398,6 +438,8 @@ impl MuseDflashRuntime {
                 &layer.ffn_gate_weight,
                 &layer.ffn_up_weight,
                 &layer.ffn_down_weight,
+                layer_index,
+                self.layers.len(),
                 &prior_k,
                 &prior_v,
                 &mut hidden,
@@ -530,29 +572,43 @@ impl MuseDflashRuntime {
         }
 
         let normalized = rms_norm_rows(&hidden, self.hidden_dim, &self.output_norm, self.norm_eps);
-        let logits = target_output.gemv_vec(&normalized)?;
-        if logits.len() != seq_len * self.vocab_size {
+        let logits = target_output
+            .gemv_vec(&normalized[self.hidden_dim..(max_draft_tokens + 1) * self.hidden_dim])?;
+        let expected_logits = max_draft_tokens * self.vocab_size;
+        if logits.len() != expected_logits {
             return Err(LlmError::Forward(format!(
                 "Muse DFlash logits length {} != {}",
                 logits.len(),
-                seq_len * self.vocab_size
+                expected_logits
             )));
         }
-        let mut result_tokens = Vec::with_capacity(seq_len - 1);
-        let mut probabilities = Vec::with_capacity(seq_len - 1);
-        for row in logits.chunks_exact(self.vocab_size).skip(1) {
+        let collect_probabilities =
+            confidence_cutoff.is_some() || crate::runtime::mtp_trace_enabled();
+        let mut result_tokens = Vec::with_capacity(max_draft_tokens);
+        let mut probabilities = Vec::with_capacity(
+            collect_probabilities
+                .then_some(max_draft_tokens)
+                .unwrap_or_default(),
+        );
+        for row in logits.chunks_exact(self.vocab_size) {
             let (token, max_logit) = row
                 .iter()
                 .copied()
                 .enumerate()
                 .max_by(|left, right| left.1.total_cmp(&right.1))
                 .unwrap_or((0, f32::NEG_INFINITY));
-            let sum = row
-                .iter()
-                .map(|value| (*value - max_logit).exp())
-                .sum::<f32>();
             result_tokens.push(token as u32);
-            probabilities.push(sum.recip());
+            if collect_probabilities {
+                let sum = row
+                    .iter()
+                    .map(|value| (*value - max_logit).exp())
+                    .sum::<f32>();
+                let probability = sum.recip();
+                probabilities.push(probability);
+                if confidence_cutoff.is_some_and(|cutoff| probability < cutoff) {
+                    break;
+                }
+            }
         }
         Ok(MuseDflashDraft {
             tokens: result_tokens,

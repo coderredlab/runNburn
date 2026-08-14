@@ -14,7 +14,7 @@ use objc2_metal::{
 };
 
 use crate::compute::MetalContext;
-use crate::{QwenMoePrefillBackendSpecRef, QwenRouteAlgorithm};
+use crate::{QwenMoePrefillBackendSpecRef, QwenRouteAlgorithm, TensoropsQuant};
 
 const QWEN_MOE_WEIGHT_TABLE_CAP: usize = 257;
 const QWEN_MOE_WEIGHT_CHUNK_EXPERTS: usize = 32;
@@ -721,14 +721,20 @@ pub(crate) struct DenseFfnBatchCarrier {
     batch: usize,
     hidden_dim: usize,
     ffn_dim: usize,
+    eps: f32,
+    post_norm_eps: f32,
     normed_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    normed_f16_all: Retained<ProtocolObject<dyn MTLBuffer>>,
     gate_all: Retained<ProtocolObject<dyn MTLBuffer>>,
     up_all: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gate_act_f16_all: Retained<ProtocolObject<dyn MTLBuffer>>,
     down_all: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_total_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     batch_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    post_norm_eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     silu_total_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
@@ -744,16 +750,36 @@ impl DenseFfnBatchCarrier {
             batch,
             hidden_dim,
             ffn_dim,
+            eps,
+            post_norm_eps: eps,
             normed_all: empty_f32_buf(ctx, batch * hidden_dim),
+            normed_f16_all: empty_f16_buf(ctx, batch * hidden_dim),
             gate_all: empty_f32_buf(ctx, batch * ffn_dim),
             up_all: empty_f32_buf(ctx, batch * ffn_dim),
+            gate_act_f16_all: empty_f16_buf(ctx, batch * ffn_dim),
             down_all: empty_f32_buf(ctx, batch * hidden_dim),
             hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            hidden_total_buf: u32_buf(ctx, (batch * hidden_dim) as u32),
             ffn_dim_buf: u32_buf(ctx, ffn_dim as u32),
             batch_buf: u32_buf(ctx, batch as u32),
             eps_buf: f32_buf(ctx, eps),
             silu_total_buf: u32_buf(ctx, (batch * ffn_dim) as u32),
+            post_norm_eps_buf: f32_buf(ctx, eps),
         }
+    }
+
+    pub(crate) fn new_muse(
+        ctx: &MetalContext,
+        batch: usize,
+        hidden_dim: usize,
+        ffn_dim: usize,
+        eps: f32,
+        post_norm_eps: f32,
+    ) -> Self {
+        let mut carrier = Self::new(ctx, batch, hidden_dim, ffn_dim, eps);
+        carrier.post_norm_eps = post_norm_eps;
+        carrier.post_norm_eps_buf = f32_buf(ctx, post_norm_eps);
+        carrier
     }
 }
 
@@ -857,6 +883,148 @@ pub(crate) fn dense_ffn_chain_encode_bcol(
         );
     }
     crate::compute::chain_barrier(ctx, enc);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn muse_dense_ffn_chain_encode_bcol(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &DenseFfnBatchCarrier,
+    shared_hidden: &ProtocolObject<dyn MTLBuffer>,
+    attention_out: &ProtocolObject<dyn MTLBuffer>,
+    post_attn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    post_ffn_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_w_off: u32,
+    up_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    up_w_off: u32,
+    down_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    down_w_off: u32,
+    down_quant: TensoropsQuant,
+) {
+    let hidden_total = carrier.batch * carrier.hidden_dim;
+    let ffn_total = carrier.batch * carrier.ffn_dim;
+
+    encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        enc,
+        attention_out,
+        post_attn_norm_w_buf,
+        &carrier.down_all,
+        carrier.batch,
+        carrier.hidden_dim,
+        carrier.post_norm_eps,
+    )
+    .expect("Muse verify post-attention RMSNorm");
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.down_all]);
+    encode_residual_add(
+        ctx,
+        enc,
+        shared_hidden,
+        &carrier.down_all,
+        &carrier.hidden_total_buf,
+        hidden_total,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [shared_hidden, &*carrier.down_all]);
+
+    encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        enc,
+        shared_hidden,
+        ffn_norm_w_buf,
+        &carrier.normed_all,
+        carrier.batch,
+        carrier.hidden_dim,
+        carrier.eps,
+    )
+    .expect("Muse verify FFN RMSNorm");
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.normed_all]);
+    crate::compute::encode_cast_f32_to_f16(
+        ctx,
+        enc,
+        &carrier.normed_all,
+        &carrier.normed_f16_all,
+        &carrier.hidden_total_buf,
+        hidden_total,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.normed_f16_all]);
+
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        gate_w_buf,
+        gate_w_off,
+        &carrier.normed_f16_all,
+        &carrier.gate_all,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        &carrier.batch_buf,
+        carrier.ffn_dim,
+        carrier.batch,
+    );
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        up_w_buf,
+        up_w_off,
+        &carrier.normed_f16_all,
+        &carrier.up_all,
+        &carrier.ffn_dim_buf,
+        &carrier.hidden_dim_buf,
+        &carrier.batch_buf,
+        carrier.ffn_dim,
+        carrier.batch,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.gate_all, &*carrier.up_all]);
+    crate::compute::encode_silu_mul_to_f16(
+        ctx,
+        enc,
+        &carrier.gate_all,
+        &carrier.up_all,
+        &carrier.gate_act_f16_all,
+        &carrier.silu_total_buf,
+        ffn_total,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.gate_act_f16_all]);
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        down_quant,
+        down_w_buf,
+        down_w_off,
+        &carrier.gate_act_f16_all,
+        &carrier.down_all,
+        &carrier.hidden_dim_buf,
+        &carrier.ffn_dim_buf,
+        &carrier.batch_buf,
+        carrier.hidden_dim,
+        carrier.batch,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.down_all]);
+    encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        enc,
+        &carrier.down_all,
+        post_ffn_norm_w_buf,
+        &carrier.normed_all,
+        carrier.batch,
+        carrier.hidden_dim,
+        carrier.post_norm_eps,
+    )
+    .expect("Muse verify post-FFN RMSNorm");
+    crate::compute::chain_barrier_resources(ctx, enc, [&*carrier.normed_all]);
+    encode_residual_add(
+        ctx,
+        enc,
+        shared_hidden,
+        &carrier.normed_all,
+        &carrier.hidden_total_buf,
+        hidden_total,
+    );
+    crate::compute::chain_barrier_resources(ctx, enc, [shared_hidden, &*carrier.normed_all]);
 }
 
 /// FFN chain 한 token 실행. weight buffer/offset(NoCopy resident)은 caller 가 준비.

@@ -179,6 +179,26 @@ pub fn mtp_trace_enabled() -> bool {
     env_flag("RNB_MTP_TRACE")
 }
 
+pub fn mtp_dflash_adaptive_target_enabled() -> bool {
+    env_truthy_override("RNB_MTP_DFLASH_ADAPTIVE_TARGET").unwrap_or(true)
+}
+
+const MTP_DFLASH_CONFIDENCE_CUTOFF_DEFAULT: f32 = 0.15;
+
+pub fn mtp_dflash_confidence_cutoff() -> Option<f32> {
+    let Some(raw) = env_string("RNB_MTP_DFLASH_CONFIDENCE_CUTOFF") else {
+        return Some(MTP_DFLASH_CONFIDENCE_CUTOFF_DEFAULT);
+    };
+    let normalized = raw.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "" | "0" | "false" | "off" | "no") {
+        return None;
+    }
+    raw.parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+        .or(Some(MTP_DFLASH_CONFIDENCE_CUTOFF_DEFAULT))
+}
+
 /// `RNB_MTP_ACCEPT_PROBE=1`이면 MTP sequential verify가 target 분포 p와 draft 분포 q를
 /// 모두 만들어 accept 확률을 계측한다. 진단 전용이며 draft device fast path를 끄므로
 /// 느려진다.

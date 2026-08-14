@@ -1069,6 +1069,7 @@ pub struct DecodeOutputArgmaxSpecRef<'a> {
 
 #[cfg(target_os = "macos")]
 struct BatchedOutputTailBuffers {
+    normed: Retained<ProtocolObject<dyn MTLBuffer>>,
     logits: Retained<ProtocolObject<dyn MTLBuffer>>,
     token_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
@@ -1625,6 +1626,71 @@ pub struct MusePrefillFullLayerBackendRequest<'a> {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct DflashFullLayerBackendRequest<'a> {
+    pub hidden: &'a [f32],
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub q_weight: PrefillAtnCoreWeightView<'a>,
+    pub k_weight: PrefillAtnCoreWeightView<'a>,
+    pub v_weight: PrefillAtnCoreWeightView<'a>,
+    pub o_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_gate_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
+    pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
+    pub prior_k: &'a [u16],
+    pub prior_v: &'a [u16],
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub position: usize,
+    pub sliding_window: usize,
+    pub layer_index: usize,
+    pub layer_count: usize,
+}
+
+#[cfg(target_os = "macos")]
+struct DflashFullLayerRangeState {
+    hidden: Retained<ProtocolObject<dyn MTLBuffer>>,
+    next_layer: usize,
+    layer_count: usize,
+}
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct DflashCacheSeedBackendLayer<'a> {
+    pub k_norm_w: &'a [f32],
+    pub k_weight: PrefillAtnCoreWeightView<'a>,
+    pub v_weight: PrefillAtnCoreWeightView<'a>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct DflashCacheSeedBackendRequest<'a> {
+    pub features: &'a [f32],
+    pub encoder_norm_w: &'a [f32],
+    pub encoder_weight: PrefillAtnCoreWeightView<'a>,
+    pub layers: &'a [DflashCacheSeedBackendLayer<'a>],
+    pub token_count: usize,
+    pub feature_dim: usize,
+    pub hidden_dim: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub start_position: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
+
+#[cfg(target_os = "macos")]
 impl MusePrefillFullLayerCarrierShapeKey {
     fn from_request(req: MusePrefillFullLayerBackendRequest<'_>) -> Self {
         Self {
@@ -1649,11 +1715,23 @@ impl MusePrefillFullLayerCarrierShapeKey {
 pub struct MusePrefillLayerRangeBackendLayer<'a> {
     pub layer_idx: usize,
     pub request: MusePrefillFullLayerBackendRequest<'a>,
+    pub target: Option<MusePrefillLayerRangeTarget>,
+}
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+pub struct MusePrefillLayerRangeTarget {
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub pos_start: usize,
+    pub kv_len: usize,
 }
 
 #[cfg(target_os = "macos")]
 pub struct MusePrefillLayerRangeBackendOut {
     pub hidden: Vec<f32>,
+    pub features: Vec<f32>,
+    pub target_tokens: Vec<u32>,
+    pub output_hidden_rows: Vec<f32>,
     pub hidden_uploads: usize,
     pub hidden_readbacks: usize,
     pub intermediate_hidden_transfers: usize,
@@ -2089,6 +2167,19 @@ pub struct MetalBackend {
     dflash_attention_carriers: RefCell<
         HashMap<(usize, usize, usize, usize, usize), dflash_attention::DflashAttentionCarrier>,
     >,
+    dflash_full_layer_carriers: RefCell<
+        HashMap<
+            (usize, usize, usize, usize, usize, usize, usize, usize),
+            prefill_atn_core_chain::DflashFullLayerCarrier,
+        >,
+    >,
+    dflash_full_layer_range_state: RefCell<Option<DflashFullLayerRangeState>>,
+    dflash_cache_seed_carrier: RefCell<
+        Option<(
+            (usize, usize, usize, usize, usize, usize, usize),
+            prefill_atn_core_chain::DflashCacheSeedCarrier,
+        )>,
+    >,
     /// Muse target continuation attention scratch, keyed by tiny verify shape.
     muse_target_attention_carriers:
         RefCell<HashMap<(usize, usize, usize), dflash_attention::MuseTargetAttentionCarrier>>,
@@ -2175,9 +2266,10 @@ pub struct MetalBackend {
     /// milestone 4: batched(B-lane) attention core carrier. `attn_moe_carriers`(single-token)
     /// 와 분리(프로덕션 single-token 경로 불변). MTP verify mixed-chain body fusion 전용.
     attn_batch_carriers: RefCell<HashMap<AttnBatchCarrierKey, attn_chain::AttnBatchCarrier>>,
-    /// Batched dense FFN B-column scratch. (batch, hidden, ffn, eps_bits) 별 1회 alloc.
+    /// Batched dense FFN B-column scratch.
+    /// (batch, hidden, ffn, eps_bits, post_norm_eps_bits) 별 1회 alloc.
     dense_ffn_batch_carriers:
-        RefCell<HashMap<(usize, usize, usize, u32), ffn_chain::DenseFfnBatchCarrier>>,
+        RefCell<HashMap<(usize, usize, usize, u32, u32), ffn_chain::DenseFfnBatchCarrier>>,
     /// Registered host weight slice identity(`raw.as_ptr() as usize`, `raw.len()`) →
     /// NoCopy buffer, page offset, and a strong source-storage lease. The lease
     /// prevents the loader mapping from being released while any cached NoCopy
@@ -2371,6 +2463,9 @@ impl MetalBackend {
                 prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
                 prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
                 dflash_attention_carriers: RefCell::new(HashMap::new()),
+                dflash_full_layer_carriers: RefCell::new(HashMap::new()),
+                dflash_full_layer_range_state: RefCell::new(None),
+                dflash_cache_seed_carrier: RefCell::new(None),
                 muse_target_attention_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_core_carriers: RefCell::new(HashMap::new()),
                 prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
@@ -2612,6 +2707,9 @@ impl MetalBackend {
             prefill_gdn_full_ffn_carriers: RefCell::new(HashMap::new()),
             prefill_attn_chain_carriers: RefCell::new(HashMap::new()),
             dflash_attention_carriers: RefCell::new(HashMap::new()),
+            dflash_full_layer_carriers: RefCell::new(HashMap::new()),
+            dflash_full_layer_range_state: RefCell::new(None),
+            dflash_cache_seed_carrier: RefCell::new(None),
             muse_target_attention_carriers: RefCell::new(HashMap::new()),
             prefill_atn_core_carriers: RefCell::new(HashMap::new()),
             prefill_atn_full_layer_carriers: RefCell::new(HashMap::new()),
@@ -4749,6 +4847,91 @@ impl MetalBackend {
         Ok(Some(output))
     }
 
+    #[cfg(target_os = "macos")]
+    fn sync_muse_target_kv_resident(
+        &self,
+        ctx: &compute::MetalContext,
+        cached_k_f16: &[u16],
+        cached_v_f16: &[u16],
+        sequence_epoch: u64,
+        cache_layer: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dirty_start: usize,
+        target_len: usize,
+        capacity: usize,
+    ) {
+        let mut cache = self.gemma_prefill_f16kv_residents.borrow_mut();
+        let recreate = cache.get(&cache_layer).is_none_or(|entry| {
+            entry.sequence_epoch != sequence_epoch
+                || entry.kv.kv_int8
+                || entry.kv.num_kv_heads != num_kv_heads
+                || entry.kv.head_dim != head_dim
+                || entry.kv.capacity < capacity
+        });
+        if recreate {
+            cache.insert(
+                cache_layer,
+                GemmaPrefillF16KvResident {
+                    sequence_epoch,
+                    kv: compute::KvResident::new_f16_zeroed(ctx, num_kv_heads, head_dim, capacity),
+                },
+            );
+        }
+        cache
+            .get_mut(&cache_layer)
+            .expect("Metal Muse target resident initialized")
+            .kv
+            .sync_f16_range(cached_k_f16, cached_v_f16, dirty_start, target_len);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_muse_target_kv_resident_if_supported(
+        &self,
+        cached_k_f16: &[u16],
+        cached_v_f16: &[u16],
+        sequence_epoch: u64,
+        cache_layer: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pos_start: usize,
+        capacity_len: usize,
+    ) -> Result<bool, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(false);
+        };
+        let kv_dim = num_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "Metal Muse target KV dimension overflow".to_string())?;
+        let expected = pos_start
+            .checked_mul(kv_dim)
+            .ok_or_else(|| "Metal Muse target KV length overflow".to_string())?;
+        if cached_k_f16.len() != expected
+            || cached_v_f16.len() != expected
+            || capacity_len < pos_start
+        {
+            return Err(format!(
+                "Metal Muse target KV prepare mismatch: k={} v={} expected={expected} capacity={capacity_len}",
+                cached_k_f16.len(),
+                cached_v_f16.len()
+            ));
+        }
+        self.sync_muse_target_kv_resident(
+            ctx,
+            cached_k_f16,
+            cached_v_f16,
+            sequence_epoch,
+            cache_layer,
+            num_kv_heads,
+            head_dim,
+            pos_start,
+            pos_start,
+            capacity_len.next_multiple_of(64),
+        );
+        Ok(true)
+    }
+
     /// Muse dense layer tail: O projection, both residual branches, and SwiGLU FFN.
     #[cfg(target_os = "macos")]
     pub fn prefill_muse_o_tail_ffn_if_supported(
@@ -4934,36 +5117,18 @@ impl MetalBackend {
                 scale,
                 sliding_window,
             } => {
-                let capacity = kv_len.next_multiple_of(64);
-                {
-                    let mut cache = self.gemma_prefill_f16kv_residents.borrow_mut();
-                    let recreate = cache.get(&cache_layer).is_none_or(|entry| {
-                        entry.sequence_epoch != sequence_epoch
-                            || entry.kv.kv_int8
-                            || entry.kv.num_kv_heads != num_kv_heads
-                            || entry.kv.head_dim != head_dim
-                            || entry.kv.capacity < capacity
-                    });
-                    if recreate {
-                        cache.insert(
-                            cache_layer,
-                            GemmaPrefillF16KvResident {
-                                sequence_epoch,
-                                kv: compute::KvResident::new_f16_zeroed(
-                                    ctx,
-                                    num_kv_heads,
-                                    head_dim,
-                                    capacity,
-                                ),
-                            },
-                        );
-                    }
-                    cache
-                        .get_mut(&cache_layer)
-                        .expect("Metal Muse target resident initialized")
-                        .kv
-                        .sync_f16_range(cached_k_f16, cached_v_f16, pos_start, kv_len);
-                }
+                self.sync_muse_target_kv_resident(
+                    ctx,
+                    cached_k_f16,
+                    cached_v_f16,
+                    sequence_epoch,
+                    cache_layer,
+                    num_kv_heads,
+                    head_dim,
+                    pos_start,
+                    kv_len,
+                    kv_len.next_multiple_of(64),
+                );
                 let cache = self.gemma_prefill_f16kv_residents.borrow();
                 let resident = &cache
                     .get(&cache_layer)
@@ -5176,7 +5341,10 @@ impl MetalBackend {
                 attention_gate_w_off,
                 attention_gate_quant: req.attention_gate_weight.quant,
                 apply_rope: req.apply_rope,
+                rope_theta: req.rope_theta,
+                pos_start: 0,
                 sliding_window: req.sliding_window,
+                target_kv: None,
                 ops: prefill_atn_core_chain::MuseOTailFfnOpsRequest {
                     hidden: req.hidden,
                     post_attn_norm_w: req.post_attn_norm_w,
@@ -5200,6 +5368,381 @@ impl MetalBackend {
             },
         )?;
         Ok(Some(out))
+    }
+    #[cfg(target_os = "macos")]
+    pub fn dflash_full_layer_if_supported(
+        &self,
+        req: DflashFullLayerBackendRequest<'_>,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        let result = self.dflash_full_layer_if_supported_impl(req);
+        let interrupted = result.is_err() || result.as_ref().is_ok_and(Option::is_none);
+        let had_active_range = interrupted
+            && self
+                .dflash_full_layer_range_state
+                .borrow_mut()
+                .take()
+                .is_some();
+        if had_active_range {
+            if let Some(ctx) = self.ctx.as_ref() {
+                if let Some(command) = ctx.queue.commandBuffer() {
+                    command.commit();
+                    command.waitUntilCompleted();
+                }
+            }
+            if result.as_ref().is_ok_and(Option::is_none) {
+                return Err(
+                    "Metal DFlash layer range became unsupported after it started".to_string(),
+                );
+            }
+        }
+        result
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dflash_full_layer_if_supported_impl(
+        &self,
+        req: DflashFullLayerBackendRequest<'_>,
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        if req.layer_count == 0
+            || req.layer_index >= req.layer_count
+            || req.seq_len == 0
+            || req.head_dim != 128
+            || req.num_heads == 0
+            || req.num_kv_heads == 0
+            || req.num_heads % req.num_kv_heads != 0
+            || req.q_dim != req.num_heads * req.head_dim
+            || req.kv_dim != req.num_kv_heads * req.head_dim
+            || req.hidden.len() != req.seq_len * req.hidden_dim
+            || req.prior_k.len() != req.prior_v.len()
+            || req.prior_k.len() % req.kv_dim != 0
+            || req.position < req.prior_k.len() / req.kv_dim
+            || req.sliding_window == 0
+            || !req.rope_theta.is_finite()
+            || req.rope_theta <= 0.0
+            || !req.scale.is_finite()
+            || req.scale <= 0.0
+            || !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+        {
+            return Err("Metal DFlash full layer contract mismatch".to_string());
+        }
+        for (role, norm, len) in [
+            ("attention norm", req.attn_norm_w, req.hidden_dim),
+            ("Q norm", req.q_norm_w, req.head_dim),
+            ("K norm", req.k_norm_w, req.head_dim),
+            ("FFN norm", req.ffn_norm_w, req.hidden_dim),
+        ] {
+            Self::atn_core_require_eq(&format!("{role} len"), norm.len(), len)?;
+        }
+        for (role, weight, rows, cols) in [
+            ("q", req.q_weight, req.q_dim, req.hidden_dim),
+            ("k", req.k_weight, req.kv_dim, req.hidden_dim),
+            ("v", req.v_weight, req.kv_dim, req.hidden_dim),
+            ("o", req.o_weight, req.hidden_dim, req.q_dim),
+            ("ffn gate", req.ffn_gate_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn up", req.ffn_up_weight, req.ffn_dim, req.hidden_dim),
+            ("ffn down", req.ffn_down_weight, req.hidden_dim, req.ffn_dim),
+        ] {
+            if !Self::atn_core_tensorops_v2_ready(ctx, weight.quant) {
+                return Ok(None);
+            }
+            Self::atn_core_require_eq(&format!("{role} rows"), weight.rows, rows)?;
+            Self::atn_core_require_eq(&format!("{role} cols"), weight.cols, cols)?;
+            Self::atn_core_validate_weight(role, weight)?;
+        }
+
+        let (
+            q_w_buf,
+            q_w_off,
+            k_w_buf,
+            k_w_off,
+            v_w_buf,
+            v_w_off,
+            o_w_buf,
+            o_w_off,
+            gate_w_buf,
+            gate_w_off,
+            up_w_buf,
+            up_w_off,
+            down_w_buf,
+            down_w_off,
+        ) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (q, qo) = wrap(req.q_weight.raw);
+            let (k, ko) = wrap(req.k_weight.raw);
+            let (v, vo) = wrap(req.v_weight.raw);
+            let (o, oo) = wrap(req.o_weight.raw);
+            let (gate, gate_o) = wrap(req.ffn_gate_weight.raw);
+            let (up, up_o) = wrap(req.ffn_up_weight.raw);
+            let (down, down_o) = wrap(req.ffn_down_weight.raw);
+            (
+                q, qo, k, ko, v, vo, o, oo, gate, gate_o, up, up_o, down, down_o,
+            )
+        };
+        let key = (
+            req.seq_len,
+            req.num_heads,
+            req.num_kv_heads,
+            req.head_dim,
+            req.hidden_dim,
+            req.ffn_dim,
+            req.sliding_window,
+            req.layer_index,
+        );
+        let (hidden_dev, final_layer) = {
+            let mut state = self.dflash_full_layer_range_state.borrow_mut();
+            if req.layer_index == 0 {
+                if state.is_some() {
+                    return Err("Metal DFlash layer range restarted before completion".to_string());
+                }
+                *state = Some(DflashFullLayerRangeState {
+                    hidden: ffn_chain::shared_f32_buf(ctx, req.hidden),
+                    next_layer: 0,
+                    layer_count: req.layer_count,
+                });
+            }
+            let state = state
+                .as_mut()
+                .ok_or_else(|| "Metal DFlash layer range missing initial layer".to_string())?;
+            if state.next_layer != req.layer_index || state.layer_count != req.layer_count {
+                return Err(format!(
+                    "Metal DFlash layer range order mismatch: got {}/{}, expected {}/{}",
+                    req.layer_index, req.layer_count, state.next_layer, state.layer_count
+                ));
+            }
+            state.next_layer += 1;
+            (state.hidden.clone(), req.layer_index + 1 == req.layer_count)
+        };
+        let mut carriers = self.dflash_full_layer_carriers.borrow_mut();
+        let carrier = carriers.entry(key).or_insert_with(|| {
+            prefill_atn_core_chain::DflashFullLayerCarrier::new(
+                ctx,
+                req.seq_len,
+                req.num_heads,
+                req.num_kv_heads,
+                req.head_dim,
+                req.hidden_dim,
+                req.q_dim,
+                req.kv_dim,
+                req.ffn_dim,
+                req.rope_theta,
+                req.scale,
+                req.norm_eps,
+                req.sliding_window,
+            )
+        });
+        let hidden = prefill_atn_core_chain::dflash_full_layer_dispatch(
+            ctx,
+            carrier,
+            &hidden_dev,
+            false,
+            final_layer,
+            prefill_atn_core_chain::DflashFullLayerDispatchRequest {
+                layer: prefill_atn_core_chain::PrefillAtnFullLayerDispatchRequest {
+                    core: prefill_atn_core_chain::PrefillAtnCoreDispatchRequest {
+                        hidden: req.hidden,
+                        attn_norm_w: req.attn_norm_w,
+                        q_norm_w: req.q_norm_w,
+                        k_norm_w: req.k_norm_w,
+                        q_w_buf: &q_w_buf,
+                        q_w_off,
+                        q_quant: req.q_weight.quant,
+                        k_w_buf: &k_w_buf,
+                        k_w_off,
+                        k_quant: req.k_weight.quant,
+                        v_w_buf: &v_w_buf,
+                        v_w_off,
+                        v_quant: req.v_weight.quant,
+                    },
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: req.o_weight.quant,
+                    ffn_norm_w: req.ffn_norm_w,
+                    ffn_gate_w_buf: &gate_w_buf,
+                    ffn_gate_w_off: gate_w_off,
+                    ffn_gate_quant: req.ffn_gate_weight.quant,
+                    ffn_up_w_buf: &up_w_buf,
+                    ffn_up_w_off: up_w_off,
+                    ffn_up_quant: req.ffn_up_weight.quant,
+                    ffn_down_w_buf: &down_w_buf,
+                    ffn_down_w_off: down_w_off,
+                    ffn_down_quant: req.ffn_down_weight.quant,
+                },
+                prior_k: req.prior_k,
+                prior_v: req.prior_v,
+                position: req.position,
+                rope_theta: req.rope_theta,
+                norm_eps: req.norm_eps,
+            },
+        );
+        drop(carriers);
+        if final_layer {
+            self.dflash_full_layer_range_state.borrow_mut().take();
+        }
+        Ok(Some(hidden?))
+    }
+    #[cfg(target_os = "macos")]
+    pub fn dflash_cache_seed_if_supported(
+        &self,
+        req: DflashCacheSeedBackendRequest<'_>,
+    ) -> std::result::Result<Option<Vec<(Vec<u16>, Vec<u16>)>>, String> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Ok(None);
+        };
+        let kv_dim = req.num_kv_heads.saturating_mul(req.head_dim);
+        if req.token_count == 0
+            || req.layers.is_empty()
+            || req.feature_dim == 0
+            || req.hidden_dim == 0
+            || req.num_kv_heads == 0
+            || req.head_dim != 128
+            || req.features.len() != req.token_count.saturating_mul(req.feature_dim)
+            || req.encoder_norm_w.len() != req.hidden_dim
+            || !req.rope_theta.is_finite()
+            || req.rope_theta <= 0.0
+            || !req.norm_eps.is_finite()
+            || req.norm_eps <= 0.0
+        {
+            return Err("Metal DFlash cache seed contract mismatch".to_string());
+        }
+        Self::atn_core_require_eq(
+            "DFlash encoder rows",
+            req.encoder_weight.rows,
+            req.hidden_dim,
+        )?;
+        Self::atn_core_require_eq(
+            "DFlash encoder cols",
+            req.encoder_weight.cols,
+            req.feature_dim,
+        )?;
+        if !Self::atn_core_tensorops_v2_ready(ctx, req.encoder_weight.quant) {
+            return Ok(None);
+        }
+        Self::atn_core_validate_weight("DFlash encoder", req.encoder_weight)?;
+        for (layer_index, layer) in req.layers.iter().enumerate() {
+            Self::atn_core_require_eq(
+                &format!("DFlash layer {layer_index} K norm len"),
+                layer.k_norm_w.len(),
+                req.head_dim,
+            )?;
+            for (role, weight) in [("K", layer.k_weight), ("V", layer.v_weight)] {
+                if !Self::atn_core_tensorops_v2_ready(ctx, weight.quant) {
+                    return Ok(None);
+                }
+                Self::atn_core_require_eq(
+                    &format!("DFlash layer {layer_index} {role} rows"),
+                    weight.rows,
+                    kv_dim,
+                )?;
+                Self::atn_core_require_eq(
+                    &format!("DFlash layer {layer_index} {role} cols"),
+                    weight.cols,
+                    req.hidden_dim,
+                )?;
+                Self::atn_core_validate_weight(
+                    &format!("DFlash layer {layer_index} {role}"),
+                    weight,
+                )?;
+            }
+        }
+
+        let (encoder_w_buf, encoder_w_off, layer_buffers) = {
+            let mut resident = self.resident.borrow_mut();
+            let mut wrap = |raw: &[u8]| {
+                let entry = resident
+                    .entry(resident_key(raw))
+                    .or_insert_with(|| resident_cache_entry(ctx, raw));
+                (entry.0.clone(), entry.1)
+            };
+            let (encoder, encoder_off) = wrap(req.encoder_weight.raw);
+            let layers = req
+                .layers
+                .iter()
+                .map(|layer| {
+                    let (k, k_off) = wrap(layer.k_weight.raw);
+                    let (v, v_off) = wrap(layer.v_weight.raw);
+                    (k, k_off, v, v_off)
+                })
+                .collect::<Vec<_>>();
+            (encoder, encoder_off, layers)
+        };
+        let dispatch_layers = req
+            .layers
+            .iter()
+            .zip(&layer_buffers)
+            .map(|(layer, (k_w_buf, k_w_off, v_w_buf, v_w_off))| {
+                prefill_atn_core_chain::DflashCacheSeedLayerDispatchRequest {
+                    k_w_buf,
+                    k_w_off: *k_w_off,
+                    k_quant: layer.k_weight.quant,
+                    v_w_buf,
+                    v_w_off: *v_w_off,
+                    v_quant: layer.v_weight.quant,
+                    k_norm_w: layer.k_norm_w,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let capacity = if req.token_count <= 8 {
+            8
+        } else {
+            req.token_count
+        };
+        let key = (
+            capacity,
+            req.layers.len(),
+            req.feature_dim,
+            req.hidden_dim,
+            req.num_kv_heads,
+            req.head_dim,
+            req.norm_eps.to_bits() as usize,
+        );
+        let mut slot = self.dflash_cache_seed_carrier.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|(cached_key, _)| *cached_key != key)
+        {
+            *slot = Some((
+                key,
+                prefill_atn_core_chain::DflashCacheSeedCarrier::new(
+                    ctx,
+                    capacity,
+                    req.layers.len(),
+                    req.feature_dim,
+                    req.hidden_dim,
+                    req.num_kv_heads,
+                    req.head_dim,
+                    req.norm_eps,
+                ),
+            ));
+        }
+        let carrier = &slot.as_ref().expect("DFlash cache seed carrier").1;
+        let output = prefill_atn_core_chain::dflash_cache_seed_dispatch(
+            ctx,
+            carrier,
+            prefill_atn_core_chain::DflashCacheSeedDispatchRequest {
+                features: req.features,
+                encoder_norm_w: req.encoder_norm_w,
+                encoder_w_buf: &encoder_w_buf,
+                encoder_w_off,
+                encoder_quant: req.encoder_weight.quant,
+                layers: &dispatch_layers,
+                token_count: req.token_count,
+                start_position: req.start_position,
+                rope_theta: req.rope_theta,
+                norm_eps: req.norm_eps,
+            },
+        )?;
+        Ok(Some(output))
     }
 
     /// Gemma dense layer: attention carrier output, post-attention norm/residual,
@@ -5560,6 +6103,8 @@ impl MetalBackend {
         &self,
         hidden: &[f32],
         layers: &[MusePrefillLayerRangeBackendLayer<'_>],
+        feature_layers: &[usize],
+        output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         mut on_kv: F,
     ) -> Result<Option<MusePrefillLayerRangeBackendOut>, String>
     where
@@ -5600,13 +6145,33 @@ impl MetalBackend {
                 return Ok(None);
             }
         }
+        if let Some(tail) = output_argmax.as_ref() {
+            Self::atn_core_require_eq("output cols", tail.cols, first.request.hidden_dim)?;
+            Self::atn_core_require_eq(
+                "output norm weight len",
+                tail.norm_weight.len(),
+                first.request.hidden_dim,
+            )?;
+            if tail.rows == 0
+                || !matches!(tail.output_quant, 0..=2)
+                || tail.excluded_token.is_some()
+            {
+                return Ok(None);
+            }
+        }
         {
             let mut carriers = self.muse_prefill_full_layer_carriers.borrow_mut();
             retain_only_muse_prefill_full_layer_shape(&mut carriers, shape);
         }
-        let mut state = prefill_atn_core_chain::MusePrefillLayerRangeState::new(ctx, hidden);
+        let mut state = prefill_atn_core_chain::MusePrefillLayerRangeState::new(
+            ctx,
+            hidden,
+            first.request.hidden_dim,
+            feature_layers.len(),
+        );
         let mut pending: Option<prefill_atn_core_chain::MusePrefillLayerRangePending> = None;
         let mut kv_layers_streamed = 0usize;
+        let mut output_tail_buffers = None;
         for (layer_offset, layer) in layers.iter().copied().enumerate() {
             let req = layer.request;
             let key = MusePrefillFullLayerCarrierKey {
@@ -5668,52 +6233,123 @@ impl MetalBackend {
                     q, qo, k, ko, v, vo, ag, ago, o, oo, fg, fgo, fu, fuo, fd, fdo,
                 )
             };
+            let target_buffers = if let Some(target) = layer.target {
+                let cache = self.gemma_prefill_f16kv_residents.borrow();
+                let resident = &cache
+                    .get(&target.cache_layer)
+                    .ok_or_else(|| {
+                        format!(
+                            "Metal Muse target resident missing for layer {}",
+                            target.cache_layer
+                        )
+                    })?
+                    .kv;
+                Some((resident.k_buf.clone(), resident.v_buf.clone()))
+            } else {
+                None
+            };
+            let target_kv =
+                target_buffers
+                    .as_ref()
+                    .zip(layer.target)
+                    .map(
+                        |((key, value), target)| prefill_atn_core_chain::MuseTargetKvBuffers {
+                            key,
+                            value,
+                            pos_start: target.pos_start,
+                            kv_len: target.kv_len,
+                        },
+                    );
+            if std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_some()
+                && layer.layer_idx == layers[0].layer_idx
+                && layer.target.is_some()
+            {
+                eprintln!(
+                    "[muse-stage] reference-config layer={} rope={} window={:?} pos={}",
+                    layer.layer_idx,
+                    req.apply_rope,
+                    req.sliding_window,
+                    layer.target.map_or(0, |target| target.pos_start)
+                );
+            }
+            let feature_index = feature_layers
+                .iter()
+                .position(|&feature_layer| feature_layer == layer.layer_idx);
+            let dispatch = prefill_atn_core_chain::MusePrefillFullLayerDispatchRequest {
+                hidden: req.hidden,
+                attn_norm_w: req.attn_norm_w,
+                q_norm_w: req.q_norm_w,
+                k_norm_w: req.k_norm_w,
+                q_w_buf: &q_w_buf,
+                q_w_off,
+                q_quant: req.q_weight.quant,
+                k_w_buf: &k_w_buf,
+                k_w_off,
+                k_quant: req.k_weight.quant,
+                v_w_buf: &v_w_buf,
+                v_w_off,
+                v_quant: req.v_weight.quant,
+                attention_gate_w_buf: &attention_gate_w_buf,
+                attention_gate_w_off,
+                attention_gate_quant: req.attention_gate_weight.quant,
+                apply_rope: req.apply_rope,
+                rope_theta: req.rope_theta,
+                pos_start: layer.target.map_or(0, |target| target.pos_start),
+                sliding_window: req.sliding_window,
+                target_kv,
+                ops: prefill_atn_core_chain::MuseOTailFfnOpsRequest {
+                    hidden: req.hidden,
+                    post_attn_norm_w: req.post_attn_norm_w,
+                    ffn_norm_w: req.ffn_norm_w,
+                    post_ffn_norm_w: req.post_ffn_norm_w,
+                    o_w_buf: &o_w_buf,
+                    o_w_off,
+                    o_quant: req.o_weight.quant,
+                    ffn_gate_w_buf: &ffn_gate_w_buf,
+                    ffn_gate_w_off,
+                    ffn_gate_quant: req.ffn_gate_weight.quant,
+                    ffn_up_w_buf: &ffn_up_w_buf,
+                    ffn_up_w_off,
+                    ffn_up_quant: req.ffn_up_weight.quant,
+                    ffn_down_w_buf: &ffn_down_w_buf,
+                    ffn_down_w_off,
+                    ffn_down_quant: req.ffn_down_weight.quant,
+                },
+                norm_eps: req.norm_eps,
+                scale: req.scale,
+            };
             let next_pending = prefill_atn_core_chain::prefill_muse_layer_range_submit(
                 ctx,
                 &mut state,
                 carrier,
                 layer.layer_idx,
-                prefill_atn_core_chain::MusePrefillFullLayerDispatchRequest {
-                    hidden: req.hidden,
-                    attn_norm_w: req.attn_norm_w,
-                    q_norm_w: req.q_norm_w,
-                    k_norm_w: req.k_norm_w,
-                    q_w_buf: &q_w_buf,
-                    q_w_off,
-                    q_quant: req.q_weight.quant,
-                    k_w_buf: &k_w_buf,
-                    k_w_off,
-                    k_quant: req.k_weight.quant,
-                    v_w_buf: &v_w_buf,
-                    v_w_off,
-                    v_quant: req.v_weight.quant,
-                    attention_gate_w_buf: &attention_gate_w_buf,
-                    attention_gate_w_off,
-                    attention_gate_quant: req.attention_gate_weight.quant,
-                    apply_rope: req.apply_rope,
-                    sliding_window: req.sliding_window,
-                    ops: prefill_atn_core_chain::MuseOTailFfnOpsRequest {
-                        hidden: req.hidden,
-                        post_attn_norm_w: req.post_attn_norm_w,
-                        ffn_norm_w: req.ffn_norm_w,
-                        post_ffn_norm_w: req.post_ffn_norm_w,
-                        o_w_buf: &o_w_buf,
-                        o_w_off,
-                        o_quant: req.o_weight.quant,
-                        ffn_gate_w_buf: &ffn_gate_w_buf,
-                        ffn_gate_w_off,
-                        ffn_gate_quant: req.ffn_gate_weight.quant,
-                        ffn_up_w_buf: &ffn_up_w_buf,
-                        ffn_up_w_off,
-                        ffn_up_quant: req.ffn_up_weight.quant,
-                        ffn_down_w_buf: &ffn_down_w_buf,
-                        ffn_down_w_off,
-                        ffn_down_quant: req.ffn_down_weight.quant,
-                    },
-                    norm_eps: req.norm_eps,
-                    scale: req.scale,
+                feature_index,
+                dispatch,
+                |encoder, hidden_dev| {
+                    if layer_offset + 1 == layers.len() {
+                        if let Some(tail) = output_argmax.as_ref() {
+                            output_tail_buffers =
+                                Some(self.encode_decode_chain_batched_output_argmax(
+                                    ctx,
+                                    encoder,
+                                    hidden_dev,
+                                    req.seq_len,
+                                    req.hidden_dim,
+                                    tail,
+                                ));
+                        }
+                    }
+                    Ok(())
                 },
             )?;
+            if let Some(target) = layer.target {
+                self.gemma_prefill_f16kv_residents
+                    .borrow_mut()
+                    .get_mut(&target.cache_layer)
+                    .expect("Metal Muse target resident retained after append")
+                    .kv
+                    .filled = target.kv_len;
+            }
             drop(carriers);
             if let Some(previous) = pending.replace(next_pending) {
                 prefill_atn_core_chain::prefill_muse_layer_range_complete(previous, &mut on_kv)?;
@@ -5724,8 +6360,29 @@ impl MetalBackend {
             prefill_atn_core_chain::prefill_muse_layer_range_complete(previous, &mut on_kv)?;
             kv_layers_streamed += 1;
         }
+        let (target_tokens, output_hidden_rows) =
+            if let Some(output_tail_buffers) = output_tail_buffers {
+                let target_tokens = output_tail_buffers
+                    .token_bufs
+                    .iter()
+                    .map(|token| unsafe { *(token.contents().as_ptr() as *const u32) })
+                    .collect();
+                let output_hidden_rows = unsafe {
+                    std::slice::from_raw_parts(
+                        output_tail_buffers.normed.contents().as_ptr() as *const f32,
+                        first.request.seq_len * first.request.hidden_dim,
+                    )
+                    .to_vec()
+                };
+                (target_tokens, output_hidden_rows)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         Ok(Some(MusePrefillLayerRangeBackendOut {
             hidden: state.finish(),
+            features: state.finish_features(),
+            target_tokens,
+            output_hidden_rows,
             hidden_uploads: 1,
             hidden_readbacks: 1,
             intermediate_hidden_transfers: 0,
@@ -11946,6 +12603,7 @@ impl MetalBackend {
     /// attn KV 동기화(2.1 dispatch 패턴): 첫 token(`filled == 0`)만 encode 전 `ensure_filled`
     /// 로 prior KV(host f16) device init, commit 후 `filled = pos+1` 갱신. GDN state 는
     /// chain 양끝에서만 host↔device sync(진입 upload, commit 후 readback).
+
     #[cfg(target_os = "macos")]
     pub fn decode_chain_run(
         &self,
@@ -12105,6 +12763,9 @@ impl MetalBackend {
                             s.muse_semantics,
                         )
                     });
+                    if s.muse_semantics {
+                        carrier.ensure_f16_kv_capacity(ctx, s.capacity);
+                    }
                     // 첫 token(filled==0)만 prefill KV(host f16, 0..pos)를 device 로 1회 init.
                     // 이후 토큰은 chain 안 kv_append 로 device 누적(host roundtrip 없음).
                     carrier.kv_ensure_filled(s.prior_k, s.prior_v, s.pos);
@@ -12935,6 +13596,8 @@ impl MetalBackend {
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         mut out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
         mut out_output_logits: Option<&mut Vec<f32>>,
+        feature_layers: &[usize],
+        mut out_features: Option<&mut Vec<f32>>,
     ) -> Vec<DecodeChainReport> {
         assert!(batch >= 1, "decode_chain_run_batched: batch must be >= 1");
         assert_eq!(
@@ -13032,7 +13695,7 @@ impl MetalBackend {
                     ChainLayerSpecRef::AttnMoeQwen(a) => a.kvarn.is_none(),
                     _ => true,
                 });
-            let enabled = std::env::var_os("RNB_METAL_BATCH_FUSED").map_or(true, |v| v != "0");
+            let enabled = std::env::var("RNB_METAL_BATCH_FUSED").as_deref() == Ok("1");
             if all_qwen_chain && attn_fusable && (fused_lo..=8).contains(&batch) && enabled {
                 self.decode_chain_run_batched_fused(
                     hidden,
@@ -13049,6 +13712,8 @@ impl MetalBackend {
                     } else {
                         None
                     },
+                    feature_layers,
+                    out_features.as_deref_mut(),
                 );
                 true
             } else {
@@ -13162,6 +13827,8 @@ impl MetalBackend {
             output_argmax,
             None,
             None,
+            &[],
+            None,
         )
     }
 
@@ -13181,10 +13848,13 @@ impl MetalBackend {
         out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
         out_gdn_state_handle: &mut Option<u64>,
         mut out_output_logits: Option<&mut Vec<f32>>,
+        feature_layers: &[usize],
+        out_features: &mut Vec<f32>,
     ) -> Vec<DecodeChainReport> {
         if let Some(output_logits) = out_output_logits.as_deref_mut() {
             output_logits.clear();
         }
+        out_features.clear();
         out_attn_kv.clear();
         out_attn_kv.resize(specs.len(), None);
         *out_gdn_state_handle = None;
@@ -13197,6 +13867,8 @@ impl MetalBackend {
             output_argmax,
             Some(out_attn_kv),
             out_output_logits,
+            feature_layers,
+            Some(out_features),
         );
         if reports.first().is_some_and(|report| report.did_run) {
             *out_gdn_state_handle = self.register_batched_gdn_state(specs, batch);
@@ -13306,6 +13978,8 @@ impl MetalBackend {
         out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
         output_argmax: Option<DecodeOutputArgmaxSpecRef<'_>>,
         out_output_logits: Option<&mut Vec<f32>>,
+        feature_layers: &[usize],
+        mut out_features: Option<&mut Vec<f32>>,
     ) {
         let ctx = self.ctx.as_ref().expect("MetalBackend: no Metal context");
         let defer_gdn_state_readback = out_attn_kv.is_some();
@@ -13328,6 +14002,20 @@ impl MetalBackend {
         // 공유 hidden buffer [B*hidden_dim] (row i = lane i). 진입 1회 upload, layer 들이 in/out
         // 누적, 마지막에 readback. (batched 경로는 hot single-token 경로와 분리 — 매 호출 alloc.)
         let shared_hidden = ffn_chain::shared_f32_buf(ctx, hidden);
+        let feature_dim = hidden_dim
+            .checked_mul(feature_layers.len())
+            .expect("Muse DFlash feature width overflow");
+        let feature_buffer = (!feature_layers.is_empty()).then(|| {
+            ffn_chain::empty_f32_buf(
+                ctx,
+                batch
+                    .checked_mul(feature_dim)
+                    .expect("Muse DFlash feature buffer overflow"),
+            )
+        });
+        let hidden_dim_buf = constant_u32(hidden_dim as u32);
+        let feature_dim_buf = constant_u32(feature_dim as u32);
+        let feature_total_buf = constant_u32((batch * hidden_dim) as u32);
 
         let cmd = ctx.queue.commandBuffer().expect("command buffer");
         let enc = compute::chain_compute_encoder(ctx, &cmd);
@@ -13335,6 +14023,33 @@ impl MetalBackend {
         let mut attn_layers = 0usize;
         let mut dense_layers = 0usize;
         for spec in specs {
+            let layer_idx = match spec {
+                ChainLayerSpecRef::Attn(layer) => layer.layer,
+                ChainLayerSpecRef::AttnMoeQwen(layer) => layer.layer,
+                ChainLayerSpecRef::Gdn(layer) => layer.layer,
+                ChainLayerSpecRef::GdnMoeQwen(layer) => layer.layer,
+            };
+            if let (Some(features), Some(feature_index)) = (
+                feature_buffer.as_ref(),
+                feature_layers.iter().position(|&layer| layer == layer_idx),
+            ) {
+                let feature_base = feature_index
+                    .checked_mul(hidden_dim)
+                    .expect("Muse DFlash feature offset overflow");
+                let feature_base_buf = constant_u32(feature_base as u32);
+                compute::encode_muse_capture_feature(
+                    ctx,
+                    &enc,
+                    &shared_hidden,
+                    features,
+                    &hidden_dim_buf,
+                    &feature_dim_buf,
+                    &feature_base_buf,
+                    &feature_total_buf,
+                    batch * hidden_dim,
+                );
+                compute::chain_barrier_resources(ctx, &enc, [&*shared_hidden, &**features]);
+            }
             match spec {
                 ChainLayerSpecRef::Gdn(s) => {
                     dense_layers += 1;
@@ -13426,7 +14141,13 @@ impl MetalBackend {
                     }
                     {
                         let mut carriers = self.dense_ffn_batch_carriers.borrow_mut();
-                        let key = (batch, s.hidden_dim, s.ffn_dim, s.eps.to_bits());
+                        let key = (
+                            batch,
+                            s.hidden_dim,
+                            s.ffn_dim,
+                            s.eps.to_bits(),
+                            s.eps.to_bits(),
+                        );
                         let carrier = carriers.entry(key).or_insert_with(|| {
                             ffn_chain::DenseFfnBatchCarrier::new(
                                 ctx,
@@ -13569,6 +14290,10 @@ impl MetalBackend {
                     let (k_w, k_off) = wrap(s.k_raw);
                     let (v_w, v_off) = wrap(s.v_raw);
                     let (o_w, o_off) = wrap(s.o_raw);
+                    let attn_gate = s.attn_gate_raw.map(|raw| {
+                        let (weight, offset) = wrap(raw);
+                        (weight, offset, constant_u32(offset))
+                    });
                     let (ffn_gate_w, ffn_gate_off) = wrap(s.ffn_gate_raw);
                     let (ffn_up_w, ffn_up_off) = wrap(s.ffn_up_raw);
                     let (ffn_down_w, ffn_down_off) = wrap(s.ffn_down_raw);
@@ -13583,6 +14308,10 @@ impl MetalBackend {
                     let q_norm_w_buf = constant_f32(s.q_norm_weight);
                     let k_norm_w_buf = constant_f32(s.k_norm_weight);
                     let ffn_norm_w_buf = constant_f32(s.ffn_norm_weight);
+                    let post_attn_norm_w_buf =
+                        s.post_attn_norm_weight.map(|weight| constant_f32(weight));
+                    let post_ffn_norm_w_buf =
+                        s.post_ffn_norm_weight.map(|weight| constant_f32(weight));
 
                     {
                         let mut carriers = self.attn_batch_carriers.borrow_mut();
@@ -13606,32 +14335,134 @@ impl MetalBackend {
                             )
                         });
                         carrier.upload_prior(s.prior_k, s.prior_v, s.pos);
-                        attn_chain::attn_core_chain_encode_bcol(
+                        if s.muse_semantics {
+                            let (attention_gate_w, attention_gate_off, _) =
+                                attn_gate.as_ref().expect("Muse separate attention gate");
+                            if std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_some()
+                                && s.pos > 0
+                            {
+                                eprintln!(
+                                    "[muse-stage] candidate-config layer={} rope={} n_rot={} window={:?} pos={}",
+                                    s.layer, s.apply_rope, s.n_rot, s.sliding_window, s.pos
+                                );
+                            }
+                            attn_chain::muse_attn_core_chain_encode_prefill(
+                                ctx,
+                                &enc,
+                                carrier,
+                                &shared_hidden,
+                                &norm_w_buf,
+                                &q_w,
+                                q_off,
+                                &k_w,
+                                k_off,
+                                &v_w,
+                                v_off,
+                                if s.v_is_q6k {
+                                    TensoropsQuant::Q6K
+                                } else {
+                                    TensoropsQuant::Q4K
+                                },
+                                &q_norm_w_buf,
+                                &k_norm_w_buf,
+                                attention_gate_w,
+                                *attention_gate_off,
+                                &o_w,
+                                o_off,
+                                s.apply_rope,
+                                s.sliding_window,
+                                s.theta,
+                                s.pos,
+                            );
+                        } else {
+                            attn_chain::attn_core_chain_encode_bcol(
+                                ctx,
+                                &enc,
+                                carrier,
+                                &shared_hidden,
+                                &norm_w_buf,
+                                &q_w,
+                                &q_off_buf,
+                                &k_w,
+                                &k_off_buf,
+                                &v_w,
+                                &v_off_buf,
+                                &q_norm_w_buf,
+                                &k_norm_w_buf,
+                                &o_w,
+                                &o_off_buf,
+                                0,
+                                0,
+                                if s.v_is_q6k { 2 } else { 0 },
+                                s.o_q,
+                                attn_gate
+                                    .as_ref()
+                                    .map(|(weight, _, offset)| (&**weight, &**offset)),
+                                s.apply_rope,
+                                s.sliding_window,
+                                false,
+                                s.pos,
+                            );
+                        }
+                    }
+                    if s.muse_semantics {
+                        let attn_carriers = self.attn_batch_carriers.borrow();
+                        let attention_out = attn_carriers
+                            .get(&AttnBatchCarrierKey::dense(s, batch))
+                            .expect("Muse fused attention batch carrier after encode")
+                            .o_output_buffer();
+                        let mut carriers = self.dense_ffn_batch_carriers.borrow_mut();
+                        let key = (
+                            batch,
+                            s.hidden_dim,
+                            s.ffn_dim,
+                            s.eps.to_bits(),
+                            s.post_norm_eps.to_bits(),
+                        );
+                        let carrier = carriers.entry(key).or_insert_with(|| {
+                            ffn_chain::DenseFfnBatchCarrier::new_muse(
+                                ctx,
+                                batch,
+                                s.hidden_dim,
+                                s.ffn_dim,
+                                s.eps,
+                                s.post_norm_eps,
+                            )
+                        });
+                        ffn_chain::muse_dense_ffn_chain_encode_bcol(
                             ctx,
                             &enc,
                             carrier,
                             &shared_hidden,
-                            &norm_w_buf,
-                            &q_w,
-                            &q_off_buf,
-                            &k_w,
-                            &k_off_buf,
-                            &v_w,
-                            &v_off_buf,
-                            &q_norm_w_buf,
-                            &k_norm_w_buf,
-                            &o_w,
-                            &o_off_buf,
-                            0,
-                            0,
-                            if s.v_is_q6k { 2 } else { 0 },
-                            0,
-                            s.pos,
+                            attention_out,
+                            post_attn_norm_w_buf
+                                .as_deref()
+                                .expect("Muse post-attention norm weight"),
+                            &ffn_norm_w_buf,
+                            post_ffn_norm_w_buf
+                                .as_deref()
+                                .expect("Muse post-FFN norm weight"),
+                            &ffn_gate_w,
+                            ffn_gate_off,
+                            &ffn_up_w,
+                            ffn_up_off,
+                            &ffn_down_w,
+                            ffn_down_off,
+                            if s.ffn_down_is_q6k {
+                                TensoropsQuant::Q6K
+                            } else {
+                                TensoropsQuant::Q4K
+                            },
                         );
-                    }
-                    {
+                    } else {
                         let mut carriers = self.dense_ffn_batch_carriers.borrow_mut();
-                        let key = (batch, s.hidden_dim, s.ffn_dim, s.eps.to_bits());
+                        let key = (
+                            batch,
+                            s.hidden_dim,
+                            s.ffn_dim,
+                            s.eps.to_bits(),
+                            s.eps.to_bits(),
+                        );
                         let carrier = carriers.entry(key).or_insert_with(|| {
                             ffn_chain::DenseFfnBatchCarrier::new(
                                 ctx,
@@ -13715,6 +14546,10 @@ impl MetalBackend {
                             s.k_q,
                             s.v_q,
                             s.o_q,
+                            None,
+                            true,
+                            None,
+                            false,
                             s.pos,
                         );
                     }
@@ -13763,6 +14598,24 @@ impl MetalBackend {
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
+        if std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_some() {
+            if let Some(ChainLayerSpecRef::Attn(layer)) = specs
+                .iter()
+                .find(|spec| matches!(spec, ChainLayerSpecRef::Attn(layer) if layer.muse_semantics))
+            {
+                self.attn_batch_carriers
+                    .borrow()
+                    .get(&AttnBatchCarrierKey::dense(layer, batch))
+                    .expect("Muse stage trace carrier")
+                    .trace_muse_stages();
+            }
+        }
+        if let Some(features) = feature_buffer.as_ref() {
+            let output = out_features
+                .as_deref_mut()
+                .expect("feature buffer requires output destination");
+            *output = ffn_chain::readback(features, batch * feature_dim);
+        }
         {
             let mut carriers = self.attn_batch_carriers.borrow_mut();
             for spec in specs {
@@ -14059,8 +14912,8 @@ impl MetalBackend {
             "batched output norm weight length mismatch"
         );
         assert!(
-            matches!(tail.output_quant, 0 | 2),
-            "batched output tail supports Q4_K/Q6_K only"
+            matches!(tail.output_quant, 0..=2),
+            "batched output tail supports Q4_K/Q5_K/Q6_K only"
         );
         assert!(tail.rows > 0, "batched output tail rows must be > 0");
 
@@ -14130,7 +14983,11 @@ impl MetalBackend {
             );
         }
 
-        BatchedOutputTailBuffers { logits, token_bufs }
+        BatchedOutputTailBuffers {
+            normed,
+            logits,
+            token_bufs,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -23836,6 +24693,8 @@ kernel void q4k_ro_vec4(
             &mut first_attn_kv,
             &mut gdn_handle,
             None,
+            &[],
+            &mut Vec::new(),
         );
         assert_eq!(reps.len(), 2);
         assert!(reps[0].did_run && reps[1].did_run);
@@ -24167,6 +25026,8 @@ kernel void q4k_ro_vec4(
             &mut attn_kv,
             &mut gdn_handle,
             Some(&mut output_logits),
+            &[],
+            &mut Vec::new(),
         );
         assert_eq!(output_logits.len(), 2 * out_rows);
         for (report, row) in reports.iter().zip(output_logits.chunks_exact(out_rows)) {
@@ -24290,6 +25151,8 @@ kernel void q4k_ro_vec4(
             &mut attn_kv,
             &mut gdn_handle,
             None,
+            &[],
+            &mut Vec::new(),
         );
         assert_eq!(reps.len(), 1);
         assert!(reps[0].did_run);
@@ -24537,6 +25400,8 @@ kernel void q4k_ro_vec4(
             &mut attn_kv,
             &mut handle,
             None,
+            &[],
+            &mut Vec::new(),
         );
         assert!(
             collect_st[0].is_none(),
@@ -24587,6 +25452,8 @@ kernel void q4k_ro_vec4(
             &mut next_attn_kv,
             &mut next_handle,
             None,
+            &[],
+            &mut Vec::new(),
         );
         assert_close(
             &h_next[..hidden_dim],

@@ -186,6 +186,8 @@ fn metal_decode_chain_run_impl(
     out_attn_kv: Option<&mut Vec<Option<(Vec<u16>, Vec<u16>)>>>,
     out_gdn_state_handle: Option<&mut Option<u64>>,
     out_output_logits: Option<&mut Vec<f32>>,
+    feature_layers: &[usize],
+    out_features: Option<&mut Vec<f32>>,
     capacity: usize,
     hidden_dim: usize,
     conv_channels: usize,
@@ -574,6 +576,8 @@ fn metal_decode_chain_run_impl(
         };
         return match out_attn_kv {
             Some(out_kv) => {
+                let out_features =
+                    out_features.expect("batched decode chain requires feature output");
                 let state_handle = out_gdn_state_handle
                     .expect("batched decode chain requires GDN state handle output");
                 metal_decode_chain_runtime_result_batched(
@@ -586,6 +590,8 @@ fn metal_decode_chain_run_impl(
                         state_handle,
                         output_tail,
                         out_output_logits,
+                        feature_layers,
+                        out_features,
                     ),
                 )
             }
@@ -610,6 +616,8 @@ fn metal_decode_chain_run_impl(
             out_attn_kv,
             out_gdn_state_handle,
             out_output_logits,
+            feature_layers,
+            out_features,
             capacity,
             hidden_dim,
             conv_channels,
@@ -661,6 +669,8 @@ pub(in crate::engine) fn metal_decode_chain_run(
         None,
         None,
         None,
+        &[],
+        None,
         capacity,
         hidden_dim,
         conv_channels,
@@ -694,6 +704,8 @@ pub(in crate::engine) fn metal_decode_chain_run_batched(
     out_attn_kv: &mut Vec<Option<(Vec<u16>, Vec<u16>)>>,
     out_gdn_state_handle: &mut Option<u64>,
     out_output_logits: Option<&mut Vec<f32>>,
+    feature_layers: &[usize],
+    out_features: &mut Vec<f32>,
     capacity: usize,
     hidden_dim: usize,
     conv_channels: usize,
@@ -716,6 +728,8 @@ pub(in crate::engine) fn metal_decode_chain_run_batched(
         Some(out_attn_kv),
         Some(out_gdn_state_handle),
         out_output_logits,
+        feature_layers,
+        Some(out_features),
         capacity,
         hidden_dim,
         conv_channels,

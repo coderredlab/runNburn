@@ -449,4 +449,30 @@ mod policy_tests {
         std::env::remove_var("RNB_CUDA_KVARN_ATTN");
         std::env::remove_var("RNB_METAL_KVARN_ATTN");
     }
+
+    #[test]
+    fn dflash_confidence_defaults_on_and_supports_override_and_opt_out() {
+        let _guard = env_lock().lock().expect("policy test env lock poisoned");
+        let key = "RNB_MTP_DFLASH_CONFIDENCE_CUTOFF";
+        let previous = std::env::var_os(key);
+
+        std::env::remove_var(key);
+        assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.15));
+
+        for value in ["", "0", "false", "off", "no"] {
+            std::env::set_var(key, value);
+            assert_eq!(mtp_dflash_confidence_cutoff(), None);
+        }
+
+        std::env::set_var(key, "0.2");
+        assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.2));
+        std::env::set_var(key, "invalid");
+        assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.15));
+
+        if let Some(value) = previous {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
 }

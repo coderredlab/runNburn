@@ -1135,7 +1135,7 @@ impl Engine {
             .map(|runtime| runtime.window_size())
     }
 
-    pub(super) fn mtp_dflash_observe_target_batch(
+    pub(crate) fn mtp_dflash_observe_target_batch(
         &mut self,
         features: &[f32],
         token_count: usize,
@@ -1176,6 +1176,7 @@ impl Engine {
         &mut self,
         anchor_token: u32,
         max_draft_tokens: usize,
+        confidence_cutoff: Option<f32>,
     ) -> Result<super::models::muse_dflash::MuseDflashDraft> {
         let mut runtime = self
             .mtp_runtime
@@ -1192,6 +1193,7 @@ impl Engine {
             dflash.draft(
                 anchor_token,
                 max_draft_tokens,
+                confidence_cutoff,
                 &weights.token_embd,
                 &weights.output,
             )

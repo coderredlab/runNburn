@@ -17,14 +17,15 @@ use objc2_metal::{
 
 use crate::compute::{
     self, chain_barrier, chain_barrier_resources, chain_compute_encoder, encode_attn_decode,
-    encode_attn_decode_at, encode_attn_decode_f16_gqa16, encode_attn_decode_gqa_splitk,
-    encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk, encode_attn_decode_i8_splitk,
-    encode_attn_decode_qk_norm_rope_batch, encode_attn_decode_qk_norm_rope_pair,
-    encode_attn_decode_splitk, encode_attn_decode_splitk_at, encode_attn_decode_splitk_batch,
-    encode_attn_decode_window, encode_gate_apply, encode_gate_apply_at, encode_gemv_quant_bcol,
-    encode_kv_append, encode_kv_append_batch, encode_kv_append_i8, encode_prefill_gate_apply,
-    encode_prefill_split_q_gate, encode_qk_norm, encode_rms_norm_batch, encode_rope_partial,
-    encode_split_qgate, encode_split_qgate_at, KvResident, MetalContext,
+    encode_attn_decode_at, encode_attn_decode_f16_gqa16, encode_attn_decode_f16_gqa16_at,
+    encode_attn_decode_gqa_splitk, encode_attn_decode_i8, encode_attn_decode_i8_gqa_splitk,
+    encode_attn_decode_i8_splitk, encode_attn_decode_qk_norm_rope_batch,
+    encode_attn_decode_qk_norm_rope_pair, encode_attn_decode_splitk, encode_attn_decode_splitk_at,
+    encode_attn_decode_splitk_batch, encode_attn_decode_window, encode_cast_f32_to_f16,
+    encode_gate_apply, encode_gate_apply_at, encode_gemv_quant_bcol, encode_kv_append,
+    encode_kv_append_batch, encode_kv_append_i8, encode_prefill_gate_apply,
+    encode_prefill_rope_only, encode_prefill_split_q_gate, encode_qk_norm, encode_rms_norm_batch,
+    encode_rope_partial, encode_split_qgate, encode_split_qgate_at, KvResident, MetalContext,
 };
 use crate::ffn_chain::{
     empty_f32_buf, encode_fused_post_attn_residual_ffn_rms_norm,
@@ -32,6 +33,7 @@ use crate::ffn_chain::{
     encode_fused_residual_rms_norm, encode_residual_add, encode_rms_norm, encode_silu_mul, f32_buf,
     readback, shared_u32_buf, u32_buf,
 };
+use crate::TensoropsQuant;
 
 // f16 grouped kernel은 register pressure 회귀 때문에 명시적 opt-in만 허용한다.
 fn gqa_group_requested(value: Option<&str>) -> bool {
@@ -186,6 +188,32 @@ impl AttnCarrier {
             fdim_buf: u32_buf(ctx, ffn_dim as u32),
             k_ffn_buf: u32_buf(ctx, ffn_dim as u32),
         }
+    }
+
+    pub(crate) fn ensure_f16_kv_capacity(&mut self, ctx: &MetalContext, capacity: usize) {
+        if capacity <= self.kv.capacity {
+            return;
+        }
+        assert!(
+            !self.kv.kv_int8,
+            "Muse decode capacity growth requires F16 KV"
+        );
+        let mut grown = KvResident::new_f16(ctx, self.kv.num_kv_heads, self.kv.head_dim, capacity);
+        let elements = self.kv.filled * self.kv.kv_dim;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.kv.k_buf.contents().as_ptr() as *const u16,
+                grown.k_buf.contents().as_ptr() as *mut u16,
+                elements,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.kv.v_buf.contents().as_ptr() as *const u16,
+                grown.v_buf.contents().as_ptr() as *mut u16,
+                elements,
+            );
+        }
+        grown.filled = self.kv.filled;
+        self.kv = grown;
     }
 
     /// chain run(2단계)이 attn layer encode 전 호출 — 첫 token(filled==0)만 prior KV
@@ -1371,13 +1399,19 @@ pub(crate) struct AttnBatchCarrier {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    eps: f32,
+    scale: f32,
+    n_rot: usize,
     pub capacity: usize,
 
     normed_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*hidden_dim]
+    normed_f16_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*hidden_dim]
     q_full_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*q_out_dim] (gated 인터리브)
     q_all: Retained<ProtocolObject<dyn MTLBuffer>>,      // [b*q_dim]
+    q_f16_all: Retained<ProtocolObject<dyn MTLBuffer>>,  // [b*q_dim]
     gate_all: Retained<ProtocolObject<dyn MTLBuffer>>,   // [b*q_dim]
     k_all: Retained<ProtocolObject<dyn MTLBuffer>>,      // [b*kv_dim]
+    k_normed_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*kv_dim]
     v_all: Retained<ProtocolObject<dyn MTLBuffer>>,      // [b*kv_dim]
     attn_out_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*q_dim]
     attn_splitk_acc_all: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -1385,6 +1419,7 @@ pub(crate) struct AttnBatchCarrier {
     attn_splitk_s_all: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     attn_splitk_splits_buf: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     o_out_all: Retained<ProtocolObject<dyn MTLBuffer>>, // [b*hidden_dim]
+    rope_cos_sin: Retained<ProtocolObject<dyn MTLBuffer>>,
     kv: KvResident,
 
     hdim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -1406,6 +1441,7 @@ pub(crate) struct AttnBatchCarrier {
     kv_lens_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_all_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_all_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    kv_all_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl AttnBatchCarrier {
@@ -1460,12 +1496,18 @@ impl AttnBatchCarrier {
             num_heads,
             num_kv_heads,
             head_dim,
+            n_rot,
             capacity,
+            eps,
+            scale,
             normed_all: empty_f32_buf(ctx, b * hidden_dim),
+            normed_f16_all: crate::ffn_chain::empty_f16_buf(ctx, b * hidden_dim),
             q_full_all: empty_f32_buf(ctx, b * q_out_dim),
             q_all: empty_f32_buf(ctx, b * q_dim),
+            q_f16_all: crate::ffn_chain::empty_f16_buf(ctx, b * q_dim),
             gate_all: empty_f32_buf(ctx, b * q_dim),
             k_all: empty_f32_buf(ctx, b * kv_dim),
+            k_normed_all: empty_f32_buf(ctx, b * kv_dim),
             v_all: empty_f32_buf(ctx, b * kv_dim),
             attn_out_all: empty_f32_buf(ctx, b * q_dim),
             attn_splitk_acc_all,
@@ -1473,6 +1515,7 @@ impl AttnBatchCarrier {
             attn_splitk_s_all,
             attn_splitk_splits_buf,
             o_out_all: empty_f32_buf(ctx, b * hidden_dim),
+            rope_cos_sin: empty_f32_buf(ctx, (b * n_rot).max(2)),
             kv: KvResident::new_f16(ctx, num_kv_heads, head_dim, capacity),
             hdim_buf: u32_buf(ctx, hidden_dim as u32),
             qdim_buf: u32_buf(ctx, q_dim as u32),
@@ -1491,6 +1534,7 @@ impl AttnBatchCarrier {
             pos_bufs: (0..b).map(|_| u32_buf(ctx, 0)).collect(),
             kl_bufs: (0..b).map(|_| u32_buf(ctx, 0)).collect(),
             kv_lens_buf: shared_u32_buf(ctx, &vec![0; b]),
+            kv_all_elems_buf: u32_buf(ctx, (b * kv_dim) as u32),
             hidden_all_buf: u32_buf(ctx, (b * hidden_dim) as u32),
             q_all_elems_buf: u32_buf(ctx, (b * q_dim) as u32),
         }
@@ -1588,6 +1632,33 @@ impl AttnBatchCarrier {
             )
         }
     }
+
+    pub(crate) fn o_output_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.o_out_all
+    }
+
+    pub(crate) fn trace_muse_stages(&self) {
+        if std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_none() {
+            return;
+        }
+        let trace = |label: &str, values: Vec<f32>| {
+            let hash = values.iter().fold(0xcbf29ce484222325u64, |hash, value| {
+                (hash ^ value.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            eprintln!(
+                "[muse-stage] candidate {label} hash={hash:016x} first={:?}",
+                &values[..values.len().min(8)]
+            );
+        };
+        trace("q_raw", readback(&self.q_full_all, self.b * self.q_dim));
+        trace("k_raw", readback(&self.k_all, self.b * self.kv_dim));
+        trace("q", readback(&self.q_all, self.b * self.q_dim));
+        trace("k", readback(&self.k_normed_all, self.b * self.kv_dim));
+        trace("v", readback(&self.v_all, self.b * self.kv_dim));
+        trace("attn", readback(&self.attn_out_all, self.b * self.q_dim));
+        trace("gated", readback(&self.q_full_all, self.b * self.q_dim));
+        trace("o", readback(&self.o_out_all, self.b * self.hidden_dim));
+    }
 }
 
 /// Batched attention core encode (milestone 4). `shared_hidden` = `[b*hidden_dim]`(lane i =
@@ -1617,6 +1688,13 @@ pub(crate) fn attn_core_chain_encode_bcol(
     k_q: u8,
     v_q: u8,
     o_q: u8,
+    attn_gate: Option<(
+        &ProtocolObject<dyn MTLBuffer>,
+        &ProtocolObject<dyn MTLBuffer>,
+    )>,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    muse_semantics: bool,
     base_pos: usize,
 ) {
     let b = carrier.b;
@@ -1707,45 +1785,69 @@ pub(crate) fn attn_core_chain_encode_bcol(
         &carrier.b_buf,
         kv_dim,
     );
-    chain_barrier(ctx, enc);
-
-    // 3. all-lane split_qgate. prefill helper가 비활성화된 진단 구성은 기존 lane 경로.
-    if ctx.prefill_split_gate_pipeline.is_some() {
-        encode_prefill_split_q_gate(
+    if let Some((gate_w_buf, gate_off_buf)) = attn_gate {
+        encode_gemv_quant_bcol(
             ctx,
             enc,
-            &carrier.q_full_all,
-            &carrier.q_all,
+            0,
+            gate_w_buf,
+            &carrier.normed_all,
             &carrier.gate_all,
+            &carrier.qdim_buf,
+            &carrier.k_hidden_buf,
+            gate_off_buf,
             &carrier.b_buf,
-            &carrier.nh_buf,
-            &carrier.hd_buf,
-            b * q_dim,
+            q_dim,
         );
-    } else {
-        for i in 0..b {
-            encode_split_qgate_at(
-                ctx,
-                enc,
-                &carrier.q_full_all,
-                i * q_out_dim * f32b,
-                &carrier.q_all,
-                i * q_dim * f32b,
-                &carrier.gate_all,
-                i * q_dim * f32b,
-                &carrier.hd_buf,
-                num_heads,
-                q_dim / num_heads,
-            );
-        }
     }
     chain_barrier(ctx, enc);
 
-    // 4-5. q/k per-head RMSNorm + RoPE를 q와 k 각 한 dispatch로 처리한다.
+    // 3. Packed Q+gate tensors need a split. Muse carries a separate attention
+    // gate projection, so q_full_all is already the query.
+    if attn_gate.is_none() {
+        if ctx.prefill_split_gate_pipeline.is_some() {
+            encode_prefill_split_q_gate(
+                ctx,
+                enc,
+                &carrier.q_full_all,
+                &carrier.q_all,
+                &carrier.gate_all,
+                &carrier.b_buf,
+                &carrier.nh_buf,
+                &carrier.hd_buf,
+                b * q_dim,
+            );
+        } else {
+            for i in 0..b {
+                encode_split_qgate_at(
+                    ctx,
+                    enc,
+                    &carrier.q_full_all,
+                    i * q_out_dim * f32b,
+                    &carrier.q_all,
+                    i * q_dim * f32b,
+                    &carrier.gate_all,
+                    i * q_dim * f32b,
+                    &carrier.hd_buf,
+                    num_heads,
+                    q_dim / num_heads,
+                );
+            }
+        }
+        chain_barrier(ctx, enc);
+    }
+    let query_all = if attn_gate.is_some() {
+        &carrier.q_full_all
+    } else {
+        &carrier.q_all
+    };
+
+    // 4-5. q/k per-head RMSNorm + optional RoPE를 q와 k 각 한 dispatch로 처리한다.
+    debug_assert!(apply_rope || carrier.n_rot == 0);
     encode_attn_decode_qk_norm_rope_batch(
         ctx,
         enc,
-        &carrier.q_all,
+        query_all,
         q_norm_w_buf,
         &carrier.nh_buf,
         &carrier.hd_buf,
@@ -1774,150 +1876,197 @@ pub(crate) fn attn_core_chain_encode_bcol(
     );
     chain_barrier(ctx, enc);
 
-    // 6. all-lane kv_append: k_all/v_all -> KV[base_pos..base_pos+b].
-    encode_kv_append_batch(
-        ctx,
-        enc,
-        &carrier.k_all,
-        &carrier.v_all,
-        &carrier.kv.k_buf,
-        &carrier.kv.v_buf,
-        &carrier.kvdim_buf,
-        &carrier.pos_bufs[0],
-        &carrier.b_buf,
-        b * kv_dim,
-    );
-    chain_barrier(ctx, enc);
-
-    // 7. attention: 모든 lane이 긴-context면 part/reduce를 각각 한 dispatch로 합친다.
-    // threshold를 가로지르는 한 window만 lane별 single-token 정책으로 처리한다.
-    let first_kv_len = base_pos + 1;
-    if ctx.attn_splitk_splits > 1 && first_kv_len >= ctx.attn_splitk_min_kv {
-        encode_attn_decode_splitk_batch(
+    let muse_gqa16 =
+        muse_semantics && head_dim == 128 && num_heads == num_kv_heads * 16 && attn_gate.is_some();
+    if muse_semantics {
+        assert!(
+            muse_gqa16,
+            "Muse batched attention requires HD128 GQA16 with separate gate"
+        );
+        let window_buf = u32_buf(ctx, sliding_window.unwrap_or(0) as u32);
+        for i in 0..b {
+            encode_attn_decode_f16_gqa16_at(
+                ctx,
+                enc,
+                query_all,
+                i * q_dim * f32b,
+                &carrier.kv.k_buf,
+                &carrier.kv.v_buf,
+                &carrier.attn_out_all,
+                i * q_dim * f32b,
+                &carrier.nh_buf,
+                &carrier.nkv_buf,
+                &carrier.hd_buf,
+                &carrier.kl_bufs[i],
+                &carrier.scale_buf,
+                &window_buf,
+                &carrier.gate_all,
+                i * q_dim * f32b,
+                &carrier.pos_bufs[i],
+                &carrier.k_all,
+                i * kv_dim * f32b,
+                &carrier.v_all,
+                i * kv_dim * f32b,
+                num_heads,
+            );
+            chain_barrier_resources(
+                ctx,
+                enc,
+                [
+                    &*carrier.kv.k_buf,
+                    &*carrier.kv.v_buf,
+                    &*carrier.attn_out_all,
+                ],
+            );
+        }
+    } else {
+        // 6. all-lane kv_append: k_all/v_all -> KV[base_pos..base_pos+b].
+        encode_kv_append_batch(
             ctx,
             enc,
-            &carrier.q_all,
+            &carrier.k_all,
+            &carrier.v_all,
             &carrier.kv.k_buf,
             &carrier.kv.v_buf,
-            carrier
-                .attn_splitk_acc_all
-                .as_ref()
-                .expect("batch splitk acc buffer missing"),
-            carrier
-                .attn_splitk_m_all
-                .as_ref()
-                .expect("batch splitk m buffer missing"),
-            carrier
-                .attn_splitk_s_all
-                .as_ref()
-                .expect("batch splitk s buffer missing"),
-            &carrier.attn_out_all,
-            &carrier.nh_buf,
-            &carrier.nkv_buf,
-            &carrier.hd_buf,
-            &carrier.kv_lens_buf,
-            &carrier.scale_buf,
-            carrier
-                .attn_splitk_splits_buf
-                .as_ref()
-                .expect("batch splitk splits buffer missing"),
+            &carrier.kvdim_buf,
+            &carrier.pos_bufs[0],
             &carrier.b_buf,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            ctx.attn_splitk_splits,
-            b,
+            b * kv_dim,
         );
-    } else {
-        for i in 0..b {
-            let kv_len = base_pos + i + 1;
-            if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
-                let partial_acc_off = i * ctx.attn_splitk_splits * num_heads * head_dim * f32b;
-                let partial_stats_off = i * ctx.attn_splitk_splits * num_heads * f32b;
-                encode_attn_decode_splitk_at(
-                    ctx,
-                    enc,
-                    &carrier.q_all,
-                    i * q_dim * f32b,
-                    &carrier.kv.k_buf,
-                    &carrier.kv.v_buf,
-                    carrier
-                        .attn_splitk_acc_all
-                        .as_ref()
-                        .expect("batch splitk acc buffer missing"),
-                    partial_acc_off,
-                    carrier
-                        .attn_splitk_m_all
-                        .as_ref()
-                        .expect("batch splitk m buffer missing"),
-                    carrier
-                        .attn_splitk_s_all
-                        .as_ref()
-                        .expect("batch splitk s buffer missing"),
-                    partial_stats_off,
-                    &carrier.attn_out_all,
-                    i * q_dim * f32b,
-                    &carrier.nh_buf,
-                    &carrier.nkv_buf,
-                    &carrier.hd_buf,
-                    &carrier.kl_bufs[i],
-                    &carrier.scale_buf,
-                    carrier
-                        .attn_splitk_splits_buf
-                        .as_ref()
-                        .expect("batch splitk splits buffer missing"),
-                    num_heads,
-                    head_dim,
-                    ctx.attn_splitk_splits,
-                );
-            } else {
-                encode_attn_decode_at(
-                    ctx,
-                    enc,
-                    &carrier.q_all,
-                    i * q_dim * f32b,
-                    &carrier.kv.k_buf,
-                    &carrier.kv.v_buf,
-                    &carrier.attn_out_all,
-                    i * q_dim * f32b,
-                    &carrier.nh_buf,
-                    &carrier.nkv_buf,
-                    &carrier.hd_buf,
-                    &carrier.kl_bufs[i],
-                    &carrier.scale_buf,
-                    num_heads,
-                );
+        chain_barrier(ctx, enc);
+
+        // 7. attention: 모든 lane이 긴-context면 part/reduce를 각각 한 dispatch로 합친다.
+        // threshold를 가로지르는 한 window만 lane별 single-token 정책으로 처리한다.
+        let first_kv_len = base_pos + 1;
+        if ctx.attn_splitk_splits > 1 && first_kv_len >= ctx.attn_splitk_min_kv {
+            encode_attn_decode_splitk_batch(
+                ctx,
+                enc,
+                query_all,
+                &carrier.kv.k_buf,
+                &carrier.kv.v_buf,
+                carrier
+                    .attn_splitk_acc_all
+                    .as_ref()
+                    .expect("batch splitk acc buffer missing"),
+                carrier
+                    .attn_splitk_m_all
+                    .as_ref()
+                    .expect("batch splitk m buffer missing"),
+                carrier
+                    .attn_splitk_s_all
+                    .as_ref()
+                    .expect("batch splitk s buffer missing"),
+                &carrier.attn_out_all,
+                &carrier.nh_buf,
+                &carrier.nkv_buf,
+                &carrier.hd_buf,
+                &carrier.kv_lens_buf,
+                &carrier.scale_buf,
+                carrier
+                    .attn_splitk_splits_buf
+                    .as_ref()
+                    .expect("batch splitk splits buffer missing"),
+                &carrier.b_buf,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                ctx.attn_splitk_splits,
+                b,
+            );
+        } else {
+            for i in 0..b {
+                let kv_len = base_pos + i + 1;
+                if ctx.attn_splitk_splits > 1 && kv_len >= ctx.attn_splitk_min_kv {
+                    let partial_acc_off = i * ctx.attn_splitk_splits * num_heads * head_dim * f32b;
+                    let partial_stats_off = i * ctx.attn_splitk_splits * num_heads * f32b;
+                    encode_attn_decode_splitk_at(
+                        ctx,
+                        enc,
+                        query_all,
+                        i * q_dim * f32b,
+                        &carrier.kv.k_buf,
+                        &carrier.kv.v_buf,
+                        carrier
+                            .attn_splitk_acc_all
+                            .as_ref()
+                            .expect("batch splitk acc buffer missing"),
+                        partial_acc_off,
+                        carrier
+                            .attn_splitk_m_all
+                            .as_ref()
+                            .expect("batch splitk m buffer missing"),
+                        carrier
+                            .attn_splitk_s_all
+                            .as_ref()
+                            .expect("batch splitk s buffer missing"),
+                        partial_stats_off,
+                        &carrier.attn_out_all,
+                        i * q_dim * f32b,
+                        &carrier.nh_buf,
+                        &carrier.nkv_buf,
+                        &carrier.hd_buf,
+                        &carrier.kl_bufs[i],
+                        &carrier.scale_buf,
+                        carrier
+                            .attn_splitk_splits_buf
+                            .as_ref()
+                            .expect("batch splitk splits buffer missing"),
+                        num_heads,
+                        head_dim,
+                        ctx.attn_splitk_splits,
+                    );
+                } else {
+                    encode_attn_decode_at(
+                        ctx,
+                        enc,
+                        query_all,
+                        i * q_dim * f32b,
+                        &carrier.kv.k_buf,
+                        &carrier.kv.v_buf,
+                        &carrier.attn_out_all,
+                        i * q_dim * f32b,
+                        &carrier.nh_buf,
+                        &carrier.nkv_buf,
+                        &carrier.hd_buf,
+                        &carrier.kl_bufs[i],
+                        &carrier.scale_buf,
+                        num_heads,
+                    );
+                }
             }
         }
+        chain_barrier(ctx, enc);
     }
-    chain_barrier(ctx, enc);
 
-    // 8. all-lane gate_apply. 진단 구성에서 prefill helper가 없으면 기존 lane 경로.
-    if ctx.prefill_gate_apply_pipeline.is_some() {
-        encode_prefill_gate_apply(
-            ctx,
-            enc,
-            &carrier.attn_out_all,
-            &carrier.gate_all,
-            &carrier.attn_out_all,
-            &carrier.q_all_elems_buf,
-            b * q_dim,
-        );
-    } else {
-        for i in 0..b {
-            encode_gate_apply_at(
+    // Muse GQA16 applies its separate gate inside the attention kernel.
+    if !muse_gqa16 {
+        if ctx.prefill_gate_apply_pipeline.is_some() {
+            encode_prefill_gate_apply(
                 ctx,
                 enc,
                 &carrier.attn_out_all,
-                i * q_dim * f32b,
                 &carrier.gate_all,
-                i * q_dim * f32b,
-                &carrier.qdim_buf,
-                q_dim,
+                &carrier.attn_out_all,
+                &carrier.q_all_elems_buf,
+                b * q_dim,
             );
+        } else {
+            for i in 0..b {
+                encode_gate_apply_at(
+                    ctx,
+                    enc,
+                    &carrier.attn_out_all,
+                    i * q_dim * f32b,
+                    &carrier.gate_all,
+                    i * q_dim * f32b,
+                    &carrier.qdim_buf,
+                    q_dim,
+                );
+            }
         }
+        chain_barrier(ctx, enc);
     }
-    chain_barrier(ctx, enc);
 
     // 9. B-column o(weight 1회): attn_out_all -> o_out_all (N=hidden_dim, K=q_dim).
     encode_gemv_quant_bcol(
@@ -1935,18 +2084,303 @@ pub(crate) fn attn_core_chain_encode_bcol(
     );
     chain_barrier(ctx, enc);
 
-    // 10. all-lane residual: shared_hidden += o_out_all.
-    encode_residual_add(
+    // Standard dense layers add O directly. Muse applies post-attention norm
+    // before the residual, so its caller owns the tail.
+    if !muse_semantics {
+        encode_residual_add(
+            ctx,
+            enc,
+            shared_hidden,
+            &carrier.o_out_all,
+            &carrier.hidden_all_buf,
+            b * hidden_dim,
+        );
+        chain_barrier(ctx, enc);
+    }
+}
+
+fn muse_prefill_rope_cos_sin(
+    seq_len: usize,
+    head_dim: usize,
+    n_rot: usize,
+    theta: f32,
+    pos_start: usize,
+) -> Vec<f32> {
+    let n_rot = n_rot.min(head_dim);
+    if n_rot == 0 {
+        return vec![1.0, 0.0];
+    }
+    let theta_scale = theta.powf(-2.0f32 / n_rot as f32);
+    let mut table = Vec::with_capacity(seq_len * n_rot);
+    for token in 0..seq_len {
+        let mut angle = (pos_start + token) as f32;
+        for _ in 0..(n_rot / 2) {
+            table.push(angle.cos());
+            table.push(angle.sin());
+            angle *= theta_scale;
+        }
+    }
+    table
+}
+
+/// Muse verify 전용 exact prefill arithmetic. 기존 DFlash batch-prefill과 같은
+/// F16 projection input, exact RMSNorm, table RoPE, mixed-precision attention을
+/// 유지하되 prior KV와 B개 continuation row를 한 device-resident layer로 잇는다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn muse_attn_core_chain_encode_prefill(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    carrier: &AttnBatchCarrier,
+    shared_hidden: &ProtocolObject<dyn MTLBuffer>,
+    norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_w_off: u32,
+    k_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_w_off: u32,
+    v_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_w_off: u32,
+    v_quant: TensoropsQuant,
+    q_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_norm_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    attention_gate_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    attention_gate_w_off: u32,
+    o_w_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_w_off: u32,
+    apply_rope: bool,
+    sliding_window: Option<usize>,
+    theta: f32,
+    base_pos: usize,
+) {
+    let b = carrier.b;
+    for i in 0..b {
+        let pos = u32::try_from(base_pos + i).expect("validated Muse verify position");
+        let kv_len = u32::try_from(base_pos + i + 1).expect("validated Muse verify KV length");
+        unsafe {
+            (carrier.pos_bufs[i].contents().as_ptr() as *mut u32).write(pos);
+            (carrier.kl_bufs[i].contents().as_ptr() as *mut u32).write(kv_len);
+            (carrier.kv_lens_buf.contents().as_ptr() as *mut u32)
+                .add(i)
+                .write(kv_len);
+        }
+    }
+    let hidden_dim = carrier.hidden_dim;
+    let q_dim = carrier.q_dim;
+    let kv_dim = carrier.kv_dim;
+    assert_eq!(
+        carrier.q_out_dim, q_dim,
+        "Muse query must use a separate gate"
+    );
+    assert_eq!(carrier.head_dim, 128, "Muse verify requires head_dim=128");
+    assert_eq!(
+        carrier.num_heads,
+        carrier.num_kv_heads * 16,
+        "Muse verify requires GQA16"
+    );
+
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
         ctx,
         enc,
         shared_hidden,
-        &carrier.o_out_all,
+        norm_w_buf,
+        &carrier.normed_all,
+        b,
+        hidden_dim,
+        carrier.eps,
+    )
+    .expect("Muse verify attention RMSNorm");
+    chain_barrier_resources(ctx, enc, [&*carrier.normed_all]);
+    encode_cast_f32_to_f16(
+        ctx,
+        enc,
+        &carrier.normed_all,
+        &carrier.normed_f16_all,
         &carrier.hidden_all_buf,
         b * hidden_dim,
     );
+    chain_barrier_resources(ctx, enc, [&*carrier.normed_f16_all]);
+
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        q_w_buf,
+        q_w_off,
+        &carrier.normed_f16_all,
+        &carrier.q_full_all,
+        &carrier.qoutdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.b_buf,
+        q_dim,
+        b,
+    );
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        k_w_buf,
+        k_w_off,
+        &carrier.normed_f16_all,
+        &carrier.k_all,
+        &carrier.kvdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.b_buf,
+        kv_dim,
+        b,
+    );
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        v_quant,
+        v_w_buf,
+        v_w_off,
+        &carrier.normed_f16_all,
+        &carrier.v_all,
+        &carrier.kvdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.b_buf,
+        kv_dim,
+        b,
+    );
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        attention_gate_w_buf,
+        attention_gate_w_off,
+        &carrier.normed_f16_all,
+        &carrier.gate_all,
+        &carrier.qdim_buf,
+        &carrier.k_hidden_buf,
+        &carrier.b_buf,
+        q_dim,
+        b,
+    );
     chain_barrier(ctx, enc);
 
-    let _ = head_dim;
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        enc,
+        &carrier.q_full_all,
+        q_norm_w_buf,
+        &carrier.q_all,
+        b * carrier.num_heads,
+        carrier.head_dim,
+        carrier.eps,
+    )
+    .expect("Muse verify Q RMSNorm");
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        enc,
+        &carrier.k_all,
+        k_norm_w_buf,
+        &carrier.k_normed_all,
+        b * carrier.num_kv_heads,
+        carrier.head_dim,
+        carrier.eps,
+    )
+    .expect("Muse verify K RMSNorm");
+    chain_barrier_resources(ctx, enc, [&*carrier.q_all, &*carrier.k_normed_all]);
+
+    if apply_rope {
+        let table = muse_prefill_rope_cos_sin(b, carrier.head_dim, carrier.n_rot, theta, base_pos);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                table.as_ptr(),
+                carrier.rope_cos_sin.contents().as_ptr() as *mut f32,
+                table.len(),
+            );
+        }
+        encode_prefill_rope_only(
+            ctx,
+            enc,
+            &carrier.q_all,
+            &carrier.q_all,
+            &carrier.rope_cos_sin,
+            carrier.num_heads,
+            carrier.head_dim,
+            carrier.n_rot,
+            b,
+        )
+        .expect("Muse verify Q RoPE");
+        encode_prefill_rope_only(
+            ctx,
+            enc,
+            &carrier.k_normed_all,
+            &carrier.k_normed_all,
+            &carrier.rope_cos_sin,
+            carrier.num_kv_heads,
+            carrier.head_dim,
+            carrier.n_rot,
+            b,
+        )
+        .expect("Muse verify K RoPE");
+        chain_barrier_resources(ctx, enc, [&*carrier.q_all, &*carrier.k_normed_all]);
+    }
+
+    encode_kv_append_batch(
+        ctx,
+        enc,
+        &carrier.k_normed_all,
+        &carrier.v_all,
+        &carrier.kv.k_buf,
+        &carrier.kv.v_buf,
+        &carrier.kvdim_buf,
+        &carrier.pos_bufs[0],
+        &carrier.b_buf,
+        b * kv_dim,
+    );
+    chain_barrier_resources(ctx, enc, [&*carrier.kv.k_buf, &*carrier.kv.v_buf]);
+
+    crate::dflash_attention::encode_muse_target_attention_f16_hd128(
+        ctx,
+        enc,
+        &carrier.q_all,
+        &carrier.kv.k_buf,
+        &carrier.kv.v_buf,
+        &carrier.attn_out_all,
+        b,
+        base_pos + b,
+        carrier.num_heads,
+        carrier.num_kv_heads,
+        sliding_window,
+        carrier.scale,
+    )
+    .expect("Muse verify continuation attention");
+    chain_barrier_resources(ctx, enc, [&*carrier.attn_out_all]);
+    encode_prefill_gate_apply(
+        ctx,
+        enc,
+        &carrier.attn_out_all,
+        &carrier.gate_all,
+        &carrier.q_full_all,
+        &carrier.q_all_elems_buf,
+        b * q_dim,
+    );
+    chain_barrier_resources(ctx, enc, [&*carrier.q_full_all]);
+    encode_cast_f32_to_f16(
+        ctx,
+        enc,
+        &carrier.q_full_all,
+        &carrier.q_f16_all,
+        &carrier.q_all_elems_buf,
+        b * q_dim,
+    );
+    chain_barrier_resources(ctx, enc, [&*carrier.q_f16_all]);
+    crate::prefill_atn_core_chain::encode_quant_gemm_v2(
+        ctx,
+        enc,
+        TensoropsQuant::Q4K,
+        o_w_buf,
+        o_w_off,
+        &carrier.q_f16_all,
+        &carrier.o_out_all,
+        &carrier.hdim_buf,
+        &carrier.k_qdim_buf,
+        &carrier.b_buf,
+        hidden_dim,
+        b,
+    );
+    chain_barrier_resources(ctx, enc, [&*carrier.o_out_all]);
 }
 
 #[cfg(test)]

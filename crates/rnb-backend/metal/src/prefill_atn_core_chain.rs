@@ -84,6 +84,41 @@ pub(crate) struct PrefillAtnFullLayerCarrier {
     ffn_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     ffn_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
+pub(crate) struct DflashFullLayerCarrier {
+    layer: PrefillAtnFullLayerCarrier,
+    attention: crate::dflash_attention::DflashAttentionCarrier,
+}
+pub(crate) struct DflashCacheSeedCarrier {
+    pub capacity: usize,
+    pub layer_count: usize,
+    pub feature_dim: usize,
+    pub hidden_dim: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub kv_dim: usize,
+    features_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    features_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    encoder_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    projected_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    fused_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    fused_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_norm_w_dev: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    kv_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_normed_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    k_f16_dev: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    v_f16_dev: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    rope_cos_sin_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
+    feature_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    kv_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    token_count_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    feature_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    hidden_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    kv_elems_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    num_kv_heads_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    head_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
 
 pub(crate) struct MusePrefillOTailFfnCarrier {
     pub seq_len: usize,
@@ -131,22 +166,97 @@ pub(crate) struct MusePrefillFullLayerCarrier {
 pub(crate) struct MusePrefillLayerRangeState {
     hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     hidden_elements: usize,
+    feature_dev: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    feature_elements: usize,
+    hidden_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    feature_dim_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    feature_total_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    feature_base_bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl MusePrefillLayerRangeState {
-    pub(crate) fn new(ctx: &MetalContext, hidden: &[f32]) -> Self {
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        hidden: &[f32],
+        hidden_dim: usize,
+        feature_count: usize,
+    ) -> Self {
         let hidden_dev = empty_f32_buf(ctx, hidden.len());
         copy_f32(hidden, &hidden_dev);
+        let feature_dim = hidden_dim
+            .checked_mul(feature_count)
+            .expect("Muse DFlash feature width overflow");
+        let feature_elements = hidden
+            .len()
+            .checked_mul(feature_count)
+            .expect("Muse DFlash feature buffer overflow");
         Self {
             hidden_dev,
             hidden_elements: hidden.len(),
+            feature_dev: (feature_count != 0).then(|| empty_f32_buf(ctx, feature_elements)),
+            feature_elements,
+            hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            feature_dim_buf: u32_buf(ctx, feature_dim as u32),
+            feature_total_buf: u32_buf(ctx, hidden.len() as u32),
+            feature_base_bufs: (0..feature_count)
+                .map(|index| u32_buf(ctx, (index * hidden_dim) as u32))
+                .collect(),
         }
+    }
+
+    fn encode_feature(
+        &self,
+        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        feature_index: Option<usize>,
+    ) {
+        let (Some(features), Some(feature_index)) = (&self.feature_dev, feature_index) else {
+            return;
+        };
+        compute::encode_muse_capture_feature(
+            ctx,
+            encoder,
+            &self.hidden_dev,
+            features,
+            &self.hidden_dim_buf,
+            &self.feature_dim_buf,
+            &self.feature_base_bufs[feature_index],
+            &self.feature_total_buf,
+            self.hidden_elements,
+        );
+        compute::chain_barrier_resources(ctx, encoder, [&*self.hidden_dev, &**features]);
     }
 
     pub(crate) fn finish(&self) -> Vec<f32> {
         readback(&self.hidden_dev, self.hidden_elements)
     }
+
+    pub(crate) fn finish_features(&self) -> Vec<f32> {
+        self.feature_dev
+            .as_ref()
+            .map(|features| readback(features, self.feature_elements))
+            .unwrap_or_default()
+    }
 }
+
+type MusePrefillLayerRangeStageTrace = (
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    usize,
+);
 
 pub(crate) struct MusePrefillLayerRangePending {
     layer_idx: usize,
@@ -155,6 +265,7 @@ pub(crate) struct MusePrefillLayerRangePending {
     v_f16_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     kv_len: usize,
     completed: bool,
+    stage_trace: Option<MusePrefillLayerRangeStageTrace>,
 }
 
 impl Drop for MusePrefillLayerRangePending {
@@ -388,6 +499,161 @@ impl PrefillAtnFullLayerCarrier {
         assert_eq!(ffn_norm_w.len(), self.core.hidden_dim);
         copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
     }
+
+    fn upload_weights(
+        &self,
+        attn_norm_w: &[f32],
+        q_norm_w: &[f32],
+        k_norm_w: &[f32],
+        ffn_norm_w: &[f32],
+    ) {
+        assert_eq!(attn_norm_w.len(), self.core.hidden_dim);
+        assert_eq!(q_norm_w.len(), self.core.head_dim);
+        assert_eq!(k_norm_w.len(), self.core.head_dim);
+        assert_eq!(ffn_norm_w.len(), self.core.hidden_dim);
+        copy_f32(attn_norm_w, &self.core.attn_norm_w_dev);
+        copy_f32(q_norm_w, &self.core.q_norm_w_dev);
+        copy_f32(k_norm_w, &self.core.k_norm_w_dev);
+        copy_f32(ffn_norm_w, &self.ffn_norm_w_dev);
+    }
+}
+impl DflashFullLayerCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_dim: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        ffn_dim: usize,
+        rope_theta: f32,
+        scale: f32,
+        norm_eps: f32,
+        sliding_window: usize,
+    ) -> Self {
+        Self {
+            layer: PrefillAtnFullLayerCarrier::new(
+                ctx,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                kv_dim,
+                ffn_dim,
+                head_dim,
+                rope_theta,
+                scale,
+                norm_eps,
+                0,
+            ),
+            attention: crate::dflash_attention::DflashAttentionCarrier::new(
+                ctx,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                sliding_window,
+            ),
+        }
+    }
+}
+impl DflashCacheSeedCarrier {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &MetalContext,
+        capacity: usize,
+        layer_count: usize,
+        feature_dim: usize,
+        hidden_dim: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        norm_eps: f32,
+    ) -> Self {
+        let kv_dim = num_kv_heads * head_dim;
+        Self {
+            capacity,
+            layer_count,
+            feature_dim,
+            hidden_dim,
+            num_kv_heads,
+            head_dim,
+            kv_dim,
+            features_dev: empty_f32_buf(ctx, capacity * feature_dim),
+            features_f16_dev: private_f16_buf(ctx, capacity * feature_dim),
+            encoder_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
+            projected_dev: private_f32_buf(ctx, capacity * hidden_dim),
+            fused_dev: private_f32_buf(ctx, capacity * hidden_dim),
+            fused_f16_dev: private_f16_buf(ctx, capacity * hidden_dim),
+            k_norm_w_dev: (0..layer_count)
+                .map(|_| empty_f32_buf(ctx, head_dim))
+                .collect(),
+            kv_dev: private_f32_buf(ctx, capacity * kv_dim),
+            k_normed_dev: private_f32_buf(ctx, capacity * kv_dim),
+            k_f16_dev: (0..layer_count)
+                .map(|_| empty_f16_buf(ctx, capacity * kv_dim))
+                .collect(),
+            v_f16_dev: (0..layer_count)
+                .map(|_| empty_f16_buf(ctx, capacity * kv_dim))
+                .collect(),
+            rope_cos_sin_dev: empty_f32_buf(ctx, capacity * head_dim),
+            feature_dim_buf: u32_buf(ctx, feature_dim as u32),
+            hidden_dim_buf: u32_buf(ctx, hidden_dim as u32),
+            kv_dim_buf: u32_buf(ctx, kv_dim as u32),
+            token_count_buf: u32_buf(ctx, 0),
+            feature_elems_buf: u32_buf(ctx, 0),
+            hidden_elems_buf: u32_buf(ctx, 0),
+            kv_elems_buf: u32_buf(ctx, 0),
+            num_kv_heads_buf: u32_buf(ctx, num_kv_heads as u32),
+            head_dim_buf: u32_buf(ctx, head_dim as u32),
+            eps_buf: f32_buf(ctx, norm_eps),
+        }
+    }
+
+    fn upload(
+        &self,
+        features: &[f32],
+        encoder_norm_w: &[f32],
+        k_norm_weights: &[&[f32]],
+        token_count: usize,
+        start_position: usize,
+        rope_theta: f32,
+    ) {
+        debug_assert!(token_count <= self.capacity);
+        debug_assert_eq!(features.len(), token_count * self.feature_dim);
+        debug_assert_eq!(encoder_norm_w.len(), self.hidden_dim);
+        debug_assert_eq!(k_norm_weights.len(), self.layer_count);
+        copy_f32(features, &self.features_dev);
+        copy_f32(encoder_norm_w, &self.encoder_norm_w_dev);
+        for (weight, buffer) in k_norm_weights.iter().zip(&self.k_norm_w_dev) {
+            debug_assert_eq!(weight.len(), self.head_dim);
+            copy_f32(weight, buffer);
+        }
+        copy_f32(
+            &prefill_rope_cos_sin(
+                token_count,
+                self.head_dim,
+                self.head_dim,
+                rope_theta,
+                start_position,
+            ),
+            &self.rope_cos_sin_dev,
+        );
+        for (buffer, value) in [
+            (&self.token_count_buf, token_count),
+            (&self.feature_elems_buf, token_count * self.feature_dim),
+            (&self.hidden_elems_buf, token_count * self.hidden_dim),
+            (&self.kv_elems_buf, token_count * self.kv_dim),
+        ] {
+            unsafe {
+                *(buffer.contents().as_ptr() as *mut u32) = value as u32;
+            }
+        }
+    }
 }
 
 impl MusePrefillOTailFfnCarrier {
@@ -596,23 +862,32 @@ pub(crate) fn encode_quant_gemm_v2(
     n: usize,
     m: usize,
 ) {
-    match quant {
-        TensoropsQuant::Q4K => compute::encode_gemm_q4k_tensorops_v2(
+    match (quant, m <= 8) {
+        (TensoropsQuant::Q4K, true) => compute::encode_gemm_q4k_tensorops_v2_64x32(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q5K => compute::encode_gemm_q5k_tensorops_v2(
+        (TensoropsQuant::Q5K, true) => compute::encode_gemm_q5k_tensorops_v2_64x32(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q6K => compute::encode_gemm_q6k_tensorops_v2(
+        (TensoropsQuant::Q6K, true) => compute::encode_gemm_q6k_tensorops_v2_64x32(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q8_0 => compute::encode_gemm_q8_0_tensorops_v2(
+        (TensoropsQuant::Q4K, false) => compute::encode_gemm_q4k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q2K => compute::encode_gemm_q2k_tensorops_v2(
+        (TensoropsQuant::Q5K, false) => compute::encode_gemm_q5k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q3K => compute::encode_gemm_q3k_tensorops_v2(
+        (TensoropsQuant::Q6K, false) => compute::encode_gemm_q6k_tensorops_v2(
+            ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
+        ),
+        (TensoropsQuant::Q8_0, _) => compute::encode_gemm_q8_0_tensorops_v2(
+            ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
+        ),
+        (TensoropsQuant::Q2K, _) => compute::encode_gemm_q2k_tensorops_v2(
+            ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
+        ),
+        (TensoropsQuant::Q3K, _) => compute::encode_gemm_q3k_tensorops_v2(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
     }
@@ -652,6 +927,38 @@ pub(crate) struct PrefillAtnFullLayerDispatchRequest<'a> {
     pub ffn_down_w_off: u32,
     pub ffn_down_quant: TensoropsQuant,
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct DflashFullLayerDispatchRequest<'a> {
+    pub layer: PrefillAtnFullLayerDispatchRequest<'a>,
+    pub prior_k: &'a [u16],
+    pub prior_v: &'a [u16],
+    pub position: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct DflashCacheSeedLayerDispatchRequest<'a> {
+    pub k_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub k_w_off: u32,
+    pub k_quant: TensoropsQuant,
+    pub v_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub v_w_off: u32,
+    pub v_quant: TensoropsQuant,
+    pub k_norm_w: &'a [f32],
+}
+
+pub(crate) struct DflashCacheSeedDispatchRequest<'a> {
+    pub features: &'a [f32],
+    pub encoder_norm_w: &'a [f32],
+    pub encoder_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
+    pub encoder_w_off: u32,
+    pub encoder_quant: TensoropsQuant,
+    pub layers: &'a [DflashCacheSeedLayerDispatchRequest<'a>],
+    pub token_count: usize,
+    pub start_position: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct MuseOTailFfnOpsRequest<'a> {
@@ -690,6 +997,13 @@ pub(crate) struct MuseTargetAttentionOTailFfnDispatchRequest<'a> {
     pub attention_gate: &'a [f32],
     pub ops: MuseOTailFfnOpsRequest<'a>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct MuseTargetKvBuffers<'a> {
+    pub key: &'a ProtocolObject<dyn MTLBuffer>,
+    pub value: &'a ProtocolObject<dyn MTLBuffer>,
+    pub pos_start: usize,
+    pub kv_len: usize,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) struct MusePrefillFullLayerDispatchRequest<'a> {
@@ -710,7 +1024,10 @@ pub(crate) struct MusePrefillFullLayerDispatchRequest<'a> {
     pub attention_gate_w_off: u32,
     pub attention_gate_quant: TensoropsQuant,
     pub apply_rope: bool,
+    pub rope_theta: f32,
+    pub pos_start: usize,
     pub sliding_window: Option<usize>,
+    pub target_kv: Option<MuseTargetKvBuffers<'a>>,
     pub ops: MuseOTailFfnOpsRequest<'a>,
     pub norm_eps: f32,
     pub scale: f32,
@@ -1444,34 +1761,35 @@ fn encode_muse_o_tail_ffn_ops(
         carrier.seq_len * carrier.hidden_dim,
     );
     compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_normed_f16_dev]);
-    encode_quant_gemm_v2(
-        ctx,
-        enc,
-        req.ffn_gate_quant,
-        req.ffn_gate_w_buf,
-        req.ffn_gate_w_off,
-        &carrier.ffn_normed_f16_dev,
-        &carrier.ffn_gate_dev,
-        &carrier.ffn_dim_buf,
-        &carrier.hidden_dim_buf,
-        &carrier.seq_buf,
-        carrier.ffn_dim,
-        carrier.seq_len,
-    );
-    encode_quant_gemm_v2(
-        ctx,
-        enc,
-        req.ffn_up_quant,
-        req.ffn_up_w_buf,
-        req.ffn_up_w_off,
-        &carrier.ffn_normed_f16_dev,
-        &carrier.ffn_up_dev,
-        &carrier.ffn_dim_buf,
-        &carrier.hidden_dim_buf,
-        &carrier.seq_buf,
-        carrier.ffn_dim,
-        carrier.seq_len,
-    );
+    for (quant, weight, offset, output) in [
+        (
+            req.ffn_gate_quant,
+            req.ffn_gate_w_buf,
+            req.ffn_gate_w_off,
+            &*carrier.ffn_gate_dev,
+        ),
+        (
+            req.ffn_up_quant,
+            req.ffn_up_w_buf,
+            req.ffn_up_w_off,
+            &*carrier.ffn_up_dev,
+        ),
+    ] {
+        encode_quant_gemm_v2(
+            ctx,
+            enc,
+            quant,
+            weight,
+            offset,
+            &carrier.ffn_normed_f16_dev,
+            output,
+            &carrier.ffn_dim_buf,
+            &carrier.hidden_dim_buf,
+            &carrier.seq_buf,
+            carrier.ffn_dim,
+            carrier.seq_len,
+        );
+    }
     compute::chain_barrier_resources(ctx, enc, [&*carrier.ffn_gate_dev, &*carrier.ffn_up_dev]);
     encode_silu_mul_to_f16(
         ctx,
@@ -1529,17 +1847,30 @@ fn encode_muse_full_layer_ops(
 ) -> Result<(), String> {
     let core = &carrier.core;
 
-    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-        ctx,
-        &enc,
-        hidden_dev,
-        &core.attn_norm_w_dev,
-        &core.normed_dev,
-        core.seq_len,
-        core.hidden_dim,
-        req.norm_eps,
-    )
-    .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
+    if req.target_kv.is_some() {
+        encode_rms_norm_batch(
+            ctx,
+            enc,
+            hidden_dev,
+            &core.attn_norm_w_dev,
+            &core.normed_dev,
+            &core.hidden_cols_buf,
+            &core.eps_buf,
+            core.seq_len,
+        );
+    } else {
+        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+            ctx,
+            enc,
+            hidden_dev,
+            &core.attn_norm_w_dev,
+            &core.normed_dev,
+            core.seq_len,
+            core.hidden_dim,
+            req.norm_eps,
+        )
+        .map_err(|error| format!("Metal Muse prefill attention RMS norm failed: {error:?}"))?;
+    }
     compute::chain_barrier_resources(ctx, enc, [&*core.normed_dev]);
     encode_cast_f32_to_f16(
         ctx,
@@ -1608,28 +1939,51 @@ fn encode_muse_full_layer_ops(
     );
     compute::chain_barrier(ctx, &enc);
 
-    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-        ctx,
-        &enc,
-        &core.q_dev,
-        &core.q_norm_w_dev,
-        &core.q_normed_dev,
-        core.seq_len * core.num_heads,
-        core.head_dim,
-        req.norm_eps,
-    )
-    .map_err(|error| format!("Metal Muse prefill Q RMS norm failed: {error:?}"))?;
-    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
-        ctx,
-        &enc,
-        &core.k_dev,
-        &core.k_norm_w_dev,
-        &core.k_normed_dev,
-        core.seq_len * core.num_kv_heads,
-        core.head_dim,
-        req.norm_eps,
-    )
-    .map_err(|error| format!("Metal Muse prefill K RMS norm failed: {error:?}"))?;
+    if req.target_kv.is_some() {
+        encode_rms_norm_batch(
+            ctx,
+            enc,
+            &core.q_dev,
+            &core.q_norm_w_dev,
+            &core.q_normed_dev,
+            &core.hd_buf,
+            &core.eps_buf,
+            core.seq_len * core.num_heads,
+        );
+        encode_rms_norm_batch(
+            ctx,
+            enc,
+            &core.k_dev,
+            &core.k_norm_w_dev,
+            &core.k_normed_dev,
+            &core.hd_buf,
+            &core.eps_buf,
+            core.seq_len * core.num_kv_heads,
+        );
+    } else {
+        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+            ctx,
+            enc,
+            &core.q_dev,
+            &core.q_norm_w_dev,
+            &core.q_normed_dev,
+            core.seq_len * core.num_heads,
+            core.head_dim,
+            req.norm_eps,
+        )
+        .map_err(|error| format!("Metal Muse prefill Q RMS norm failed: {error:?}"))?;
+        crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+            ctx,
+            enc,
+            &core.k_dev,
+            &core.k_norm_w_dev,
+            &core.k_normed_dev,
+            core.seq_len * core.num_kv_heads,
+            core.head_dim,
+            req.norm_eps,
+        )
+        .map_err(|error| format!("Metal Muse prefill K RMS norm failed: {error:?}"))?;
+    }
     compute::chain_barrier(ctx, &enc);
     if req.apply_rope {
         compute::encode_prefill_rope_only(
@@ -1674,16 +2028,35 @@ fn encode_muse_full_layer_ops(
         &core.kv_elems_buf,
         core.seq_len * core.kv_dim,
     );
+    let (attention_key, attention_value, attention_kv_len) = if let Some(target) = req.target_kv {
+        let pos_start_buf = u32_buf(ctx, target.pos_start as u32);
+        compute::encode_kv_append_batch(
+            ctx,
+            enc,
+            &core.k_normed_dev,
+            &core.v_dev,
+            target.key,
+            target.value,
+            &core.kv_n_buf,
+            &pos_start_buf,
+            &core.seq_buf,
+            core.seq_len * core.kv_dim,
+        );
+        compute::chain_barrier_resources(ctx, enc, [target.key, target.value]);
+        (target.key, target.value, target.kv_len)
+    } else {
+        (&*core.k_f16_dev, &*core.v_f16_dev, core.seq_len)
+    };
     compute::chain_barrier(ctx, &enc);
     crate::dflash_attention::encode_muse_target_attention_f16_hd128(
         ctx,
         &enc,
         &core.q_normed_dev,
-        &core.k_f16_dev,
-        &core.v_f16_dev,
+        attention_key,
+        attention_value,
         &core.attn_out_dev,
         core.seq_len,
-        core.seq_len,
+        attention_kv_len,
         core.num_heads,
         core.num_kv_heads,
         req.sliding_window,
@@ -1738,6 +2111,49 @@ pub(crate) fn prefill_muse_full_layer_dispatch(
         &carrier.tail.hidden_dev,
         carrier.seq_len * carrier.tail.hidden_dim,
     );
+    if carrier.seq_len <= 8
+        && std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_some()
+        && !{
+            static TRACED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            TRACED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
+    {
+        let trace = |label: &str, values: Vec<f32>| {
+            let hash = values.iter().fold(0xcbf29ce484222325u64, |hash, value| {
+                (hash ^ value.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            eprintln!(
+                "[muse-stage] reference {label} hash={hash:016x} first={:?}",
+                &values[..values.len().min(8)]
+            );
+        };
+        trace(
+            "q",
+            readback(&core.q_normed_dev, carrier.seq_len * carrier.q_dim),
+        );
+        trace(
+            "k",
+            readback(&core.k_normed_dev, carrier.seq_len * carrier.kv_dim),
+        );
+        trace("v", readback(&core.v_dev, carrier.seq_len * carrier.kv_dim));
+        trace(
+            "attn",
+            readback(&core.attn_out_dev, carrier.seq_len * carrier.q_dim),
+        );
+        trace(
+            "gated",
+            readback(&core.attn_gated_dev, carrier.seq_len * carrier.q_dim),
+        );
+        trace(
+            "o",
+            readback(
+                &carrier.tail.o_proj_dev,
+                carrier.seq_len * carrier.tail.hidden_dim,
+            ),
+        );
+        trace("hidden", hidden.clone());
+    }
     let k_bits = unsafe {
         std::slice::from_raw_parts(
             core.k_f16_dev.contents().as_ptr().cast::<u16>(),
@@ -1756,13 +2172,21 @@ pub(crate) fn prefill_muse_full_layer_dispatch(
     Ok((hidden, k_bits, v_bits))
 }
 
-pub(crate) fn prefill_muse_layer_range_submit(
+pub(crate) fn prefill_muse_layer_range_submit<F>(
     ctx: &MetalContext,
     state: &mut MusePrefillLayerRangeState,
     carrier: &MusePrefillFullLayerCarrier,
     layer_idx: usize,
+    feature_index: Option<usize>,
     req: MusePrefillFullLayerDispatchRequest<'_>,
-) -> Result<MusePrefillLayerRangePending, String> {
+    after_layer: F,
+) -> Result<MusePrefillLayerRangePending, String>
+where
+    F: FnOnce(
+        &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        &ProtocolObject<dyn MTLBuffer>,
+    ) -> Result<(), String>,
+{
     let core = &carrier.core;
     if state.hidden_elements != core.seq_len * core.hidden_dim {
         return Err("Metal Muse prefill range hidden shape mismatch".to_string());
@@ -1770,13 +2194,16 @@ pub(crate) fn prefill_muse_layer_range_submit(
     copy_f32(req.attn_norm_w, &core.attn_norm_w_dev);
     copy_f32(req.q_norm_w, &core.q_norm_w_dev);
     copy_f32(req.k_norm_w, &core.k_norm_w_dev);
+    core.update_rope_cos_sin(None, [0; 4], req.rope_theta, req.pos_start);
     carrier.tail.upload_op_weights(None, req.ops);
     let command = ctx
         .queue
         .commandBuffer()
         .ok_or_else(|| "Metal Muse prefill range command buffer creation failed".to_string())?;
     let encoder = compute::chain_compute_encoder(ctx, &command);
+    state.encode_feature(ctx, &encoder, feature_index);
     encode_muse_full_layer_ops(ctx, &encoder, carrier, &state.hidden_dev, &req)?;
+    after_layer(&encoder, &state.hidden_dev)?;
     encoder.endEncoding();
     command.commit();
     Ok(MusePrefillLayerRangePending {
@@ -1785,6 +2212,29 @@ pub(crate) fn prefill_muse_layer_range_submit(
         k_f16_dev: core.k_f16_dev.clone(),
         v_f16_dev: core.v_f16_dev.clone(),
         kv_len: core.seq_len * core.kv_dim,
+        stage_trace: (core.seq_len <= 8
+            && layer_idx == 0
+            && std::env::var_os("RNB_METAL_MUSE_STAGE_COMPARE").is_some())
+        .then(|| {
+            (
+                core.q_dev.clone(),
+                core.seq_len * core.q_dim,
+                core.k_dev.clone(),
+                core.seq_len * core.kv_dim,
+                core.q_normed_dev.clone(),
+                core.seq_len * core.q_dim,
+                core.k_normed_dev.clone(),
+                core.seq_len * core.kv_dim,
+                core.v_dev.clone(),
+                core.seq_len * core.kv_dim,
+                core.attn_out_dev.clone(),
+                core.seq_len * core.q_dim,
+                core.attn_gated_dev.clone(),
+                core.seq_len * core.q_dim,
+                carrier.tail.o_proj_dev.clone(),
+                core.seq_len * core.hidden_dim,
+            )
+        }),
         completed: false,
     })
 }
@@ -1796,6 +2246,27 @@ pub(crate) fn prefill_muse_layer_range_complete(
     pending.command.waitUntilCompleted();
     pending.completed = true;
     ensure_command_completed(&pending.command)?;
+    if let Some((q_raw, qrn, k_raw, krn, q, qn, k, kn, v, vn, attn, an, gated, gn, o, on)) =
+        pending.stage_trace.as_ref()
+    {
+        let trace = |label: &str, values: Vec<f32>| {
+            let hash = values.iter().fold(0xcbf29ce484222325u64, |hash, value| {
+                (hash ^ value.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            eprintln!(
+                "[muse-stage] reference-range {label} hash={hash:016x} first={:?}",
+                &values[..values.len().min(8)]
+            );
+        };
+        trace("q_raw", readback(q_raw, *qrn));
+        trace("k_raw", readback(k_raw, *krn));
+        trace("q", readback(q, *qn));
+        trace("k", readback(k, *kn));
+        trace("v", readback(v, *vn));
+        trace("attn", readback(attn, *an));
+        trace("gated", readback(gated, *gn));
+        trace("o", readback(o, *on));
+    }
 
     let k_bits = unsafe {
         std::slice::from_raw_parts(
@@ -1893,6 +2364,429 @@ pub(crate) fn prefill_muse_target_attention_o_tail_ffn_dispatch(
         &carrier.hidden_dev,
         carrier.seq_len * carrier.hidden_dim,
     ))
+}
+
+pub(crate) fn dflash_full_layer_dispatch(
+    ctx: &MetalContext,
+    carrier: &DflashFullLayerCarrier,
+    hidden_dev: &ProtocolObject<dyn MTLBuffer>,
+    upload_hidden: bool,
+    wait_readback: bool,
+    req: DflashFullLayerDispatchRequest<'_>,
+) -> Result<Vec<f32>, String> {
+    let layer = &carrier.layer;
+    let core = &layer.core;
+    let base = &req.layer;
+    if upload_hidden {
+        copy_f32(base.core.hidden, hidden_dev);
+    }
+    layer.upload_weights(
+        base.core.attn_norm_w,
+        base.core.q_norm_w,
+        base.core.k_norm_w,
+        base.ffn_norm_w,
+    );
+    core.update_rope_cos_sin(None, [0; 4], req.rope_theta, req.position);
+    let context_len = carrier
+        .attention
+        .upload_context(req.prior_k, req.prior_v, req.position)?;
+
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal DFlash full layer command buffer creation failed".to_string())?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal DFlash full layer encoder creation failed".to_string())?;
+
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        hidden_dev,
+        &core.attn_norm_w_dev,
+        &core.normed_dev,
+        core.seq_len,
+        core.hidden_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal DFlash attention RMS norm failed: {error:?}"))?;
+    compute::chain_barrier_resources(ctx, &enc, [&*core.normed_dev]);
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &core.normed_dev,
+        &core.normed_f16_dev,
+        &core.hidden_elems_buf,
+        core.seq_len * core.hidden_dim,
+    );
+    compute::chain_barrier(ctx, &enc);
+    for (quant, weight, offset, output, n_buf, n) in [
+        (
+            base.core.q_quant,
+            base.core.q_w_buf,
+            base.core.q_w_off,
+            &*core.q_dev,
+            &*core.q_n_buf,
+            core.q_dim,
+        ),
+        (
+            base.core.k_quant,
+            base.core.k_w_buf,
+            base.core.k_w_off,
+            &*core.k_dev,
+            &*core.kv_n_buf,
+            core.kv_dim,
+        ),
+        (
+            base.core.v_quant,
+            base.core.v_w_buf,
+            base.core.v_w_off,
+            &*core.v_dev,
+            &*core.kv_n_buf,
+            core.kv_dim,
+        ),
+    ] {
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            quant,
+            weight,
+            offset,
+            &core.normed_f16_dev,
+            output,
+            n_buf,
+            &core.hidden_cols_buf,
+            &core.seq_buf,
+            n,
+            core.seq_len,
+        );
+    }
+    compute::chain_barrier(ctx, &enc);
+    compute::encode_prefill_neox_qk_norm_table(
+        ctx,
+        &enc,
+        &core.q_dev,
+        &core.q_norm_w_dev,
+        &core.q_normed_dev,
+        &core.rope_cos_sin_dev,
+        &core.nh_buf,
+        &core.hd_buf,
+        &core.eps_buf,
+        core.seq_len,
+        core.num_heads,
+    );
+    compute::encode_prefill_neox_qk_norm_table(
+        ctx,
+        &enc,
+        &core.k_dev,
+        &core.k_norm_w_dev,
+        &core.k_normed_dev,
+        &core.rope_cos_sin_dev,
+        &core.nkv_buf,
+        &core.hd_buf,
+        &core.eps_buf,
+        core.seq_len,
+        core.num_kv_heads,
+    );
+    compute::chain_barrier(ctx, &enc);
+    carrier.attention.encode_from_buffers(
+        ctx,
+        &enc,
+        &core.q_normed_dev,
+        &core.k_normed_dev,
+        &core.v_dev,
+        &core.attn_out_dev,
+        context_len,
+        req.position,
+    )?;
+    compute::chain_barrier(ctx, &enc);
+
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &core.attn_out_dev,
+        &layer.o_in_f16_dev,
+        &core.q_elems_buf,
+        core.seq_len * core.q_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.o_in_f16_dev]);
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        base.o_quant,
+        base.o_w_buf,
+        base.o_w_off,
+        &layer.o_in_f16_dev,
+        &layer.o_proj_dev,
+        &core.hidden_cols_buf,
+        &layer.q_dim_buf,
+        &core.seq_buf,
+        core.hidden_dim,
+        core.seq_len,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.o_proj_dev]);
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &enc,
+        hidden_dev,
+        &layer.o_proj_dev,
+        &core.hidden_elems_buf,
+        core.seq_len * core.hidden_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [hidden_dev]);
+
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        hidden_dev,
+        &layer.ffn_norm_w_dev,
+        &layer.ffn_normed_dev,
+        core.seq_len,
+        core.hidden_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal DFlash FFN RMS norm failed: {error:?}"))?;
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.ffn_normed_dev]);
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &layer.ffn_normed_dev,
+        &layer.ffn_normed_f16_dev,
+        &core.hidden_elems_buf,
+        core.seq_len * core.hidden_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.ffn_normed_f16_dev]);
+    for (quant, weight, offset, output) in [
+        (
+            base.ffn_gate_quant,
+            base.ffn_gate_w_buf,
+            base.ffn_gate_w_off,
+            &*layer.ffn_gate_dev,
+        ),
+        (
+            base.ffn_up_quant,
+            base.ffn_up_w_buf,
+            base.ffn_up_w_off,
+            &*layer.ffn_up_dev,
+        ),
+    ] {
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            quant,
+            weight,
+            offset,
+            &layer.ffn_normed_f16_dev,
+            output,
+            &layer.ffn_dim_buf,
+            &core.hidden_cols_buf,
+            &core.seq_buf,
+            layer.ffn_dim,
+            core.seq_len,
+        );
+    }
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.ffn_gate_dev, &*layer.ffn_up_dev]);
+    encode_silu_mul_to_f16(
+        ctx,
+        &enc,
+        &layer.ffn_gate_dev,
+        &layer.ffn_up_dev,
+        &layer.ffn_act_f16_dev,
+        &layer.ffn_elems_buf,
+        core.seq_len * layer.ffn_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.ffn_act_f16_dev]);
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        base.ffn_down_quant,
+        base.ffn_down_w_buf,
+        base.ffn_down_w_off,
+        &layer.ffn_act_f16_dev,
+        &layer.ffn_down_dev,
+        &core.hidden_cols_buf,
+        &layer.ffn_dim_buf,
+        &core.seq_buf,
+        core.hidden_dim,
+        core.seq_len,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*layer.ffn_down_dev]);
+    crate::ffn_chain::encode_residual_add(
+        ctx,
+        &enc,
+        hidden_dev,
+        &layer.ffn_down_dev,
+        &core.hidden_elems_buf,
+        core.seq_len * core.hidden_dim,
+    );
+
+    enc.endEncoding();
+    cmd.commit();
+    if wait_readback {
+        cmd.waitUntilCompleted();
+        ensure_command_completed(&cmd)?;
+        Ok(readback(hidden_dev, core.seq_len * core.hidden_dim))
+    } else {
+        Ok(Vec::new())
+    }
+}
+pub(crate) fn dflash_cache_seed_dispatch(
+    ctx: &MetalContext,
+    carrier: &DflashCacheSeedCarrier,
+    req: DflashCacheSeedDispatchRequest<'_>,
+) -> Result<Vec<(Vec<u16>, Vec<u16>)>, String> {
+    let k_norm_weights = req
+        .layers
+        .iter()
+        .map(|layer| layer.k_norm_w)
+        .collect::<Vec<_>>();
+    carrier.upload(
+        req.features,
+        req.encoder_norm_w,
+        &k_norm_weights,
+        req.token_count,
+        req.start_position,
+        req.rope_theta,
+    );
+
+    let cmd = ctx
+        .queue
+        .commandBuffer()
+        .ok_or_else(|| "Metal DFlash cache seed command buffer creation failed".to_string())?;
+    let enc = cmd
+        .computeCommandEncoder()
+        .ok_or_else(|| "Metal DFlash cache seed encoder creation failed".to_string())?;
+
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &carrier.features_dev,
+        &carrier.features_f16_dev,
+        &carrier.feature_elems_buf,
+        req.token_count * carrier.feature_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*carrier.features_f16_dev]);
+    encode_quant_gemm_v2(
+        ctx,
+        &enc,
+        req.encoder_quant,
+        req.encoder_w_buf,
+        req.encoder_w_off,
+        &carrier.features_f16_dev,
+        &carrier.projected_dev,
+        &carrier.hidden_dim_buf,
+        &carrier.feature_dim_buf,
+        &carrier.token_count_buf,
+        carrier.hidden_dim,
+        req.token_count,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*carrier.projected_dev]);
+    crate::ffn_chain::encode_qwen_prefill_rms_norm_exact(
+        ctx,
+        &enc,
+        &carrier.projected_dev,
+        &carrier.encoder_norm_w_dev,
+        &carrier.fused_dev,
+        req.token_count,
+        carrier.hidden_dim,
+        req.norm_eps,
+    )
+    .map_err(|error| format!("Metal DFlash encoder RMS norm failed: {error:?}"))?;
+    encode_cast_f32_to_f16(
+        ctx,
+        &enc,
+        &carrier.fused_dev,
+        &carrier.fused_f16_dev,
+        &carrier.hidden_elems_buf,
+        req.token_count * carrier.hidden_dim,
+    );
+    compute::chain_barrier_resources(ctx, &enc, [&*carrier.fused_f16_dev]);
+
+    for (layer_index, layer) in req.layers.iter().enumerate() {
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            layer.k_quant,
+            layer.k_w_buf,
+            layer.k_w_off,
+            &carrier.fused_f16_dev,
+            &carrier.kv_dev,
+            &carrier.kv_dim_buf,
+            &carrier.hidden_dim_buf,
+            &carrier.token_count_buf,
+            carrier.kv_dim,
+            req.token_count,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*carrier.kv_dev]);
+        compute::encode_prefill_neox_qk_norm_table(
+            ctx,
+            &enc,
+            &carrier.kv_dev,
+            &carrier.k_norm_w_dev[layer_index],
+            &carrier.k_normed_dev,
+            &carrier.rope_cos_sin_dev,
+            &carrier.num_kv_heads_buf,
+            &carrier.head_dim_buf,
+            &carrier.eps_buf,
+            req.token_count,
+            carrier.num_kv_heads,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*carrier.k_normed_dev]);
+        encode_cast_f32_to_f16(
+            ctx,
+            &enc,
+            &carrier.k_normed_dev,
+            &carrier.k_f16_dev[layer_index],
+            &carrier.kv_elems_buf,
+            req.token_count * carrier.kv_dim,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*carrier.k_f16_dev[layer_index]]);
+
+        encode_quant_gemm_v2(
+            ctx,
+            &enc,
+            layer.v_quant,
+            layer.v_w_buf,
+            layer.v_w_off,
+            &carrier.fused_f16_dev,
+            &carrier.kv_dev,
+            &carrier.kv_dim_buf,
+            &carrier.hidden_dim_buf,
+            &carrier.token_count_buf,
+            carrier.kv_dim,
+            req.token_count,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*carrier.kv_dev]);
+        encode_cast_f32_to_f16(
+            ctx,
+            &enc,
+            &carrier.kv_dev,
+            &carrier.v_f16_dev[layer_index],
+            &carrier.kv_elems_buf,
+            req.token_count * carrier.kv_dim,
+        );
+        compute::chain_barrier_resources(ctx, &enc, [&*carrier.v_f16_dev[layer_index]]);
+    }
+
+    enc.endEncoding();
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    ensure_command_completed(&cmd)?;
+
+    let elements = req.token_count * carrier.kv_dim;
+    Ok(carrier
+        .k_f16_dev
+        .iter()
+        .zip(&carrier.v_f16_dev)
+        .map(|(keys, values)| unsafe {
+            (
+                std::slice::from_raw_parts(keys.contents().as_ptr() as *const u16, elements)
+                    .to_vec(),
+                std::slice::from_raw_parts(values.contents().as_ptr() as *const u16, elements)
+                    .to_vec(),
+            )
+        })
+        .collect())
 }
 
 pub(crate) fn prefill_atn_full_layer_dispatch(

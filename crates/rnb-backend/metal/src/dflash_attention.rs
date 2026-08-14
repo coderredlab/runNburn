@@ -51,6 +51,82 @@ impl DflashAttentionCarrier {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_context(
+        &self,
+        context_key: &[u16],
+        context_value: &[u16],
+        position: usize,
+    ) -> Result<usize, String> {
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        if context_key.len() != context_value.len() || context_key.len() % kv_dim != 0 {
+            return Err("Metal DFlash attention context shape mismatch".to_string());
+        }
+        let context_len = context_key.len() / kv_dim;
+        if context_len > self.sliding_window || position < context_len {
+            return Err(format!(
+                "Metal DFlash context contract mismatch: position={position}, context_len={context_len}, window={}",
+                self.sliding_window
+            ));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                context_key.as_ptr(),
+                self.context_key.contents().as_ptr().cast::<u16>(),
+                context_key.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                context_value.as_ptr(),
+                self.context_value.contents().as_ptr().cast::<u16>(),
+                context_value.len(),
+            );
+        }
+        Ok(context_len)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_from_buffers(
+        &self,
+        ctx: &MetalContext,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        query: &ProtocolObject<dyn MTLBuffer>,
+        block_key: &ProtocolObject<dyn MTLBuffer>,
+        block_value: &ProtocolObject<dyn MTLBuffer>,
+        output: &ProtocolObject<dyn MTLBuffer>,
+        context_len: usize,
+        position: usize,
+    ) -> Result<(), String> {
+        encoder.setComputePipelineState(&ctx.dflash_attention_hd128_pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(query), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&self.context_key), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&self.context_value), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(block_key), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(block_value), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 5);
+        }
+        set_u32(encoder, context_len, 6)?;
+        set_u32(encoder, self.seq_len, 7)?;
+        set_u32(encoder, position, 8)?;
+        set_u32(encoder, self.num_heads, 9)?;
+        set_u32(encoder, self.num_kv_heads, 10)?;
+        set_u32(encoder, self.sliding_window, 11)?;
+        set_f32(encoder, (self.head_dim as f32).sqrt().recip(), 12);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: self.seq_len,
+                height: self.num_heads,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch(
         &self,
         ctx: &MetalContext,
@@ -70,34 +146,15 @@ impl DflashAttentionCarrier {
             || query.len() != self.seq_len * q_dim
             || block_key.len() != self.seq_len * kv_dim
             || block_value.len() != self.seq_len * kv_dim
-            || context_key.len() != context_value.len()
-            || context_key.len() % kv_dim != 0
         {
             return Err("Metal DFlash attention shape mismatch".to_string());
         }
-        let context_len = context_key.len() / kv_dim;
-        if context_len > self.sliding_window || position < context_len {
-            return Err(format!(
-                "Metal DFlash context contract mismatch: position={position}, context_len={context_len}, window={}",
-                self.sliding_window
-            ));
-        }
-
+        let context_len = self.upload_context(context_key, context_value, position)?;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 query.as_ptr(),
                 self.query.contents().as_ptr().cast::<f32>(),
                 query.len(),
-            );
-            std::ptr::copy_nonoverlapping(
-                context_key.as_ptr(),
-                self.context_key.contents().as_ptr().cast::<u16>(),
-                context_key.len(),
-            );
-            std::ptr::copy_nonoverlapping(
-                context_value.as_ptr(),
-                self.context_value.contents().as_ptr().cast::<u16>(),
-                context_value.len(),
             );
             std::ptr::copy_nonoverlapping(
                 block_key.as_ptr(),
@@ -118,34 +175,16 @@ impl DflashAttentionCarrier {
         let encoder = command
             .computeCommandEncoder()
             .ok_or_else(|| "Metal DFlash compute encoder unavailable".to_string())?;
-        encoder.setComputePipelineState(&ctx.dflash_attention_hd128_pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&self.query), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(&self.context_key), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(&self.context_value), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(&self.block_key), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(&self.block_value), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(&self.output), 0, 5);
-        }
-        set_u32(&encoder, context_len, 6)?;
-        set_u32(&encoder, self.seq_len, 7)?;
-        set_u32(&encoder, position, 8)?;
-        set_u32(&encoder, self.num_heads, 9)?;
-        set_u32(&encoder, self.num_kv_heads, 10)?;
-        set_u32(&encoder, self.sliding_window, 11)?;
-        set_f32(&encoder, (self.head_dim as f32).sqrt().recip(), 12);
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: self.seq_len,
-                height: self.num_heads,
-                depth: 1,
-            },
-            MTLSize {
-                width: 32,
-                height: 1,
-                depth: 1,
-            },
-        );
+        self.encode_from_buffers(
+            ctx,
+            &encoder,
+            &self.query,
+            &self.block_key,
+            &self.block_value,
+            &self.output,
+            context_len,
+            position,
+        )?;
         encoder.endEncoding();
         command.commit();
         command.waitUntilCompleted();

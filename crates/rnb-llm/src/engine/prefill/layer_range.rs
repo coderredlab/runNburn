@@ -5,6 +5,10 @@ use super::*;
 use crate::engine::backend_runtime;
 use std::ops::Range;
 use std::time::Instant;
+pub(in crate::engine) struct MusePrefillOutputTail {
+    pub target_tokens: Vec<u32>,
+    pub output_hidden_rows: Vec<f32>,
+}
 
 pub(in crate::engine) fn run_prefill_layers_cpu_range(
     kv_cache: &mut KVCache,
@@ -45,6 +49,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range(
         false,
         None,
         None,
+        None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
 }
@@ -66,8 +71,10 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_dflash_features(
     rope_theta: f32,
     norm_eps: f32,
     target_layers: &[usize],
-) -> crate::error::Result<(Tensor, Vec<f32>)> {
+    collect_output_tail: bool,
+) -> crate::error::Result<(Tensor, Vec<f32>, Option<MusePrefillOutputTail>)> {
     let mut feature_rows = Vec::new();
+    let mut output_tail = None;
     let hidden = run_prefill_layers_cpu_range_impl(
         kv_cache,
         metadata,
@@ -90,9 +97,10 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_dflash_features(
         true,
         None,
         Some((target_layers, &mut feature_rows)),
+        collect_output_tail.then_some(&mut output_tail),
     )?
     .into_host_for_layer(None, "range_end")?;
-    Ok((hidden, feature_rows))
+    Ok((hidden, feature_rows, output_tail))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +141,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_external_target_batch(
         norm_eps,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -177,6 +186,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_non_causal(
         norm_eps,
         true,
         false,
+        None,
         None,
         None,
     )
@@ -230,6 +240,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_with_positions(
         false,
         None,
         None,
+        None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
 }
@@ -273,6 +284,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_mtp_resident_kv(
         norm_eps,
         false,
         false,
+        None,
         None,
         None,
     )
@@ -320,6 +332,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_carrier(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -362,6 +375,7 @@ pub(in crate::engine) fn run_prefill_layers_cpu_range_collect_prefix_state(
         true,
         false,
         prefix_collector,
+        None,
         None,
     )
     .and_then(|hidden| hidden.into_host_for_layer(None, "range_end"))
@@ -1608,11 +1622,12 @@ fn try_run_metal_muse_prefill_layer_range(
     non_causal: bool,
     norm_eps: f32,
     profiler_enabled: bool,
-) -> crate::error::Result<Option<Tensor>> {
+    feature_layers: &[usize],
+    fuse_output_tail: bool,
+) -> crate::error::Result<Option<(Tensor, Vec<f32>, Option<MusePrefillOutputTail>)>> {
     if architecture != ModelArchitecture::MuseGlimmer
         || non_causal
         || imrope_positions.is_some()
-        || pos_start != 0
         || metal_prefill_host_requirement(layer_range, profiler_enabled).is_some()
         || layer_range.start >= layer_range.end
         || layer_range.end > weights.layers.len()
@@ -1663,8 +1678,33 @@ fn try_run_metal_muse_prefill_layer_range(
             return Ok(None);
         }
         let ffn_norm = select_ffn_pre_norm_weight(w, architecture);
+        let target = if pos_start == 0 {
+            None
+        } else {
+            let cached = kv_cache.read_up_to(layer_idx, pos_start);
+            let (cached_k_f16, cached_v_f16) = cached.as_slices();
+            if !backend_runtime::metal_muse_prepare_target_kv_resident_if_supported(
+                cached_k_f16,
+                cached_v_f16,
+                kv_cache.sequence_epoch(),
+                layer_idx,
+                layout.num_kv_heads,
+                layout.head_dim,
+                pos_start,
+                pos_start + seq_len,
+            )? {
+                return Ok(None);
+            }
+            Some(backend_runtime::MusePrefillLayerRangeTarget {
+                sequence_epoch: kv_cache.sequence_epoch(),
+                cache_layer: layer_idx,
+                pos_start,
+                kv_len: pos_start + seq_len,
+            })
+        };
         specs.push(backend_runtime::MusePrefillLayerRangeSpec {
             layer_idx,
+            target,
             hidden: hidden_data,
             attn_norm_w: kernels::tensor_as_f32_slice(&w.attn_norm).to_vec(),
             q_norm_w: kernels::tensor_as_f32_slice(q_norm).to_vec(),
@@ -1696,12 +1736,30 @@ fn try_run_metal_muse_prefill_layer_range(
             sliding_window,
         });
     }
+    let output_norm = kernels::tensor_as_f32_slice(&weights.output_norm);
+    let output_argmax = (fuse_output_tail
+        && !crate::engine::logits::use_token_embedding_as_output()
+        && !crate::engine::policy::exact_output_gemv_enabled()
+        && metadata.logit_scale > 0.0
+        && output_norm.len() == metadata.hidden_dim
+        && weights.output.cols == metadata.hidden_dim)
+        .then_some(backend_runtime::MetalDecodeOutputArgmax {
+            norm_weight: output_norm,
+            output_weight: &weights.output,
+            rows: weights.output.rows,
+            cols: weights.output.cols,
+            eps: norm_eps,
+            excluded_token: None,
+        });
+    let output_tail_requested = output_argmax.is_some();
     let out = backend_runtime::metal_muse_prefill_layer_range_if_supported(
         hidden_data,
         &specs,
+        feature_layers,
+        output_argmax,
         |layer_idx, k_bits, v_bits| {
             kv_cache
-                .replace_layer_f16_range_compacted(layer_idx, 0, seq_len, k_bits, v_bits)
+                .replace_layer_f16_range_compacted(layer_idx, pos_start, seq_len, k_bits, v_bits)
                 .map_err(|error| error.to_string())
         },
     )?;
@@ -1712,9 +1770,35 @@ fn try_run_metal_muse_prefill_layer_range(
     debug_assert_eq!(out.hidden_readbacks, 1);
     debug_assert_eq!(out.intermediate_hidden_transfers, 0);
     debug_assert_eq!(out.kv_layers_streamed, layer_range.len());
-    Ok(Some(Tensor::from_vec(
-        out.hidden,
-        &[seq_len, metadata.hidden_dim],
+    let expected_features = seq_len * metadata.hidden_dim * feature_layers.len();
+    if out.features.len() != expected_features {
+        return Err(crate::error::LlmError::Forward(format!(
+            "Metal Muse prefill feature length mismatch: got {}, expected {expected_features}",
+            out.features.len()
+        )));
+    }
+    let output_tail = if output_tail_requested {
+        let expected_output_hidden = seq_len * metadata.hidden_dim;
+        if out.target_tokens.len() != seq_len
+            || out.output_hidden_rows.len() != expected_output_hidden
+        {
+            return Err(crate::error::LlmError::Forward(format!(
+                "Metal Muse prefill output tail mismatch: tokens={}, hidden={}, expected tokens={seq_len}, hidden={expected_output_hidden}",
+                out.target_tokens.len(),
+                out.output_hidden_rows.len(),
+            )));
+        }
+        Some(MusePrefillOutputTail {
+            target_tokens: out.target_tokens,
+            output_hidden_rows: out.output_hidden_rows,
+        })
+    } else {
+        None
+    };
+    Ok(Some((
+        Tensor::from_vec(out.hidden, &[seq_len, metadata.hidden_dim]),
+        out.features,
+        output_tail,
     )))
 }
 
@@ -2169,6 +2253,7 @@ fn run_prefill_layers_cpu_range_impl(
     external_target_batch: bool,
     mut prefix_collector: Option<&mut verify_window::GdnPrefixStateCollector>,
     mut dflash_features: Option<(&[usize], &mut Vec<f32>)>,
+    mut _dflash_output_tail: Option<&mut Option<MusePrefillOutputTail>>,
 ) -> crate::error::Result<hidden_carrier::PrefillHidden> {
     #[cfg(feature = "cuda")]
     let nemotron_workspace_plan =
@@ -2248,12 +2333,17 @@ fn run_prefill_layers_cpu_range_impl(
     let mut hidden = hidden_carrier::PrefillHidden::Host(hidden);
     let mut layer_idx = layer_range.start;
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    if prefix_collector.is_none() && dflash_features.is_none() && gemma_per_layer_base.is_none() {
+    if prefix_collector.is_none() && gemma_per_layer_base.is_none() {
         crate::generate::check_generation_cancellation()?;
         let chain_input = hidden
             .as_host()
             .expect("Metal Muse prefill range input must be host-resident");
-        if let Some(chain_hidden) = try_run_metal_muse_prefill_layer_range(
+        let feature_layers = dflash_features
+            .as_ref()
+            .map(|(layers, _)| *layers)
+            .unwrap_or(&[]);
+        let fuse_output_tail = _dflash_output_tail.is_some();
+        if let Some((chain_hidden, features, output_tail)) = try_run_metal_muse_prefill_layer_range(
             kv_cache,
             metadata,
             architecture,
@@ -2266,7 +2356,15 @@ fn run_prefill_layers_cpu_range_impl(
             non_causal,
             norm_eps,
             profiler.enabled(),
+            feature_layers,
+            fuse_output_tail,
         )? {
+            if let Some((_, feature_rows)) = dflash_features.as_mut() {
+                **feature_rows = features;
+            }
+            if let Some(output_tail_slot) = _dflash_output_tail.as_mut() {
+                **output_tail_slot = output_tail;
+            }
             return Ok(hidden_carrier::PrefillHidden::Host(chain_hidden));
         }
     }

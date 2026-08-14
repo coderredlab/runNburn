@@ -535,6 +535,7 @@ pub struct MetalContext {
     pub silu_mul_half_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub residual_add_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub residual_add_scaled_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub muse_capture_feature_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_gather_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_gather_f16_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub qwen_moe_prefill_scatter_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -736,6 +737,12 @@ pub struct MetalContext {
     pub(crate) gemm_q5k_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q6k_tensorops_v2_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q4k_tensorops_v2_64x32_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q5k_tensorops_v2_64x32_pipeline:
+        Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    pub(crate) gemm_q6k_tensorops_v2_64x32_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) gemm_q3k_tensorops_v2_pipeline:
         Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -1795,6 +1802,15 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let gemm_q4k_tensorops_v2_64x32_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q4k_tensorops_v2",
+        ))
+    } else {
+        None
+    };
     let gemm_q8_0_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     > = if tensorops_capable {
@@ -1837,6 +1853,15 @@ pub fn build_metal_context_with_opts(
     } else {
         None
     };
+    let gemm_q5k_tensorops_v2_64x32_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q5k_tensorops_v2_64x32",
+        ))
+    } else {
+        None
+    };
     let gemm_q6k_tensorops_v2_pipeline: Option<
         Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     > = if tensorops_capable {
@@ -1844,6 +1869,15 @@ pub fn build_metal_context_with_opts(
             &device,
             GEMM_TENSOROPS_POC_SRC,
             "gemm_q6k_tensorops_v2_64x128",
+        ))
+    } else {
+        None
+    };
+    let gemm_q6k_tensorops_v2_64x32_pipeline = if tensorops_capable {
+        Some(build_pipeline_v4(
+            &device,
+            GEMM_TENSOROPS_POC_SRC,
+            "gemm_q6k_tensorops_v2_64x32",
         ))
     } else {
         None
@@ -2204,6 +2238,8 @@ pub fn build_metal_context_with_opts(
     let residual_add_pipeline = build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add");
     let residual_add_scaled_pipeline =
         build_pipeline(&device, RESIDUAL_ADD_SRC, "residual_add_scaled");
+    let muse_capture_feature_pipeline =
+        build_pipeline(&device, RESIDUAL_ADD_SRC, "muse_capture_feature");
     let qwen_moe_prefill_gather_pipeline = build_pipeline(
         &device,
         QWEN_MOE_PREFILL_SCATTER_SRC,
@@ -2573,6 +2609,7 @@ pub fn build_metal_context_with_opts(
         silu_mul_half_f16_pipeline,
         residual_add_pipeline,
         residual_add_scaled_pipeline,
+        muse_capture_feature_pipeline,
         qwen_moe_prefill_gather_pipeline,
         qwen_moe_prefill_gather_f16_pipeline,
         qwen_moe_prefill_scatter_pipeline,
@@ -2673,6 +2710,9 @@ pub fn build_metal_context_with_opts(
         gemm_q4k_tensorops_v2_pair_pipeline,
         gemm_q5k_tensorops_v2_pipeline,
         gemm_q6k_tensorops_v2_pipeline,
+        gemm_q4k_tensorops_v2_64x32_pipeline,
+        gemm_q5k_tensorops_v2_64x32_pipeline,
+        gemm_q6k_tensorops_v2_64x32_pipeline,
         gemm_q3k_tensorops_v2_pipeline,
         gemm_q2k_tensorops_v2_pipeline,
         gemm_q8_0_tensorops_library,
@@ -7382,6 +7422,41 @@ pub(crate) fn encode_gemm_q4k_tensorops_v2(
         64,
     );
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q4k_tensorops_v2_64x32(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q4k_tensorops_v2_64x32_pipeline
+        .as_ref()
+        .expect("gemm_q4k_tensorops_v2_64x32_pipeline missing");
+    encode_tensorops_v2_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_f16_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        8,
+        64,
+    );
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_gemm_q4k_tensorops_v2_offset(
@@ -7497,6 +7572,41 @@ pub(crate) fn encode_gemm_q5k_tensorops_v2(
         64,
     );
 }
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q5k_tensorops_v2_64x32(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q5k_tensorops_v2_64x32_pipeline
+        .as_ref()
+        .expect("gemm_q5k_tensorops_v2_64x32_pipeline missing");
+    encode_tensorops_v2_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_f16_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        8,
+        64,
+    );
+}
 
 /// pm42 M3: Q6_K v2 GEMM encode(chain down Q6_K + GDN in_proj Q6_K). NRA=64,NRB=128,NK=128,4sg.
 #[allow(clippy::too_many_arguments)]
@@ -7531,6 +7641,41 @@ pub(crate) fn encode_gemm_q6k_tensorops_v2(
         m,
         64,
         128,
+        128,
+    );
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_gemm_q6k_tensorops_v2_64x32(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    w_buf: &ProtocolObject<dyn MTLBuffer>,
+    weight_byte_offset: u32,
+    in_f16_buf: &ProtocolObject<dyn MTLBuffer>,
+    out_buf: &ProtocolObject<dyn MTLBuffer>,
+    n_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    m_buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+    m: usize,
+) {
+    let pipeline = ctx
+        .gemm_q6k_tensorops_v2_64x32_pipeline
+        .as_ref()
+        .expect("gemm_q6k_tensorops_v2_64x32_pipeline missing");
+    encode_tensorops_v2_dispatch(
+        pipeline,
+        enc,
+        w_buf,
+        weight_byte_offset,
+        in_f16_buf,
+        out_buf,
+        n_buf,
+        k_buf,
+        m_buf,
+        n,
+        m,
+        64,
+        8,
         128,
     );
 }
@@ -10913,6 +11058,43 @@ pub(crate) fn encode_prefill_gate_apply(
     enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_muse_capture_feature(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    hidden_buf: &ProtocolObject<dyn MTLBuffer>,
+    features_buf: &ProtocolObject<dyn MTLBuffer>,
+    hidden_dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    feature_dim_buf: &ProtocolObject<dyn MTLBuffer>,
+    feature_base_buf: &ProtocolObject<dyn MTLBuffer>,
+    total_buf: &ProtocolObject<dyn MTLBuffer>,
+    total: usize,
+) {
+    let pipeline = &ctx.muse_capture_feature_pipeline;
+    enc.setComputePipelineState(pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(hidden_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(features_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(hidden_dim_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(feature_dim_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(feature_base_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(total_buf), 0, 5);
+    }
+    let tg_width = pipeline.threadExecutionWidth().max(1);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: total.div_ceil(tg_width),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// kv_append(k/v device f32 → KV_dev[pos] f16) 을 encoder 에 encode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_kv_append(
@@ -11403,34 +11585,86 @@ pub(crate) fn encode_attn_decode_f16_gqa16(
     v_current_buf: &ProtocolObject<dyn MTLBuffer>,
     num_heads: usize,
 ) {
+    encode_attn_decode_f16_gqa16_at(
+        ctx,
+        enc,
+        q_buf,
+        0,
+        k_buf,
+        v_buf,
+        o_buf,
+        0,
+        nh_buf,
+        nkv_buf,
+        hd_buf,
+        kl_buf,
+        scale_buf,
+        window_buf,
+        gate_buf,
+        0,
+        pos_buf,
+        k_current_buf,
+        0,
+        v_current_buf,
+        0,
+        num_heads,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_attn_decode_f16_gqa16_at(
+    ctx: &MetalContext,
+    enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    q_buf: &ProtocolObject<dyn MTLBuffer>,
+    q_offset: usize,
+    k_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_buf: &ProtocolObject<dyn MTLBuffer>,
+    o_offset: usize,
+    nh_buf: &ProtocolObject<dyn MTLBuffer>,
+    nkv_buf: &ProtocolObject<dyn MTLBuffer>,
+    hd_buf: &ProtocolObject<dyn MTLBuffer>,
+    kl_buf: &ProtocolObject<dyn MTLBuffer>,
+    scale_buf: &ProtocolObject<dyn MTLBuffer>,
+    window_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_buf: &ProtocolObject<dyn MTLBuffer>,
+    gate_offset: usize,
+    pos_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_current_buf: &ProtocolObject<dyn MTLBuffer>,
+    k_current_offset: usize,
+    v_current_buf: &ProtocolObject<dyn MTLBuffer>,
+    v_current_offset: usize,
+    num_heads: usize,
+) {
     enc.setComputePipelineState(&ctx.attn_decode_f16_gqa16_pipeline);
     unsafe {
-        enc.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(q_buf), q_offset, 0);
         enc.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
         enc.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(o_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(o_buf), o_offset, 3);
         enc.setBuffer_offset_atIndex(Some(nh_buf), 0, 4);
         enc.setBuffer_offset_atIndex(Some(nkv_buf), 0, 5);
         enc.setBuffer_offset_atIndex(Some(hd_buf), 0, 6);
         enc.setBuffer_offset_atIndex(Some(kl_buf), 0, 7);
         enc.setBuffer_offset_atIndex(Some(scale_buf), 0, 8);
         enc.setBuffer_offset_atIndex(Some(window_buf), 0, 9);
-        enc.setBuffer_offset_atIndex(Some(gate_buf), 0, 10);
+        enc.setBuffer_offset_atIndex(Some(gate_buf), gate_offset, 10);
         enc.setBuffer_offset_atIndex(Some(pos_buf), 0, 11);
-        enc.setBuffer_offset_atIndex(Some(k_current_buf), 0, 12);
-        enc.setBuffer_offset_atIndex(Some(v_current_buf), 0, 13);
+        enc.setBuffer_offset_atIndex(Some(k_current_buf), k_current_offset, 12);
+        enc.setBuffer_offset_atIndex(Some(v_current_buf), v_current_offset, 13);
     }
-    let grid = MTLSize {
-        width: num_heads,
-        height: 1,
-        depth: 1,
-    };
-    let tg = MTLSize {
-        width: 16 * SIMD_WIDTH,
-        height: 1,
-        depth: 1,
-    };
-    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 16 * SIMD_WIDTH,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 #[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]

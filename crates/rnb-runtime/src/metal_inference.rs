@@ -220,13 +220,107 @@ pub struct MetalMusePrefillFullLayerOut {
     pub v_bits: Vec<u16>,
 }
 
+pub struct MetalDflashFullLayerRequest<'a> {
+    pub hidden: &'a [f32],
+    pub attn_norm_w: &'a [f32],
+    pub q_norm_w: &'a [f32],
+    pub k_norm_w: &'a [f32],
+    pub ffn_norm_w: &'a [f32],
+    pub q_weight_ggml: GGMLType,
+    pub q_weight_raw: &'a [u8],
+    pub q_weight_rows: usize,
+    pub q_weight_cols: usize,
+    pub k_weight_ggml: GGMLType,
+    pub k_weight_raw: &'a [u8],
+    pub k_weight_rows: usize,
+    pub k_weight_cols: usize,
+    pub v_weight_ggml: GGMLType,
+    pub v_weight_raw: &'a [u8],
+    pub v_weight_rows: usize,
+    pub v_weight_cols: usize,
+    pub o_weight_ggml: GGMLType,
+    pub o_weight_raw: &'a [u8],
+    pub o_weight_rows: usize,
+    pub o_weight_cols: usize,
+    pub ffn_gate_weight_ggml: GGMLType,
+    pub ffn_gate_weight_raw: &'a [u8],
+    pub ffn_gate_weight_rows: usize,
+    pub ffn_gate_weight_cols: usize,
+    pub ffn_up_weight_ggml: GGMLType,
+    pub ffn_up_weight_raw: &'a [u8],
+    pub ffn_up_weight_rows: usize,
+    pub ffn_up_weight_cols: usize,
+    pub ffn_down_weight_ggml: GGMLType,
+    pub ffn_down_weight_raw: &'a [u8],
+    pub ffn_down_weight_rows: usize,
+    pub ffn_down_weight_cols: usize,
+    pub prior_k: &'a [u16],
+    pub prior_v: &'a [u16],
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub ffn_dim: usize,
+    pub rope_theta: f32,
+    pub scale: f32,
+    pub norm_eps: f32,
+    pub position: usize,
+    pub sliding_window: usize,
+    pub layer_index: usize,
+    pub layer_count: usize,
+}
+pub struct MetalDflashCacheSeedLayer<'a> {
+    pub k_norm_w: &'a [f32],
+    pub k_weight_ggml: GGMLType,
+    pub k_weight_raw: &'a [u8],
+    pub k_weight_rows: usize,
+    pub k_weight_cols: usize,
+    pub v_weight_ggml: GGMLType,
+    pub v_weight_raw: &'a [u8],
+    pub v_weight_rows: usize,
+    pub v_weight_cols: usize,
+}
+
+pub struct MetalDflashCacheSeedRequest<'a> {
+    pub features: &'a [f32],
+    pub encoder_norm_w: &'a [f32],
+    pub encoder_weight_ggml: GGMLType,
+    pub encoder_weight_raw: &'a [u8],
+    pub encoder_weight_rows: usize,
+    pub encoder_weight_cols: usize,
+    pub layers: &'a [MetalDflashCacheSeedLayer<'a>],
+    pub token_count: usize,
+    pub feature_dim: usize,
+    pub hidden_dim: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub start_position: usize,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct MetalMusePrefillLayerRangeTarget {
+    pub sequence_epoch: u64,
+    pub cache_layer: usize,
+    pub pos_start: usize,
+    pub kv_len: usize,
+}
+
 pub struct MetalMusePrefillLayerRangeLayer<'a> {
     pub layer_idx: usize,
     pub request: MetalMusePrefillFullLayerRequest<'a>,
+    pub target: Option<MetalMusePrefillLayerRangeTarget>,
 }
 
 pub struct MetalMusePrefillLayerRangeOut {
     pub hidden: Vec<f32>,
+    pub features: Vec<f32>,
+    pub target_tokens: Vec<u32>,
+    pub output_hidden_rows: Vec<f32>,
     pub hidden_uploads: usize,
     pub hidden_readbacks: usize,
     pub intermediate_hidden_transfers: usize,
@@ -486,6 +580,58 @@ thread_local! {
     static METAL: rnb_backend_metal::MetalBackend = rnb_backend_metal::MetalBackend::new();
     static GEMMA_PREFILL_F16KV_RESIDENT_USED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static METAL_DECODE_CAPACITY_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+pub struct MetalDecodeCapacityGuard {
+    previous: usize,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for MetalDecodeCapacityGuard {
+    fn drop(&mut self) {
+        METAL_DECODE_CAPACITY_LIMIT.set(self.previous);
+    }
+}
+
+pub fn metal_decode_capacity_guard(capacity: usize) -> MetalDecodeCapacityGuard {
+    let previous = METAL_DECODE_CAPACITY_LIMIT.replace(capacity);
+    MetalDecodeCapacityGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+fn active_metal_decode_capacity(requested: usize, position: usize) -> usize {
+    METAL_DECODE_CAPACITY_LIMIT.with(|limit| {
+        let limit = limit.get();
+        if limit == 0 {
+            requested
+        } else {
+            requested.min(limit.max(position + 1))
+        }
+    })
+}
+
+#[cfg(test)]
+mod metal_decode_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn request_limit_is_scoped_and_never_smaller_than_next_position() {
+        assert_eq!(active_metal_decode_capacity(1_000, 10), 1_000);
+        {
+            let _outer = metal_decode_capacity_guard(100);
+            assert_eq!(active_metal_decode_capacity(1_000, 10), 100);
+            {
+                let _inner = metal_decode_capacity_guard(50);
+                assert_eq!(active_metal_decode_capacity(1_000, 75), 76);
+            }
+            assert_eq!(active_metal_decode_capacity(1_000, 10), 100);
+        }
+        assert_eq!(active_metal_decode_capacity(1_000, 10), 1_000);
+    }
 }
 static GEMMA_PREFILL_F16KV_RESIDENT_USED_TLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -3078,7 +3224,11 @@ fn chain_layer_to_ref<'a>(
                 num_heads: a.num_heads,
                 num_kv_heads: a.num_kv_heads,
                 n_rot: a.n_rot,
-                capacity: a.capacity,
+                capacity: if a.muse_semantics {
+                    active_metal_decode_capacity(a.capacity, a.pos)
+                } else {
+                    a.capacity
+                },
                 ffn_dim: a.ffn_dim,
                 eps: a.eps,
                 post_norm_eps: a.post_norm_eps,
@@ -3198,6 +3348,7 @@ fn chain_output_argmax_to_ref<'a>(
 ///
 /// `decode_chain_run` 의 CommandBuffer/encoder 는 backend 메서드 안에서 commit·
 /// waitUntilCompleted 까지 완결하므로 `METAL.with(...)` closure 밖으로 새지 않는다.
+
 #[cfg(feature = "metal")]
 pub fn metal_decode_chain_run(
     hidden: &mut [f32],
@@ -3232,7 +3383,9 @@ pub fn metal_decode_chain_run(
     // CommandBuffer 는 backend 메서드 안에서 완결 → closure 안에서 atomic.
     let options = decode_chain_options(policy);
     let mut report: MetalDecodeChainReport = METAL
-        .with(|b| b.decode_chain_run(hidden, &refs, out_states, options, output_argmax_ref))
+        .with(|backend| {
+            backend.decode_chain_run(hidden, &refs, out_states, options, output_argmax_ref)
+        })
         .into();
     if report.did_run {
         if policy.parity_requested {
@@ -3259,8 +3412,11 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
     out_gdn_state_handle: &mut Option<u64>,
     output_argmax: Option<MetalDecodeOutputArgmax<'_>>,
     out_output_logits: Option<&mut Vec<f32>>,
+    feature_layers: &[usize],
+    out_features: &mut Vec<f32>,
 ) -> Result<Vec<MetalDecodeChainReport>> {
     *out_gdn_state_handle = None;
+    out_features.clear();
     let fallback_reports = |reason: &'static str| {
         (0..batch)
             .map(|_| MetalDecodeChainReport::fallback(reason, false))
@@ -3302,6 +3458,8 @@ pub fn metal_decode_chain_run_batched_collect_attn_kv(
             out_attn_kv,
             out_gdn_state_handle,
             out_output_logits,
+            feature_layers,
+            out_features,
         )
     });
     Ok(reports
@@ -6136,15 +6294,191 @@ pub fn metal_muse_prefill_full_layer_if_supported(
             })
     })
 }
+pub fn metal_dflash_full_layer_if_supported(
+    req: MetalDflashFullLayerRequest<'_>,
+) -> Result<Option<Vec<f32>>> {
+    let Some(q_quant) = tensorops_quant_from_ggml(req.q_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(k_quant) = tensorops_quant_from_ggml(req.k_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(v_quant) = tensorops_quant_from_ggml(req.v_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(o_quant) = tensorops_quant_from_ggml(req.o_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_gate_quant) = tensorops_quant_from_ggml(req.ffn_gate_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_up_quant) = tensorops_quant_from_ggml(req.ffn_up_weight_ggml) else {
+        return Ok(None);
+    };
+    let Some(ffn_down_quant) = tensorops_quant_from_ggml(req.ffn_down_weight_ggml) else {
+        return Ok(None);
+    };
+    METAL.with(|backend| {
+        backend.dflash_full_layer_if_supported(rnb_backend_metal::DflashFullLayerBackendRequest {
+            hidden: req.hidden,
+            attn_norm_w: req.attn_norm_w,
+            q_norm_w: req.q_norm_w,
+            k_norm_w: req.k_norm_w,
+            ffn_norm_w: req.ffn_norm_w,
+            q_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.q_weight_raw,
+                quant: q_quant,
+                rows: req.q_weight_rows,
+                cols: req.q_weight_cols,
+            },
+            k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.k_weight_raw,
+                quant: k_quant,
+                rows: req.k_weight_rows,
+                cols: req.k_weight_cols,
+            },
+            v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.v_weight_raw,
+                quant: v_quant,
+                rows: req.v_weight_rows,
+                cols: req.v_weight_cols,
+            },
+            o_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.o_weight_raw,
+                quant: o_quant,
+                rows: req.o_weight_rows,
+                cols: req.o_weight_cols,
+            },
+            ffn_gate_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.ffn_gate_weight_raw,
+                quant: ffn_gate_quant,
+                rows: req.ffn_gate_weight_rows,
+                cols: req.ffn_gate_weight_cols,
+            },
+            ffn_up_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.ffn_up_weight_raw,
+                quant: ffn_up_quant,
+                rows: req.ffn_up_weight_rows,
+                cols: req.ffn_up_weight_cols,
+            },
+            ffn_down_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.ffn_down_weight_raw,
+                quant: ffn_down_quant,
+                rows: req.ffn_down_weight_rows,
+                cols: req.ffn_down_weight_cols,
+            },
+            prior_k: req.prior_k,
+            prior_v: req.prior_v,
+            seq_len: req.seq_len,
+            num_heads: req.num_heads,
+            num_kv_heads: req.num_kv_heads,
+            head_dim: req.head_dim,
+            hidden_dim: req.hidden_dim,
+            q_dim: req.q_dim,
+            kv_dim: req.kv_dim,
+            ffn_dim: req.ffn_dim,
+            rope_theta: req.rope_theta,
+            scale: req.scale,
+            norm_eps: req.norm_eps,
+            position: req.position,
+            sliding_window: req.sliding_window,
+            layer_index: req.layer_index,
+            layer_count: req.layer_count,
+        })
+    })
+}
+pub fn metal_dflash_cache_seed_if_supported(
+    req: MetalDflashCacheSeedRequest<'_>,
+) -> Result<Option<Vec<(Vec<u16>, Vec<u16>)>>> {
+    let Some(encoder_quant) = tensorops_quant_from_ggml(req.encoder_weight_ggml) else {
+        return Ok(None);
+    };
+    let mut layers = Vec::with_capacity(req.layers.len());
+    for layer in req.layers {
+        let Some(k_quant) = tensorops_quant_from_ggml(layer.k_weight_ggml) else {
+            return Ok(None);
+        };
+        let Some(v_quant) = tensorops_quant_from_ggml(layer.v_weight_ggml) else {
+            return Ok(None);
+        };
+        layers.push(rnb_backend_metal::DflashCacheSeedBackendLayer {
+            k_norm_w: layer.k_norm_w,
+            k_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: layer.k_weight_raw,
+                quant: k_quant,
+                rows: layer.k_weight_rows,
+                cols: layer.k_weight_cols,
+            },
+            v_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: layer.v_weight_raw,
+                quant: v_quant,
+                rows: layer.v_weight_rows,
+                cols: layer.v_weight_cols,
+            },
+        });
+    }
+    METAL.with(|backend| {
+        backend.dflash_cache_seed_if_supported(rnb_backend_metal::DflashCacheSeedBackendRequest {
+            features: req.features,
+            encoder_norm_w: req.encoder_norm_w,
+            encoder_weight: rnb_backend_metal::PrefillAtnCoreWeightView {
+                raw: req.encoder_weight_raw,
+                quant: encoder_quant,
+                rows: req.encoder_weight_rows,
+                cols: req.encoder_weight_cols,
+            },
+            layers: &layers,
+            token_count: req.token_count,
+            feature_dim: req.feature_dim,
+            hidden_dim: req.hidden_dim,
+            num_kv_heads: req.num_kv_heads,
+            head_dim: req.head_dim,
+            start_position: req.start_position,
+            rope_theta: req.rope_theta,
+            norm_eps: req.norm_eps,
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_muse_prepare_target_kv_resident_if_supported(
+    cached_k_f16: &[u16],
+    cached_v_f16: &[u16],
+    sequence_epoch: u64,
+    cache_layer: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_start: usize,
+    capacity_len: usize,
+) -> Result<bool> {
+    METAL.with(|backend| {
+        backend.prepare_muse_target_kv_resident_if_supported(
+            cached_k_f16,
+            cached_v_f16,
+            sequence_epoch,
+            cache_layer,
+            num_kv_heads,
+            head_dim,
+            pos_start,
+            capacity_len,
+        )
+    })
+}
 
 pub fn metal_muse_prefill_layer_range_if_supported(
     hidden: &[f32],
     layers: &[MetalMusePrefillLayerRangeLayer<'_>],
+    feature_layers: &[usize],
+    output_argmax: Option<MetalDecodeOutputArgmax<'_>>,
     mut on_kv: impl FnMut(usize, &[u16], &[u16]) -> Result<()>,
 ) -> Result<Option<MetalMusePrefillLayerRangeOut>> {
     if env_falsey("RNB_METAL_MUSE_PREFILL_LAYER_RANGE_CHAIN") || layers.is_empty() {
         return Ok(None);
     }
+    let output_argmax = match chain_output_argmax_to_ref(output_argmax) {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
     let mut backend_layers = Vec::with_capacity(layers.len());
     for layer in layers {
         let req = &layer.request;
@@ -6175,6 +6509,14 @@ pub fn metal_muse_prefill_layer_range_if_supported(
         };
         backend_layers.push(rnb_backend_metal::MusePrefillLayerRangeBackendLayer {
             layer_idx: layer.layer_idx,
+            target: layer
+                .target
+                .map(|target| rnb_backend_metal::MusePrefillLayerRangeTarget {
+                    sequence_epoch: target.sequence_epoch,
+                    cache_layer: target.cache_layer,
+                    pos_start: target.pos_start,
+                    kv_len: target.kv_len,
+                }),
             request: rnb_backend_metal::MusePrefillFullLayerBackendRequest {
                 hidden: req.hidden,
                 attn_norm_w: req.attn_norm_w,
@@ -6250,12 +6592,19 @@ pub fn metal_muse_prefill_layer_range_if_supported(
     }
     METAL.with(|backend| {
         backend
-            .prefill_muse_layer_range_if_supported(hidden, &backend_layers, |layer, k, v| {
-                on_kv(layer, k, v)
-            })
+            .prefill_muse_layer_range_if_supported(
+                hidden,
+                &backend_layers,
+                feature_layers,
+                output_argmax,
+                |layer, k, v| on_kv(layer, k, v),
+            )
             .map(|result| {
                 result.map(|output| MetalMusePrefillLayerRangeOut {
                     hidden: output.hidden,
+                    features: output.features,
+                    target_tokens: output.target_tokens,
+                    output_hidden_rows: output.output_hidden_rows,
                     hidden_uploads: output.hidden_uploads,
                     hidden_readbacks: output.hidden_readbacks,
                     intermediate_hidden_transfers: output.intermediate_hidden_transfers,

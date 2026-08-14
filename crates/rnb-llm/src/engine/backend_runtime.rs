@@ -72,10 +72,11 @@ pub(super) use cuda_basic::{
 pub(super) use cuda_basic::{
     cuda_deepseek4_q8_output_projection_if_supported,
     dense_q4k_attention_output_gelu_ffn_batch_norm_residual_if_supported,
-    dflash_q4k_layer_chain_if_supported, gdn_prefill_quantized_projection,
-    gdn_prefill_quantized_projection_q, gemma4_ple_q4k_batch_norm_residual_if_supported,
-    nemotron_q5_decode_moe_shared_sparse, nemotron_q8_shared_q5_sparse_decode_enabled,
-    nemotron_q8_shared_q5_sparse_decode_moe, nemotron_q8_shared_q5_sparse_decode_moe_cached_layer,
+    dflash_cache_seed_if_supported, dflash_q4k_layer_chain_if_supported,
+    gdn_prefill_quantized_projection, gdn_prefill_quantized_projection_q,
+    gemma4_ple_q4k_batch_norm_residual_if_supported, nemotron_q5_decode_moe_shared_sparse,
+    nemotron_q8_shared_q5_sparse_decode_enabled, nemotron_q8_shared_q5_sparse_decode_moe,
+    nemotron_q8_shared_q5_sparse_decode_moe_cached_layer,
     prefill_attention_hd128_f16kv_muse_dense_chain_if_supported,
     prefill_attention_hd128_muse_dense_chain_if_supported, prefill_attention_hd256_if_supported,
     prefill_attention_non_causal_if_supported,
@@ -217,10 +218,11 @@ pub(super) use metal_prefill::{
     metal_gemma_prefill_full_layer_if_supported, metal_gemma_prefill_layer_range_if_supported,
     metal_gemma_prefill_qkv_o_resident_if_supported, metal_gemma_prefill_qkv_o_tail_if_supported,
     metal_muse_prefill_layer_range_if_supported, metal_muse_prefill_o_tail_ffn_if_supported,
+    metal_muse_prepare_target_kv_resident_if_supported,
     metal_muse_target_attention_o_tail_ffn_if_supported, metal_prefill_atn_core_if_supported,
     metal_prefill_atn_full_layer_if_supported, metal_prefill_atn_o_tail_if_supported,
     metal_prefill_atn_o_tail_record_adapter_reject, GemmaPrefillLayerRangeSpec,
-    MetalPrefillAtnCoreShape, MusePrefillLayerRangeSpec,
+    MetalPrefillAtnCoreShape, MusePrefillLayerRangeSpec, MusePrefillLayerRangeTarget,
 };
 #[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
 pub(super) use metal_prefill::{

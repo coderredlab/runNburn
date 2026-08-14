@@ -451,7 +451,9 @@ impl Engine {
         }
         if !matches!(
             self.architecture,
-            ModelArchitecture::Qwen35 | ModelArchitecture::Qwen35MoE
+            ModelArchitecture::Qwen35
+                | ModelArchitecture::Qwen35MoE
+                | ModelArchitecture::MuseGlimmer
         ) {
             return false;
         }
@@ -459,11 +461,15 @@ impl Engine {
             return false;
         };
         if use_token_embedding_as_output()
-            || self.metadata.final_logit_softcapping != 0.0
+            || (self.metadata.final_logit_softcapping != 0.0
+                && !matches!(self.architecture, ModelArchitecture::MuseGlimmer))
+            || self.metadata.logit_scale <= 0.0
             || weights.output.cols != self.metadata.hidden_dim
             || !matches!(
                 weights.output.ggml_type,
-                rnb_loader::GGMLType::Q4_K | rnb_loader::GGMLType::Q6_K
+                rnb_loader::GGMLType::Q4_K
+                    | rnb_loader::GGMLType::Q5_K
+                    | rnb_loader::GGMLType::Q6_K
             )
             || weights.output.data.as_bytes().is_none()
             || weights.output_norm.numel() != self.metadata.hidden_dim
@@ -539,7 +545,16 @@ impl Engine {
                     else {
                         return false;
                     };
-                    let dense = attn_carrier_eligible(w, layout.has_gated_attn, true, 0, 0, false);
+                    let dense = attn_carrier_eligible(w, layout.has_gated_attn, true, 0, 0, false)
+                        || muse_attn_carrier_eligible(
+                            self.architecture,
+                            w,
+                            layout.has_gated_attn,
+                            true,
+                            0,
+                            0,
+                            false,
+                        );
                     let moe = qwen_attn_moe_chain_eligible(
                         w,
                         layout.has_gated_attn,
@@ -598,13 +613,20 @@ impl Engine {
         &self,
         verify_input: &[u32],
         collect_output_logits: bool,
+        feature_layers: &[usize],
     ) -> crate::error::Result<
         Option<(
             crate::engine::verify_window::VerifyWindowResult,
             BatchedVerifyCommit,
+            Vec<f32>,
         )>,
     > {
+        let batch_trace =
+            crate::engine::policy::env_string("RNB_METAL_BATCH_FUSED_TRACE").is_some();
         if !batched_decode_chain_position_supported(self.sequence_cursor) {
+            if batch_trace {
+                eprintln!("[batch-fused] unsupported sequence cursor");
+            }
             return Ok(None);
         }
         let metadata = &self.metadata;
@@ -613,6 +635,15 @@ impl Engine {
             return Ok(None);
         };
         let batch = verify_input.len();
+        if batch_trace {
+            eprintln!(
+                "[batch-fused] entry architecture={architecture:?} batch={batch} embed_output={} softcap={} output_cols={} hidden_dim={}",
+                use_token_embedding_as_output(),
+                metadata.final_logit_softcapping,
+                weights.output.cols,
+                metadata.hidden_dim,
+            );
+        }
         if batch == 0 || batch > 8 {
             return Ok(None);
         }
@@ -621,12 +652,17 @@ impl Engine {
         let base_pos = self.kv_cache.current_len();
 
         // GDN shape (decode_gdn_layer_qwen 과 동일 — 모든 GDN layer 동일).
+        // Muse는 attention-only라 SSM metadata가 0이며 이 값들은 seam에서 사용되지 않는다.
+        let has_gdn = weights
+            .layers
+            .iter()
+            .any(|layer| matches!(layer, LayerType::GatedDeltaNet(_)));
         let d_inner = metadata.ssm_d_inner;
         let d_state = metadata.ssm_d_state;
         let n_group = metadata.ssm_n_group;
         let dt_rank = metadata.ssm_dt_rank;
         let conv_kernel = metadata.ssm_conv_kernel;
-        let head_v_dim = d_inner / dt_rank;
+        let head_v_dim = if dt_rank == 0 { 0 } else { d_inner / dt_rank };
         let head_k_dim = d_state;
         let num_v_heads = dt_rank;
         let num_k_heads = n_group;
@@ -635,13 +671,24 @@ impl Engine {
 
         // output argmax tail(vocab projection) — 배치 B-column GEMV 로 vocab weight 1회 읽기.
         if use_token_embedding_as_output()
-            || metadata.final_logit_softcapping != 0.0
+            || (metadata.final_logit_softcapping != 0.0
+                && !matches!(architecture, ModelArchitecture::MuseGlimmer))
+            || metadata.logit_scale <= 0.0
             || weights.output.cols != hidden_dim
         {
+            if batch_trace {
+                eprintln!("[batch-fused] output tail ineligible");
+            }
             return Ok(None);
         }
         let output_norm = kernels::tensor_as_f32_slice(&weights.output_norm);
         if output_norm.len() != hidden_dim {
+            if batch_trace {
+                eprintln!(
+                    "[batch-fused] output norm mismatch got={} hidden_dim={hidden_dim}",
+                    output_norm.len()
+                );
+            }
             return Ok(None);
         }
         let output_argmax = Some(backend_runtime::MetalDecodeOutputArgmax {
@@ -685,6 +732,9 @@ impl Engine {
                     if shared_kv_source_layer(metadata, architecture, li).is_some()
                         || self.kv_cache.layer_uses_kvarn(li)
                     {
+                        if batch_trace {
+                            eprintln!("[batch-fused] shared/KVarN attention layer={li}");
+                        }
                         return Ok(None);
                     }
                     let layer_kv_override = metadata
@@ -693,6 +743,14 @@ impl Engine {
                         .and_then(|v| v.get(li).copied());
                     let layout = resolve_attention_layout(metadata, w, layer_kv_override)?;
                     let dense_attn = attn_carrier_eligible(
+                        w,
+                        layout.has_gated_attn,
+                        true,
+                        base_pos,
+                        base_pos,
+                        false,
+                    ) || muse_attn_carrier_eligible(
+                        architecture,
                         w,
                         layout.has_gated_attn,
                         true,
@@ -709,11 +767,34 @@ impl Engine {
                         false,
                         true,
                     );
+                    if crate::engine::policy::env_string("RNB_METAL_BATCH_FUSED_TRACE").is_some()
+                        && !dense_attn
+                        && !moe_attn
+                    {
+                        eprintln!(
+                            "[batch-fused] ineligible attention layer={li} architecture={architecture:?} gated={} q={:?} k={:?} v={:?} o={:?}",
+                            layout.has_gated_attn,
+                            w.q_weight.ggml_type,
+                            w.k_weight.ggml_type,
+                            w.v_weight.ggml_type,
+                            w.o_weight.ggml_type,
+                        );
+                    }
                     if !dense_attn && !moe_attn {
                         return Ok(None);
                     }
                     let (carrier_rope_dim, carrier_rope_theta, _) =
                         resolve_rope_params(metadata, architecture, li, layout.head_dim);
+                    let apply_rope = !matches!(architecture, ModelArchitecture::MuseGlimmer)
+                        || is_sliding_window_layer(metadata, architecture, li);
+                    let sliding_window =
+                        if models::muse_glimmer::uses_muse_glimmer_semantics(architecture)
+                            && is_sliding_window_layer(metadata, architecture, li)
+                        {
+                            active_sliding_window(metadata, architecture, li)
+                        } else {
+                            None
+                        };
                     let (prior_k, prior_v) = self.kv_cache.get_up_to(li, base_pos);
                     inputs.push(backend_runtime::ChainLayerInput::Attn {
                         prior_k,
@@ -727,14 +808,24 @@ impl Engine {
                         head_dim: layout.head_dim,
                         num_heads: layout.num_heads,
                         num_kv_heads: layout.num_kv_heads,
-                        n_rot: carrier_rope_dim,
+                        n_rot: if matches!(architecture, ModelArchitecture::MuseGlimmer)
+                            && apply_rope
+                        {
+                            layout.head_dim
+                        } else if apply_rope {
+                            carrier_rope_dim
+                        } else {
+                            0
+                        },
                         pos: base_pos,
                         theta: carrier_rope_theta,
-                        scale: (layout.head_dim as f32).sqrt().recip(),
+                        scale: resolve_attention_scale(metadata, architecture),
                         post_norm_eps: metadata.post_norm_eps,
-                        apply_rope: true,
-                        sliding_window: None,
-                        muse_semantics: false,
+                        apply_rope,
+                        sliding_window,
+                        muse_semantics: models::muse_glimmer::uses_muse_glimmer_semantics(
+                            architecture,
+                        ),
                     }));
                     kv_dims.push(Some(layout.kv_dim));
                     run.push((li, &weights.layers[li]));
@@ -770,6 +861,7 @@ impl Engine {
         let mut out_attn_kv: Vec<Option<(Vec<u16>, Vec<u16>)>> = Vec::new();
         let mut gdn_state_handle = None;
         let mut output_logits = Vec::new();
+        let mut dflash_features = Vec::new();
         let reports = backend_runtime::metal_decode_chain_run_batched(
             &mut hidden,
             batch,
@@ -780,6 +872,8 @@ impl Engine {
             &mut out_attn_kv,
             &mut gdn_state_handle,
             collect_output_logits.then_some(&mut output_logits),
+            feature_layers,
+            &mut dflash_features,
             capacity,
             hidden_dim,
             conv_channels,
@@ -793,8 +887,23 @@ impl Engine {
             output_argmax,
         )?;
         drop(inputs);
+        if crate::engine::policy::env_string("RNB_METAL_BATCH_FUSED_TRACE").is_some()
+            && reports.first().is_some_and(|report| !report.did_run)
+        {
+            eprintln!(
+                "[batch-fused] runtime fallback={}",
+                reports[0].fallback_reason.unwrap_or("-")
+            );
+        }
         if reports.len() != batch || !reports[0].did_run {
             return Ok(None);
+        }
+        if collect_output_logits {
+            models::muse_glimmer::scale_logits_inplace(&mut output_logits, metadata.logit_scale);
+            models::gemma::apply_logit_softcapping(
+                &mut output_logits,
+                metadata.final_logit_softcapping,
+            );
         }
         let mut target_tokens = Vec::with_capacity(batch);
         for r in &reports {
@@ -803,17 +912,38 @@ impl Engine {
                 None => return Ok(None),
             }
         }
-        if gdn_state_handle.is_none() {
+        if has_gdn && gdn_state_handle.is_none() {
             return Err(crate::error::LlmError::Forward(
                 "batched verify returned no GDN state handle".to_string(),
             ));
+        }
+        let expected_features = batch
+            .checked_mul(hidden_dim)
+            .and_then(|values| values.checked_mul(feature_layers.len()))
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(
+                    "batched verify feature length overflow".to_string(),
+                )
+            })?;
+        if dflash_features.len() != expected_features {
+            return Err(crate::error::LlmError::Forward(format!(
+                "batched verify feature length mismatch: got {}, expected {expected_features}",
+                dflash_features.len()
+            )));
+        }
+        let mut output_hidden_rows = vec![0.0; hidden.len()];
+        for (source, output) in hidden
+            .chunks_exact(hidden_dim)
+            .zip(output_hidden_rows.chunks_exact_mut(hidden_dim))
+        {
+            apply_model_norm_into(source, output_norm, metadata.norm_eps, output, architecture);
         }
         let layer_indices: Vec<usize> = run.iter().map(|(li, _)| *li).collect();
         let window = crate::engine::verify_window::VerifyWindowResult {
             target_tokens,
             output_logits,
             mtp_hidden_rows: hidden,
-            output_hidden_rows: Vec::new(),
+            output_hidden_rows,
             hidden_dim,
             prefix_state: None,
             prefix_states: Vec::new(),
@@ -832,7 +962,7 @@ impl Engine {
             out_attn_kv,
             kv_dims,
         };
-        Ok(Some((window, commit)))
+        Ok(Some((window, commit, dflash_features)))
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -950,6 +1080,7 @@ impl Engine {
                     ))
                 })?
             }
+            None if commit.kv_dims.iter().all(Option::is_some) => vec![None; layer_count],
             None => {
                 #[cfg(test)]
                 {
@@ -2433,7 +2564,13 @@ fn try_run_decode_chain(
                     head_dim: layout.head_dim,
                     num_heads: layout.num_heads,
                     num_kv_heads: layout.num_kv_heads,
-                    n_rot: carrier_rope_dim,
+                    n_rot: if matches!(architecture, ModelArchitecture::MuseGlimmer)
+                        && is_sliding_window_layer(metadata, architecture, li)
+                    {
+                        layout.head_dim
+                    } else {
+                        carrier_rope_dim
+                    },
                     pos,
                     theta: carrier_rope_theta,
                     scale: resolve_attention_scale(metadata, architecture),

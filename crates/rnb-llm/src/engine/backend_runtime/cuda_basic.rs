@@ -2,7 +2,7 @@
 use crate::engine::cuda_runtime;
 #[allow(unused_imports)]
 use crate::engine::layer_weights::LayerType;
-use crate::engine::layer_weights::ModelWeights;
+use crate::engine::layer_weights::{AttentionLayerWeights, ModelWeights};
 #[cfg(any(feature = "cuda", all(feature = "metal", not(feature = "cuda"))))]
 use crate::engine::quantized_weight_types::backend_ggml_type;
 use crate::engine::quantized_weight_types::QuantizedWeight;
@@ -25,6 +25,8 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
     gate_weight: &QuantizedWeight,
     up_weight: &QuantizedWeight,
     down_weight: &QuantizedWeight,
+    layer_index: usize,
+    layer_count: usize,
     prior_k: &[u16],
     prior_v: &[u16],
     hidden: &mut [f32],
@@ -42,6 +44,90 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
     n_embd: usize,
     norm_eps: f32,
 ) -> crate::error::Result<bool> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        if crate::engine::policy::env_string("RNB_DFLASH_DEVICE_CHAIN").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        }) {
+            return Ok(false);
+        }
+        let (Some(q), Some(k), Some(v), Some(o), Some(gate), Some(up), Some(down)) = (
+            q_weight.backend_view(),
+            k_weight.backend_view(),
+            v_weight.backend_view(),
+            o_weight.backend_view(),
+            gate_weight.backend_view(),
+            up_weight.backend_view(),
+            down_weight.backend_view(),
+        ) else {
+            return Ok(false);
+        };
+        let Some(output) = crate::engine::metal_runtime::metal_dflash_full_layer_if_supported(
+            crate::engine::metal_runtime::MetalDflashFullLayerRequest {
+                hidden,
+                attn_norm_w: attn_norm_weight,
+                q_norm_w: q_norm,
+                k_norm_w: k_norm,
+                ffn_norm_w: ffn_norm_weight,
+                q_weight_ggml: backend_ggml_type(q.quant()),
+                q_weight_raw: q.raw(),
+                q_weight_rows: q.rows(),
+                q_weight_cols: q.cols(),
+                k_weight_ggml: backend_ggml_type(k.quant()),
+                k_weight_raw: k.raw(),
+                k_weight_rows: k.rows(),
+                k_weight_cols: k.cols(),
+                v_weight_ggml: backend_ggml_type(v.quant()),
+                v_weight_raw: v.raw(),
+                v_weight_rows: v.rows(),
+                v_weight_cols: v.cols(),
+                o_weight_ggml: backend_ggml_type(o.quant()),
+                o_weight_raw: o.raw(),
+                o_weight_rows: o.rows(),
+                o_weight_cols: o.cols(),
+                ffn_gate_weight_ggml: backend_ggml_type(gate.quant()),
+                ffn_gate_weight_raw: gate.raw(),
+                ffn_gate_weight_rows: gate.rows(),
+                ffn_gate_weight_cols: gate.cols(),
+                ffn_up_weight_ggml: backend_ggml_type(up.quant()),
+                ffn_up_weight_raw: up.raw(),
+                ffn_up_weight_rows: up.rows(),
+                ffn_up_weight_cols: up.cols(),
+                ffn_down_weight_ggml: backend_ggml_type(down.quant()),
+                ffn_down_weight_raw: down.raw(),
+                ffn_down_weight_rows: down.rows(),
+                ffn_down_weight_cols: down.cols(),
+                prior_k,
+                prior_v,
+                seq_len: hidden.len() / n_embd,
+                num_heads,
+                num_kv_heads,
+                head_dim: q.rows() / num_heads,
+                hidden_dim: n_embd,
+                q_dim: q.rows(),
+                kv_dim: k.rows(),
+                ffn_dim: n_ff,
+                rope_theta,
+                scale,
+                norm_eps,
+                position: pos_start,
+                sliding_window: window,
+                layer_index,
+                layer_count,
+            },
+        )
+        .map_err(crate::error::LlmError::Forward)?
+        else {
+            return Ok(false);
+        };
+        if !output.is_empty() {
+            hidden.copy_from_slice(&output);
+        }
+        return Ok(true);
+    }
     #[cfg(feature = "cuda")]
     {
         if crate::engine::policy::env_string("RNB_DFLASH_DEVICE_CHAIN").is_some_and(|value| {
@@ -106,6 +192,93 @@ pub(in crate::engine) fn dflash_q4k_layer_chain_if_supported(
     }
     #[cfg(not(feature = "cuda"))]
     Ok(false)
+}
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine) fn dflash_cache_seed_if_supported(
+    encoder_projection: &QuantizedWeight,
+    encoder_norm: &[f32],
+    layers: &[AttentionLayerWeights],
+    features: &[f32],
+    token_count: usize,
+    start_position: usize,
+    hidden_dim: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+) -> crate::error::Result<Option<Vec<(Vec<u16>, Vec<u16>)>>> {
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    {
+        if crate::engine::policy::env_string("RNB_DFLASH_DEVICE_SEED").is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        }) {
+            return Ok(None);
+        }
+        let Some(encoder) = encoder_projection.backend_view() else {
+            return Ok(None);
+        };
+        let mut metal_layers = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let (Some(k), Some(v), Some(k_norm)) = (
+                layer.k_weight.backend_view(),
+                layer.v_weight.backend_view(),
+                layer.k_norm.as_ref(),
+            ) else {
+                return Ok(None);
+            };
+            metal_layers.push(crate::engine::metal_runtime::MetalDflashCacheSeedLayer {
+                k_norm_w: crate::engine::cpu_runtime::kernels::tensor_as_f32_slice(k_norm),
+                k_weight_ggml: backend_ggml_type(k.quant()),
+                k_weight_raw: k.raw(),
+                k_weight_rows: k.rows(),
+                k_weight_cols: k.cols(),
+                v_weight_ggml: backend_ggml_type(v.quant()),
+                v_weight_raw: v.raw(),
+                v_weight_rows: v.rows(),
+                v_weight_cols: v.cols(),
+            });
+        }
+        return crate::engine::metal_runtime::metal_dflash_cache_seed_if_supported(
+            crate::engine::metal_runtime::MetalDflashCacheSeedRequest {
+                features,
+                encoder_norm_w: encoder_norm,
+                encoder_weight_ggml: backend_ggml_type(encoder.quant()),
+                encoder_weight_raw: encoder.raw(),
+                encoder_weight_rows: encoder.rows(),
+                encoder_weight_cols: encoder.cols(),
+                layers: &metal_layers,
+                token_count,
+                feature_dim: hidden_dim * layers.len(),
+                hidden_dim,
+                num_kv_heads,
+                head_dim,
+                start_position,
+                rope_theta,
+                norm_eps,
+            },
+        )
+        .map_err(crate::error::LlmError::Forward);
+    }
+    #[cfg(any(feature = "cuda", not(feature = "metal")))]
+    {
+        let _ = (
+            encoder_projection,
+            encoder_norm,
+            layers,
+            features,
+            token_count,
+            start_position,
+            hidden_dim,
+            num_kv_heads,
+            head_dim,
+            rope_theta,
+            norm_eps,
+        );
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "cuda")]

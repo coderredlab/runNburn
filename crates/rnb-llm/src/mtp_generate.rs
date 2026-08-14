@@ -55,14 +55,25 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-fn dflash_should_fallback_to_target(
-    rounds: usize,
-    accepted: usize,
-    speculative_ms: f64,
-    target_token_ms: f64,
-) -> bool {
-    let committed = rounds + accepted;
-    rounds >= 1 && committed > 0 && speculative_ms > target_token_ms * committed as f64 * 1.05
+const DFLASH_ADAPTIVE_BURST_ROUNDS: usize = 2;
+
+fn dflash_should_finish_with_target(completed_rounds: usize) -> bool {
+    completed_rounds >= DFLASH_ADAPTIVE_BURST_ROUNDS
+}
+
+fn dflash_confident_verify_len(
+    probabilities: &[f32],
+    draft_len: usize,
+    cutoff: Option<f32>,
+) -> usize {
+    let Some(cutoff) = cutoff else {
+        return draft_len;
+    };
+    probabilities
+        .iter()
+        .take(draft_len)
+        .position(|&probability| probability < cutoff)
+        .map_or(draft_len, |index| index + 1)
 }
 fn trace_mtp_sequence_state(engine: &Engine, label: &str) {
     if crate::engine::policy::env_os_string("RNB_MTP_STATE_TRACE").is_none() {
@@ -1159,8 +1170,8 @@ fn generate_stream_mtp_with_tokens(
             verify_input.extend_from_slice(&draft_tokens);
 
             let phase_start = Instant::now();
-            let (mut window, commit) = engine
-                .forward_batched_decode_verify_window(&verify_input, sampled_verify)?
+            let (mut window, commit, _) = engine
+                .forward_batched_decode_verify_window(&verify_input, sampled_verify, &[])?
                 .ok_or_else(|| {
                     crate::error::LlmError::Forward(
                         "MTP batched decode-chain verify ineligible mid-generation".to_string(),
@@ -2131,30 +2142,30 @@ fn generate_with_muse_dflash(
     };
     let mut phase = MtpPhaseTimings::default();
     let decode_loop_start = Instant::now();
-    let adaptive_target = crate::engine::policy::env_string("RNB_MTP_DFLASH_ADAPTIVE_TARGET")
-        .map(|value| {
-            let value = value.to_ascii_lowercase();
-            !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(true);
-    let target_token_probe_ms = if adaptive_target {
-        let checkpoint = SpecCheckpoint::save_engine(engine)?;
-        let probe_start = Instant::now();
-        let _ = engine.forward(&[current_token])?;
-        let probe_ms = elapsed_ms(probe_start);
-        checkpoint.restore_engine(engine)?;
-        Some(probe_ms)
-    } else {
-        None
-    };
+    let adaptive_target = crate::runtime::policy::mtp_dflash_adaptive_target_enabled();
+    let confidence_cutoff = (!sampled_verify && adaptive_target)
+        .then(crate::runtime::policy::mtp_dflash_confidence_cutoff)
+        .flatten();
+    let mut finish_with_target = false;
 
     while tokens_remaining > 0 {
         crate::generate::check_generation_cancellation()?;
         let max_draft_tokens = params.spec_k.max(1).min(tokens_remaining).min(15);
         let draft_start = Instant::now();
-        let draft = engine.mtp_dflash_draft(current_token, max_draft_tokens)?;
+        let draft = engine.mtp_dflash_draft(current_token, max_draft_tokens, confidence_cutoff)?;
         phase.draft_ms += elapsed_ms(draft_start);
-        let effective_n = draft.tokens.len();
+        if confidence_cutoff.is_some() && draft.probabilities.len() != draft.tokens.len() {
+            return Err(crate::error::LlmError::Forward(format!(
+                "Muse DFlash confidence count {} does not match draft count {}",
+                draft.probabilities.len(),
+                draft.tokens.len()
+            )));
+        }
+        let effective_n = dflash_confident_verify_len(
+            &draft.probabilities,
+            draft.tokens.len(),
+            confidence_cutoff,
+        );
         if effective_n == 0 {
             break;
         }
@@ -2169,6 +2180,77 @@ fn generate_with_muse_dflash(
         verify_tokens.push(current_token);
         verify_tokens.extend_from_slice(drafts);
         let verify_start = Instant::now();
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let (mut verify, dflash_features, batched_commit) = {
+            let target_layers = if std::env::var_os("RNB_METAL_BATCH_COMPARE").is_some() {
+                (0..engine.metadata.num_layers).collect()
+            } else {
+                engine.mtp_dflash_target_layers()
+            };
+            match engine.forward_batched_decode_verify_window(
+                &verify_tokens,
+                sampled_verify,
+                &target_layers,
+            )? {
+                Some((verify, commit, features)) => {
+                    if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                        eprintln!("[batch-fused] Muse DFlash verify selected");
+                    }
+                    if std::env::var_os("RNB_METAL_BATCH_COMPARE").is_some() {
+                        let (reference, reference_features) =
+                            engine.forward_prefill_dflash_verify(&verify_tokens, sampled_verify)?;
+                        let hidden_dim = engine.metadata.hidden_dim;
+                        let feature_dim = hidden_dim * target_layers.len();
+                        eprintln!(
+                            "[batch-compare] target candidate={:?} reference={:?}",
+                            verify.target_tokens, reference.target_tokens
+                        );
+                        for (feature_index, &layer) in target_layers.iter().enumerate() {
+                            let start = feature_index * hidden_dim;
+                            let candidate = &features[start..start + hidden_dim];
+                            let reference_row = &reference_features[start..start + hidden_dim];
+                            let max_abs = candidate
+                                .iter()
+                                .zip(reference_row)
+                                .map(|(a, b)| (a - b).abs())
+                                .fold(0.0f32, f32::max);
+                            let mean_abs = candidate
+                                .iter()
+                                .zip(reference_row)
+                                .map(|(a, b)| (a - b).abs() as f64)
+                                .sum::<f64>()
+                                / hidden_dim as f64;
+                            eprintln!(
+                                "[batch-compare] layer={layer} max_abs={max_abs:.9e} mean_abs={mean_abs:.9e}"
+                            );
+                            if layer == 1 {
+                                eprintln!(
+                                    "[batch-compare] layer1-input candidate={:?} reference={:?}",
+                                    &candidate[..8],
+                                    &reference_row[..8]
+                                );
+                            }
+                        }
+                        debug_assert_eq!(
+                            reference_features.len(),
+                            verify_tokens.len() * feature_dim
+                        );
+                        (reference, reference_features, None)
+                    } else {
+                        (verify, features, Some(commit))
+                    }
+                }
+                None => {
+                    if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                        eprintln!("[batch-fused] Muse DFlash verify fell back to prefill");
+                    }
+                    let (verify, features) =
+                        engine.forward_prefill_dflash_verify(&verify_tokens, sampled_verify)?;
+                    (verify, features, None)
+                }
+            }
+        };
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
         let (mut verify, dflash_features) =
             engine.forward_prefill_dflash_verify(&verify_tokens, sampled_verify)?;
         phase.verify_ms += elapsed_ms(verify_start);
@@ -2251,7 +2333,11 @@ fn generate_with_muse_dflash(
         let emitted = round.emitted();
         let stopped = sampled_stopped || round.stopped();
         let committed_tokens = 1 + emitted;
-        if committed_tokens != verify_tokens.len() {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let retain_required = batched_commit.is_some() || committed_tokens != verify_tokens.len();
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        let retain_required = committed_tokens != verify_tokens.len();
+        if retain_required {
             let retain_start = Instant::now();
             let feature_dim = engine
                 .metadata
@@ -2275,9 +2361,28 @@ fn generate_with_muse_dflash(
                         dflash_features.len()
                     ))
                 })?;
-            engine.commit_kv_through((checkpoint.kv_len + committed_tokens) as u32)?;
-            engine
-                .restore_batch_verify_last_hidden(&verify.output_hidden_rows, committed_tokens)?;
+            #[cfg(all(feature = "metal", not(feature = "cuda")))]
+            if let Some(commit) = batched_commit.as_ref() {
+                let last_hidden = engine.prepare_batched_verify_last_hidden(
+                    &verify.mtp_hidden_rows,
+                    committed_tokens,
+                )?;
+                engine.commit_batched_verify(commit, committed_tokens, last_hidden)?;
+            } else {
+                engine.commit_kv_through((checkpoint.kv_len + committed_tokens) as u32)?;
+                engine.restore_batch_verify_last_hidden(
+                    &verify.output_hidden_rows,
+                    committed_tokens,
+                )?;
+            }
+            #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+            {
+                engine.commit_kv_through((checkpoint.kv_len + committed_tokens) as u32)?;
+                engine.restore_batch_verify_last_hidden(
+                    &verify.output_hidden_rows,
+                    committed_tokens,
+                )?;
+            }
             let mtp_checkpoint = checkpoint.mtp_checkpoint().ok_or_else(|| {
                 crate::error::LlmError::Forward(
                     "Muse DFlash checkpoint has no drafter state".to_string(),
@@ -2307,49 +2412,78 @@ fn generate_with_muse_dflash(
         }
         tokens_remaining = tokens_remaining.saturating_sub(1);
         current_token = correction;
-        if let Some(target_token_ms) = target_token_probe_ms {
-            let speculative_ms =
-                phase.checkpoint_ms + phase.draft_ms + phase.verify_ms + phase.retain_ms;
-            let committed = stats.rounds + stats.accepted;
-            if dflash_should_fallback_to_target(
-                stats.rounds,
-                stats.accepted,
-                speculative_ms,
-                target_token_ms,
-            ) {
-                if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
-                    eprintln!(
-                        "  [MTP/dflash] adaptive_target rounds={} speculative={:.1}ms committed={} target_probe={:.1}ms",
-                        stats.rounds, speculative_ms, committed, target_token_ms,
-                    );
-                }
-                let mut target_logits = engine.forward(&[current_token])?;
-                while tokens_remaining > 0 {
-                    crate::generate::check_generation_cancellation()?;
-                    let token = next_token_from_current_logits(
-                        engine,
-                        &mut target_logits,
-                        &mut sampler,
-                        &generated_tokens,
-                        &mut rng,
-                        params,
-                    )?;
-                    if params.should_stop(token, eos) {
-                        break;
-                    }
-                    generated_tokens.push(token);
-                    if !generated_text.push(&engine.tokenizer, token, &mut callback) {
-                        break;
-                    }
-                    tokens_remaining = tokens_remaining.saturating_sub(1);
-                    current_token = token;
-                    target_logits = engine.forward(&[current_token])?;
-                    if tokens_remaining == 0 {
-                        break;
-                    }
-                }
+        if adaptive_target && dflash_should_finish_with_target(stats.rounds) {
+            if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
+                eprintln!(
+                    "  [MTP/dflash] adaptive_target after_rounds={}",
+                    stats.rounds,
+                );
+            }
+            finish_with_target = true;
+            break;
+        }
+    }
+
+    if finish_with_target {
+        let target_start = Instant::now();
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let _decode_capacity = crate::engine::metal_runtime::metal_decode_capacity_guard(
+            engine
+                .kv_cache
+                .current_len()
+                .saturating_add(tokens_remaining)
+                .saturating_add(1)
+                .min(engine.kv_cache.max_seq_len),
+        );
+        let backend_argmax_only = params.backend_argmax_allowed();
+        let mut target_logits = Vec::new();
+        let mut backend_argmax = if backend_argmax_only {
+            engine.forward_decode_backend_argmax_only(current_token)?
+        } else {
+            target_logits = engine.forward(&[current_token])?;
+            None
+        };
+        while tokens_remaining > 0 {
+            crate::generate::check_generation_cancellation()?;
+            let token = if backend_argmax_only {
+                backend_argmax.ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Muse DFlash adaptive target decode returned no argmax token".to_string(),
+                    )
+                })?
+            } else {
+                next_token_from_current_logits(
+                    engine,
+                    &mut target_logits,
+                    &mut sampler,
+                    &generated_tokens,
+                    &mut rng,
+                    params,
+                )?
+            };
+            if params.should_stop(token, eos) {
                 break;
             }
+            generated_tokens.push(token);
+            if !generated_text.push(&engine.tokenizer, token, &mut callback) {
+                break;
+            }
+            tokens_remaining = tokens_remaining.saturating_sub(1);
+            current_token = token;
+            if tokens_remaining == 0 {
+                break;
+            }
+            if backend_argmax_only {
+                backend_argmax = engine.forward_decode_backend_argmax_only(current_token)?;
+            } else {
+                target_logits = engine.forward(&[current_token])?;
+            }
+        }
+        if crate::runtime::profiling_enabled() || crate::runtime::spec_profile_enabled() {
+            eprintln!(
+                "  [MTP/dflash] adaptive_target completion={:.1}ms",
+                elapsed_ms(target_start),
+            );
         }
     }
 
@@ -3287,10 +3421,30 @@ mod tests {
     }
 
     #[test]
-    fn dflash_falls_back_when_speculation_loses_to_measured_target() {
-        assert!(!dflash_should_fallback_to_target(0, 0, 1_000.0, 50.0));
-        assert!(!dflash_should_fallback_to_target(1, 2, 157.5, 50.0));
-        assert!(dflash_should_fallback_to_target(1, 2, 157.6, 50.0));
+    fn dflash_adaptive_mode_runs_two_verified_rounds_before_target() {
+        assert!(!dflash_should_finish_with_target(0));
+        assert!(!dflash_should_finish_with_target(1));
+        assert!(dflash_should_finish_with_target(2));
+        assert!(dflash_should_finish_with_target(3));
+    }
+
+    #[test]
+    fn dflash_confidence_includes_first_below_cutoff_position() {
+        assert_eq!(
+            dflash_confident_verify_len(&[0.8, 0.4, 0.14, 0.9], 4, Some(0.15)),
+            3
+        );
+        assert_eq!(dflash_confident_verify_len(&[0.14, 0.9], 2, Some(0.15)), 1);
+    }
+
+    #[test]
+    fn dflash_confidence_keeps_full_draft_without_cutoff_or_low_probability() {
+        assert_eq!(
+            dflash_confident_verify_len(&[0.8, 0.4, 0.2], 3, Some(0.15)),
+            3
+        );
+        assert_eq!(dflash_confident_verify_len(&[], 3, None), 3);
+        assert_eq!(dflash_confident_verify_len(&[0.1], 0, Some(0.15)), 0);
     }
 
     #[test]

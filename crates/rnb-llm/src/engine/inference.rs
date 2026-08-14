@@ -363,7 +363,7 @@ impl Engine {
         #[cfg(feature = "cuda")]
         let prefill_result = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
             let target_layers = self.mtp_dflash_target_layers();
-            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
+            let (hidden, features, _) = run_prefill_layers_cpu_range_collect_dflash_features(
                 &mut self.kv_cache,
                 &self.metadata,
                 self.architecture,
@@ -380,6 +380,7 @@ impl Engine {
                 rope_theta,
                 norm_eps,
                 &target_layers,
+                false,
             )?;
             dflash_features = features;
             Ok(hidden)
@@ -425,7 +426,7 @@ impl Engine {
         #[cfg(not(feature = "cuda"))]
         let prefill_result = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
             let target_layers = self.mtp_dflash_target_layers();
-            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
+            let (hidden, features, _) = run_prefill_layers_cpu_range_collect_dflash_features(
                 &mut self.kv_cache,
                 &self.metadata,
                 self.architecture,
@@ -442,6 +443,7 @@ impl Engine {
                 rope_theta,
                 norm_eps,
                 &target_layers,
+                false,
             )?;
             dflash_features = features;
             Ok(hidden)
@@ -1115,32 +1117,40 @@ impl Engine {
         let mut prefix_collector =
             prefix_tokens.map(crate::engine::verify_window::GdnPrefixStateCollector::new_many);
         let mut dflash_features = Vec::new();
+        let mut fused_output_tail = None;
         let hidden = if self.mtp_is_muse_dflash_runtime() && self.mtp_spec_requested() {
             if prefix_collector.is_some() {
                 return Err(crate::error::LlmError::Forward(
                     "Muse DFlash verify does not use recurrent prefix snapshots".to_string(),
                 ));
             }
-            let target_layers = self.mtp_dflash_target_layers();
-            let (hidden, features) = run_prefill_layers_cpu_range_collect_dflash_features(
-                &mut self.kv_cache,
-                &self.metadata,
-                self.architecture,
-                weights,
-                gemma_per_layer_base.as_ref(),
-                hidden,
-                0..self.metadata.num_layers,
-                seq_len,
-                pos_start,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                kv_dim,
-                rope_theta,
-                norm_eps,
-                &target_layers,
-            )?;
+            let target_layers = if std::env::var_os("RNB_METAL_BATCH_COMPARE").is_some() {
+                (0..self.metadata.num_layers).collect()
+            } else {
+                self.mtp_dflash_target_layers()
+            };
+            let (hidden, features, output_tail) =
+                run_prefill_layers_cpu_range_collect_dflash_features(
+                    &mut self.kv_cache,
+                    &self.metadata,
+                    self.architecture,
+                    weights,
+                    gemma_per_layer_base.as_ref(),
+                    hidden,
+                    0..self.metadata.num_layers,
+                    seq_len,
+                    pos_start,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    rope_theta,
+                    norm_eps,
+                    &target_layers,
+                    !collect_output_logits,
+                )?;
             dflash_features = features;
+            fused_output_tail = output_tail;
             hidden
         } else if prefix_collector.is_some() {
             run_prefill_layers_cpu_range_collect_prefix_state(
@@ -1206,17 +1216,27 @@ impl Engine {
         let mtp_hidden_rows = self
             .mtp_spec_requested()
             .then(|| kernels::tensor_as_f32_slice(&hidden).to_vec());
-        let (target_tokens, output_hidden_rows, output_logits) = finalize_prefill_argmax_tokens(
-            &mut self.kv_cache,
-            &self.metadata,
-            self.architecture,
-            weights,
-            hidden,
-            seq_len,
-            pos_start,
-            norm_eps,
-            collect_output_logits,
-        )?;
+        let (target_tokens, output_hidden_rows, output_logits) =
+            if let Some(output_tail) = fused_output_tail {
+                self.kv_cache.set_len(pos_start + seq_len);
+                (
+                    output_tail.target_tokens,
+                    output_tail.output_hidden_rows,
+                    Vec::new(),
+                )
+            } else {
+                finalize_prefill_argmax_tokens(
+                    &mut self.kv_cache,
+                    &self.metadata,
+                    self.architecture,
+                    weights,
+                    hidden,
+                    seq_len,
+                    pos_start,
+                    norm_eps,
+                    collect_output_logits,
+                )?
+            };
         if let Some(last_hidden) = output_hidden_rows
             .chunks_exact(self.metadata.hidden_dim)
             .next_back()
@@ -1238,7 +1258,7 @@ impl Engine {
                 self.mtp_observe_target_batch(tokens, hidden_rows)?;
             }
         }
-        if !dflash_features.is_empty() {
+        if !dflash_features.is_empty() && std::env::var_os("RNB_METAL_BATCH_COMPARE").is_none() {
             self.mtp_dflash_observe_target_batch(&dflash_features, seq_len, pos_start)?;
         }
         let mut prefix_states = prefix_collector
