@@ -639,6 +639,7 @@ pub(super) struct CudaState {
     pub(super) mtp_verify_snapshot_pool: Vec<MtpVerifySnapshotPoolEntry>,
     pub(super) nemotron_decode_sparse_calls: usize,
     pub(super) q4k_gemv_module: Option<usize>,
+    pub(super) q4k_tile128_grid_cap: Option<u32>,
     pub(super) nemotron_selected_module: Option<usize>,
     pub(super) persistent_decode_module: Option<usize>,
     pub(super) gemma_mtp2_module: Option<usize>,

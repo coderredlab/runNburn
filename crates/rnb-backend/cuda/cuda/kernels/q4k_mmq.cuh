@@ -736,7 +736,7 @@ extern "C" __global__ void __launch_bounds__(512, 2) rnb_q4k_q8_1_matmul_mmq_til
 // 128-row x 128-sequence Ampere MMQ tile. Eight warps each own one
 // 16-row slab and sweep sixteen 8-column MMA fragments. Full-block Q4
 // unpacking is reused across the complete sequence tile.
-extern "C" __global__ void __launch_bounds__(256, 1)
+extern "C" __global__ void __launch_bounds__(256, 2)
 rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -760,8 +760,6 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     const unsigned tid = threadIdx.x;
     const unsigned warp = tid >> 5;
     const unsigned lane = tid & 31u;
-    const unsigned row_base = blockIdx.x * 128u;
-    const unsigned seq_base = blockIdx.y * 128u;
     const unsigned warp_row_off = warp * 16u;
     const unsigned t_row_a = lane >> 2;
     const unsigned t_row_b = t_row_a + 8u;
@@ -774,6 +772,15 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
     __shared__ unsigned char x_mn[8][128];
     __shared__ float y_d[2][128];
     __shared__ float y_s[2][128];
+    __shared__ float2 x_dm_sc[2][128];
+    const unsigned row_tiles = (rows + 127u) / 128u;
+    const unsigned seq_tiles = (seq_len + 127u) / 128u;
+    const unsigned tile_count = row_tiles * seq_tiles;
+    for (unsigned tile = blockIdx.x; tile < tile_count; tile += gridDim.x) {
+        const unsigned row_tile = tile / seq_tiles;
+        const unsigned seq_tile = tile - row_tile * seq_tiles;
+        const unsigned row_base = row_tile * 128u;
+        const unsigned seq_base = seq_tile * 128u;
 
     const unsigned row_a = row_base + warp_row_off + t_row_a;
     const unsigned row_b = row_base + warp_row_off + t_row_b;
@@ -844,6 +851,16 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
 
 #pragma unroll
         for (unsigned pair = 0; pair < 4u; ++pair) {
+            if (tid < 128u) {
+                const unsigned sub0 = pair * 2u;
+                const unsigned sub1 = sub0 + 1u;
+                x_dm_sc[0][tid] = make_float2(
+                    x_d[tid] * static_cast<float>(x_sc[sub0][tid]),
+                    -x_dmin[tid] * static_cast<float>(x_mn[sub0][tid]));
+                x_dm_sc[1][tid] = make_float2(
+                    x_d[tid] * static_cast<float>(x_sc[sub1][tid]),
+                    -x_dmin[tid] * static_cast<float>(x_mn[sub1][tid]));
+            }
             for (unsigned item = tid; item < 2048u; item += 256u) {
                 const unsigned slot = item >> 10;
                 const unsigned local = item & 1023u;
@@ -862,7 +879,8 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                         const unsigned metadata =
                             global_seq * blocks_per_row * 8u + chunk;
                         y_d[slot][load_seq] = input_ds[metadata];
-                        y_s[slot][load_seq] = input_sums[metadata];
+                        y_s[slot][load_seq] =
+                            input_ds[metadata] * input_sums[metadata];
                     }
                 } else if (seq_off == 0u) {
                     y_d[slot][load_seq] = 0.0f;
@@ -886,18 +904,8 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                     &a_tile[sub][(warp_row_off + t_row_a) * 32u + a_col_hi]);
                 const int a3 = *reinterpret_cast<const int*>(
                     &a_tile[sub][(warp_row_off + t_row_b) * 32u + a_col_hi]);
-                const float d_a = x_d[warp_row_off + t_row_a];
-                const float d_b = x_d[warp_row_off + t_row_b];
-                const float dmin_a = x_dmin[warp_row_off + t_row_a];
-                const float dmin_b = x_dmin[warp_row_off + t_row_b];
-                const float scale_a =
-                    static_cast<float>(x_sc[sub][warp_row_off + t_row_a]);
-                const float scale_b =
-                    static_cast<float>(x_sc[sub][warp_row_off + t_row_b]);
-                const float min_a =
-                    static_cast<float>(x_mn[sub][warp_row_off + t_row_a]);
-                const float min_b =
-                    static_cast<float>(x_mn[sub][warp_row_off + t_row_b]);
+                const float2 dm_a = x_dm_sc[slot][warp_row_off + t_row_a];
+                const float2 dm_b = x_dm_sc[slot][warp_row_off + t_row_b];
 
 #pragma unroll
                 for (unsigned frag = 0; frag < 16u; ++frag) {
@@ -926,17 +934,17 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
                     const float sum_a = y_s[slot][col_a];
                     const float sum_b = y_s[slot][col_b];
                     acc[frag * 4u + 0u] +=
-                        d_a * dy_a * scale_a * static_cast<float>(dot0)
-                        - dmin_a * dy_a * min_a * sum_a;
+                        dm_a.x * dy_a * static_cast<float>(dot0);
+                    acc[frag * 4u + 0u] += dm_a.y * sum_a;
                     acc[frag * 4u + 1u] +=
-                        d_a * dy_b * scale_a * static_cast<float>(dot1)
-                        - dmin_a * dy_b * min_a * sum_b;
+                        dm_a.x * dy_b * static_cast<float>(dot1);
+                    acc[frag * 4u + 1u] += dm_a.y * sum_b;
                     acc[frag * 4u + 2u] +=
-                        d_b * dy_a * scale_b * static_cast<float>(dot2)
-                        - dmin_b * dy_a * min_b * sum_a;
+                        dm_b.x * dy_a * static_cast<float>(dot2);
+                    acc[frag * 4u + 2u] += dm_b.y * sum_a;
                     acc[frag * 4u + 3u] +=
-                        d_b * dy_b * scale_b * static_cast<float>(dot3)
-                        - dmin_b * dy_b * min_b * sum_b;
+                        dm_b.x * dy_b * static_cast<float>(dot3);
+                    acc[frag * 4u + 3u] += dm_b.y * sum_b;
                 }
             }
             __syncthreads();
@@ -961,6 +969,7 @@ rnb_q4k_q8_1_matmul_mmq_tile128_seq128(
         if (row_b < rows && seq_b < seq_len) {
             out[seq_b * rows + row_b] = acc[frag * 4u + 3u];
         }
+    }
     }
 #endif
 }

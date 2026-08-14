@@ -6115,6 +6115,33 @@ impl CudaState {
         )
     }
 
+    fn q4k_tile128_grid_cap(&mut self) -> Result<u32, String> {
+        if let Some(grid_cap) = self.q4k_tile128_grid_cap {
+            return Ok(grid_cap);
+        }
+        let module = self.ensure_q4k_gemv_module()?;
+        let function = unsafe {
+            self.api.module_get_function(
+                module as *mut libc::c_void,
+                "rnb_q4k_q8_1_matmul_mmq_tile128_seq128",
+            )?
+        };
+        let sm_count = unsafe { self.api.device_multiprocessor_count()? };
+        let blocks_per_sm = unsafe {
+            self.api
+                .occupancy_max_active_blocks_per_multiprocessor(function, 256, 0)?
+        };
+        if sm_count <= 0 || blocks_per_sm <= 0 {
+            return Err(format!(
+                "Q4_K tile128 occupancy invalid: sm_count={sm_count}, blocks_per_sm={blocks_per_sm}"
+            ));
+        }
+        let grid_cap = u32::try_from(sm_count.saturating_mul(blocks_per_sm))
+            .map_err(|_| "Q4_K tile128 occupancy grid overflow".to_string())?;
+        self.q4k_tile128_grid_cap = Some(grid_cap);
+        Ok(grid_cap)
+    }
+
     pub(in crate::runtime) fn launch_q4k_q8_1_matmul_mmq_tile128_seq128(
         &mut self,
         weights: &[u8],
@@ -6135,6 +6162,10 @@ impl CudaState {
         let mut rows_arg = rows as u32;
         let mut blocks_per_row_arg = blocks_per_row as u32;
         let mut seq_len_arg = seq_len as u32;
+        let tile_count = rows.div_ceil(128).saturating_mul(seq_len.div_ceil(128));
+        let grid_x = u32::try_from(tile_count)
+            .unwrap_or(u32::MAX)
+            .min(self.q4k_tile128_grid_cap()?);
         self.launch_cached_gemv(
             "rnb_q4k_q8_1_matmul_mmq_tile128_seq128",
             &[
@@ -6147,7 +6178,7 @@ impl CudaState {
                 (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
                 (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
             ],
-            (rows.div_ceil(128) as u32, seq_len.div_ceil(128) as u32, 1),
+            (grid_x, 1, 1),
             (256, 1, 1),
         )
     }
