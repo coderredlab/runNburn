@@ -183,6 +183,12 @@ pub fn mtp_dflash_adaptive_target_enabled() -> bool {
     env_truthy_override("RNB_MTP_DFLASH_ADAPTIVE_TARGET").unwrap_or(true)
 }
 
+// Metal의 16-slot DFlash verify는 한 invocation 비용이 커서 paired Muse drafter가
+// 유효한 후보를 일찍 끊지 않도록 낮은 confidence gate를 쓴다. 다른 backend의
+// 기존 8-slot 비용/수락률 계약은 유지한다.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+const MTP_DFLASH_CONFIDENCE_CUTOFF_DEFAULT: f32 = 0.08;
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
 const MTP_DFLASH_CONFIDENCE_CUTOFF_DEFAULT: f32 = 0.15;
 
 pub fn mtp_dflash_confidence_cutoff() -> Option<f32> {

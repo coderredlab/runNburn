@@ -457,7 +457,12 @@ mod policy_tests {
         let previous = std::env::var_os(key);
 
         std::env::remove_var(key);
-        assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.15));
+        let expected_default = if cfg!(all(feature = "metal", not(feature = "cuda"))) {
+            0.08
+        } else {
+            0.15
+        };
+        assert_eq!(mtp_dflash_confidence_cutoff(), Some(expected_default));
 
         for value in ["", "0", "false", "off", "no"] {
             std::env::set_var(key, value);
@@ -467,7 +472,7 @@ mod policy_tests {
         std::env::set_var(key, "0.2");
         assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.2));
         std::env::set_var(key, "invalid");
-        assert_eq!(mtp_dflash_confidence_cutoff(), Some(0.15));
+        assert_eq!(mtp_dflash_confidence_cutoff(), Some(expected_default));
 
         if let Some(value) = previous {
             std::env::set_var(key, value);

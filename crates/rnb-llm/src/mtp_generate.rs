@@ -55,6 +55,11 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+// Metal target verify는 첫 burst만 수락 이득이 고정비를 상각한다. 이후 token은
+// device argmax target decode로 넘기고, 다른 backend의 기존 2-round 정책은 유지한다.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+const DFLASH_ADAPTIVE_BURST_ROUNDS: usize = 1;
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
 const DFLASH_ADAPTIVE_BURST_ROUNDS: usize = 2;
 
 fn dflash_should_finish_with_target(completed_rounds: usize) -> bool {
@@ -3421,11 +3426,13 @@ mod tests {
     }
 
     #[test]
-    fn dflash_adaptive_mode_runs_two_verified_rounds_before_target() {
+    fn dflash_adaptive_mode_uses_backend_burst_rounds() {
         assert!(!dflash_should_finish_with_target(0));
-        assert!(!dflash_should_finish_with_target(1));
+        assert_eq!(
+            dflash_should_finish_with_target(1),
+            DFLASH_ADAPTIVE_BURST_ROUNDS == 1
+        );
         assert!(dflash_should_finish_with_target(2));
-        assert!(dflash_should_finish_with_target(3));
     }
 
     #[test]
