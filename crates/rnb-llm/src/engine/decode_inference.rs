@@ -68,6 +68,7 @@ fn full_device_decode_weight_bytes<'a>(
     })
 }
 
+
 #[cfg(feature = "cuda")]
 fn muse_full_device_decode_supported(
     metadata: &ModelMetadata,
@@ -148,6 +149,13 @@ fn muse_full_device_decode_supported(
             && w.shared_expert_moe.is_none()
             && w.ffn_gate_up_fused.is_none()
     })
+#[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
+fn batched_decode_chain_max_batch(architecture: ModelArchitecture) -> usize {
+    if architecture == ModelArchitecture::MuseGlimmer {
+        16
+    } else {
+        8
+    }
 }
 
 impl Engine {
@@ -644,7 +652,8 @@ impl Engine {
                 metadata.hidden_dim,
             );
         }
-        if batch == 0 || batch > 8 {
+        let max_batch = batched_decode_chain_max_batch(architecture);
+        if batch == 0 || batch > max_batch {
             return Ok(None);
         }
         let num_layers = metadata.num_layers;
@@ -2806,6 +2815,19 @@ mod tests {
             cursor
         )));
         assert!(super::batched_decode_chain_position_supported(None));
+    }
+
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    #[test]
+    fn muse_batched_verify_admits_anchor_plus_fifteen_drafts() {
+        assert_eq!(
+            super::batched_decode_chain_max_batch(super::ModelArchitecture::MuseGlimmer),
+            16
+        );
+        assert_eq!(
+            super::batched_decode_chain_max_batch(super::ModelArchitecture::Qwen35),
+            8
+        );
     }
 
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

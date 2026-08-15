@@ -13801,11 +13801,11 @@ impl MetalBackend {
     /// attend 하고, GDN lane i 는 lane i-1 의 conv/delta state 를 이어받아 전진한다. 이는
     /// MTP verify 시맨틱(후보 토큰 d_0..d_{B-1} 을 pos..pos+B-1 에 순차 forward)과 동일하다.
     ///
-    /// 적격 Qwen dense/MoE chain은 batch 1..=8을 한 command buffer에서 실행하고,
-    /// attention/GDN core와 dense/shared FFN을 B-column GEMV로 묶어 weight read를
-    /// amortize한다. 비적격 일반 호출은 검증된 단일-token `decode_chain_run`을 lane별로
-    /// 실행하며 state를 threading하고, state 수집을 요청한 비적격 verify는 명시적으로
-    /// fallback report를 반환한다.
+    /// 적격 Qwen dense/MoE chain은 batch 1..=8을, Muse dense chain은 DFlash의
+    /// anchor+15-token window인 batch 1..=16을 한 command buffer에서 실행한다.
+    /// 비적격 일반 호출은 검증된 단일-token `decode_chain_run`을 lane별로 실행하며 state를
+    /// threading하고, state 수집을 요청한 비적격 verify는 명시적으로 fallback report를
+    /// 반환한다.
     ///
     /// 반환: lane 당 `DecodeChainReport`(각 `output_argmax.token_id` 에 그 위치의 argmax
     /// 토큰). `out_states` 에는 마지막 lane 처리 후의 per-layer state 를 채운다.
@@ -13863,14 +13863,18 @@ impl MetalBackend {
             }
         }
 
-        // batch 1..=8이고 output tail이 있으면 최종 출력 projection도 B-column GEMV로 묶는다.
-        // chain body는 아래 적격 gate를 통과하면 함께 융합하고, 일반 비적격 호출만 lane별로
-        // 실행한다. collect 모드(MTP verify)는 batch=1도 배치 carrier를 사용해 full reject
-        // commit이 production stateful carrier를 건드리지 않고 host state를 얻도록 한다.
-        // B-column 커널의 sumf[BCOL_MAX=8] 한계 때문에 batch>8은 lane별 정확 경로로 후퇴한다.
+        // Qwen batch chain은 1..=8, Muse DFlash는 anchor+15-token인 1..=16까지 묶는다.
+        // Muse의 Q5_K output은 아래 small-M TensorOps 경로가 M=16을 지원한다. 다른 quant의
+        // B-column output은 BCOL_MAX=8이므로 batch>8 admission에서 제외한다.
         let collect = out_attn_kv.is_some();
         let fused_lo = if collect { 1usize } else { 2 };
-        let want_batched_tail = (fused_lo..=8).contains(&batch) && output_argmax.is_some();
+        let all_muse_chain = !specs.is_empty()
+            && specs
+                .iter()
+                .all(|spec| matches!(spec, ChainLayerSpecRef::Attn(s) if s.muse_semantics));
+        let fused_hi = if all_muse_chain { 16 } else { 8 };
+        let want_batched_tail = (fused_lo..=fused_hi).contains(&batch)
+            && output_argmax.is_some_and(|tail| batch <= 8 || tail.output_quant == 1);
         let body_argmax = if want_batched_tail {
             None
         } else {
@@ -13878,10 +13882,10 @@ impl MetalBackend {
         };
 
         let mut reports = Vec::with_capacity(batch);
-        // Qwen dense/MoE full chain을 batch 1..=8에서 **body fusion**한다. attention/GDN core와
-        // dense FFN 또는 MoE shared FFN의 weight를 B-column GEMV로 한 번만 읽는다. MoE sparse
-        // expert만 routing 발산 때문에 lane별로 남는다. opt-out 또는 KVarn attention은 아래
-        // 검증된 per-lane 경로로 폴백한다.
+        // Qwen dense/MoE full chain은 batch 1..=8, Muse dense full chain은 batch 1..=16에서
+        // **body fusion**한다. Muse는 existing small-M TensorOps projection을 쓰며, Qwen
+        // attention/GDN core와 dense/shared FFN은 B-column GEMV로 weight read를 amortize한다.
+        // 비적격 호출은 아래 검증된 lane별 경로로 폴백한다.
         let fused_ran = {
             let bcol_quant = |quant: u8| quant <= 4;
             let all_qwen_chain = !specs.is_empty()
@@ -13921,7 +13925,12 @@ impl MetalBackend {
                     _ => true,
                 });
             let enabled = std::env::var("RNB_METAL_BATCH_FUSED").as_deref() == Ok("1");
-            if all_qwen_chain && attn_fusable && (fused_lo..=8).contains(&batch) && enabled {
+            if all_qwen_chain
+                && attn_fusable
+                && (fused_lo..=fused_hi).contains(&batch)
+                && (batch <= 8 || want_batched_tail)
+                && enabled
+            {
                 self.decode_chain_run_batched_fused(
                     hidden,
                     batch,
@@ -20180,7 +20189,7 @@ kernel void coop_right_direct_fill_probe(
         }
     }
 
-    /// DFlash target verify의 M<=16 packed Q4_K/Q5_K 경로는 CPU dequant dot와
+    /// DFlash target verify의 M<=16 packed Q4_K/Q5_K/Q6_K 경로는 CPU dequant dot와
     /// production tensorops의 F16 staging 오차 범위 안에서 일치해야 한다.
     #[cfg(target_os = "macos")]
     #[test]
@@ -20248,6 +20257,7 @@ kernel void coop_right_direct_fill_probe(
             let q6_want = cpu_q6k_gemm_reference(&q6, n, k, &input, m);
             let q6_max_w = q6_want.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
             for kernel in [
+                "gemm_q6k_tensorops_v2_64x32",
                 "gemm_q6k_tensorops_v2_64x8_parallel2",
                 "gemm_q6k_tensorops_v2_64x8_parallel4",
             ] {

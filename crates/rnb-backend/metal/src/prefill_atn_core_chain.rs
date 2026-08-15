@@ -931,7 +931,7 @@ pub(crate) fn encode_quant_gemm_v2(
         TensoropsQuant::Q5K if m <= 16 => compute::encode_gemm_q5k_tensorops_v2_64x8_packed(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
-        TensoropsQuant::Q6K if m <= 8 => compute::encode_gemm_q6k_tensorops_v2_64x32(
+        TensoropsQuant::Q6K if m <= 16 => compute::encode_gemm_q6k_tensorops_v2_64x32(
             ctx, enc, w_buf, w_off, in_f16_buf, out_buf, n_buf, k_buf, m_buf, n, m,
         ),
         TensoropsQuant::Q4K => compute::encode_gemm_q4k_tensorops_v2(
