@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cooperative_groups.h>
 #include <mma.h>
 
 #include "kernels/quant_gemv.cuh"

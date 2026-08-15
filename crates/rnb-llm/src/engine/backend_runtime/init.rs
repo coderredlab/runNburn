@@ -26,6 +26,7 @@ pub(in crate::engine) fn reset_backend_state_for_engine_init() -> crate::error::
 #[cfg(feature = "cuda")]
 pub(in crate::engine) fn release_prefill_residency_after_prefill(
     architecture: rnb_loader::Architecture,
+    release_compute_buffers: bool,
 ) -> crate::error::Result<()> {
     let env_bool_or = |name: &str, default: bool| {
         crate::engine::policy::env_string(name)
@@ -71,6 +72,16 @@ pub(in crate::engine) fn release_prefill_residency_after_prefill(
     cuda_runtime::release_q8_0_prefill_f32_after_prefill()
         .map_err(crate::error::LlmError::Forward)?;
     cuda_runtime::clear_host_registered_ranges().map_err(crate::error::LlmError::Forward)?;
+    if release_compute_buffers {
+        let released = cuda_runtime::release_prefill_compute_buffers()
+            .map_err(crate::error::LlmError::Forward)?;
+        if released > 0 {
+            eprintln!(
+                "[INFO] CUDA prefill compute buffers released: {:.2} MiB",
+                released as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -88,6 +99,7 @@ pub(in crate::engine) fn clear_decode_attention_kv_cache_before_prefill() -> cra
 #[cfg(not(feature = "cuda"))]
 pub(in crate::engine) fn release_prefill_residency_after_prefill(
     _architecture: rnb_loader::Architecture,
+    _release_compute_buffers: bool,
 ) -> crate::error::Result<()> {
     Ok(())
 }

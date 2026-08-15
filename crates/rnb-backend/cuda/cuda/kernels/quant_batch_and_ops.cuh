@@ -1431,6 +1431,7 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_warp8(
     }
 }
 
+
 extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_row4(
     float* __restrict__ out,
     const unsigned char* __restrict__ weights,
@@ -1475,6 +1476,7 @@ extern "C" __global__ void rnb_q6k_gemv_q8dot_wide_row4(
         out[row] = partial[0] + partial[1] + partial[2] + partial[3];
     }
 }
+
 extern "C" __global__ void rnb_qkv_gate_gemv_q8dot_wide_row4(
     float* __restrict__ q_out,
     float* __restrict__ k_out,
@@ -4025,6 +4027,7 @@ extern "C" __global__ void rnb_q8_1_integer_sums_by_32(
 }
 
 
+
 extern "C" __global__ void rnb_rms_norm_f32(
     const float* __restrict__ input,
     const float* __restrict__ weight,
@@ -4132,6 +4135,138 @@ extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_f32(
     }
     const float pre_inv_rms = rsqrtf(partial[0] / (float)len + pre_eps);
     for (unsigned i = tid; i < len; i += blockDim.x) {
+        const float scale = pre_unit_offset != 0u ? (1.0f + pre_weight[i]) : pre_weight[i];
+        output[i] = residual[i] * pre_inv_rms * scale;
+    }
+}
+
+__device__ __forceinline__ float rnb_coop_rms_sum(
+    float value,
+    float* shared,
+    float* block_sums,
+    cooperative_groups::grid_group grid) {
+    const unsigned tid = threadIdx.x;
+    shared[tid] = value;
+    __syncthreads();
+    for (unsigned stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        block_sums[blockIdx.x] = shared[0];
+    }
+    grid.sync();
+    if (blockIdx.x == 0u) {
+        float total = tid < gridDim.x ? block_sums[tid] : 0.0f;
+        shared[tid] = total;
+        __syncthreads();
+        for (unsigned stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                shared[tid] += shared[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            block_sums[0] = shared[0];
+        }
+    }
+    grid.sync();
+    return block_sums[0];
+}
+
+extern "C" __global__ void rnb_rms_norm_f32_coop(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    float* __restrict__ block_sums,
+    float eps,
+    unsigned len,
+    unsigned unit_offset) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    const unsigned tid = threadIdx.x;
+    const unsigned global_tid = blockIdx.x * blockDim.x + tid;
+    const unsigned grid_stride = gridDim.x * blockDim.x;
+    __shared__ float shared[256];
+    float sum = 0.0f;
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float v = input[i];
+        sum += v * v;
+    }
+    const float total = rnb_coop_rms_sum(sum, shared, block_sums, grid);
+    const float inv_rms = rsqrtf(total / (float)len + eps);
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float scale = unit_offset != 0u ? (1.0f + weight[i]) : weight[i];
+        output[i] = input[i] * inv_rms * scale;
+    }
+}
+
+extern "C" __global__ void rnb_rms_norm_add_f32_inplace_coop(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ residual,
+    float* __restrict__ block_sums,
+    float eps,
+    unsigned len,
+    unsigned unit_offset) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    const unsigned tid = threadIdx.x;
+    const unsigned global_tid = blockIdx.x * blockDim.x + tid;
+    const unsigned grid_stride = gridDim.x * blockDim.x;
+    __shared__ float shared[256];
+    float sum = 0.0f;
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float v = input[i];
+        sum += v * v;
+    }
+    const float total = rnb_coop_rms_sum(sum, shared, block_sums, grid);
+    const float inv_rms = rsqrtf(total / (float)len + eps);
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float scale = unit_offset != 0u ? (1.0f + weight[i]) : weight[i];
+        residual[i] += input[i] * inv_rms * scale;
+    }
+}
+
+extern "C" __global__ void rnb_rms_norm_add_then_rms_norm_f32_coop(
+    const float* __restrict__ input,
+    const float* __restrict__ post_weight,
+    float* __restrict__ residual,
+    const float* __restrict__ pre_weight,
+    float* __restrict__ output,
+    float* __restrict__ block_sums,
+    float post_eps,
+    float pre_eps,
+    unsigned len,
+    unsigned post_unit_offset,
+    unsigned pre_unit_offset) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    const unsigned tid = threadIdx.x;
+    const unsigned global_tid = blockIdx.x * blockDim.x + tid;
+    const unsigned grid_stride = gridDim.x * blockDim.x;
+    __shared__ float shared[256];
+    float sum = 0.0f;
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float v = input[i];
+        sum += v * v;
+    }
+    const float post_total = rnb_coop_rms_sum(sum, shared, block_sums, grid);
+    const float post_inv_rms = rsqrtf(post_total / (float)len + post_eps);
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float scale =
+            post_unit_offset != 0u ? (1.0f + post_weight[i]) : post_weight[i];
+        residual[i] += input[i] * post_inv_rms * scale;
+    }
+    grid.sync();
+
+    float residual_sum = 0.0f;
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
+        const float v = residual[i];
+        residual_sum += v * v;
+    }
+    const float pre_total = rnb_coop_rms_sum(residual_sum, shared, block_sums, grid);
+    const float pre_inv_rms = rsqrtf(pre_total / (float)len + pre_eps);
+    for (unsigned i = global_tid; i < len; i += grid_stride) {
         const float scale = pre_unit_offset != 0u ? (1.0f + pre_weight[i]) : pre_weight[i];
         output[i] = residual[i] * pre_inv_rms * scale;
     }
@@ -6394,6 +6529,7 @@ extern "C" __global__ void rnb_q4k_q8_1_matmul_mma_4warp_v3(
 }
 
 
+#include "q8_1_mmq.cuh"
 #include "q2k_mmq.cuh"
 #include "q3k_mmq.cuh"
 #include "q4k_mmq.cuh"

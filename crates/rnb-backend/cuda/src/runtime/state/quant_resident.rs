@@ -100,6 +100,10 @@ pub(in crate::runtime) fn pinned_prefix_reserve_mib(total_mib: usize) -> usize {
         .clamp(1536, 3584)
 }
 
+pub(in crate::runtime) fn decode_tail_reserve_mib(total_mib: usize) -> usize {
+    (total_mib / 48).clamp(256, 512).min(total_mib)
+}
+
 #[cfg(test)]
 pub fn quant_resident_budget_plan_for_test(
     total_mib: usize,
@@ -144,5 +148,12 @@ mod tests {
         assert_eq!(pinned_prefix_reserve_mib(8 * 1024), 1536);
         assert_eq!(pinned_prefix_reserve_mib(12 * 1024), 1536);
         assert_eq!(pinned_prefix_reserve_mib(24 * 1024), 3072);
+    }
+
+    #[test]
+    fn decode_tail_reserve_scales_with_total_vram() {
+        assert_eq!(decode_tail_reserve_mib(8 * 1024), 256);
+        assert_eq!(decode_tail_reserve_mib(12 * 1024), 256);
+        assert_eq!(decode_tail_reserve_mib(24 * 1024), 512);
     }
 }

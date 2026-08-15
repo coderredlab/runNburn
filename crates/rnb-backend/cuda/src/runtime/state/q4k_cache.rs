@@ -27,7 +27,7 @@ impl CudaState {
             .saturating_add(self.resident_q4k_arena_offset);
     }
 
-    fn resident_q4k_effective_limit(&self) -> usize {
+    pub(in crate::runtime) fn resident_q4k_effective_limit(&self) -> usize {
         let physical_bytes = self
             .resident_q4k_non_arena_bytes()
             .saturating_add(self.resident_q4k_arena_capacity);

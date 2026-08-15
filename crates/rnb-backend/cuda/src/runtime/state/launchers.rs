@@ -4336,7 +4336,6 @@ impl CudaState {
             block,
         )
     }
-
     #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn launch_q4k_gate_up_gemv_batch_seq2_q8dot_to_dev(
         &mut self,
@@ -6366,6 +6365,116 @@ impl CudaState {
             (256, 1, 1),
         )
     }
+
+    pub(in crate::runtime) fn launch_quantize_q8_1_mmq_j128(
+        &mut self,
+        input_dev: u64,
+        output_dev: u64,
+        blocks_per_row: usize,
+        seq_len: usize,
+        q4_metadata: bool,
+    ) -> Result<(), String> {
+        let cols = blocks_per_row
+            .checked_mul(256)
+            .ok_or_else(|| "MMQ J128 activation column count overflow".to_string())?;
+        let k128 = cols / 128;
+        let mut input_arg = input_dev;
+        let mut output_arg = output_dev;
+        let mut cols_arg = u32::try_from(cols)
+            .map_err(|_| "MMQ J128 activation columns exceed u32".to_string())?;
+        let mut seq_len_arg = u32::try_from(seq_len)
+            .map_err(|_| "MMQ J128 sequence length exceeds u32".to_string())?;
+        let grid_y = seq_len_arg;
+        self.launch_cached_gemv(
+            if q4_metadata {
+                "rnb_quantize_q8_1_mmq_q4"
+            } else {
+                "rnb_quantize_q8_1_mmq_q6"
+            },
+            &[
+                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut cols_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (
+                u32::try_from(k128)
+                    .map_err(|_| "MMQ J128 activation K blocks exceed u32".to_string())?,
+                grid_y,
+                1,
+            ),
+            (128, 1, 1),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q4k_q8_1_matmul_mmq_llama_ampere_j128(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        activation_mmq_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        self.launch_quantize_q8_1_mmq_j128(
+            input_dev,
+            activation_mmq_dev,
+            blocks_per_row,
+            seq_len,
+            true,
+        )?;
+        self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            activation_mmq_dev,
+            output_dev,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        activation_mmq_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut activation_arg = activation_mmq_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        let tile_count = rows.div_ceil(128).saturating_mul(seq_len.div_ceil(128));
+        let sm_count = unsafe { self.api.device_multiprocessor_count()? };
+        if sm_count <= 0 {
+            return Err(format!("Q4_K llama MMQ J128 invalid SM count: {sm_count}"));
+        }
+        let grid_x = u32::try_from(tile_count)
+            .unwrap_or(u32::MAX)
+            .min(sm_count as u32);
+        self.launch_cached_gemv(
+            "rnb_q4k_q8_1_matmul_mmq_llama_ampere_j128",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut activation_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (grid_x, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     pub(in crate::runtime) fn launch_q8_0_q8_1_matmul_mmq_tile32(
         &mut self,
         weights: &[u8],
@@ -6713,6 +6822,74 @@ impl CudaState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q6k_q8_1_matmul_mmq_llama_ampere_j128(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_dev: u64,
+        activation_mmq_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        self.launch_quantize_q8_1_mmq_j128(
+            input_dev,
+            activation_mmq_dev,
+            blocks_per_row,
+            seq_len,
+            false,
+        )?;
+        self.launch_q6k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+            weights,
+            rows,
+            blocks_per_row,
+            seq_len,
+            activation_mmq_dev,
+            output_dev,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q6k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+        &mut self,
+        weights: &[u8],
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        activation_mmq_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
+        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        let mut output_arg = output_dev;
+        let mut weights_arg = weights_dev;
+        let mut activation_arg = activation_mmq_dev;
+        let mut rows_arg = rows as u32;
+        let mut blocks_per_row_arg = blocks_per_row as u32;
+        let mut seq_len_arg = seq_len as u32;
+        let tile_count = rows.div_ceil(128).saturating_mul(seq_len.div_ceil(128));
+        let sm_count = unsafe { self.api.device_multiprocessor_count()? };
+        if sm_count <= 0 {
+            return Err(format!("Q6_K llama MMQ J128 invalid SM count: {sm_count}"));
+        }
+        let grid_x = u32::try_from(tile_count)
+            .unwrap_or(u32::MAX)
+            .min(sm_count as u32);
+        self.launch_cached_gemv(
+            "rnb_q6k_q8_1_matmul_mmq_llama_ampere_j128",
+            &[
+                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut weights_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut activation_arg as *mut u64).cast::<libc::c_void>(),
+                (&mut rows_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut blocks_per_row_arg as *mut u32).cast::<libc::c_void>(),
+                (&mut seq_len_arg as *mut u32).cast::<libc::c_void>(),
+            ],
+            (grid_x, 1, 1),
+            (256, 1, 1),
+        )
+    }
+
     // cu39 Phase 6 v3: packed nibble unpack (mmq pattern) — 16-iter byte loop →
     // 4-int load + bit shift.
     pub(in crate::runtime) fn launch_q4k_q8_1_matmul_mma_4warp_v3(
@@ -6963,26 +7140,47 @@ impl CudaState {
         eps: f32,
         len: usize,
         unit_offset: bool,
+        cooperative: bool,
     ) -> Result<(), String> {
+        let mut block_sums_arg = if cooperative {
+            self.compute_q8_sums_ptr(8 * std::mem::size_of::<f32>())?
+        } else {
+            0
+        };
         let mut input_arg = input_dev;
         let mut weight_arg = weight_dev;
         let mut output_arg = output_dev;
         let mut eps_arg = eps;
         let mut len_arg = len as u32;
         let mut unit_offset_arg = u32::from(unit_offset);
-        self.launch_cached_gemv(
-            "rnb_rms_norm_f32",
-            &[
-                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
-                (&mut len_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
-            ],
-            (1, 1, 1),
-            (256, 1, 1),
-        )
+        if cooperative {
+            self.launch_cached_cooperative_norm(
+                "rnb_rms_norm_f32_coop",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut block_sums_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+            )
+        } else {
+            self.launch_cached_gemv(
+                "rnb_rms_norm_f32",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (1, 1, 1),
+                (256, 1, 1),
+            )
+        }
     }
 
     pub(in crate::runtime) fn launch_rms_norm_add_f32_inplace(
@@ -6993,26 +7191,47 @@ impl CudaState {
         eps: f32,
         len: usize,
         unit_offset: bool,
+        cooperative: bool,
     ) -> Result<(), String> {
+        let mut block_sums_arg = if cooperative {
+            self.compute_q8_sums_ptr(8 * std::mem::size_of::<f32>())?
+        } else {
+            0
+        };
         let mut input_arg = input_dev;
         let mut weight_arg = weight_dev;
         let mut residual_arg = residual_dev;
         let mut eps_arg = eps;
         let mut len_arg = len as u32;
         let mut unit_offset_arg = u32::from(unit_offset);
-        self.launch_cached_gemv(
-            "rnb_rms_norm_add_f32_inplace",
-            &[
-                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
-                (&mut len_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
-            ],
-            (1, 1, 1),
-            (256, 1, 1),
-        )
+        if cooperative {
+            self.launch_cached_cooperative_norm(
+                "rnb_rms_norm_add_f32_inplace_coop",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut block_sums_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+            )
+        } else {
+            self.launch_cached_gemv(
+                "rnb_rms_norm_add_f32_inplace",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (1, 1, 1),
+                (256, 1, 1),
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7028,7 +7247,13 @@ impl CudaState {
         len: usize,
         post_unit_offset: bool,
         pre_unit_offset: bool,
+        cooperative: bool,
     ) -> Result<(), String> {
+        let mut block_sums_arg = if cooperative {
+            self.compute_q8_sums_ptr(8 * std::mem::size_of::<f32>())?
+        } else {
+            0
+        };
         let mut input_arg = input_dev;
         let mut post_weight_arg = post_weight_dev;
         let mut residual_arg = residual_dev;
@@ -7039,23 +7264,42 @@ impl CudaState {
         let mut len_arg = len as u32;
         let mut post_unit_offset_arg = u32::from(post_unit_offset);
         let mut pre_unit_offset_arg = u32::from(pre_unit_offset);
-        self.launch_cached_gemv(
-            "rnb_rms_norm_add_then_rms_norm_f32",
-            &[
-                (&mut input_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut post_weight_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut pre_weight_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut output_arg as *mut u64).cast::<libc::c_void>(),
-                (&mut post_eps_arg as *mut f32).cast::<libc::c_void>(),
-                (&mut pre_eps_arg as *mut f32).cast::<libc::c_void>(),
-                (&mut len_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut post_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
-                (&mut pre_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
-            ],
-            (1, 1, 1),
-            (256, 1, 1),
-        )
+        if cooperative {
+            self.launch_cached_cooperative_norm(
+                "rnb_rms_norm_add_then_rms_norm_f32_coop",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut post_weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut pre_weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut block_sums_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut post_eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut pre_eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut post_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut pre_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+            )
+        } else {
+            self.launch_cached_gemv(
+                "rnb_rms_norm_add_then_rms_norm_f32",
+                &[
+                    (&mut input_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut post_weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut residual_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut pre_weight_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut output_arg as *mut u64).cast::<libc::c_void>(),
+                    (&mut post_eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut pre_eps_arg as *mut f32).cast::<libc::c_void>(),
+                    (&mut len_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut post_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                    (&mut pre_unit_offset_arg as *mut u32).cast::<libc::c_void>(),
+                ],
+                (1, 1, 1),
+                (256, 1, 1),
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7413,6 +7657,58 @@ impl CudaState {
                 function,
                 grid,
                 block,
+                0,
+                self.stream,
+                params.as_ptr() as *mut *mut libc::c_void,
+            )
+        }
+    }
+
+    fn launch_cached_cooperative_norm(
+        &mut self,
+        kernel_name: &str,
+        params: &[*mut libc::c_void],
+    ) -> Result<(), String> {
+        self.set_current()?;
+        let module = self.ensure_q4k_gemv_module()?;
+        let function = unsafe {
+            self.api
+                .module_get_function(module as *mut libc::c_void, kernel_name)?
+        };
+        let grid_x = match self.cooperative_norm_grid_cap {
+            Some(grid_x) => grid_x,
+            None => {
+                let occupancy_function = unsafe {
+                    self.api.module_get_function(
+                        module as *mut libc::c_void,
+                        "rnb_rms_norm_add_then_rms_norm_f32_coop",
+                    )?
+                };
+                let sm_count = unsafe { self.api.device_multiprocessor_count()? };
+                let blocks_per_sm = unsafe {
+                    self.api.occupancy_max_active_blocks_per_multiprocessor(
+                        occupancy_function,
+                        256,
+                        0,
+                    )?
+                };
+                if sm_count <= 0 || blocks_per_sm <= 0 {
+                    return Err(format!(
+                        "cooperative norm occupancy invalid: sm_count={sm_count}, blocks_per_sm={blocks_per_sm}"
+                    ));
+                }
+                let grid_x = u32::try_from(sm_count.saturating_mul(blocks_per_sm))
+                    .map_err(|_| "cooperative norm occupancy grid overflow".to_string())?
+                    .min(8);
+                self.cooperative_norm_grid_cap = Some(grid_x);
+                grid_x
+            }
+        };
+        unsafe {
+            self.api.launch_cooperative_kernel(
+                function,
+                (grid_x, 1, 1),
+                (256, 1, 1),
                 0,
                 self.stream,
                 params.as_ptr() as *mut *mut libc::c_void,

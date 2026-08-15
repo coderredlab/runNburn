@@ -133,6 +133,7 @@ impl CudaState {
             req.norm_eps,
             n_embd,
             false,
+            false,
         )?;
 
         // 3. normed Q8_1 양자화 → qkv/gate 공유

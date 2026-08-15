@@ -2468,7 +2468,15 @@ pub fn rms_norm_f32_dev_input_to_carrier(
     }
     let state = guard.as_mut().expect("cuda compute state initialized");
     let weight_dev = state.resident_f32_ptr(weight)?;
-    state.launch_rms_norm_f32(input_dev, weight_dev, output_carrier, eps, len, unit_offset)
+    state.launch_rms_norm_f32(
+        input_dev,
+        weight_dev,
+        output_carrier,
+        eps,
+        len,
+        unit_offset,
+        false,
+    )
 }
 
 pub fn rms_norm_f32_to_carrier(
@@ -2513,6 +2521,7 @@ pub fn rms_norm_f32_to_carrier(
         eps,
         input.len(),
         unit_offset,
+        false,
     )
 }
 pub fn rms_norm_rows_f32(

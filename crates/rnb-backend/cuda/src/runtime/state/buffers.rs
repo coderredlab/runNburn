@@ -180,6 +180,57 @@ impl CudaState {
         Ok(())
     }
 
+    pub(in crate::runtime) fn release_prefill_compute_buffers(&mut self) -> Result<usize, String> {
+        self.set_current()?;
+        self.stream_synchronize()?;
+        unsafe {
+            self.api.stream_synchronize(self.copy_stream)?;
+        }
+
+        macro_rules! release {
+            ($ptr:ident, $capacity:ident, $released:ident) => {
+                if let Some(ptr) = self.$ptr.take() {
+                    unsafe { self.api.mem_free(ptr)? };
+                    $released = $released.saturating_add(self.$capacity);
+                    self.$capacity = 0;
+                }
+            };
+        }
+
+        let mut released = 0usize;
+        release!(compute_weights, compute_weights_capacity, released);
+        release!(compute_input, compute_input_capacity, released);
+        release!(compute_output, compute_output_capacity, released);
+        release!(compute_aux_output, compute_aux_output_capacity, released);
+        release!(compute_q8_sums, compute_q8_sums_capacity, released);
+        release!(
+            compute_q8_transposed,
+            compute_q8_transposed_capacity,
+            released
+        );
+        release!(
+            compute_q8_transposed_meta,
+            compute_q8_transposed_meta_capacity,
+            released
+        );
+        release!(compute_mid_a, compute_mid_a_capacity, released);
+        release!(compute_mid_b, compute_mid_b_capacity, released);
+        release!(compute_gate_ptrs, compute_gate_ptrs_capacity, released);
+        release!(compute_up_ptrs, compute_up_ptrs_capacity, released);
+        release!(compute_down_ptrs, compute_down_ptrs_capacity, released);
+        release!(compute_full_gate, compute_full_gate_capacity, released);
+        release!(compute_full_up, compute_full_up_capacity, released);
+        release!(compute_full_down, compute_full_down_capacity, released);
+        release!(compute_temp_slab, compute_temp_slab_capacity, released);
+        release!(compute_q_rope_out, compute_q_rope_out_capacity, released);
+        release!(compute_k_bits_out, compute_k_bits_out_capacity, released);
+        release!(compute_v_bits_out, compute_v_bits_out_capacity, released);
+        release!(compute_route, compute_route_capacity, released);
+        release!(compute_token_ids, compute_token_ids_capacity, released);
+        release!(compute_group_meta, compute_group_meta_capacity, released);
+        Ok(released)
+    }
+
     pub(in crate::runtime) fn qwen35_packed_act_ptr(
         &mut self,
         bytes: usize,

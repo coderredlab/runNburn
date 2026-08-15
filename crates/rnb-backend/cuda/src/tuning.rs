@@ -198,6 +198,22 @@ pub fn q4k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
     seq_len >= 128 && rows >= 128 && env_bool("RNB_CUDA_Q4K_MMQ_TILE128", true)
 }
 
+/// 최신 llama.cpp/ggml Ampere MMQ의 non-fallback J=128 계약이다. 특정 GPU
+/// 이름이 아니라 컴파일 compute capability와 128x128 tile을 충분히 채우는
+/// shape로만 고른다. `=0`이면 기존 runNburn transposed MMQ로 즉시 되돌린다.
+pub fn q4k_llama_ampere_mmq_j128_enabled(
+    seq_len: usize,
+    rows: usize,
+    blocks_per_row: usize,
+) -> bool {
+    compiled_ampere_mma_supported()
+        && seq_len >= 128
+        && rows >= 128
+        && blocks_per_row >= 4
+        && !dflash_exact_verify_active()
+        && env_bool("RNB_CUDA_Q4K_MMQ_LLAMA_AMPERE_J128", true)
+}
+
 /// cu278: Q4_K MMQ의 Q8_1 입력을 chunk-major로 전치하고 packed Q4_K와
 /// 함께 shared-memory tile에 올리는 Ampere 경로. 128x128 출력 tile은 기존
 /// f32 metadata/누산 순서를 유지하면서 coalesced load를 사용한다. Muse
@@ -207,7 +223,6 @@ pub fn q4k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
 pub fn q4k_mmq_transposed_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_MMQ_TRANSPOSED", true)
 }
-
 /// cu278: Muse Q/K/V/attention-gate가 같은 normalized activation의 Q8_1을
 /// 재사용하고, attention-gate 및 FFN up projection을 보조 stream에서
 /// 실행한다. RTX 3090 1144/100에서 공유-Q8 단독 prefill -1.64%, 병렬화
@@ -241,6 +256,22 @@ pub fn q6k_mmq_tile64_enabled(seq_len: usize, rows: usize) -> bool {
 /// `RNB_CUDA_Q6K_MMQ_TILE128=0` retains the 64x64 diagnostic baseline.
 pub fn q6k_mmq_tile128_enabled(seq_len: usize, rows: usize) -> bool {
     seq_len >= 64 && rows >= 128 && env_bool("RNB_CUDA_Q6K_MMQ_TILE128", true)
+}
+
+/// Q6_K용 최신 llama.cpp/ggml Ampere non-fallback J=128 MMQ 게이트.
+/// Q4와 별도 환경변수라 quant별 A/B가 가능하며, 꺼지면 기존 128x64/64x64
+/// runNburn MMQ 선택을 그대로 보존한다.
+pub fn q6k_llama_ampere_mmq_j128_enabled(
+    seq_len: usize,
+    rows: usize,
+    blocks_per_row: usize,
+) -> bool {
+    compiled_ampere_mma_supported()
+        && seq_len >= 128
+        && rows >= 128
+        && blocks_per_row >= 4
+        && !dflash_exact_verify_active()
+        && env_bool("RNB_CUDA_Q6K_MMQ_LLAMA_AMPERE_J128", true)
 }
 
 pub fn q2k_mmq_tile32_enabled(seq_len: usize, rows: usize, blocks_per_row: usize) -> bool {
@@ -388,7 +419,6 @@ pub fn q6k_q8dot_wide_enabled() -> bool {
 pub fn q4k_q8dot_row4_enabled() -> bool {
     env_bool("RNB_CUDA_Q4K_Q8DOT_ROW4", true)
 }
-
 pub fn q6k_q8dot_row4_enabled() -> bool {
     env_bool("RNB_CUDA_Q6K_Q8DOT_ROW4", true)
 }
@@ -884,6 +914,10 @@ pub fn full_device_decode_qkv_q8dot_enabled() -> bool {
     env_bool("RNB_CUDA_FULL_DEVICE_DECODE_QKV_Q8DOT", true)
 }
 
+pub fn full_device_decode_cooperative_norms_enabled() -> bool {
+    env_bool("RNB_CUDA_COOPERATIVE_DECODE_NORMS", true)
+}
+
 pub fn decode_attention_kv_cache_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_KV_CACHE", true)
 }
@@ -904,12 +938,11 @@ pub fn decode_attention_hd128_split_enabled() -> bool {
     env_bool("RNB_CUDA_DECODE_ATTN_HD128_SPLIT", true)
 }
 
-pub fn decode_attention_hd128_split_chunk_size() -> usize {
+pub fn decode_attention_hd128_split_chunk_override() -> Option<usize> {
     std::env::var("RNB_CUDA_DECODE_ATTN_HD128_SPLIT_CHUNK")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&chunk| matches!(chunk, 64 | 128 | 256 | 512))
-        .unwrap_or(128)
+        .filter(|&chunk| (8..=512).contains(&chunk) && chunk.is_multiple_of(8))
 }
 
 pub fn decode_attention_hd256_split_enabled() -> bool {

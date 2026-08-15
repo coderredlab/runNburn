@@ -510,18 +510,24 @@ __device__ __forceinline__ RnbQ4WideLane rnb_q4k_wide_lane_decode(
     unsigned j,
     unsigned elem) {
     RnbQ4WideLane out;
-    const unsigned raw_d = (unsigned)block[0] | ((unsigned)block[1] << 8);
-    const unsigned raw_dmin = (unsigned)block[2] | ((unsigned)block[3] << 8);
+    const uint4 meta = *reinterpret_cast<const uint4*>(block);
+    const unsigned raw_d = meta.x & 0xffffu;
+    const unsigned raw_dmin = meta.x >> 16;
     out.d = __half2float(__ushort_as_half((unsigned short)raw_d));
     out.dmin = __half2float(__ushort_as_half((unsigned short)raw_dmin));
     unsigned sc;
     unsigned mn;
     if (j < 4u) {
-        sc = block[4u + j] & 63u;
-        mn = block[4u + j + 4u] & 63u;
+        const unsigned shift = j * 8u;
+        sc = (meta.y >> shift) & 63u;
+        mn = (meta.z >> shift) & 63u;
     } else {
-        sc = (block[4u + j + 4u] & 0x0fu) | ((block[4u + j - 4u] >> 6) << 4);
-        mn = (block[4u + j + 4u] >> 4) | ((block[4u + j] >> 6) << 4);
+        const unsigned shift = (j - 4u) * 8u;
+        const unsigned lo = (meta.y >> shift) & 0xffu;
+        const unsigned hi = (meta.z >> shift) & 0xffu;
+        const unsigned mixed = (meta.w >> shift) & 0xffu;
+        sc = (mixed & 0x0fu) | ((lo >> 6) << 4);
+        mn = (mixed >> 4) | ((hi >> 6) << 4);
     }
     out.sc = (float)sc;
     out.mn = (float)mn;
@@ -532,6 +538,7 @@ __device__ __forceinline__ RnbQ4WideLane rnb_q4k_wide_lane_decode(
     out.q_pack1 = (int)((q_raw.y >> shift) & 0x0f0f0f0fu);
     return out;
 }
+
 
 __device__ __forceinline__ int2 rnb_load_i32x2_aligned8(const void* ptr) {
     return *reinterpret_cast<const int2*>(ptr);
@@ -579,6 +586,8 @@ extern "C" __global__ void rnb_q4k_gemv_q8dot_wide_warp8(
         out[row] = acc;
     }
 }
+
+
 
 // cu274: llama.cpp MMVQ와 같은 single-token Ampere mapping. CTA의 4 warp가
 // 한 output row의 K block을 나눠 읽고 shared partial을 합친다.
@@ -1021,6 +1030,8 @@ extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_warp8(
     }
 }
 
+
+
 extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_row4(
     float* __restrict__ gate_out,
     float* __restrict__ up_out,
@@ -1085,7 +1096,6 @@ extern "C" __global__ void rnb_q4k_gate_up_gemv_q8dot_wide_row4(
         up_out[row] = up_partial[0] + up_partial[1] + up_partial[2] + up_partial[3];
     }
 }
-
 extern "C" __global__ void rnb_q4k_gate_up_gemv_batch_seq2_q8dot_warp8(
     float* __restrict__ gate_out,
     float* __restrict__ up_out,

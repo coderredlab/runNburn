@@ -2,6 +2,9 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static DENSE_CHAIN_TRACE_CALLS: AtomicUsize = AtomicUsize::new(0);
+// Must match RnbBlockQ8_1Mmq in cuda/kernels/q8_1_mmq.cuh:
+// 128 int8 values plus the 16B llama.cpp MMQ metadata/padding payload.
+const LLAMA_MMQ_Q8_1_BLOCK_BYTES: usize = 144;
 static DENSE_EXPERT_TRACE_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy)]
 enum Qwen35DeviceSharedWeights<'a> {
@@ -798,6 +801,25 @@ impl CudaState {
         input_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        if tuning::q4k_llama_ampere_mmq_j128_enabled(seq_len, rows, blocks_per_row) {
+            // llama.cpp block_q8_1_mmq: 128 Q8 values plus 16B metadata/padding,
+            // physically transposed as [k128][sequence].
+            let activation_bytes = seq_len
+                .checked_mul(blocks_per_row)
+                .and_then(|value| value.checked_mul(2 * LLAMA_MMQ_Q8_1_BLOCK_BYTES))
+                .ok_or_else(|| "Q4_K llama MMQ activation scratch overflow".to_string())?;
+            let activation_mmq_dev = self.compute_q8_transposed_ptr(activation_bytes)?;
+            return self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_dev,
+                activation_mmq_dev,
+                output_dev,
+            );
+        }
+
         let mmq_tile32 = tuning::q4k_mmq_tile32_enabled(seq_len, rows, blocks_per_row);
         if mmq_tile32
             || (!tuning::q4k_batch_raw_seq4_enabled(seq_len, rows, blocks_per_row)
@@ -883,7 +905,9 @@ impl CudaState {
                 if tuning::q4k_mmq_tile128_enabled(seq_len, rows) {
                     let chunks_per_seq = blocks_per_row * 8;
                     let chunks = seq_len * chunks_per_seq;
-                    if tuning::q4k_mmq_transposed_enabled() {
+                    if tuning::q4k_mmq_transposed_enabled()
+                        && self.q4k_weight_slice_is_resident(weights)
+                    {
                         let transposed_qs_dev = self.compute_q8_transposed_ptr(chunks * 32)?;
                         let transposed_meta_dev = self.compute_q8_transposed_meta_ptr(
                             chunks * std::mem::size_of::<(f32, f32)>(),
@@ -1064,7 +1088,9 @@ impl CudaState {
             && tuning::q4k_mmq_transposed_enabled()
             && tuning::q4k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
             && tuning::mmq_tile_seq64_enabled(seq_len)
-            && tuning::q4k_mmq_tile128_enabled(seq_len, rows);
+            && tuning::q4k_mmq_tile128_enabled(seq_len, rows)
+            && self.q4k_weight_slice_is_resident(gate_weights)
+            && self.q4k_weight_slice_is_resident(up_weights);
         if !parallel {
             self.q4k_batch_q8dot_to_dev(
                 gate_weights,
@@ -1333,6 +1359,25 @@ impl CudaState {
         input_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        if tuning::q6k_llama_ampere_mmq_j128_enabled(seq_len, rows, blocks_per_row) {
+            // Q6_K shares the 144B [k128][sequence] MMQ scratch layout; its
+            // metadata payload is four f32 Q8 scales rather than Q4's half2 d/sum.
+            let activation_bytes = seq_len
+                .checked_mul(blocks_per_row)
+                .and_then(|value| value.checked_mul(2 * LLAMA_MMQ_Q8_1_BLOCK_BYTES))
+                .ok_or_else(|| "Q6_K llama MMQ activation scratch overflow".to_string())?;
+            let activation_mmq_dev = self.compute_q8_transposed_ptr(activation_bytes)?;
+            return self.launch_q6k_q8_1_matmul_mmq_llama_ampere_j128(
+                weights,
+                rows,
+                blocks_per_row,
+                seq_len,
+                input_dev,
+                activation_mmq_dev,
+                output_dev,
+            );
+        }
+
         if tuning::q6k_mmq_tile32_enabled(seq_len, rows, blocks_per_row) {
             let qs_dev = self.compute_gate_ptrs_ptr(seq_len * blocks_per_row * 256)?;
             let ds_dev = self
@@ -2852,6 +2897,7 @@ impl CudaState {
         unit_offset_post_attn_norm: bool,
         unit_offset_ffn_norm: bool,
         unit_offset_post_ffn_norm: bool,
+        reuse_device_output_id: Option<rnb_backend_api::DeviceTensorId>,
     ) -> Result<Option<rnb_backend_api::DeviceTensorId>, String> {
         let trace_call = dense_chain_trace_call();
         let trace_total = trace_call.map(|_| std::time::Instant::now());
@@ -3409,6 +3455,23 @@ impl CudaState {
                     "dense attention+FFN device output bytes mismatch: desc={desc_bytes} hidden={hidden_bytes}"
                 ));
             }
+            if let Some(output_id) = reuse_device_output_id {
+                if trace_call.is_some() {
+                    self.trace_dense_stage(
+                        trace_call,
+                        "cuda-attn-dense-batch-chain",
+                        "reuse_hidden",
+                        &mut trace_stage,
+                    )?;
+                }
+                if let (Some(call), Some(total)) = (trace_call, trace_total) {
+                    eprintln!(
+                        "[cuda-attn-dense-batch-chain] call={call} stage=total ms={:.3}",
+                        total.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                return Ok(Some(output_id));
+            }
             let output_dev = unsafe { self.api.mem_alloc(hidden_bytes)? };
             let copy_result = unsafe {
                 self.api
@@ -3940,6 +4003,7 @@ impl CudaState {
         layer_output_scale: Option<f32>,
         trace_call: Option<usize>,
         trace_stage: &mut std::time::Instant,
+        cooperative_norms: bool,
     ) -> Result<(), String> {
         self.q4k_dev_input_to_dev(o_weights, n_embd, o_cols / 256, attn_out_dev, proj_dev)?;
         self.trace_dense_stage(trace_call, "cuda-dense-chain", "o_proj", trace_stage)?;
@@ -3985,6 +4049,7 @@ impl CudaState {
                         n_embd,
                         unit_offset_post_attn_norm,
                         unit_offset_ffn_norm,
+                        cooperative_norms,
                     )?;
                     self.trace_dense_stage(
                         trace_call,
@@ -4001,6 +4066,7 @@ impl CudaState {
                     post_norm_eps,
                     n_embd,
                     unit_offset_post_attn_norm,
+                    cooperative_norms,
                 )?;
                 self.trace_dense_stage(
                     trace_call,
@@ -4015,6 +4081,7 @@ impl CudaState {
                     norm_eps,
                     n_embd,
                     unit_offset_ffn_norm,
+                    cooperative_norms,
                 )?;
                 self.trace_dense_stage(
                     trace_call,
@@ -4038,6 +4105,7 @@ impl CudaState {
                 norm_eps,
                 n_embd,
                 unit_offset_ffn_norm,
+                cooperative_norms,
             )?;
             self.trace_dense_stage(trace_call, "cuda-dense-chain", "ffn_pre_norm", trace_stage)?;
         }
@@ -4063,6 +4131,7 @@ impl CudaState {
                 post_norm_eps,
                 n_embd,
                 unit_offset_ffn_norm,
+                cooperative_norms,
             )?;
         } else {
             self.launch_add_f32_inplace(hidden_dev, proj_dev, n_embd)?;
@@ -4186,6 +4255,7 @@ impl CudaState {
                 norm_eps,
                 n_embd,
                 unit_offset_ple_norm,
+                cooperative_norms,
             )?;
             self.trace_dense_stage(trace_call, "cuda-dense-chain", "ple_post_norm", trace_stage)?;
         }
@@ -6372,6 +6442,7 @@ impl CudaState {
             norm_eps,
             n_embd,
             unit_offset_norm,
+            false,
         )?;
         self.qwen35_expert_dev_input_to_dev(
             gate_weights,
@@ -6394,6 +6465,7 @@ impl CudaState {
                 post_norm_eps,
                 n_embd,
                 unit_offset_norm,
+                false,
             )?;
         } else {
             self.launch_add_f32_inplace(hidden_dev, ffn_out_dev, n_embd)?;
@@ -6753,16 +6825,18 @@ impl CudaState {
             let raw_weights_resident = base_raw_weights_resident && ple_raw_weights_resident;
             if raw_weights_resident {
                 let q8dot_gate_up = dense_q8dot_gate_up_enabled(ffn_uses_gelu);
-                let packed_q4_gate_up = if q8dot_gate_up && dense_q4_packed_q8dot_enabled(true) {
-                    let gate = self.resident_q4k_packed_ptrs(gate_weights, n_ff, n_embd / 256)?;
-                    let up = self.resident_q4k_packed_ptrs(up_weights, n_ff, n_embd / 256)?;
-                    match (gate, up) {
-                        (Some(gate), Some(up)) => Some((gate, up)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
+                let packed_q4_gate_up =
+                    if ffn_uses_gelu && q8dot_gate_up && dense_q4_packed_q8dot_enabled(true) {
+                        let gate =
+                            self.resident_q4k_packed_ptrs(gate_weights, n_ff, n_embd / 256)?;
+                        let up = self.resident_q4k_packed_ptrs(up_weights, n_ff, n_embd / 256)?;
+                        match (gate, up) {
+                            (Some(gate), Some(up)) => Some((gate, up)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                 let packed_q4_down =
                     if ffn_uses_gelu && down_quant == 12 && dense_q4_packed_q8dot_enabled(true) {
                         self.resident_q4k_packed_ptrs(down_weights, n_embd, n_ff / 256)?
@@ -7105,6 +7179,7 @@ impl CudaState {
                                 layer_output_scale,
                                 None,
                                 &mut trace_stage,
+                                false,
                             );
                             if let Err(err) = capture_result {
                                 unsafe {
@@ -7212,6 +7287,7 @@ impl CudaState {
                             layer_output_scale,
                             None,
                             &mut trace_stage,
+                            false,
                         );
                         if let Err(err) = capture_result {
                             unsafe {
@@ -7300,6 +7376,7 @@ impl CudaState {
                             n_embd,
                             unit_offset_post_attn_norm,
                             unit_offset_ffn_norm,
+                            false,
                         )?;
                         self.trace_dense_stage(
                             trace_call,
@@ -7316,6 +7393,7 @@ impl CudaState {
                         post_norm_eps,
                         n_embd,
                         unit_offset_post_attn_norm,
+                        false,
                     )?;
                     self.trace_dense_stage(
                         trace_call,
@@ -7330,6 +7408,7 @@ impl CudaState {
                         norm_eps,
                         n_embd,
                         unit_offset_ffn_norm,
+                        false,
                     )?;
                     self.trace_dense_stage(
                         trace_call,
@@ -7353,6 +7432,7 @@ impl CudaState {
                     norm_eps,
                     n_embd,
                     unit_offset_ffn_norm,
+                    false,
                 )?;
                 self.trace_dense_stage(
                     trace_call,
@@ -7383,6 +7463,7 @@ impl CudaState {
                     post_norm_eps,
                     n_embd,
                     unit_offset_ffn_norm,
+                    false,
                 )?;
             } else {
                 self.launch_add_f32_inplace(hidden_dev, proj_dev, n_embd)?;
@@ -7572,6 +7653,7 @@ impl CudaState {
                         norm_eps,
                         n_embd,
                         unit_offset_ple_norm,
+                        false,
                     )?;
                     self.trace_dense_stage(
                         trace_call,

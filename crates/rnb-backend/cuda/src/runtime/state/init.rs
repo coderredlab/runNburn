@@ -366,6 +366,8 @@ impl CudaState {
             nemotron_decode_sparse_calls: 0,
             q4k_gemv_module: None,
             q4k_tile128_grid_cap: None,
+            cooperative_norm_grid_cap: None,
+            device_sm_count: None,
             nemotron_selected_module: None,
             persistent_decode_module: None,
             gemma_mtp2_module: None,

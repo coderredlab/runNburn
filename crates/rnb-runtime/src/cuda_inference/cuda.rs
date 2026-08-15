@@ -903,6 +903,10 @@ pub fn clear_sequence_state_cache() -> Result<()> {
     backend::clear_sequence_state_cache().map_err(|err| err)
 }
 
+pub fn release_prefill_compute_buffers() -> Result<usize> {
+    backend::release_prefill_compute_buffers().map_err(|err| err)
+}
+
 pub fn release_q4_f32_after_prefill() -> Result<()> {
     backend::release_q4_f32_after_prefill().map_err(|err| err)
 }
@@ -981,6 +985,13 @@ pub fn prewarm_q4k_weight_slices_pinned(weights: &[&[u8]]) -> Result<usize> {
 
 pub fn prewarm_q4k_weight_slices_pinned_prefix(weights: &[&[u8]]) -> Result<usize> {
     backend::prewarm_q4k_weights_pinned_prefix(weights)
+}
+
+pub fn prewarm_q4k_weight_slices_pinned_complete_groups(
+    weights: &[&[u8]],
+    group_ends: &[usize],
+) -> Result<(usize, usize)> {
+    backend::prewarm_q4k_weights_pinned_complete_groups(weights, group_ends)
 }
 
 pub fn prewarm_quant_resident_weights(weights: &[&[u8]]) -> Result<usize> {

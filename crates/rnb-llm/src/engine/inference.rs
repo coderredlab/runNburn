@@ -2028,8 +2028,31 @@ impl Engine {
             };
             Ok(logits)
         })();
-        let cleanup =
-            super::backend_runtime::release_prefill_residency_after_prefill(self.architecture);
+        let release_compute_buffers =
+            matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer)
+                && !self
+                    .backend_runtime
+                    .decode_all_layers_use_gpu(self.metadata.num_layers);
+        let cleanup = super::backend_runtime::release_prefill_residency_after_prefill(
+            self.architecture,
+            release_compute_buffers,
+        )
+        .and_then(|()| {
+            if release_compute_buffers && result.is_ok() {
+                let weights = self.weights.as_ref().ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Muse decode tail promotion requires loaded weights".to_string(),
+                    )
+                })?;
+                if let Some(prefixes) =
+                    super::backend_runtime::promote_muse_decode_tail_after_prefill(weights)?
+                {
+                    self.backend_runtime
+                        .set_decode_gpu_layer_prefixes(Some(prefixes));
+                }
+            }
+            Ok(())
+        });
         match (result, cleanup) {
             (Ok(logits), Ok(())) => Ok(logits),
             (Err(error), Ok(())) => Err(error),

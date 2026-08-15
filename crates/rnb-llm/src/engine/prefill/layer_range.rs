@@ -2744,26 +2744,35 @@ fn run_prefill_layers_cpu_range_impl(
                                     "CUDA Muse device chain returned no device output; input cleanup={cleanup:?}"
                                 )));
                             };
-                            match device_hidden.output.release() {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    let _ = device_output.release();
-                                    return Err(crate::error::LlmError::Forward(
-                                        "CUDA Muse device hidden tensor was already missing"
-                                            .to_string(),
-                                    ));
+                            if device_output.output_id == device_hidden.output.output_id {
+                                hidden = hidden_carrier::PrefillHidden::Device(
+                                    hidden_carrier::DevicePrefillHidden {
+                                        output: device_hidden.output,
+                                        producer_layer_idx: layer_idx,
+                                    },
+                                );
+                            } else {
+                                match device_hidden.output.release() {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        let _ = device_output.release();
+                                        return Err(crate::error::LlmError::Forward(
+                                            "CUDA Muse device hidden tensor was already missing"
+                                                .to_string(),
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        let _ = device_output.release();
+                                        return Err(err);
+                                    }
                                 }
-                                Err(err) => {
-                                    let _ = device_output.release();
-                                    return Err(err);
-                                }
+                                hidden = hidden_carrier::PrefillHidden::Device(
+                                    hidden_carrier::DevicePrefillHidden {
+                                        output: device_output,
+                                        producer_layer_idx: layer_idx,
+                                    },
+                                );
                             }
-                            hidden = hidden_carrier::PrefillHidden::Device(
-                                hidden_carrier::DevicePrefillHidden {
-                                    output: device_output,
-                                    producer_layer_idx: layer_idx,
-                                },
-                            );
                             layer_idx += 1;
                             continue;
                         }

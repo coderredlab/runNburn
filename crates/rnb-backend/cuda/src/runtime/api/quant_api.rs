@@ -1085,6 +1085,105 @@ pub fn prewarm_q4k_weights_pinned_prefix(weights: &[&[u8]]) -> Result<usize, Str
     Ok(warmed)
 }
 
+pub fn prewarm_q4k_weights_pinned_complete_groups(
+    weights: &[&[u8]],
+    group_ends: &[usize],
+) -> Result<(usize, usize), String> {
+    if weights.is_empty() || group_ends.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut previous_end = 0usize;
+    for &end in group_ends {
+        if end <= previous_end || end > weights.len() {
+            return Err(format!(
+                "invalid pinned Q4_K group end {end}: previous={previous_end}, weights={}",
+                weights.len()
+            ));
+        }
+        previous_end = end;
+    }
+
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    let state = guard.as_mut().expect("cuda compute state initialized");
+    let (free_bytes, total_bytes) = unsafe { state.api.mem_get_info() }?;
+    let mib = 1024 * 1024;
+    let reserve_bytes =
+        super::super::state::decode_tail_reserve_mib(total_bytes / mib).saturating_mul(mib);
+    state.configure_decode_residency_reserve(reserve_bytes);
+    let free_budget = free_bytes.saturating_sub(reserve_bytes);
+    let cache_budget = if std::env::var("RNB_CUDA_Q4K_CACHE_MB").is_err() {
+        state.resident_q4k_limit = state.resident_q4k_bytes.saturating_add(free_budget);
+        free_budget
+    } else {
+        state
+            .resident_q4k_limit
+            .saturating_sub(state.resident_q4k_bytes)
+            .min(free_budget)
+    };
+    let effective_budget = state
+        .resident_q4k_effective_limit()
+        .saturating_sub(state.resident_q4k_bytes);
+    let mut remaining = cache_budget.min(effective_budget);
+    let trace = std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1");
+    if trace {
+        eprintln!(
+            "[cuda] decode tail budget free={}MiB reserve={}MiB available={}MiB",
+            free_bytes / mib,
+            reserve_bytes / mib,
+            remaining / mib
+        );
+    }
+
+    let mut newly_warmed = 0usize;
+    let mut complete_groups = 0usize;
+    let mut start = 0usize;
+    for &end in group_ends {
+        let group = &weights[start..end];
+        let missing_bytes = group.iter().try_fold(0usize, |total, weight| {
+            if state.q4k_weight_slice_is_resident(weight) {
+                Ok(total)
+            } else {
+                total
+                    .checked_add(weight.len())
+                    .ok_or_else(|| "pinned Q4_K group byte count overflow".to_string())
+            }
+        })?;
+        if trace && missing_bytes > 0 {
+            eprintln!(
+                "[cuda] decode tail group={} missing={}MiB remaining={}MiB",
+                complete_groups,
+                missing_bytes / mib,
+                remaining / mib
+            );
+        }
+        if missing_bytes > remaining {
+            break;
+        }
+        for weight in group {
+            let was_resident = state.q4k_weight_slice_is_resident(weight);
+            match state.resident_q4k_weights_ptr_pinned_with_lease(weight) {
+                Ok(_) => newly_warmed += usize::from(!was_resident),
+                Err(err) if err.contains("pinned resident Q4_K admission failed") => {
+                    state.stream_synchronize()?;
+                    return Ok((newly_warmed, complete_groups));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        remaining = remaining.saturating_sub(missing_bytes);
+        complete_groups += 1;
+        start = end;
+    }
+    state.stream_synchronize()?;
+    Ok((newly_warmed, complete_groups))
+}
+
 pub fn prewarm_q4k_packed_gate_up_weights(
     weights: &[(&[u8], &[u8], usize, usize)],
 ) -> Result<usize, String> {

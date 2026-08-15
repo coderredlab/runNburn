@@ -58,6 +58,7 @@ impl CudaState {
         let input_blocks = n_embd / 256;
         let f32_size = std::mem::size_of::<f32>();
         let qkv_q8dot = tuning::full_device_decode_qkv_q8dot_enabled();
+        let cooperative_norms = tuning::full_device_decode_cooperative_norms_enabled();
         let q8_qs_bytes = input_blocks * 256;
         let q8_ds_bytes = input_blocks * 8 * f32_size;
         let norm_bytes = n_embd * f32_size;
@@ -79,7 +80,14 @@ impl CudaState {
             .transpose()?;
         let down_dev = mid_a_dev;
 
-        self.launch_rms_norm_device(hidden_dev, attn_norm, n_embd, norm_eps, norm_dev)?;
+        self.launch_rms_norm_device(
+            hidden_dev,
+            attn_norm,
+            n_embd,
+            norm_eps,
+            norm_dev,
+            cooperative_norms,
+        )?;
         let expected_v_q4k_bytes = kv_dim * input_blocks * 144;
         if qkv_q8dot {
             let q8_qs_dev = norm_dev + norm_bytes as u64;
@@ -290,6 +298,7 @@ impl CudaState {
             (out_scale != 1.0 && out_scale != 0.0).then_some(out_scale),
             None,
             &mut trace_stage,
+            cooperative_norms,
         )?;
         Ok(())
     }
@@ -305,9 +314,18 @@ impl CudaState {
         dim: usize,
         eps: f32,
         output_dev: u64,
+        cooperative: bool,
     ) -> Result<(), String> {
         let weight_dev = self.resident_f32_ptr_stable_source(weight)?;
-        self.launch_rms_norm_f32(input_dev, weight_dev, output_dev, eps, dim, false)
+        self.launch_rms_norm_f32(
+            input_dev,
+            weight_dev,
+            output_dev,
+            eps,
+            dim,
+            false,
+            cooperative,
+        )
     }
 
     fn launch_qk_norm_device(

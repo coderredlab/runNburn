@@ -1373,6 +1373,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain(
             None,
             norm_eps,
             post_norm_eps,
+            None,
         )?;
     Ok(output.map(|(k_bits, v_bits, _)| (k_bits, v_bits)))
 }
@@ -1558,6 +1559,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain_device_input(
         Some(output_desc),
         norm_eps,
         post_norm_eps,
+        Some(input_id),
     )?;
     let Some((k_bits, v_bits, Some(output_id))) = output else {
         return Ok(None);

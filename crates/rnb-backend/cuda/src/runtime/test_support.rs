@@ -2274,6 +2274,7 @@ pub fn rms_norm_add_then_rms_norm_for_test(
         len,
         post_unit_offset,
         pre_unit_offset,
+        true,
     )?;
     let mut updated = vec![0.0f32; len];
     let mut output = vec![0.0f32; len];

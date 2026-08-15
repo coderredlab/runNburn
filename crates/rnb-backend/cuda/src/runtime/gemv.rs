@@ -3933,6 +3933,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )?;
         Ok(Some((
             k_bits,
@@ -4260,6 +4261,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )?;
         Ok(Some(match output_id {
             Some(id) => Q4kF16DenseChainOutput::Device(id),
@@ -4545,6 +4547,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )?;
         Ok(Some(match output_id {
             Some(id) => Q4kF16DenseChainOutput::Device(id),

@@ -9965,6 +9965,7 @@ fn cuda_prefill_hd128_muse_window_dense_chain_matches_separate_cuda_path() {
     let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "1");
     let _tile128 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE128", "1");
     let cublas_off = EnvVarGuard::set("RNB_CUDA_PREFILL_CUBLAS_GQA16", "0");
+    let _llama_mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_LLAMA_AMPERE_J128", "0");
 
     let seq_len = 128usize;
     let kv_len = 128usize;
@@ -13666,7 +13667,9 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
         .launch_quantize_q8_1_by_32(input_dev, qs_dev, ds_dev, chunks * 32)
         .expect("quantize parallel gate-up input");
 
-    let mut run_pair = |parallel: &str| {
+    let resident_limit = state.resident_q4k_limit;
+    let mut run_pair = |parallel: &str, limit: usize| {
+        state.resident_q4k_limit = limit;
         let _parallel = EnvVarGuard::set("RNB_CUDA_Q4K_PARALLEL_GATE_UP", parallel);
         state
             .q4k_pair_batch_q8dot_to_dev(
@@ -13706,18 +13709,30 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
         state
             .stream_synchronize()
             .expect("synchronize gate-up pair");
-        (gate, up)
+        let used_parallel_events = state.dense_parallel_events.is_some();
+        (gate, up, used_parallel_events)
     };
 
-    let serial = run_pair("0");
-    let parallel_first = run_pair("1");
-    let parallel_second = run_pair("1");
+    let cold_requested = run_pair("1", 0);
+    let cold_serial = run_pair("0", 0);
+    let resident_serial = run_pair("0", resident_limit);
+    let parallel_first = run_pair("1", resident_limit);
+    let parallel_second = run_pair("1", resident_limit);
     drop(run_pair);
-    assert!(state.dense_parallel_events.is_some());
-    assert_eq!(parallel_first.0, serial.0);
-    assert_eq!(parallel_first.1, serial.1);
-    assert_eq!(parallel_second.0, serial.0);
-    assert_eq!(parallel_second.1, serial.1);
+    assert!(
+        !cold_requested.2,
+        "nonresident gate/up pair must use the serial staging path"
+    );
+    assert_eq!(cold_requested.0, cold_serial.0);
+    assert_eq!(cold_requested.1, cold_serial.1);
+    assert_eq!(resident_serial.0, cold_serial.0);
+    assert_eq!(resident_serial.1, cold_serial.1);
+    assert!(parallel_first.2);
+    assert_eq!(parallel_first.0, cold_serial.0);
+    assert_eq!(parallel_first.1, cold_serial.1);
+    assert!(parallel_second.2);
+    assert_eq!(parallel_second.0, cold_serial.0);
+    assert_eq!(parallel_second.1, cold_serial.1);
 }
 
 #[test]
@@ -16031,6 +16046,7 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_norm_residual_matches_cpu_refe
             true,
             true,
             true,
+            None,
         )
         .expect("CUDA dense Q4_K attention+FFN device output")
         .expect("device output id");
@@ -17241,6 +17257,7 @@ fn cuda_dense_q4k_attention_output_gelu_ffn_batch_f32_ple_device_output_matches_
             true,
             true,
             true,
+            None,
         )
         .expect("CUDA dense Q4_K attention+FFN F32 PLE device output")
         .expect("device output id");

@@ -1,6 +1,9 @@
 use super::gemv::{Q4kF16DenseChainOutput, Q4kF16QkvInput};
 use super::*;
 
+// Must match RnbBlockQ8_1Mmq in cuda/kernels/q8_1_mmq.cuh.
+const LLAMA_MMQ_Q8_1_BLOCK_BYTES: usize = 144;
+
 impl CudaState {
     pub(super) fn clear_decode_attention_kv_cache(&mut self) -> Result<(), String> {
         self.set_current()?;
@@ -799,6 +802,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )
         .map(|_| ())
     }
@@ -1038,6 +1042,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )?;
         Ok(Some((
             k_bits,
@@ -1206,6 +1211,7 @@ impl CudaState {
             unit_offset_post_attn_norm,
             unit_offset_ffn_norm,
             unit_offset_post_ffn_norm,
+            None,
         )
         .map(|_| ())
     }
@@ -1678,6 +1684,7 @@ impl CudaState {
             false,
             false,
             false,
+            None,
         )
         .map(|_| ())
     }
@@ -1831,6 +1838,7 @@ impl CudaState {
             false,
             false,
             false,
+            None,
         )
         .map(|_| ())
     }
@@ -1874,6 +1882,7 @@ impl CudaState {
         device_output_desc: Option<rnb_backend_api::DeviceTensorDesc>,
         norm_eps: f32,
         post_norm_eps: f32,
+        reuse_device_output_id: Option<rnb_backend_api::DeviceTensorId>,
     ) -> Result<Option<(Vec<u16>, Vec<u16>, Option<rnb_backend_api::DeviceTensorId>)>, String> {
         const HEAD_DIM: usize = 128;
         let q_dim = num_heads.saturating_mul(HEAD_DIM);
@@ -1914,6 +1923,23 @@ impl CudaState {
             .checked_mul(n_ff)
             .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| "CUDA Muse QKV FFN scratch byte overflow".to_string())?;
+        let llama_q4_mmq =
+            tuning::q4k_llama_ampere_mmq_j128_enabled(seq_len, q_rows, blocks_per_row)
+                && tuning::q4k_llama_ampere_mmq_j128_enabled(seq_len, kv_rows, blocks_per_row);
+        let llama_q6_mmq = v_quant == 14
+            && tuning::q6k_llama_ampere_mmq_j128_enabled(seq_len, kv_rows, blocks_per_row);
+        // Q/K/attention-gate share the Q4 d/sum layout. Q6 V has its own d4
+        // layout, but both are quantized once then read concurrently by the
+        // original primary/secondary QKV stream split.
+        let llama_qkv_mmq = llama_q4_mmq && (v_quant == 12 || llama_q6_mmq);
+        let llama_mmq_bytes = if llama_qkv_mmq {
+            seq_len
+                .checked_mul(blocks_per_row)
+                .and_then(|value| value.checked_mul(2 * LLAMA_MMQ_Q8_1_BLOCK_BYTES))
+                .ok_or_else(|| "CUDA Muse QKV llama MMQ scratch overflow".to_string())?
+        } else {
+            0
+        };
 
         // Reserve every shared slab at its largest use before the first async
         // launch. QKV postprocessing consumes these values before the dense
@@ -1926,13 +1952,23 @@ impl CudaState {
         let q_full_dev = self.compute_temp_slab_ptr(q_storage_bytes)?;
         let k_dev = self.compute_mid_a_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
         let v_dev = self.compute_mid_b_ptr(kv_f32_bytes.max(ffn_scratch_bytes))?;
+        let qkv_llama_q4_dev = if llama_qkv_mmq {
+            self.compute_q8_transposed_ptr(llama_mmq_bytes)?
+        } else {
+            0
+        };
         let qkv_secondary_qs_dev = self.compute_input_ptr(hidden_bytes)?;
         let attention_gate_dev = self.compute_aux_output_ptr(q_storage_bytes)?;
         let q_post_dev = self.compute_q_rope_out_ptr(q_bytes)?;
         let k_bits_dev = self.compute_k_bits_out_ptr(kv_f16_bytes)?;
         let v_bits_dev = self.compute_v_bits_out_ptr(kv_f16_bytes)?;
         let attn_out_dev = self.compute_full_down_ptr(q_bytes)?;
-        let qkv_secondary_meta_dev = self.compute_output_ptr(hidden_bytes)?;
+        let qkv_secondary_meta_dev =
+            self.compute_output_ptr(if llama_qkv_mmq && v_quant == 14 {
+                hidden_bytes.max(llama_mmq_bytes)
+            } else {
+                hidden_bytes
+            })?;
 
         if let Some(hidden_input) = hidden_input {
             unsafe {
@@ -1955,7 +1991,118 @@ impl CudaState {
             false,
         )?;
         let shared_q8 = seq_len >= 64 && tuning::muse_qkv_shared_q8_enabled();
-        if shared_q8 {
+        if llama_qkv_mmq {
+            // Quantize Q4 once into the upstream J=128 [k128][sequence] layout.
+            // Q/K, Q4 V, and the attention gate then only read that immutable
+            // slab, including when the gate retains the secondary stream split.
+            self.launch_quantize_q8_1_mmq_j128(
+                normed_dev,
+                qkv_llama_q4_dev,
+                blocks_per_row,
+                seq_len,
+                true,
+            )?;
+            if v_quant == 14 {
+                self.launch_quantize_q8_1_mmq_j128(
+                    normed_dev,
+                    qkv_secondary_meta_dev,
+                    blocks_per_row,
+                    seq_len,
+                    false,
+                )?;
+            }
+            let launch_v = |state: &mut Self| match v_quant {
+                12 => state.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qkv_llama_q4_dev,
+                    v_dev,
+                ),
+                14 => state.launch_q6k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                    v_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qkv_secondary_meta_dev,
+                    v_dev,
+                ),
+                other => Err(format!("CUDA Muse QKV unsupported V quant {other}")),
+            };
+            if tuning::muse_qkv_parallel_enabled() {
+                let (ready, done) = self.dense_parallel_events()?;
+                let main_stream = self.stream;
+                let secondary = (|| -> Result<(), String> {
+                    unsafe {
+                        self.api.event_record(ready, main_stream)?;
+                        self.api.stream_wait_event(self.copy_stream, ready)?;
+                    }
+                    self.stream = self.copy_stream;
+                    self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                        attention_gate_weights,
+                        q_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qkv_llama_q4_dev,
+                        attention_gate_dev,
+                    )?;
+                    unsafe { self.api.event_record(done, self.copy_stream) }
+                })();
+                self.stream = main_stream;
+                let primary = (|| -> Result<(), String> {
+                    self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                        q_weights,
+                        q_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qkv_llama_q4_dev,
+                        q_full_dev,
+                    )?;
+                    self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                        k_weights,
+                        kv_rows,
+                        blocks_per_row,
+                        seq_len,
+                        qkv_llama_q4_dev,
+                        k_dev,
+                    )?;
+                    launch_v(self)?;
+                    if secondary.is_ok() {
+                        unsafe { self.api.stream_wait_event(main_stream, done)? };
+                    }
+                    Ok(())
+                })();
+                secondary?;
+                primary?;
+            } else {
+                self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                    q_weights,
+                    q_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qkv_llama_q4_dev,
+                    q_full_dev,
+                )?;
+                self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                    k_weights,
+                    kv_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qkv_llama_q4_dev,
+                    k_dev,
+                )?;
+                launch_v(self)?;
+                self.launch_q4k_q8_1_matmul_mmq_llama_ampere_j128_from_mmq(
+                    attention_gate_weights,
+                    q_rows,
+                    blocks_per_row,
+                    seq_len,
+                    qkv_llama_q4_dev,
+                    attention_gate_dev,
+                )?;
+            }
+        } else if shared_q8 {
             let chunks = seq_len
                 .checked_mul(blocks_per_row)
                 .ok_or_else(|| "CUDA Muse QKV Q8 chunk count overflow".to_string())?;
@@ -2283,6 +2430,7 @@ impl CudaState {
             false,
             false,
             false,
+            reuse_device_output_id,
         )?;
         Ok(Some((k_bits, v_bits, device_output)))
     }
@@ -2544,6 +2692,7 @@ impl CudaState {
             false,
             false,
             false,
+            None,
         )?;
         Ok(())
     }
@@ -3120,16 +3269,6 @@ impl CudaState {
         num_kv_heads: usize,
         scale: f32,
     ) -> Result<(), String> {
-        let chunk_size = match head_dim {
-            128 => crate::tuning::decode_attention_hd128_split_chunk_size(),
-            256 => crate::tuning::decode_attention_hd256_split_chunk_size(),
-            512 => crate::tuning::decode_attention_hd512_split_chunk_size(),
-            _ => {
-                return Err(format!(
-                    "CUDA split decode attention unsupported head_dim={head_dim}"
-                ));
-            }
-        };
         let heads_per_group = if num_kv_heads > 0 {
             num_heads / num_kv_heads
         } else {
@@ -3139,6 +3278,45 @@ impl CudaState {
             && heads_per_group >= 4
             && heads_per_group.is_multiple_of(4)
             && crate::tuning::decode_attention_hd128_gqa4_enabled();
+        let chunk_size = match head_dim {
+            128 => {
+                if let Some(chunk) = crate::tuning::decode_attention_hd128_split_chunk_override() {
+                    chunk
+                } else if hd128_gqa4 {
+                    let sm_count = match self.device_sm_count {
+                        Some(sm_count) => sm_count,
+                        None => {
+                            let sm_count =
+                                usize::try_from(unsafe { self.api.device_multiprocessor_count()? })
+                                    .map_err(|_| "CUDA SM count is negative".to_string())?;
+                            if sm_count == 0 {
+                                return Err("CUDA SM count is zero".to_string());
+                            }
+                            self.device_sm_count = Some(sm_count);
+                            sm_count
+                        }
+                    };
+                    let head_groups = (num_heads / 4).max(1);
+                    // Keep roughly three waves of GQA4 partial blocks in flight.
+                    // The chunk remains proportional to context length and actual SM count.
+                    let target_chunks = sm_count.saturating_mul(3).div_ceil(head_groups).max(1);
+                    window_len
+                        .div_ceil(target_chunks)
+                        .div_ceil(8)
+                        .saturating_mul(8)
+                        .clamp(8, 512)
+                } else {
+                    128
+                }
+            }
+            256 => crate::tuning::decode_attention_hd256_split_chunk_size(),
+            512 => crate::tuning::decode_attention_hd512_split_chunk_size(),
+            _ => {
+                return Err(format!(
+                    "CUDA split decode attention unsupported head_dim={head_dim}"
+                ));
+            }
+        };
         let num_chunks = window_len.div_ceil(chunk_size);
         let partial_values = num_heads
             .checked_mul(num_chunks)

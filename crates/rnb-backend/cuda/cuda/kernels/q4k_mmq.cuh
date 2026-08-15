@@ -1019,8 +1019,8 @@ rnb_q4k_q8_1_matmul_mmq_transposed_seq128(
     const unsigned t_row_a = lane >> 2;
     const unsigned t_row_b = t_row_a + 8u;
 
-    __shared__ unsigned x_packed[128][32];
-    __shared__ float2 x_dm[4][128];
+    __shared__ unsigned x_packed[128][33];
+    __shared__ float2 x_dm[8][128];
     __shared__ int y_qs[4][16][8][8];
     __shared__ float2 y_meta[4][128];
 
@@ -1043,63 +1043,60 @@ rnb_q4k_q8_1_matmul_mmq_transposed_seq128(
         }
 
         for (unsigned block = 0; block < blocks_per_row; ++block) {
-            // Each warp loads one contiguous 128-byte qs payload at a time.
-            // Sixteen passes cover the 128 output rows.
 #pragma unroll
             for (unsigned pass = 0; pass < 16u; ++pass) {
                 const unsigned local_row = warp + pass * 8u;
                 const unsigned global_row = row_base + local_row;
-                const unsigned word = lane;
                 unsigned packed_qs = 0u;
                 if (global_row < rows) {
                     const unsigned char* packed =
                         weights + global_row * row_bytes + block * 144u;
                     packed_qs = *reinterpret_cast<const unsigned*>(
-                        packed + 16u + word * 4u);
+                        packed + 16u + lane * 4u);
                 }
-                x_packed[local_row][word] = packed_qs;
+                x_packed[local_row][lane] = packed_qs;
+            }
+
+            if (tid < 128u) {
+                const unsigned global_row = row_base + tid;
+                if (global_row < rows) {
+                    const unsigned char* packed =
+                        weights + global_row * row_bytes + block * 144u;
+                    const uint4 meta = *reinterpret_cast<const uint4*>(packed);
+                    const float d = __half2float(
+                        __ushort_as_half(static_cast<unsigned short>(meta.x & 0xffffu)));
+                    const float dmin = __half2float(
+                        __ushort_as_half(static_cast<unsigned short>(meta.x >> 16)));
+#pragma unroll
+                    for (unsigned sub = 0; sub < 8u; ++sub) {
+                        unsigned scale;
+                        unsigned min_scale;
+                        if (sub < 4u) {
+                            const unsigned shift = sub * 8u;
+                            scale = (meta.y >> shift) & 63u;
+                            min_scale = (meta.z >> shift) & 63u;
+                        } else {
+                            const unsigned shift = (sub - 4u) * 8u;
+                            const unsigned lo = (meta.y >> shift) & 0xffu;
+                            const unsigned hi = (meta.z >> shift) & 0xffu;
+                            const unsigned mixed = (meta.w >> shift) & 0xffu;
+                            scale = (mixed & 0x0fu) | ((lo >> 6) << 4);
+                            min_scale = (mixed >> 4) | ((hi >> 6) << 4);
+                        }
+                        x_dm[sub][tid] = make_float2(
+                            d * static_cast<float>(scale),
+                            -dmin * static_cast<float>(min_scale));
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned sub = 0; sub < 8u; ++sub) {
+                        x_dm[sub][tid] = make_float2(0.0f, 0.0f);
+                    }
+                }
             }
 
 #pragma unroll
             for (unsigned half = 0; half < 2u; ++half) {
-                if (tid < 128u) {
-                    const unsigned global_row = row_base + tid;
-                    if (global_row < rows) {
-                        const unsigned char* packed =
-                            weights + global_row * row_bytes + block * 144u;
-                        const unsigned raw_d = static_cast<unsigned>(packed[0])
-                            | (static_cast<unsigned>(packed[1]) << 8);
-                        const unsigned raw_dmin = static_cast<unsigned>(packed[2])
-                            | (static_cast<unsigned>(packed[3]) << 8);
-                        const float d = __half2float(
-                            __ushort_as_half(static_cast<unsigned short>(raw_d)));
-                        const float dmin = __half2float(
-                            __ushort_as_half(static_cast<unsigned short>(raw_dmin)));
-#pragma unroll
-                        for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
-                            const unsigned sub = half * 4u + local_sub;
-                            unsigned scale;
-                            unsigned min_scale;
-                            if (sub < 4u) {
-                                scale = packed[4u + sub] & 63u;
-                                min_scale = packed[8u + sub] & 63u;
-                            } else {
-                                scale = (packed[8u + sub] & 0x0fu)
-                                    | ((packed[sub] >> 6) << 4);
-                                min_scale = (packed[8u + sub] >> 4)
-                                    | ((packed[4u + sub] >> 6) << 4);
-                            }
-                            x_dm[local_sub][tid] = make_float2(
-                                d * static_cast<float>(scale),
-                                -dmin * static_cast<float>(min_scale));
-                        }
-                    } else {
-#pragma unroll
-                        for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
-                            x_dm[local_sub][tid] = make_float2(0.0f, 0.0f);
-                        }
-                    }
-                }
 
                 // Four 32-value sub-blocks x 128 sequences.
                 for (unsigned item = tid; item < 4096u; item += 256u) {
@@ -1128,28 +1125,29 @@ rnb_q4k_q8_1_matmul_mmq_transposed_seq128(
                     y_meta[local_sub][local_seq] = meta;
                 }
                 __syncthreads();
+                const unsigned word_lo = lane & 3u;
+
 
 #pragma unroll
                 for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
                     const unsigned sub = half * 4u + local_sub;
                     const unsigned pair = sub >> 1;
-                    const unsigned shift = (sub & 1u) * 4u;
-                    const unsigned word_lo = lane & 3u;
                     const unsigned word_base = pair * 8u + word_lo;
+                    const unsigned shift = (sub & 1u) * 4u;
                     const int a0 = static_cast<int>(
-                        (x_packed[warp_row_off + t_row_a][word_base] >> shift)
-                        & 0x0f0f0f0fu);
+                        (x_packed[warp_row_off + t_row_a][word_base] >> shift) &
+                        0x0f0f0f0fu);
                     const int a1 = static_cast<int>(
-                        (x_packed[warp_row_off + t_row_b][word_base] >> shift)
-                        & 0x0f0f0f0fu);
+                        (x_packed[warp_row_off + t_row_b][word_base] >> shift) &
+                        0x0f0f0f0fu);
                     const int a2 = static_cast<int>(
-                        (x_packed[warp_row_off + t_row_a][word_base + 4u] >> shift)
-                        & 0x0f0f0f0fu);
+                        (x_packed[warp_row_off + t_row_a][word_base + 4u] >> shift) &
+                        0x0f0f0f0fu);
                     const int a3 = static_cast<int>(
-                        (x_packed[warp_row_off + t_row_b][word_base + 4u] >> shift)
-                        & 0x0f0f0f0fu);
-                    const float2 dm_a = x_dm[local_sub][warp_row_off + t_row_a];
-                    const float2 dm_b = x_dm[local_sub][warp_row_off + t_row_b];
+                        (x_packed[warp_row_off + t_row_b][word_base + 4u] >> shift) &
+                        0x0f0f0f0fu);
+                    const float2 dm_a = x_dm[sub][warp_row_off + t_row_a];
+                    const float2 dm_b = x_dm[sub][warp_row_off + t_row_b];
 
 #pragma unroll
                     for (unsigned frag = 0; frag < 16u; ++frag) {
@@ -1206,6 +1204,172 @@ rnb_q4k_q8_1_matmul_mmq_transposed_seq128(
             if (row_b < rows && seq_b < seq_len) {
                 out[seq_b * rows + row_b] = acc[frag * 4u + 3u];
             }
+        }
+    }
+#endif
+}
+
+// Adapted from llama.cpp/ggml-cuda's current Ampere Q4_K MMQ configuration:
+// non-fallback, no-MUL_MAT_ID, I=128/J=128, eight warps and occupancy one.
+// RnbBlockQ8_1Mmq keeps the upstream 128-value transposed+padded activation
+// contract locally; the older runNburn transposed MMQ kernel above remains the
+// diagnostic fallback.
+extern "C" __global__ void __launch_bounds__(256, 1)
+rnb_q4k_q8_1_matmul_mmq_llama_ampere_j128(
+    float* __restrict__ out,
+    const unsigned char* __restrict__ weights,
+    const RnbBlockQ8_1Mmq* __restrict__ input,
+    unsigned rows,
+    unsigned blocks_per_row,
+    unsigned seq_len) {
+#if __CUDA_ARCH__ < 800
+    (void)out; (void)weights; (void)input; (void)rows; (void)blocks_per_row; (void)seq_len;
+    return;
+#else
+    const unsigned tid = threadIdx.x;
+    const unsigned warp = tid >> 5;
+    const unsigned lane = tid & 31u;
+    const unsigned warp_row_off = warp * 16u;
+    const unsigned row_tiles = (rows + 127u) / 128u;
+    const unsigned seq_tiles = (seq_len + 127u) / 128u;
+    const unsigned tile_count = row_tiles * seq_tiles;
+    const unsigned row_bytes = blocks_per_row * 144u;
+
+    __shared__ unsigned x_packed[128][33];
+    __shared__ float2 x_dm[8][128];
+    __shared__ int y_qs[4][16][8][8];
+    __shared__ float2 y_meta[4][128];
+
+    for (unsigned tile = blockIdx.x; tile < tile_count; tile += gridDim.x) {
+        const unsigned row_tile = tile / seq_tiles;
+        const unsigned seq_tile = tile - row_tile * seq_tiles;
+        const unsigned row_base = row_tile * 128u;
+        const unsigned seq_base = seq_tile * 128u;
+        const unsigned row_a = row_base + warp_row_off + (lane >> 2);
+        const unsigned row_b = row_a + 8u;
+        float acc[64];
+#pragma unroll
+        for (unsigned i = 0; i < 64u; ++i) acc[i] = 0.0f;
+
+        for (unsigned block = 0; block < blocks_per_row; ++block) {
+#pragma unroll
+            for (unsigned pass = 0; pass < 16u; ++pass) {
+                const unsigned local_row = warp + pass * 8u;
+                const unsigned global_row = row_base + local_row;
+                unsigned packed_qs = 0u;
+                if (global_row < rows) {
+                    packed_qs = *reinterpret_cast<const unsigned*>(
+                        weights + global_row * row_bytes + block * 144u + 16u + lane * 4u);
+                }
+                x_packed[local_row][lane] = packed_qs;
+            }
+            if (tid < 128u) {
+                const unsigned global_row = row_base + tid;
+                if (global_row < rows) {
+                    const unsigned char* packed = weights + global_row * row_bytes + block * 144u;
+                    const uint4 meta = *reinterpret_cast<const uint4*>(packed);
+                    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(meta.x)));
+                    const float dmin = __half2float(
+                        __ushort_as_half(static_cast<unsigned short>(meta.x >> 16)));
+#pragma unroll
+                    for (unsigned sub = 0; sub < 8u; ++sub) {
+                        unsigned scale;
+                        unsigned minimum;
+                        if (sub < 4u) {
+                            scale = (meta.y >> (sub * 8u)) & 63u;
+                            minimum = (meta.z >> (sub * 8u)) & 63u;
+                        } else {
+                            const unsigned shift = (sub - 4u) * 8u;
+                            const unsigned lo = (meta.y >> shift) & 0xffu;
+                            const unsigned hi = (meta.z >> shift) & 0xffu;
+                            const unsigned mixed = (meta.w >> shift) & 0xffu;
+                            scale = (mixed & 0x0fu) | ((lo >> 6) << 4);
+                            minimum = (mixed >> 4) | ((hi >> 6) << 4);
+                        }
+                        x_dm[sub][tid] = make_float2(
+                            d * static_cast<float>(scale), -dmin * static_cast<float>(minimum));
+                    }
+                } else {
+#pragma unroll
+                    for (unsigned sub = 0; sub < 8u; ++sub) x_dm[sub][tid] = make_float2(0.0f, 0.0f);
+                }
+            }
+
+#pragma unroll
+            for (unsigned half = 0; half < 2u; ++half) {
+                for (unsigned item = tid; item < 4096u; item += 256u) {
+                    const unsigned local_sub = item >> 10;
+                    const unsigned local = item & 1023u;
+                    const unsigned local_seq = local >> 3;
+                    const unsigned word = local & 7u;
+                    const unsigned global_seq = seq_base + local_seq;
+                    int qword = 0;
+                    if (global_seq < seq_len) {
+                        const RnbBlockQ8_1Mmq* source =
+                            input + (unsigned long long)(block * 2u + half) * seq_len + global_seq;
+                        qword = reinterpret_cast<const int*>(source->qs + local_sub * 32u)[word];
+                    }
+                    y_qs[local_sub][local_seq >> 3][word][local_seq & 7u] = qword;
+                }
+                for (unsigned item = tid; item < 512u; item += 256u) {
+                    const unsigned local_sub = item >> 7;
+                    const unsigned local_seq = item & 127u;
+                    const unsigned global_seq = seq_base + local_seq;
+                    float2 meta = make_float2(0.0f, 0.0f);
+                    if (global_seq < seq_len) {
+                        const RnbBlockQ8_1Mmq* source =
+                            input + (unsigned long long)(block * 2u + half) * seq_len + global_seq;
+                        meta = __half22float2(source->ds4[local_sub]);
+                    }
+                    y_meta[local_sub][local_seq] = meta;
+                }
+                __syncthreads();
+
+                const unsigned word_lo = lane & 3u;
+#pragma unroll
+                for (unsigned local_sub = 0; local_sub < 4u; ++local_sub) {
+                    const unsigned sub = half * 4u + local_sub;
+                    const unsigned pair = sub >> 1;
+                    const unsigned word_base = pair * 8u + word_lo;
+                    const unsigned shift = (sub & 1u) * 4u;
+                    const int a0 = static_cast<int>(
+                        (x_packed[warp_row_off + (lane >> 2)][word_base] >> shift) & 0x0f0f0f0fu);
+                    const int a1 = static_cast<int>(
+                        (x_packed[warp_row_off + (lane >> 2) + 8u][word_base] >> shift) & 0x0f0f0f0fu);
+                    const int a2 = static_cast<int>(
+                        (x_packed[warp_row_off + (lane >> 2)][word_base + 4u] >> shift) & 0x0f0f0f0fu);
+                    const int a3 = static_cast<int>(
+                        (x_packed[warp_row_off + (lane >> 2) + 8u][word_base + 4u] >> shift) & 0x0f0f0f0fu);
+                    const float2 dm_a = x_dm[sub][warp_row_off + (lane >> 2)];
+                    const float2 dm_b = x_dm[sub][warp_row_off + (lane >> 2) + 8u];
+#pragma unroll
+                    for (unsigned frag = 0; frag < 16u; ++frag) {
+                        const unsigned seq_in_group = lane >> 2;
+                        const int b0 = y_qs[local_sub][frag][word_lo][seq_in_group];
+                        const int b1 = y_qs[local_sub][frag][word_lo + 4u][seq_in_group];
+                        int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+                        rnb_mma_m16n8k32_s8(dot0, dot1, dot2, dot3, a0, a1, a2, a3, b0, b1, 0, 0, 0, 0);
+                        const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+                        const unsigned col_b = col_a + 1u;
+                        const float2 meta_a = y_meta[local_sub][col_a];
+                        const float2 meta_b = y_meta[local_sub][col_b];
+                        acc[frag * 4u] += dm_a.x * meta_a.x * static_cast<float>(dot0) + dm_a.y * meta_a.y;
+                        acc[frag * 4u + 1u] += dm_a.x * meta_b.x * static_cast<float>(dot1) + dm_a.y * meta_b.y;
+                        acc[frag * 4u + 2u] += dm_b.x * meta_a.x * static_cast<float>(dot2) + dm_b.y * meta_a.y;
+                        acc[frag * 4u + 3u] += dm_b.x * meta_b.x * static_cast<float>(dot3) + dm_b.y * meta_b.y;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+#pragma unroll
+        for (unsigned frag = 0; frag < 16u; ++frag) {
+            const unsigned col_a = frag * 8u + ((lane & 3u) << 1);
+            const unsigned col_b = col_a + 1u;
+            if (row_a < rows && seq_base + col_a < seq_len) out[(seq_base + col_a) * rows + row_a] = acc[frag * 4u];
+            if (row_a < rows && seq_base + col_b < seq_len) out[(seq_base + col_b) * rows + row_a] = acc[frag * 4u + 1u];
+            if (row_b < rows && seq_base + col_a < seq_len) out[(seq_base + col_a) * rows + row_b] = acc[frag * 4u + 2u];
+            if (row_b < rows && seq_base + col_b < seq_len) out[(seq_base + col_b) * rows + row_b] = acc[frag * 4u + 3u];
         }
     }
 #endif

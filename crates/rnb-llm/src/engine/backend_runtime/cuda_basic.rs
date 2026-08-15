@@ -4911,6 +4911,34 @@ pub(in crate::engine) fn prewarm_dense_q4_packed_gate_up_weights(
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
+pub(in crate::engine) fn promote_muse_decode_tail_after_prefill(
+    weights: &ModelWeights,
+) -> crate::error::Result<Option<(usize, usize)>> {
+    #[cfg(feature = "cuda")]
+    {
+        let requests = collect_cuda_product_prewarm_requests(weights, true);
+        let (newly_warmed, gpu_ffn_layers) =
+            cuda_runtime::prewarm_q4k_weight_slices_pinned_complete_groups(
+                &requests.q4_raw,
+                &requests.q4_raw_ffn_layer_ends,
+            )
+            .map_err(cuda_error)?;
+        let gpu_attention_layers = requests.q4_raw_attention_layer_ends.len();
+        if newly_warmed > 0 {
+            eprintln!(
+                "[INFO] CUDA Muse decode tail promoted after prefill: \
+                 {newly_warmed} raw quant weights, GPU FFN layers: \
+                 {gpu_ffn_layers}/{}",
+                requests.q4_raw_ffn_layer_ends.len()
+            );
+        }
+        return Ok(Some((gpu_attention_layers, gpu_ffn_layers)));
+    }
+    #[cfg(not(feature = "cuda"))]
+    Ok(None)
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code, unused_variables))]
 pub(in crate::engine) fn prewarm_prefill_q4_f32_projection_weights(
     _weights: &ModelWeights,
 ) -> crate::error::Result<()> {

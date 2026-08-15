@@ -145,6 +145,18 @@ impl CudaState {
         Ok(())
     }
 
+    pub(in crate::runtime) fn configure_decode_residency_reserve(&mut self, reserve_bytes: usize) {
+        let current = self.device_residency_plan;
+        if reserve_bytes >= current.dynamic_reserve_bytes {
+            return;
+        }
+        self.device_residency_plan = rnb_memory::DeviceResidencyPlan::from_snapshot(
+            current.total_bytes,
+            current.initial_free_bytes,
+            reserve_bytes,
+        );
+    }
+
     fn clear_low_priority_resident_caches(&mut self) -> Result<usize, String> {
         let before = self.resident_cache_bytes();
 

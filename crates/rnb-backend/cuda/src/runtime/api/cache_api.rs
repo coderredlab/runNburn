@@ -176,6 +176,17 @@ pub fn clear_sequence_state_cache() -> Result<(), String> {
     state.clear_resident_delta_states()
 }
 
+pub fn release_prefill_compute_buffers() -> Result<usize, String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    let Some(state) = guard.as_mut() else {
+        return Ok(0);
+    };
+    state.release_prefill_compute_buffers()
+}
+
 pub fn release_q4_f32_after_prefill() -> Result<(), String> {
     if !tuning::q4k_prefill_f32_gemm_enabled() || !tuning::q4_f32_release_after_prefill_enabled() {
         return Ok(());
