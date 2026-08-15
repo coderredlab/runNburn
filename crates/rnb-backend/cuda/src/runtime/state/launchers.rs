@@ -6445,6 +6445,8 @@ impl CudaState {
         activation_mmq_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        crate::runtime::test_support::record_q4k_llama_mmq_j128_launch();
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
@@ -6860,6 +6862,8 @@ impl CudaState {
         activation_mmq_dev: u64,
         output_dev: u64,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        crate::runtime::test_support::record_q6k_llama_mmq_j128_launch();
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;

@@ -1083,6 +1083,35 @@ impl Engine {
         let prof_level = super::policy::profiling_level();
         let profiling = prof_level >= 1;
         let verbose = prof_level >= 2;
+        let mtp_collect_hidden = self.mtp_spec_requested();
+        #[cfg(feature = "cuda")]
+        let full_device_decode_requested = {
+            let metadata = &self.metadata;
+            let architecture = self.architecture;
+            let weights = self.weights.as_ref().expect("loaded weights checked");
+            let gemma_e2b = matches!(architecture, ModelArchitecture::Gemma4)
+                && metadata.hidden_dim == 1536
+                && metadata.head_dim == 512
+                && metadata.num_heads == 8
+                && metadata.num_kv_heads == 1
+                && cuda_runtime::cu63_device_decode_enabled();
+            let muse = !mtp_collect_hidden
+                && crate::engine::policy::cuda_decode_device_chain_enabled()
+                && muse_full_device_decode_supported(metadata, architecture, weights);
+            (gemma_e2b || muse)
+                && self
+                    .backend_runtime
+                    .decode_all_layers_use_gpu(metadata.num_layers)
+        };
+        #[cfg(feature = "cuda")]
+        if self
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.cuda_decode_kv_authoritative)
+            && !full_device_decode_requested
+        {
+            self.materialize_sequence_state()?;
+        }
         // Take scratch out of self to avoid borrow issues with kv_cache/metadata
         let mut scratch = self.scratch.take().expect("ScratchBuffers not initialized");
         scratch.backend_argmax_only = backend_argmax_only;
@@ -1192,27 +1221,16 @@ impl Engine {
         #[cfg(feature = "vulkan")]
         let backend_max_layer = self.decode_backend_max_layer();
         let use_backend_output_logits = backend_runtime::output_logits_enabled_for_runtime();
-        let mtp_collect_hidden = self.mtp_spec_requested();
-        #[cfg(feature = "cuda")]
-        let all_decode_layers_on_gpu = self
-            .backend_runtime
-            .decode_all_layers_use_gpu(metadata.num_layers);
         let kv_cache = &mut self.kv_cache;
 
         let decode_result: crate::error::Result<Option<Vec<f32>>> = (|| {
             #[cfg(feature = "cuda")]
-            let full_device_decode_requested = {
-                let gemma_e2b = matches!(architecture, ModelArchitecture::Gemma4)
-                    && metadata.hidden_dim == 1536
-                    && metadata.head_dim == 512
-                    && metadata.num_heads == 8
-                    && metadata.num_kv_heads == 1
-                    && cuda_runtime::cu63_device_decode_enabled();
-                let muse = !mtp_collect_hidden
-                    && crate::engine::policy::cuda_decode_device_chain_enabled()
-                    && muse_full_device_decode_supported(metadata, architecture, weights);
-                (gemma_e2b || muse) && all_decode_layers_on_gpu
-            };
+            if full_device_decode_requested
+                && matches!(architecture, ModelArchitecture::MuseGlimmer)
+            {
+                cuda_runtime::begin_muse_decode_residency_lifecycle()
+                    .map_err(crate::error::LlmError::Forward)?;
+            }
 
             // Keep the device KV cache authoritative across decode steps. Re-upload host
             // state only after a sequence reset/restore or when another path invalidated it.
@@ -1327,12 +1345,10 @@ impl Engine {
                     let sliding_window = muse
                         .then(|| active_sliding_window(metadata, architecture, layer_idx))
                         .flatten();
-                    let layer_out_scale = w
-                        .out_scale
-                        .as_ref()
-                        .map(kernels::tensor_as_f32_slice)
-                        .and_then(|values| values.first().copied())
-                        .unwrap_or(1.0);
+                    let layer_out_scale =
+                        active_layer_output_scale(w.out_scale.as_ref(), layer_idx)
+                            .map(|scale| scale[0])
+                            .unwrap_or(1.0);
                     cuda_runtime::decode_full_layer_device_resident(
                         layer_idx,
                         q_raw,
@@ -1390,6 +1406,7 @@ impl Engine {
                 )
                 .map_err(crate::error::LlmError::Forward)?;
                 cuda_runtime::sync_decode_stream().map_err(crate::error::LlmError::Forward)?;
+                scratch.cuda_decode_kv_authoritative = true;
                 true
             } else {
                 false

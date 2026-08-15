@@ -1113,8 +1113,14 @@ pub fn prewarm_q4k_weights_pinned_complete_groups(
     let state = guard.as_mut().expect("cuda compute state initialized");
     let (free_bytes, total_bytes) = unsafe { state.api.mem_get_info() }?;
     let mib = 1024 * 1024;
-    let reserve_bytes =
+    state.begin_muse_decode_tail_residency();
+    let tail_reserve =
         super::super::state::decode_tail_reserve_mib(total_bytes / mib).saturating_mul(mib);
+    let reserve_bytes = if std::env::var("RNB_CUDA_Q4K_CACHE_RESERVE_MB").is_ok() {
+        tail_reserve.max(state.device_residency_plan.dynamic_reserve_bytes)
+    } else {
+        tail_reserve
+    };
     state.configure_decode_residency_reserve(reserve_bytes);
     let free_budget = free_bytes.saturating_sub(reserve_bytes);
     let cache_budget = if std::env::var("RNB_CUDA_Q4K_CACHE_MB").is_err() {
@@ -1168,7 +1174,15 @@ pub fn prewarm_q4k_weights_pinned_complete_groups(
         for weight in group {
             let was_resident = state.q4k_weight_slice_is_resident(weight);
             match state.resident_q4k_weights_ptr_pinned_with_lease(weight) {
-                Ok(_) => newly_warmed += usize::from(!was_resident),
+                Ok((_ptr, new_pin)) => {
+                    newly_warmed += usize::from(!was_resident);
+                    if let Some(key) = new_pin {
+                        state.muse_decode_tail_pinned_keys.push(key);
+                        if !was_resident {
+                            state.muse_decode_tail_uploaded_keys.push(key);
+                        }
+                    }
+                }
                 Err(err) if err.contains("pinned resident Q4_K admission failed") => {
                     state.stream_synchronize()?;
                     return Ok((newly_warmed, complete_groups));

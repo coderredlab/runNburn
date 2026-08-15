@@ -87,6 +87,8 @@ pub(crate) struct ScratchBuffers {
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(super) fullpath_resident_kv_active: bool,
     #[cfg(feature = "cuda")]
+    pub(super) cuda_decode_kv_authoritative: bool,
+    #[cfg(feature = "cuda")]
     pub(super) device_verify_static_weights_warmed: bool,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(super) arch_scratch: quantized_dispatch::ArchScratchBuffers,
@@ -170,6 +172,8 @@ impl ScratchBuffers {
             backend_argmax_excluded_token: None,
             backend_argmax_only: false,
             fullpath_resident_kv_active: false,
+            #[cfg(feature = "cuda")]
+            cuda_decode_kv_authoritative: false,
             #[cfg(feature = "cuda")]
             device_verify_static_weights_warmed: false,
             arch_scratch: quantized_dispatch::ArchScratchBuffers::new(hidden_dim, ffn_inner_dim),

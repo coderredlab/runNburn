@@ -408,6 +408,132 @@ impl CudaState {
         }
     }
 
+    fn clear_muse_decode_weight_graphs(&mut self) -> Result<(), String> {
+        if self.cu65_qkv_graphs.is_empty()
+            && self.dense_expert_graphs.is_empty()
+            && self.cu69_dense_chain_graphs.is_empty()
+            && self.cu71_layer_segment_graphs.is_empty()
+        {
+            self.cu65_qkv_graph_warmed.clear();
+            self.dense_expert_graph_warmed.clear();
+            self.cu69_dense_chain_graph_warmed.clear();
+            self.cu71_layer_segment_graph_warmed.clear();
+            return Ok(());
+        }
+        self.stream_synchronize()?;
+        let mut first_error = None;
+        for graph in self
+            .cu65_qkv_graphs
+            .drain()
+            .map(|(_, graph)| graph)
+            .chain(self.dense_expert_graphs.drain().map(|(_, graph)| graph))
+            .chain(self.cu69_dense_chain_graphs.drain().map(|(_, graph)| graph))
+            .chain(
+                self.cu71_layer_segment_graphs
+                    .drain()
+                    .map(|(_, graph)| graph),
+            )
+        {
+            for result in unsafe {
+                [
+                    self.api.graph_exec_destroy(graph.exec as *mut libc::c_void),
+                    self.api.graph_destroy(graph.graph as *mut libc::c_void),
+                ]
+            } {
+                if let Err(err) = result {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        self.cu65_qkv_graph_warmed.clear();
+        self.dense_expert_graph_warmed.clear();
+        self.cu69_dense_chain_graph_warmed.clear();
+        self.cu71_layer_segment_graph_warmed.clear();
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    pub(in crate::runtime) fn release_muse_decode_tail_residency(
+        &mut self,
+    ) -> Result<usize, String> {
+        self.release_muse_decode_tail_residency_inner(true)
+    }
+
+    pub(in crate::runtime) fn release_muse_decode_tail_residency_for_oom(
+        &mut self,
+    ) -> Result<usize, String> {
+        self.release_muse_decode_tail_residency_inner(false)
+    }
+
+    fn release_muse_decode_tail_residency_inner(
+        &mut self,
+        restore_base: bool,
+    ) -> Result<usize, String> {
+        let had_base = self.muse_decode_tail_base_residency.is_some();
+        let pinned_keys = std::mem::take(&mut self.muse_decode_tail_pinned_keys);
+        let uploaded_keys = std::mem::take(&mut self.muse_decode_tail_uploaded_keys);
+        let mut released = 0usize;
+        for key in pinned_keys {
+            if let Some(entry) = self.resident_q4k.get_mut(&key) {
+                released += usize::from(entry.pinned);
+                entry.pinned = false;
+            }
+        }
+        if !restore_base && had_base {
+            for entry in self.resident_q4k.values_mut() {
+                released += usize::from(entry.pinned);
+                entry.pinned = false;
+            }
+        }
+        let eviction_result = (|| {
+            if !uploaded_keys.is_empty() || (!restore_base && had_base) {
+                self.clear_muse_decode_weight_graphs()?;
+            }
+            if !uploaded_keys.is_empty() {
+                self.stream_synchronize()?;
+            }
+            for key in uploaded_keys {
+                if self
+                    .resident_q4k
+                    .get(&key)
+                    .is_some_and(|entry| !entry.pinned)
+                {
+                    if let Some(entry) = self.resident_q4k.remove(&key) {
+                        let _ = self.free_resident_q4k_entry(&entry)?;
+                        cache_stats().evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            self.release_resident_q4k_arena_if_unreferenced()?;
+            self.refresh_resident_q4k_bytes();
+            let resident_q4k = &self.resident_q4k;
+            self.resident_q4k_lru
+                .retain(|(key, epoch)| resident_q4k.get(key).is_some_and(|e| e.epoch == *epoch));
+            Ok::<(), String>(())
+        })();
+
+        if restore_base {
+            if let Some((plan, q4k_limit)) = self.muse_decode_tail_base_residency.take() {
+                self.device_residency_plan = plan;
+                self.resident_q4k_limit = q4k_limit;
+            }
+            self.muse_decode_tail_streaming = false;
+        } else if had_base {
+            self.muse_decode_tail_streaming = true;
+        }
+        eviction_result?;
+        if !restore_base && had_base {
+            self.stream_synchronize()?;
+            let _ = self.clear_low_priority_resident_caches()?;
+            let _ = self.offload_non_pinned_resident_q4k()?;
+        } else if restore_base && had_base {
+            self.evict_resident_q4k_until(0)?;
+        }
+        Ok(released)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::runtime) fn resident_q4k_weights_ptr_current_arena(
         &mut self,

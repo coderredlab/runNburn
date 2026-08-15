@@ -903,6 +903,18 @@ pub fn clear_sequence_state_cache() -> Result<()> {
     backend::clear_sequence_state_cache().map_err(|err| err)
 }
 
+pub fn begin_muse_decode_residency_lifecycle() -> Result<()> {
+    backend::begin_muse_decode_residency_lifecycle()
+}
+
+pub fn muse_decode_tail_reserve_bytes() -> Result<Option<usize>> {
+    backend::muse_decode_tail_reserve_bytes()
+}
+
+pub fn release_muse_decode_tail_residency() -> Result<usize> {
+    backend::release_muse_decode_tail_residency()
+}
+
 pub fn release_prefill_compute_buffers() -> Result<usize> {
     backend::release_prefill_compute_buffers().map_err(|err| err)
 }

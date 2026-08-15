@@ -177,6 +177,10 @@ impl Engine {
     pub fn clear_sequence_state(&mut self) -> crate::error::Result<()> {
         let has_loaded_model = self.has_weights();
         self.kv_cache.clear();
+        #[cfg(feature = "cuda")]
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.cuda_decode_kv_authoritative = false;
+        }
         self.sequence_cursor = None;
         if let Some(model) = self
             .weights
@@ -250,6 +254,9 @@ impl Engine {
                     .map_err(crate::error::LlmError::Forward)?;
                 cuda_runtime::sync_delta_state_cache(&mut state.delta_state)
                     .map_err(crate::error::LlmError::Forward)?;
+            }
+            if let Some(scratch) = self.scratch.as_mut() {
+                scratch.cuda_decode_kv_authoritative = false;
             }
         }
         #[cfg(all(feature = "metal", not(feature = "cuda")))]

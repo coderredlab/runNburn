@@ -208,6 +208,7 @@ pub fn q4k_llama_ampere_mmq_j128_enabled(
 ) -> bool {
     compiled_ampere_mma_supported()
         && seq_len >= 128
+        && seq_len <= u16::MAX as usize
         && rows >= 128
         && blocks_per_row >= 4
         && !dflash_exact_verify_active()
@@ -268,6 +269,7 @@ pub fn q6k_llama_ampere_mmq_j128_enabled(
 ) -> bool {
     compiled_ampere_mma_supported()
         && seq_len >= 128
+        && seq_len <= u16::MAX as usize
         && rows >= 128
         && blocks_per_row >= 4
         && !dflash_exact_verify_active()
@@ -3435,6 +3437,13 @@ mod tests {
             std::env::remove_var("RNB_CUDA_MTP_EXPERT_HOT_RESIDENT");
             std::env::remove_var("RNB_MTP_DEVICE_VERIFY");
         }
+    }
+
+    #[test]
+    fn llama_ampere_mmq_j128_rejects_cuda_grid_y_overflow() {
+        let oversized_seq = u16::MAX as usize + 1;
+        assert!(!q4k_llama_ampere_mmq_j128_enabled(oversized_seq, 128, 4));
+        assert!(!q6k_llama_ampere_mmq_j128_enabled(oversized_seq, 128, 4));
     }
 
     #[test]

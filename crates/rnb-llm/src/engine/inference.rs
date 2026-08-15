@@ -520,78 +520,164 @@ impl Engine {
         Ok(logits)
     }
 
+    fn finish_prefill_residency<T>(
+        &mut self,
+        result: crate::error::Result<T>,
+    ) -> crate::error::Result<T> {
+        let release_compute_buffers =
+            matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer)
+                && !self
+                    .backend_runtime
+                    .decode_all_layers_use_gpu(self.metadata.num_layers);
+        let cleanup = super::backend_runtime::release_prefill_residency_after_prefill(
+            self.architecture,
+            release_compute_buffers,
+        )
+        .and_then(|()| {
+            if release_compute_buffers && result.is_ok() {
+                let weights = self.weights.as_ref().ok_or_else(|| {
+                    crate::error::LlmError::Forward(
+                        "Muse decode tail promotion requires loaded weights".to_string(),
+                    )
+                })?;
+                if let Some(prefixes) =
+                    super::backend_runtime::promote_muse_decode_tail_after_prefill(weights)?
+                {
+                    self.backend_runtime
+                        .set_decode_gpu_layer_prefixes(Some(prefixes));
+                }
+            }
+            Ok(())
+        });
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(crate::error::LlmError::Forward(format!(
+                "{error}; prefill residency cleanup failed: {cleanup}"
+            ))),
+        }
+    }
+
+    fn prepare_residency_before_prefill(&mut self) -> crate::error::Result<()> {
+        if matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer) {
+            self.backend_runtime
+                .restore_initial_decode_gpu_layer_prefixes();
+        }
+        super::backend_runtime::prepare_residency_before_prefill(self.architecture)
+    }
+
     pub fn forward_prefill_all_logits(
         &mut self,
         tokens: &[u32],
     ) -> crate::error::Result<Vec<Vec<f32>>> {
-        let weights = match &self.weights {
-            Some(w) => w,
-            None => {
-                // Mock path: 각 위치마다 zero logits
-                let vocab_size = self.metadata.vocab_size;
-                return Ok(vec![vec![0.0f32; vocab_size]; tokens.len()]);
-            }
+        self.forward_prefill_all_logits_impl(tokens, true)
+    }
+
+    pub fn forward_prefill_all_logits_for_verify(
+        &mut self,
+        tokens: &[u32],
+    ) -> crate::error::Result<Vec<Vec<f32>>> {
+        let release_tail = if matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer) {
+            let required = super::mtp::mtp_verify_row_workspace_bytes(&self.metadata, tokens.len());
+            super::backend_runtime::muse_decode_tail_reserve_bytes()?
+                .is_some_and(|reserve| required > reserve)
+        } else {
+            false
         };
+        self.forward_prefill_all_logits_impl(tokens, release_tail)
+    }
 
-        let seq_len = tokens.len();
-        let pos_start = self.kv_cache.current_len();
-        let num_heads = self.metadata.num_heads;
-        let num_kv_heads = self.metadata.num_kv_heads;
-        let head_dim = self.metadata.head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let rope_theta = self.metadata.rope_theta;
-        let norm_eps = self.metadata.norm_eps;
-
-        let raw_hidden = weights.token_embd.gather(tokens)?;
-        let hidden = apply_embedding_scale(raw_hidden.clone(), &self.metadata, self.architecture);
-        let gemma_per_layer_base = prepare_gemma_per_layer_base(
-            weights,
-            if gemma_ple_pre_emb_scale_base() {
-                &raw_hidden
-            } else {
-                &hidden
-            },
-            tokens,
-            &self.metadata,
-            self.architecture,
-            norm_eps,
-        )?;
-
-        let hidden = run_prefill_layers_cpu_range(
-            &mut self.kv_cache,
-            &self.metadata,
-            self.architecture,
-            weights,
-            gemma_per_layer_base.as_ref(),
-            hidden,
-            0..self.metadata.num_layers,
-            seq_len,
-            pos_start,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_dim,
-            rope_theta,
-            norm_eps,
-        )?;
-
-        let mtp_hidden_rows = self
-            .mtp_spec_requested()
-            .then(|| kernels::tensor_as_f32_slice(&hidden).to_vec());
-        let logits = finalize_prefill_all_logits(
-            &mut self.kv_cache,
-            &self.metadata,
-            self.architecture,
-            weights,
-            hidden,
-            seq_len,
-            pos_start,
-            norm_eps,
-        )?;
-        if let Some(hidden_rows) = mtp_hidden_rows {
-            self.mtp_observe_target_batch(tokens, &hidden_rows)?;
+    fn forward_prefill_all_logits_impl(
+        &mut self,
+        tokens: &[u32],
+        release_tail: bool,
+    ) -> crate::error::Result<Vec<Vec<f32>>> {
+        if self.weights.is_none() {
+            let vocab_size = self.metadata.vocab_size;
+            return Ok(vec![vec![0.0f32; vocab_size]; tokens.len()]);
         }
-        Ok(logits)
+        #[cfg(feature = "cuda")]
+        if self
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.cuda_decode_kv_authoritative)
+        {
+            self.materialize_sequence_state()?;
+        }
+
+        if release_tail {
+            self.prepare_residency_before_prefill()?;
+        }
+        let result = (|| {
+            let weights = self.weights.as_ref().expect("loaded weights checked");
+
+            let seq_len = tokens.len();
+            let pos_start = self.kv_cache.current_len();
+            let num_heads = self.metadata.num_heads;
+            let num_kv_heads = self.metadata.num_kv_heads;
+            let head_dim = self.metadata.head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+            let rope_theta = self.metadata.rope_theta;
+            let norm_eps = self.metadata.norm_eps;
+
+            let raw_hidden = weights.token_embd.gather(tokens)?;
+            let hidden =
+                apply_embedding_scale(raw_hidden.clone(), &self.metadata, self.architecture);
+            let gemma_per_layer_base = prepare_gemma_per_layer_base(
+                weights,
+                if gemma_ple_pre_emb_scale_base() {
+                    &raw_hidden
+                } else {
+                    &hidden
+                },
+                tokens,
+                &self.metadata,
+                self.architecture,
+                norm_eps,
+            )?;
+
+            let hidden = run_prefill_layers_cpu_range(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                gemma_per_layer_base.as_ref(),
+                hidden,
+                0..self.metadata.num_layers,
+                seq_len,
+                pos_start,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                rope_theta,
+                norm_eps,
+            )?;
+
+            let mtp_hidden_rows = self
+                .mtp_spec_requested()
+                .then(|| kernels::tensor_as_f32_slice(&hidden).to_vec());
+            let logits = finalize_prefill_all_logits(
+                &mut self.kv_cache,
+                &self.metadata,
+                self.architecture,
+                weights,
+                hidden,
+                seq_len,
+                pos_start,
+                norm_eps,
+            )?;
+            if let Some(hidden_rows) = mtp_hidden_rows {
+                self.mtp_observe_target_batch(tokens, &hidden_rows)?;
+            }
+            Ok(logits)
+        })();
+        if release_tail {
+            self.finish_prefill_residency(result)
+        } else {
+            result
+        }
     }
 
     pub(crate) fn forward_prefill_argmax_tokens_collect_mtp(
@@ -1992,6 +2078,15 @@ impl Engine {
         if let Some(scratch) = self.scratch.as_mut() {
             scratch.fullpath_resident_kv_active = false;
         }
+        #[cfg(feature = "cuda")]
+        if self
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.cuda_decode_kv_authoritative)
+        {
+            self.materialize_sequence_state()?;
+        }
+        self.prepare_residency_before_prefill()?;
         super::backend_runtime::clear_host_registered_ranges_before_prefill()?;
         super::backend_runtime::clear_decode_attention_kv_cache_before_prefill()?;
         let result = (|| {
@@ -2028,39 +2123,7 @@ impl Engine {
             };
             Ok(logits)
         })();
-        let release_compute_buffers =
-            matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer)
-                && !self
-                    .backend_runtime
-                    .decode_all_layers_use_gpu(self.metadata.num_layers);
-        let cleanup = super::backend_runtime::release_prefill_residency_after_prefill(
-            self.architecture,
-            release_compute_buffers,
-        )
-        .and_then(|()| {
-            if release_compute_buffers && result.is_ok() {
-                let weights = self.weights.as_ref().ok_or_else(|| {
-                    crate::error::LlmError::Forward(
-                        "Muse decode tail promotion requires loaded weights".to_string(),
-                    )
-                })?;
-                if let Some(prefixes) =
-                    super::backend_runtime::promote_muse_decode_tail_after_prefill(weights)?
-                {
-                    self.backend_runtime
-                        .set_decode_gpu_layer_prefixes(Some(prefixes));
-                }
-            }
-            Ok(())
-        });
-        match (result, cleanup) {
-            (Ok(logits), Ok(())) => Ok(logits),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(cleanup)) => Err(cleanup),
-            (Err(error), Err(cleanup)) => Err(crate::error::LlmError::Forward(format!(
-                "{error}; prefill residency cleanup failed: {cleanup}"
-            ))),
-        }
+        self.finish_prefill_residency(result)
     }
 
     fn forward_deepseek4(&mut self, tokens: &[u32]) -> crate::error::Result<Vec<f32>> {

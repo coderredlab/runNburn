@@ -4498,6 +4498,39 @@ fn test_gemma_skip_out_scale_layer_matches_selected_layers() {
 }
 
 #[test]
+fn test_active_gemma_output_scale_preserves_zero_and_policy_disables() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    unsafe {
+        std::env::remove_var("RNB_DISABLE_GEMMA_OUT_SCALE");
+        std::env::remove_var("RNB_GEMMA_DISABLE_OUT_SCALE");
+        std::env::remove_var("RNB_GEMMA_SKIP_OUT_SCALE_LAYER");
+    }
+    let zero_scale = Tensor::from_slice(&[0.0f32], &[1]);
+    assert_eq!(
+        active_layer_output_scale(Some(&zero_scale), 7),
+        Some([0.0f32].as_slice())
+    );
+
+    unsafe {
+        std::env::set_var("RNB_DISABLE_GEMMA_OUT_SCALE", "1");
+    }
+    assert!(active_layer_output_scale(Some(&zero_scale), 7).is_none());
+    unsafe {
+        std::env::remove_var("RNB_DISABLE_GEMMA_OUT_SCALE");
+        std::env::set_var("RNB_GEMMA_DISABLE_OUT_SCALE", "1");
+    }
+    assert!(active_layer_output_scale(Some(&zero_scale), 7).is_none());
+    unsafe {
+        std::env::remove_var("RNB_GEMMA_DISABLE_OUT_SCALE");
+        std::env::set_var("RNB_GEMMA_SKIP_OUT_SCALE_LAYER", "7");
+    }
+    assert!(active_layer_output_scale(Some(&zero_scale), 7).is_none());
+    unsafe {
+        std::env::remove_var("RNB_GEMMA_SKIP_OUT_SCALE_LAYER");
+    }
+}
+
+#[test]
 fn test_gemma4_prefill_uses_f16_cache_by_default() {
     assert!(gemma4_prefill_uses_f16_cache(ModelArchitecture::Gemma4));
     assert!(!gemma4_prefill_uses_f16_cache(ModelArchitecture::Gemma));

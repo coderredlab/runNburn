@@ -1827,7 +1827,9 @@ fn run_verify_microbench(
     for _ in 0..config.rounds {
         reset_engine_to_prompt(engine, prompt_tokens);
         let start = std::time::Instant::now();
-        let _ = engine.forward_prefill_all_logits(&verify_tokens).unwrap();
+        let _ = engine
+            .forward_prefill_all_logits_for_verify(&verify_tokens)
+            .unwrap();
         batch_ms += start.elapsed().as_secs_f64() * 1000.0;
     }
 

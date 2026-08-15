@@ -1,4 +1,45 @@
 use super::*;
+fn checked_quant_weight_bytes(
+    label: &str,
+    rows: usize,
+    blocks_per_row: usize,
+    block_bytes: usize,
+) -> Result<usize, String> {
+    rows.checked_mul(blocks_per_row)
+        .and_then(|bytes| bytes.checked_mul(block_bytes))
+        .ok_or_else(|| format!("device decode {label} byte size overflow"))
+}
+
+impl CudaState {
+    fn cooperative_norms_supported(&mut self) -> bool {
+        if let Some(supported) = self.cooperative_launch_supported {
+            return supported;
+        }
+        let supported = unsafe { self.api.device_supports_cooperative_launch() }.unwrap_or(false);
+        self.cooperative_launch_supported = Some(supported);
+        supported
+    }
+
+    fn pin_full_device_layer_weights(
+        &mut self,
+        weights: &[&[u8]],
+    ) -> Result<Vec<(usize, usize)>, String> {
+        let mut leases = Vec::with_capacity(weights.len());
+        for &weight in weights {
+            match self.resident_q4k_weights_ptr_pinned_with_lease(weight) {
+                Ok((_ptr, Some(key))) => leases.push(key),
+                Ok((_ptr, None)) => {}
+                Err(err) => {
+                    for key in leases {
+                        self.unpin_resident_q4k_key(key);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(leases)
+    }
+}
 
 impl CudaState {
     #[allow(clippy::too_many_arguments)]
@@ -44,21 +85,99 @@ impl CudaState {
             || n_ff == 0
             || !n_embd.is_multiple_of(256)
             || !n_ff.is_multiple_of(256)
+            || !q_rows.is_multiple_of(256)
             || num_heads == 0
             || num_kv_heads == 0
             || num_heads % num_kv_heads != 0
             || q_rows != num_heads.saturating_mul(head_dim)
             || kv_dim != num_kv_heads.saturating_mul(head_dim)
-            || sliding_window == Some(0)
+            || [
+                n_embd,
+                n_ff,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_dim,
+                q_rows,
+                rope_pos,
+            ]
+            .into_iter()
+            .any(|value| value > u32::MAX as usize)
+            || kv_len >= u32::MAX as usize
+            || sliding_window.is_some_and(|window| window == 0 || window > u32::MAX as usize)
         {
             return Err(format!(
-                "device decode layer geometry mismatch: hidden={n_embd} ff={n_ff} q_rows={q_rows} kv_dim={kv_dim} heads={num_heads}/{num_kv_heads} head_dim={head_dim} sliding_window={sliding_window:?}"
+                "device decode layer geometry mismatch: hidden={n_embd} ff={n_ff} q_rows={q_rows} kv_dim={kv_dim} heads={num_heads}/{num_kv_heads} head_dim={head_dim} rope_pos={rope_pos} kv_len={kv_len} sliding_window={sliding_window:?}"
             ));
         }
         let input_blocks = n_embd / 256;
+        let q4_q_bytes = checked_quant_weight_bytes("Q", q_rows, input_blocks, 144)?;
+        let q4_kv_bytes = checked_quant_weight_bytes("K/V", kv_dim, input_blocks, 144)?;
+        let q6_v_bytes = checked_quant_weight_bytes("V Q6_K", kv_dim, input_blocks, 210)?;
+        let q4_o_bytes = checked_quant_weight_bytes("O", n_embd, q_rows / 256, 144)?;
+        let q4_ffn_bytes = checked_quant_weight_bytes("gate/up", n_ff, input_blocks, 144)?;
+        let q4_down_bytes = checked_quant_weight_bytes("down Q4_K", n_embd, n_ff / 256, 144)?;
+        let q6_down_bytes = checked_quant_weight_bytes("down Q6_K", n_embd, n_ff / 256, 210)?;
+        let v_q6 = match v_weights.len() {
+            len if len == q4_kv_bytes => false,
+            len if len == q6_v_bytes => true,
+            len => {
+                return Err(format!(
+                    "device decode V weight bytes mismatch: got {len}, expected Q4_K {q4_kv_bytes} or Q6_K {q6_v_bytes}"
+                ));
+            }
+        };
+        let down_quant = match down_weights.len() {
+            len if len == q4_down_bytes => 12,
+            len if len == q6_down_bytes => 14,
+            len => {
+                return Err(format!(
+                    "device decode down weight bytes mismatch: got {len}, expected Q4_K {q4_down_bytes} or Q6_K {q6_down_bytes}"
+                ));
+            }
+        };
+        let attention_gate_len_valid =
+            attention_gate_weights.is_none_or(|weight| weight.len() == q4_q_bytes);
+        let norm_lengths_valid = attn_norm.len() == n_embd
+            && ffn_norm.len() == n_embd
+            && post_attn_norm.is_none_or(|weight| weight.len() == n_embd)
+            && post_ffn_norm.is_none_or(|weight| weight.len() == n_embd)
+            && q_norm_weight.is_none_or(|weight| weight.len() == head_dim)
+            && k_norm_weight.is_none_or(|weight| weight.len() == head_dim);
+        if q_weights.len() != q4_q_bytes
+            || k_weights.len() != q4_kv_bytes
+            || o_weights.len() != q4_o_bytes
+            || gate_weights.len() != q4_ffn_bytes
+            || up_weights.len() != q4_ffn_bytes
+            || !attention_gate_len_valid
+            || !norm_lengths_valid
+        {
+            return Err(format!(
+                "device decode layer weight/norm shape mismatch: q={}/{} k={}/{} o={}/{} gate={}/{} up={}/{} attention_gate={:?}/{} norms=({},{},{:?},{:?},{:?},{:?}) hidden={n_embd} head_dim={head_dim}",
+                q_weights.len(),
+                q4_q_bytes,
+                k_weights.len(),
+                q4_kv_bytes,
+                o_weights.len(),
+                q4_o_bytes,
+                gate_weights.len(),
+                q4_ffn_bytes,
+                up_weights.len(),
+                q4_ffn_bytes,
+                attention_gate_weights.map(<[u8]>::len),
+                q4_q_bytes,
+                attn_norm.len(),
+                ffn_norm.len(),
+                post_attn_norm.map(<[f32]>::len),
+                post_ffn_norm.map(<[f32]>::len),
+                q_norm_weight.map(<[f32]>::len),
+                k_norm_weight.map(<[f32]>::len),
+            ));
+        }
         let f32_size = std::mem::size_of::<f32>();
         let qkv_q8dot = tuning::full_device_decode_qkv_q8dot_enabled();
-        let cooperative_norms = tuning::full_device_decode_cooperative_norms_enabled();
+        let cooperative_norms = tuning::full_device_decode_cooperative_norms_enabled()
+            && self.cooperative_norms_supported();
         let q8_qs_bytes = input_blocks * 256;
         let q8_ds_bytes = input_blocks * 8 * f32_size;
         let norm_bytes = n_embd * f32_size;
@@ -79,228 +198,253 @@ impl CudaState {
             .map(|_| self.compute_aux_output_ptr(q_rows * f32_size))
             .transpose()?;
         let down_dev = mid_a_dev;
-
-        self.launch_rms_norm_device(
-            hidden_dev,
-            attn_norm,
-            n_embd,
-            norm_eps,
-            norm_dev,
-            cooperative_norms,
-        )?;
-        let expected_v_q4k_bytes = kv_dim * input_blocks * 144;
-        if qkv_q8dot {
-            let q8_qs_dev = norm_dev + norm_bytes as u64;
-            let q8_ds_dev = q8_qs_dev + q8_qs_bytes as u64;
-            self.launch_quantize_q8_1_by_32(norm_dev, q8_qs_dev, q8_ds_dev, input_blocks * 256)?;
-            let v_q6 = v_weights.len() != expected_v_q4k_bytes;
-            let fused_qkv_gate = if tuning::q4k_q8dot_row4_enabled()
-                && (!v_q6 || tuning::q6k_q8dot_row4_enabled())
-            {
-                if let (Some(gate_weights), Some(gate_dev)) =
-                    (attention_gate_weights, attention_gate_dev)
+        self.ensure_decode_kv_f16_capacity(layer_idx, kv_dim, kv_len + 1)?;
+        self.prepare_muse_decode_layer_streaming_admission()?;
+        let mut layer_weights = Vec::with_capacity(8);
+        layer_weights.extend_from_slice(&[
+            q_weights,
+            k_weights,
+            v_weights,
+            o_weights,
+            gate_weights,
+            up_weights,
+            down_weights,
+        ]);
+        if let Some(attention_gate) = attention_gate_weights {
+            layer_weights.push(attention_gate);
+        }
+        let weight_leases = self.pin_full_device_layer_weights(&layer_weights)?;
+        let result = (|| -> Result<(), String> {
+            self.launch_rms_norm_device(
+                hidden_dev,
+                attn_norm,
+                n_embd,
+                norm_eps,
+                norm_dev,
+                cooperative_norms,
+            )?;
+            if qkv_q8dot {
+                let q8_qs_dev = norm_dev + norm_bytes as u64;
+                let q8_ds_dev = q8_qs_dev + q8_qs_bytes as u64;
+                self.launch_quantize_q8_1_by_32(
+                    norm_dev,
+                    q8_qs_dev,
+                    q8_ds_dev,
+                    input_blocks * 256,
+                )?;
+                let fused_qkv_gate = if tuning::q4k_q8dot_row4_enabled()
+                    && (!v_q6 || tuning::q6k_q8dot_row4_enabled())
                 {
-                    self.launch_qkv_gate_gemv_q8dot_to_dev(
+                    if let (Some(gate_weights), Some(gate_dev)) =
+                        (attention_gate_weights, attention_gate_dev)
+                    {
+                        self.launch_qkv_gate_gemv_q8dot_to_dev(
+                            q_weights,
+                            k_weights,
+                            v_weights,
+                            gate_weights,
+                            q_rows,
+                            kv_dim,
+                            v_q6,
+                            input_blocks,
+                            q8_qs_dev,
+                            q8_ds_dev,
+                            q_dev,
+                            k_dev,
+                            v_dev,
+                            gate_dev,
+                        )?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !fused_qkv_gate {
+                    self.launch_q4k_gemv_q8dot_to_dev(
                         q_weights,
-                        k_weights,
-                        v_weights,
-                        gate_weights,
                         q_rows,
-                        kv_dim,
-                        v_q6,
                         input_blocks,
                         q8_qs_dev,
                         q8_ds_dev,
                         q_dev,
-                        k_dev,
-                        v_dev,
-                        gate_dev,
                     )?;
-                    true
-                } else {
-                    false
+                    self.launch_q4k_gemv_q8dot_to_dev(
+                        k_weights,
+                        kv_dim,
+                        input_blocks,
+                        q8_qs_dev,
+                        q8_ds_dev,
+                        k_dev,
+                    )?;
+                    if !v_q6 {
+                        self.launch_q4k_gemv_q8dot_to_dev(
+                            v_weights,
+                            kv_dim,
+                            input_blocks,
+                            q8_qs_dev,
+                            q8_ds_dev,
+                            v_dev,
+                        )?;
+                    } else {
+                        self.launch_q6k_gemv_q8dot_to_dev(
+                            v_weights,
+                            kv_dim,
+                            input_blocks,
+                            q8_qs_dev,
+                            q8_ds_dev,
+                            v_dev,
+                        )?;
+                    }
+                    if let (Some(weights), Some(output_dev)) =
+                        (attention_gate_weights, attention_gate_dev)
+                    {
+                        self.launch_q4k_gemv_q8dot_to_dev(
+                            weights,
+                            q_rows,
+                            input_blocks,
+                            q8_qs_dev,
+                            q8_ds_dev,
+                            output_dev,
+                        )?;
+                    }
                 }
             } else {
-                false
-            };
-            if !fused_qkv_gate {
-                self.launch_q4k_gemv_q8dot_to_dev(
-                    q_weights,
-                    q_rows,
-                    input_blocks,
-                    q8_qs_dev,
-                    q8_ds_dev,
-                    q_dev,
-                )?;
-                self.launch_q4k_gemv_q8dot_to_dev(
-                    k_weights,
-                    kv_dim,
-                    input_blocks,
-                    q8_qs_dev,
-                    q8_ds_dev,
-                    k_dev,
-                )?;
-                if v_weights.len() == expected_v_q4k_bytes {
-                    self.launch_q4k_gemv_q8dot_to_dev(
+                self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
+                self.q4k_gemv_device_to_device(k_weights, kv_dim, input_blocks, norm_dev, k_dev)?;
+                if !v_q6 {
+                    self.q4k_gemv_device_to_device(
                         v_weights,
                         kv_dim,
                         input_blocks,
-                        q8_qs_dev,
-                        q8_ds_dev,
+                        norm_dev,
                         v_dev,
                     )?;
                 } else {
-                    self.launch_q6k_gemv_q8dot_to_dev(
+                    self.q6k_gemv_device_to_device(
                         v_weights,
                         kv_dim,
                         input_blocks,
-                        q8_qs_dev,
-                        q8_ds_dev,
+                        norm_dev,
                         v_dev,
                     )?;
                 }
                 if let (Some(weights), Some(output_dev)) =
                     (attention_gate_weights, attention_gate_dev)
                 {
-                    self.launch_q4k_gemv_q8dot_to_dev(
+                    self.q4k_gemv_device_to_device(
                         weights,
                         q_rows,
                         input_blocks,
-                        q8_qs_dev,
-                        q8_ds_dev,
+                        norm_dev,
                         output_dev,
                     )?;
                 }
             }
-        } else {
-            self.q4k_gemv_device_to_device(q_weights, q_rows, input_blocks, norm_dev, q_dev)?;
-            self.q4k_gemv_device_to_device(k_weights, kv_dim, input_blocks, norm_dev, k_dev)?;
-            if v_weights.len() == expected_v_q4k_bytes {
-                self.q4k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
-            } else {
-                self.q6k_gemv_device_to_device(v_weights, kv_dim, input_blocks, norm_dev, v_dev)?;
-            }
-            if let (Some(weights), Some(output_dev)) = (attention_gate_weights, attention_gate_dev)
-            {
-                self.q4k_gemv_device_to_device(
-                    weights,
-                    q_rows,
-                    input_blocks,
-                    norm_dev,
-                    output_dev,
-                )?;
-            }
-        }
 
-        if let Some(qn) = q_norm_weight {
-            self.launch_qk_norm_device(q_dev, qn, num_heads, head_dim, norm_eps)?;
-        }
-        if let Some(kn) = k_norm_weight {
-            self.launch_qk_norm_device(k_dev, kn, num_kv_heads, head_dim, norm_eps)?;
-        }
-        if apply_rope {
-            if rope_neox {
-                self.launch_rope_decode(
-                    q_dev,
-                    k_dev,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    rope_theta,
-                    rope_pos,
-                )?;
-            } else {
-                self.launch_rope_f32_inplace(
-                    q_dev,
-                    0,
-                    num_heads * head_dim / 2,
-                    q_rows,
-                    head_dim,
-                    head_dim,
-                    rope_pos,
-                    rope_theta,
-                    0,
-                )?;
-                self.launch_rope_f32_inplace(
-                    k_dev,
-                    0,
-                    num_kv_heads * head_dim / 2,
-                    kv_dim,
-                    head_dim,
-                    head_dim,
-                    rope_pos,
-                    rope_theta,
-                    0,
-                )?;
+            if let Some(qn) = q_norm_weight {
+                self.launch_qk_norm_device(q_dev, qn, num_heads, head_dim, norm_eps)?;
             }
-        }
+            if let Some(kn) = k_norm_weight {
+                self.launch_qk_norm_device(k_dev, kn, num_kv_heads, head_dim, norm_eps)?;
+            }
+            if apply_rope {
+                if rope_neox {
+                    self.launch_rope_decode(
+                        q_dev,
+                        k_dev,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        rope_theta,
+                        rope_pos,
+                    )?;
+                } else {
+                    self.launch_rope_f32_inplace(
+                        q_dev,
+                        0,
+                        num_heads * head_dim / 2,
+                        q_rows,
+                        head_dim,
+                        head_dim,
+                        rope_pos,
+                        rope_theta,
+                        0,
+                    )?;
+                    self.launch_rope_f32_inplace(
+                        k_dev,
+                        0,
+                        num_kv_heads * head_dim / 2,
+                        kv_dim,
+                        head_dim,
+                        head_dim,
+                        rope_pos,
+                        rope_theta,
+                        0,
+                    )?;
+                }
+            }
 
-        self.launch_kv_f16_write(layer_idx, k_dev, v_dev, kv_dim, kv_len)?;
-        self.launch_attention_decode_device_with_policy(
-            layer_idx,
-            q_dev,
-            attn_out_dev,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_len,
-            attention_scale,
-            sliding_window,
-        )?;
-        if let Some(gate_dev) = attention_gate_dev {
-            self.launch_sigmoid_mul_inplace(attn_out_dev, gate_dev, q_rows)?;
-        }
+            self.launch_kv_f16_write(layer_idx, k_dev, v_dev, kv_dim, kv_len)?;
+            self.launch_attention_decode_device_with_policy(
+                layer_idx,
+                q_dev,
+                attn_out_dev,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                kv_len,
+                attention_scale,
+                sliding_window,
+            )?;
+            if let Some(gate_dev) = attention_gate_dev {
+                self.launch_sigmoid_mul_inplace(attn_out_dev, gate_dev, q_rows)?;
+            }
 
-        let expected_q4k_down_bytes = n_embd * (n_ff / 256) * 144;
-        let expected_q6k_down_bytes = n_embd * (n_ff / 256) * 210;
-        let down_quant = if down_weights.len() == expected_q4k_down_bytes {
-            12
-        } else if down_weights.len() == expected_q6k_down_bytes {
-            14
-        } else {
-            return Err(format!(
-                "device decode unsupported down weight bytes: got {}, expected Q4_K {expected_q4k_down_bytes} or Q6_K {expected_q6k_down_bytes}",
-                down_weights.len()
-            ));
-        };
-        let mut trace_stage = std::time::Instant::now();
-        self.launch_dense_chain_graph_ops(
-            o_weights,
-            gate_weights,
-            up_weights,
-            down_weights,
-            down_quant,
-            post_attn_norm,
-            ffn_norm,
-            post_ffn_norm,
-            q_rows,
-            n_ff,
-            n_embd,
-            norm_eps,
-            post_norm_eps,
-            false,
-            false,
-            hidden_dev,
-            attn_out_dev,
-            norm_dev,
-            down_dev,
-            ffn_uses_gelu,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-            0,
-            0,
-            false,
-            (out_scale != 1.0 && out_scale != 0.0).then_some(out_scale),
-            None,
-            &mut trace_stage,
-            cooperative_norms,
-        )?;
-        Ok(())
+            let mut trace_stage = std::time::Instant::now();
+            self.launch_dense_chain_graph_ops(
+                o_weights,
+                gate_weights,
+                up_weights,
+                down_weights,
+                down_quant,
+                post_attn_norm,
+                ffn_norm,
+                post_ffn_norm,
+                q_rows,
+                n_ff,
+                n_embd,
+                norm_eps,
+                post_norm_eps,
+                false,
+                false,
+                hidden_dev,
+                attn_out_dev,
+                norm_dev,
+                down_dev,
+                ffn_uses_gelu,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                false,
+                (out_scale != 1.0).then_some(out_scale),
+                None,
+                &mut trace_stage,
+                cooperative_norms,
+            )?;
+            Ok(())
+        })();
+        for key in weight_leases {
+            self.unpin_resident_q4k_key(key);
+        }
+        result
     }
 
     // --- Launch helpers (cu63 Tasks 4+5) ---
@@ -427,31 +571,45 @@ impl CudaState {
             (256, 1, 1),
         )
     }
+    fn alloc_decode_kv_cache_buffer(&mut self, bytes: usize) -> Result<u64, String> {
+        match unsafe { self.api.mem_alloc(bytes) } {
+            Ok(ptr) => Ok(ptr),
+            Err(err) if cuda_mem_alloc_oom(&err) => {
+                self.release_muse_decode_tail_residency_for_oom()?;
+                match unsafe { self.api.mem_alloc(bytes) } {
+                    Ok(ptr) => Ok(ptr),
+                    Err(err2) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err2) => {
+                        let _ = self.offload_non_pinned_resident_q4k();
+                        match unsafe { self.api.mem_alloc(bytes) } {
+                            Ok(ptr) => Ok(ptr),
+                            Err(err3) if cuda_mem_alloc_oom(&err3) => {
+                                self.clear_resident_moe_layer_cache()?;
+                                unsafe { self.api.mem_alloc(bytes) }
+                            }
+                            Err(err3) => Err(err3),
+                        }
+                    }
+                    Err(err2) => Err(err2),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
 
-    /// Convert f32 K/V on device to f16 and append to the per-layer KV cache.
-    /// `kv_len` is the write position (0-indexed, the slot for the new token).
-    /// After this call the cache holds `kv_len + 1` tokens.
-    fn launch_kv_f16_write(
+    fn ensure_decode_kv_f16_capacity(
         &mut self,
         layer_idx: usize,
-        k_dev: u64,
-        v_dev: u64,
         kv_dim: usize,
-        kv_len: usize,
+        total_tokens: usize,
     ) -> Result<(), String> {
-        // Total tokens after this write.
-        let total_tokens = kv_len + 1;
         let required_bytes = total_tokens
             .checked_mul(kv_dim)
-            .and_then(|v| v.checked_mul(std::mem::size_of::<u16>()))
-            .ok_or_else(|| "cu63 kv_f16_write: capacity overflow".to_string())?;
-
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "cu63 kv_f16 capacity overflow".to_string())?;
         let mut cache = self
             .decode_attention_kv
             .remove(&layer_idx)
             .unwrap_or_default();
-
-        // Reset if kv_rows changed or cached_tokens went backwards.
         if cache.kv_rows != kv_dim || cache.cached_tokens > total_tokens {
             if let Some(ptr) = cache.k_bits_dev.take() {
                 unsafe { self.api.mem_free(ptr)? };
@@ -464,52 +622,96 @@ impl CudaState {
                 ..Default::default()
             };
         }
-
-        // Grow if needed.
         if cache.k_bits_capacity < required_bytes || cache.v_bits_capacity < required_bytes {
-            if let Some(ptr) = cache.k_bits_dev.take() {
-                unsafe { self.api.mem_free(ptr)? };
-            }
-            if let Some(ptr) = cache.v_bits_dev.take() {
-                unsafe { self.api.mem_free(ptr)? };
-            }
             let capacity = align_up(required_bytes, 1024 * 1024);
-            let k_ptr = match unsafe { self.api.mem_alloc(capacity) } {
-                Ok(p) => p,
-                Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                    let _ = self.offload_non_pinned_resident_q4k();
-                    match unsafe { self.api.mem_alloc(capacity) } {
-                        Ok(p) => p,
-                        Err(err2) if cuda_mem_alloc_oom(&err2) => {
-                            self.clear_resident_moe_layer_cache()?;
-                            unsafe { self.api.mem_alloc(capacity)? }
-                        }
-                        Err(err2) => return Err(err2),
+            let copy_bytes = match cache
+                .cached_tokens
+                .checked_mul(kv_dim)
+                .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            {
+                Some(bytes) => bytes,
+                None => {
+                    self.decode_attention_kv.insert(layer_idx, cache);
+                    return Err("cu63 kv_f16 migration byte size overflow".to_string());
+                }
+            };
+            let new_k = match self.alloc_decode_kv_cache_buffer(capacity) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    self.decode_attention_kv.insert(layer_idx, cache);
+                    return Err(err);
+                }
+            };
+            let new_v = match self.alloc_decode_kv_cache_buffer(capacity) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    let _ = unsafe { self.api.mem_free(new_k) };
+                    self.decode_attention_kv.insert(layer_idx, cache);
+                    return Err(err);
+                }
+            };
+            let migrate = (|| {
+                if copy_bytes != 0 {
+                    let old_k = cache
+                        .k_bits_dev
+                        .ok_or_else(|| "cu63 kv_f16 growth missing old K buffer".to_string())?;
+                    let old_v = cache
+                        .v_bits_dev
+                        .ok_or_else(|| "cu63 kv_f16 growth missing old V buffer".to_string())?;
+                    unsafe {
+                        self.api
+                            .memcpy_dtod_async(new_k, old_k, copy_bytes, self.stream)?;
+                        self.api
+                            .memcpy_dtod_async(new_v, old_v, copy_bytes, self.stream)?;
                     }
                 }
-                Err(err) => return Err(err),
-            };
-            let v_ptr = match unsafe { self.api.mem_alloc(capacity) } {
-                Ok(p) => p,
-                Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                    let _ = self.offload_non_pinned_resident_q4k();
-                    match unsafe { self.api.mem_alloc(capacity) } {
-                        Ok(p) => p,
-                        Err(err2) if cuda_mem_alloc_oom(&err2) => {
-                            self.clear_resident_moe_layer_cache()?;
-                            unsafe { self.api.mem_alloc(capacity)? }
-                        }
-                        Err(err2) => return Err(err2),
-                    }
-                }
-                Err(err) => return Err(err),
-            };
-            cache.k_bits_dev = Some(k_ptr);
-            cache.v_bits_dev = Some(v_ptr);
+                self.stream_synchronize()
+            })();
+            if let Err(err) = migrate {
+                let _ = unsafe { self.api.mem_free(new_k) };
+                let _ = unsafe { self.api.mem_free(new_v) };
+                self.decode_attention_kv.insert(layer_idx, cache);
+                return Err(err);
+            }
+            let old_k = cache.k_bits_dev.replace(new_k);
+            let old_v = cache.v_bits_dev.replace(new_v);
             cache.k_bits_capacity = capacity;
             cache.v_bits_capacity = capacity;
-            cache.cached_tokens = 0;
+            let release_old = (|| {
+                if let Some(ptr) = old_k {
+                    unsafe { self.api.mem_free(ptr)? };
+                }
+                if let Some(ptr) = old_v {
+                    unsafe { self.api.mem_free(ptr)? };
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(err) = release_old {
+                self.decode_attention_kv.insert(layer_idx, cache);
+                return Err(err);
+            }
         }
+        self.decode_attention_kv.insert(layer_idx, cache);
+        Ok(())
+    }
+
+    /// Convert f32 K/V on device to f16 and append to the per-layer KV cache.
+    /// `kv_len` is the write position (0-indexed, the slot for the new token).
+    /// After this call the cache holds `kv_len + 1` tokens.
+    pub(super) fn launch_kv_f16_write(
+        &mut self,
+        layer_idx: usize,
+        k_dev: u64,
+        v_dev: u64,
+        kv_dim: usize,
+        kv_len: usize,
+    ) -> Result<(), String> {
+        let total_tokens = kv_len + 1;
+        self.ensure_decode_kv_f16_capacity(layer_idx, kv_dim, total_tokens)?;
+        let mut cache = self
+            .decode_attention_kv
+            .remove(&layer_idx)
+            .expect("decode KV capacity initialized");
 
         let k_cache_dev = cache
             .k_bits_dev
@@ -770,53 +972,54 @@ impl CudaState {
         num_tokens: usize,
     ) -> Result<(), String> {
         self.set_current()?;
-        let required_bytes = num_tokens * kv_dim * std::mem::size_of::<u16>();
-        if k_bits.len() < num_tokens * kv_dim || v_bits.len() < num_tokens * kv_dim {
+        if num_tokens == 0 || kv_dim == 0 {
+            return Err(format!(
+                "cu63 populate_kv requires non-zero tokens and kv_dim: tokens={num_tokens} kv_dim={kv_dim}"
+            ));
+        }
+        let required_values = num_tokens
+            .checked_mul(kv_dim)
+            .ok_or_else(|| "cu63 populate_kv: value count overflow".to_string())?;
+        let required_bytes = required_values
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| "cu63 populate_kv: byte count overflow".to_string())?;
+        if k_bits.len() < required_values || v_bits.len() < required_values {
             return Err(format!(
                 "cu63 populate_kv: bits too short — k={} v={} need={}",
                 k_bits.len(),
                 v_bits.len(),
-                num_tokens * kv_dim,
+                required_values,
             ));
         }
 
+        self.ensure_decode_kv_f16_capacity(layer_idx, kv_dim, num_tokens)?;
         let mut cache = self
             .decode_attention_kv
             .remove(&layer_idx)
-            .unwrap_or_default();
-
-        if cache.kv_rows != kv_dim || cache.k_bits_capacity < required_bytes {
-            if let Some(ptr) = cache.k_bits_dev.take() {
-                unsafe { self.api.mem_free(ptr)? };
-            }
-            if let Some(ptr) = cache.v_bits_dev.take() {
-                unsafe { self.api.mem_free(ptr)? };
-            }
-            let capacity = align_up(required_bytes, 1024 * 1024);
-            let k_ptr = unsafe { self.api.mem_alloc(capacity)? };
-            let v_ptr = unsafe { self.api.mem_alloc(capacity)? };
-            cache.k_bits_dev = Some(k_ptr);
-            cache.v_bits_dev = Some(v_ptr);
-            cache.k_bits_capacity = capacity;
-            cache.v_bits_capacity = capacity;
-            cache.kv_rows = kv_dim;
-        }
+            .expect("decode KV capacity initialized");
 
         let k_dev = cache.k_bits_dev.unwrap();
         let v_dev = cache.v_bits_dev.unwrap();
-        unsafe {
-            self.api.memcpy_htod_async(
-                k_dev,
-                k_bits.as_ptr().cast::<libc::c_void>(),
-                required_bytes,
-                self.stream,
-            )?;
-            self.api.memcpy_htod_async(
-                v_dev,
-                v_bits.as_ptr().cast::<libc::c_void>(),
-                required_bytes,
-                self.stream,
-            )?;
+        let upload = unsafe {
+            self.api
+                .memcpy_htod_async(
+                    k_dev,
+                    k_bits.as_ptr().cast::<libc::c_void>(),
+                    required_bytes,
+                    self.stream,
+                )
+                .and_then(|()| {
+                    self.api.memcpy_htod_async(
+                        v_dev,
+                        v_bits.as_ptr().cast::<libc::c_void>(),
+                        required_bytes,
+                        self.stream,
+                    )
+                })
+        };
+        if let Err(err) = upload {
+            self.decode_attention_kv.insert(layer_idx, cache);
+            return Err(err);
         }
         cache.cached_tokens = num_tokens;
         self.decode_attention_kv.insert(layer_idx, cache);

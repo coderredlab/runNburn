@@ -563,6 +563,18 @@ fn mtp_dense_decode_work_threshold(metadata: &ModelMetadata) -> usize {
         .min(4096 * 40)
 }
 
+pub(super) fn mtp_verify_row_workspace_bytes(
+    metadata: &ModelMetadata,
+    window_tokens: usize,
+) -> usize {
+    metadata
+        .hidden_dim
+        .saturating_mul(window_tokens.max(2))
+        .saturating_mul(std::mem::size_of::<f32>())
+        .saturating_mul(16)
+        .max(256 * 1024 * 1024)
+}
+
 fn mtp_device_verify_min_free_vram_mib(metadata: &ModelMetadata, spec_k: usize) -> usize {
     let window_tokens = spec_k.saturating_add(1).max(2);
     let token_embd_mib = q4k_like_matrix_mib(metadata.vocab_size, metadata.hidden_dim);
@@ -573,14 +585,8 @@ fn mtp_device_verify_min_free_vram_mib(metadata: &ModelMetadata, spec_k: usize) 
             .saturating_mul(metadata.hidden_dim)
             .saturating_mul(4),
     );
-    let row_workspace_mib = bytes_to_mib_ceil(
-        metadata
-            .hidden_dim
-            .saturating_mul(window_tokens)
-            .saturating_mul(4)
-            .saturating_mul(16),
-    )
-    .max(256);
+    let row_workspace_mib =
+        bytes_to_mib_ceil(mtp_verify_row_workspace_bytes(metadata, window_tokens));
     let layer_workspace_mib = align_mib(
         bytes_to_mib_ceil(
             metadata
@@ -2514,6 +2520,16 @@ mod tests {
                 "gemma4-external-adaptive-k2-metal-batch-verify-auto"
             );
         }
+    }
+
+    #[test]
+    fn mtp_verify_row_workspace_scales_past_tail_reserve() {
+        let metadata = policy_metadata(6656, 52);
+        assert_eq!(
+            mtp_verify_row_workspace_bytes(&metadata, 4),
+            256 * 1024 * 1024
+        );
+        assert!(mtp_verify_row_workspace_bytes(&metadata, 2048) > 512 * 1024 * 1024);
     }
 
     #[cfg(feature = "cuda")]

@@ -1445,6 +1445,7 @@ pub fn q4k_muse_prefill_hd128_dense_chain_device_input(
         || num_kv_heads.checked_mul(128) != Some(kv_rows)
         || cols == 0
         || !cols.is_multiple_of(256)
+        || cols != n_embd
         || seq_len == 0
         || n_ff == 0
         || n_embd == 0
@@ -1564,6 +1565,9 @@ pub fn q4k_muse_prefill_hd128_dense_chain_device_input(
     let Some((k_bits, v_bits, Some(output_id))) = output else {
         return Ok(None);
     };
+    if output_id == input_id && input_desc != output_desc {
+        state.retag_device_tensor_slot(input_id, input_desc, output_desc)?;
+    }
     Ok(Some(MuseQ4kPrefillDeviceOutput {
         k_bits,
         v_bits,

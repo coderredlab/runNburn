@@ -102,6 +102,8 @@ pub fn reset_state_for_engine_init() -> Result<(), String> {
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
+    state.release_muse_decode_tail_residency()?;
+    state.restore_configured_device_residency_plan();
     state.clear_resident_moe_layer_cache()?;
     state.clear_resident_q4k_cache()?;
     state.clear_moe_slice_cache()?;
@@ -174,6 +176,52 @@ pub fn clear_sequence_state_cache() -> Result<(), String> {
     };
     state.clear_decode_attention_kv_cache()?;
     state.clear_resident_delta_states()
+}
+
+pub fn begin_muse_decode_residency_lifecycle() -> Result<(), String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .begin_muse_decode_tail_residency();
+    Ok(())
+}
+
+pub fn muse_decode_tail_reserve_bytes() -> Result<Option<usize>, String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    let Some(state) = guard.as_ref() else {
+        return Ok(None);
+    };
+    if state.muse_decode_tail_base_residency.is_none() || state.muse_decode_tail_streaming {
+        return Ok(None);
+    }
+    let (free_bytes, _) = unsafe { state.api.mem_get_info() }?;
+    Ok(Some(
+        state
+            .device_residency_plan
+            .dynamic_reserve_bytes
+            .min(free_bytes),
+    ))
+}
+
+pub fn release_muse_decode_tail_residency() -> Result<usize, String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    match guard.as_mut() {
+        Some(state) => state.release_muse_decode_tail_residency(),
+        None => Ok(0),
+    }
 }
 
 pub fn release_prefill_compute_buffers() -> Result<usize, String> {

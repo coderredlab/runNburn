@@ -1191,7 +1191,7 @@ pub fn generate_stream_speculative(
         }
 
         let phase_start = Instant::now();
-        let all_logits = engine.forward_prefill_all_logits(&verify_input)?;
+        let all_logits = engine.forward_prefill_all_logits_for_verify(&verify_input)?;
         stats.add_target_verify_steps(all_logits.len());
         phase_timings.add_verify(elapsed_ms(phase_start));
         if trace_mtp {
@@ -1598,7 +1598,7 @@ pub fn generate_stream_two_model(
         let all_logits = if target_verify_needs_sequential(target_engine) {
             target_engine.forward_verify_all_logits_sequential(&verify_input)?
         } else {
-            target_engine.forward_prefill_all_logits(&verify_input)?
+            target_engine.forward_prefill_all_logits_for_verify(&verify_input)?
         };
         stats.add_target_verify_steps(all_logits.len());
 

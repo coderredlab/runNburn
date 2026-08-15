@@ -824,6 +824,24 @@ impl CudaApi {
         Ok(count)
     }
 
+    pub(super) unsafe fn device_supports_cooperative_launch(&self) -> Result<bool, String> {
+        let get_dev = self
+            .cu_ctx_get_device
+            .ok_or_else(|| "cuCtxGetDevice symbol not loaded".to_string())?;
+        let get_attr = self
+            .cu_device_get_attribute
+            .ok_or_else(|| "cuDeviceGetAttribute symbol not loaded".to_string())?;
+        let mut device = 0;
+        check_cuda(get_dev(&mut device), "cuCtxGetDevice")?;
+        let mut supported = 0;
+        // CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95.
+        check_cuda(
+            get_attr(&mut supported, 95, device),
+            "cuDeviceGetAttribute(COOPERATIVE_LAUNCH)",
+        )?;
+        Ok(supported != 0)
+    }
+
     pub(super) unsafe fn stream_begin_capture(&self, stream: usize) -> Result<(), String> {
         let Some(begin_capture) = self.cu_stream_begin_capture else {
             return Err("missing CUDA driver symbol cuStreamBeginCapture_v2".to_string());

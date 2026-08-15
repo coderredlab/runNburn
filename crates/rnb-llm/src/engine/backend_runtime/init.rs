@@ -86,6 +86,22 @@ pub(in crate::engine) fn release_prefill_residency_after_prefill(
 }
 
 #[cfg(feature = "cuda")]
+pub(in crate::engine) fn prepare_residency_before_prefill(
+    architecture: rnb_loader::Architecture,
+) -> crate::error::Result<()> {
+    if matches!(architecture, rnb_loader::Architecture::MuseGlimmer) {
+        cuda_runtime::release_muse_decode_tail_residency()
+            .map_err(crate::error::LlmError::Forward)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn muse_decode_tail_reserve_bytes() -> crate::error::Result<Option<usize>> {
+    cuda_runtime::muse_decode_tail_reserve_bytes().map_err(crate::error::LlmError::Forward)
+}
+
+#[cfg(feature = "cuda")]
 pub(in crate::engine) fn clear_host_registered_ranges_before_prefill() -> crate::error::Result<()> {
     cuda_runtime::clear_host_registered_ranges().map_err(crate::error::LlmError::Forward)
 }
@@ -94,6 +110,18 @@ pub(in crate::engine) fn clear_host_registered_ranges_before_prefill() -> crate:
 pub(in crate::engine) fn clear_decode_attention_kv_cache_before_prefill() -> crate::error::Result<()>
 {
     cuda_runtime::clear_decode_attention_kv_cache().map_err(crate::error::LlmError::Forward)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(in crate::engine) fn muse_decode_tail_reserve_bytes() -> crate::error::Result<Option<usize>> {
+    Ok(None)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(in crate::engine) fn prepare_residency_before_prefill(
+    _architecture: rnb_loader::Architecture,
+) -> crate::error::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(feature = "cuda"))]

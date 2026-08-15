@@ -105,6 +105,252 @@ fn cuda_weight_residency_counters_track_raw_quant_and_transient_uploads() {
 }
 
 #[test]
+fn cuda_engine_reset_restores_configured_residency_plan() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let configured_plan = state.configured_device_residency_plan;
+    let configured_q4k_limit = state.configured_resident_q4k_limit;
+    let prefill_q4k_limit = configured_q4k_limit.saturating_add(1);
+    state.resident_q4k_limit = prefill_q4k_limit;
+    assert_eq!(state.release_muse_decode_tail_residency().unwrap(), 0);
+    assert_eq!(state.resident_q4k_limit, prefill_q4k_limit);
+
+    state.begin_muse_decode_tail_residency();
+    let reduced_reserve = configured_plan.dynamic_reserve_bytes / 2;
+    state.configure_decode_residency_reserve(reduced_reserve);
+    state.resident_q4k_limit = prefill_q4k_limit.saturating_add(1);
+    state.release_muse_decode_tail_residency().unwrap();
+    assert_eq!(state.device_residency_plan, configured_plan);
+    assert_eq!(state.resident_q4k_limit, prefill_q4k_limit);
+
+    state.configure_decode_residency_reserve(reduced_reserve);
+    state.resident_q4k_limit = prefill_q4k_limit.saturating_add(2);
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    *compute
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
+    reset_state_for_engine_init().expect("reset CUDA state for next engine");
+    let current = compute
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = current.as_ref().expect("CUDA state remains initialized");
+    assert_eq!(current.device_residency_plan, configured_plan);
+    assert_eq!(current.resident_q4k_limit, configured_q4k_limit);
+}
+
+#[test]
+fn cuda_muse_decode_tail_release_frees_promoted_uploads() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let weight = vec![0u8; 144];
+    state.resident_q4k_limit = state.resident_q4k_limit.saturating_add(weight.len());
+    let base_limit = state.resident_q4k_limit;
+    state.begin_muse_decode_tail_residency();
+    let (_ptr, key) = state
+        .resident_q4k_weights_ptr_pinned_with_lease(&weight)
+        .expect("promote tail weight");
+    let key = key.expect("new tail pin");
+    state.muse_decode_tail_pinned_keys.push(key);
+    state.muse_decode_tail_uploaded_keys.push(key);
+    assert!(state.q4k_weight_slice_is_resident(&weight));
+
+    assert_eq!(state.release_muse_decode_tail_residency().unwrap(), 1);
+    assert!(!state.q4k_weight_slice_is_resident(&weight));
+    assert_eq!(state.resident_q4k_limit, base_limit);
+}
+
+#[test]
+fn cuda_muse_decode_tail_oom_release_allows_layer_streaming() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let preexisting_weight = vec![1u8; 144];
+    let promoted_weight = vec![2u8; 144];
+    let base_plan = state.device_residency_plan;
+    let base_limit = state.resident_q4k_limit;
+    state
+        .resident_q4k_weights_ptr(&preexisting_weight)
+        .expect("stage preexisting resident weight");
+    state.begin_muse_decode_tail_residency();
+    state.configure_decode_residency_reserve(0);
+    let (_ptr, preexisting_key) = state
+        .resident_q4k_weights_ptr_pinned_with_lease(&preexisting_weight)
+        .expect("pin preexisting tail weight");
+    state
+        .muse_decode_tail_pinned_keys
+        .push(preexisting_key.expect("preexisting tail pin"));
+    let (_ptr, promoted_key) = state
+        .resident_q4k_weights_ptr_pinned_with_lease(&promoted_weight)
+        .expect("promote tail weight");
+    let promoted_key = promoted_key.expect("new tail pin");
+    state.muse_decode_tail_pinned_keys.push(promoted_key);
+    state.muse_decode_tail_uploaded_keys.push(promoted_key);
+
+    assert_eq!(
+        state.release_muse_decode_tail_residency_for_oom().unwrap(),
+        2
+    );
+    assert!(state.muse_decode_tail_streaming);
+    assert!(state.muse_decode_tail_base_residency.is_some());
+    assert!(!state.q4k_weight_slice_is_resident(&preexisting_weight));
+    assert!(!state.q4k_weight_slice_is_resident(&promoted_weight));
+    state
+        .prepare_muse_decode_layer_streaming_admission()
+        .unwrap();
+    let (_ptr, lease) = state
+        .resident_q4k_weights_ptr_pinned_with_lease(&promoted_weight)
+        .expect("stream layer weight");
+    state.unpin_resident_q4k_key(lease.expect("streaming layer pin"));
+
+    state.release_muse_decode_tail_residency().unwrap();
+    assert!(!state.muse_decode_tail_streaming);
+    assert!(state.muse_decode_tail_base_residency.is_none());
+    assert_eq!(state.device_residency_plan, base_plan);
+    assert_eq!(state.resident_q4k_limit, base_limit);
+}
+
+#[test]
+fn cuda_populate_device_kv_rejects_empty_shape() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let err = state
+        .populate_device_kv_cache_f16(0, &[], &[], 0, 0)
+        .expect_err("empty device KV shape must fail");
+    assert!(err.contains("requires non-zero"));
+}
+
+#[test]
+fn cuda_decode_kv_growth_preserves_cached_tokens() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let layer_idx = 17usize;
+    let kv_dim = 4usize;
+    let cached_tokens = 2usize;
+    let prior_k = (0..cached_tokens * kv_dim)
+        .map(|i| half::f16::from_f32(i as f32 * 0.25 - 0.75).to_bits())
+        .collect::<Vec<_>>();
+    let prior_v = (0..cached_tokens * kv_dim)
+        .map(|i| half::f16::from_f32(i as f32 * -0.125 + 0.5).to_bits())
+        .collect::<Vec<_>>();
+    let prior_bytes = std::mem::size_of_val(prior_k.as_slice());
+    let old_k = unsafe { state.api.mem_alloc(prior_bytes).expect("old K cache") };
+    let old_v = unsafe { state.api.mem_alloc(prior_bytes).expect("old V cache") };
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                old_k,
+                prior_k.as_ptr().cast::<libc::c_void>(),
+                prior_bytes,
+                state.stream,
+            )
+            .expect("upload old K cache");
+        state
+            .api
+            .memcpy_htod_async(
+                old_v,
+                prior_v.as_ptr().cast::<libc::c_void>(),
+                prior_bytes,
+                state.stream,
+            )
+            .expect("upload old V cache");
+    }
+    state.decode_attention_kv.insert(
+        layer_idx,
+        DecodeAttentionKvCache {
+            kv_rows: kv_dim,
+            k_bits_dev: Some(old_k),
+            k_bits_capacity: prior_bytes,
+            v_bits_dev: Some(old_v),
+            v_bits_capacity: prior_bytes,
+            cached_tokens,
+            ..Default::default()
+        },
+    );
+
+    let current_k = vec![1.25f32, -1.5, 1.75, -2.0];
+    let current_v = vec![-0.5f32, 0.75, -1.0, 1.25];
+    let current_bytes = std::mem::size_of_val(current_k.as_slice());
+    let current_k_dev = unsafe { state.api.mem_alloc(current_bytes).expect("current K") };
+    let current_v_dev = unsafe { state.api.mem_alloc(current_bytes).expect("current V") };
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                current_k_dev,
+                current_k.as_ptr().cast::<libc::c_void>(),
+                current_bytes,
+                state.stream,
+            )
+            .expect("upload current K");
+        state
+            .api
+            .memcpy_htod_async(
+                current_v_dev,
+                current_v.as_ptr().cast::<libc::c_void>(),
+                current_bytes,
+                state.stream,
+            )
+            .expect("upload current V");
+    }
+    state
+        .launch_kv_f16_write(
+            layer_idx,
+            current_k_dev,
+            current_v_dev,
+            kv_dim,
+            cached_tokens,
+        )
+        .expect("grow and append decode KV cache");
+
+    let cache = state
+        .decode_attention_kv
+        .get(&layer_idx)
+        .expect("grown KV cache");
+    let mut actual_k = vec![0u16; (cached_tokens + 1) * kv_dim];
+    let mut actual_v = vec![0u16; (cached_tokens + 1) * kv_dim];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                actual_k.as_mut_ptr().cast::<libc::c_void>(),
+                cache.k_bits_dev.expect("grown K pointer"),
+                std::mem::size_of_val(actual_k.as_slice()),
+                state.stream,
+            )
+            .expect("download grown K cache");
+        state
+            .api
+            .memcpy_dtoh_async(
+                actual_v.as_mut_ptr().cast::<libc::c_void>(),
+                cache.v_bits_dev.expect("grown V pointer"),
+                std::mem::size_of_val(actual_v.as_slice()),
+                state.stream,
+            )
+            .expect("download grown V cache");
+    }
+    state.stream_synchronize().expect("sync grown KV cache");
+
+    let mut expected_k = prior_k;
+    expected_k.extend(
+        current_k
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits()),
+    );
+    let mut expected_v = prior_v;
+    expected_v.extend(
+        current_v
+            .iter()
+            .map(|&value| half::f16::from_f32(value).to_bits()),
+    );
+    assert_eq!(actual_k, expected_k);
+    assert_eq!(actual_v, expected_v);
+    unsafe {
+        state.api.mem_free(current_k_dev).expect("free current K");
+        state.api.mem_free(current_v_dev).expect("free current V");
+    }
+}
+
+#[test]
 fn cuda_weight_residency_counter_delta_includes_raw_quant_and_transient_uploads() {
     let mut before = crate::runtime::CudaWeightResidencyCounters::default();
     before.record_q4_raw_quant(144);
@@ -10247,15 +10493,18 @@ fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
     let _gate_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_GATE_UP", "0");
     let _down_q8dot = EnvVarGuard::set("RNB_CUDA_DENSE_Q8DOT_DOWN", "0");
     let _batch_q8dot = EnvVarGuard::set("RNB_CUDA_Q4K_BATCH_Q8DOT", "0");
+    let _dispatch = EnvVarGuard::set("RNB_CUDA_PREFILL_BATCH_DEV_DISPATCH", "1");
+    let q4_llama_mmq_off = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_LLAMA_AMPERE_J128", "0");
+    let q6_llama_mmq_off = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_LLAMA_AMPERE_J128", "0");
 
-    let seq_len = 3usize;
+    let seq_len = 128usize;
     let num_heads = 2usize;
     let num_kv_heads = 1usize;
     let head_dim = 128usize;
     let q_dim = num_heads * head_dim;
     let q_rows = q_dim;
     let kv_rows = num_kv_heads * head_dim;
-    let n_embd = 256usize;
+    let n_embd = 1024usize;
     let n_ff = 256usize;
     let blocks_per_row = n_embd / 256;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -10389,64 +10638,106 @@ fn cuda_q4k_muse_prefill_hd128_dense_chain_matches_separate_path() {
     )
     .expect("separate CUDA post-FFN norm");
     add_f32_inplace(&mut expected_hidden, &post_ffn).expect("separate CUDA FFN residual");
+    drop(q4_llama_mmq_off);
+    drop(q6_llama_mmq_off);
+    let _q4_llama_mmq_on = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_LLAMA_AMPERE_J128", "1");
+    let _q6_llama_mmq_on = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_LLAMA_AMPERE_J128", "1");
+    reset_llama_mmq_j128_launch_counts_for_test();
 
-    let mut actual = initial_hidden;
-    let (actual_k_bits, actual_v_bits) = q4k_muse_prefill_hd128_dense_chain(
-        &q_weights,
-        &k_weights,
-        &v_weights,
-        14,
-        &attention_gate_weights,
-        q_rows,
-        kv_rows,
+    let input_desc = DeviceTensorDesc::new(
+        seq_len,
         n_embd,
-        &actual.clone(),
-        &attn_norm,
-        &q_norm,
-        &k_norm,
-        num_heads,
-        num_kv_heads,
-        scale,
-        rope_theta,
-        0,
-        true,
-        sliding_window,
-        &o,
-        &gate,
-        &up,
-        &down,
-        12,
-        &post_attn_norm,
-        &ffn_norm,
-        &post_ffn_norm,
-        q_dim,
-        n_ff,
-        n_embd,
-        &mut actual,
-        norm_eps,
-        post_norm_eps,
-    )
-    .expect("CUDA Muse fused QKV dense chain")
-    .expect("CUDA Muse fused QKV path");
+        ScalarType::F32,
+        DeviceTensorRole::MoeOutput,
+    );
+    let input_id =
+        upload_device_tensor_f32(input_desc, &initial_hidden).expect("upload Muse device input");
+    let run_chain = |output_cols| {
+        q4k_muse_prefill_hd128_dense_chain_device_input(
+            input_id,
+            input_desc,
+            &q_weights,
+            &k_weights,
+            &v_weights,
+            14,
+            &attention_gate_weights,
+            q_rows,
+            kv_rows,
+            n_embd,
+            &attn_norm,
+            &q_norm,
+            &k_norm,
+            num_heads,
+            num_kv_heads,
+            scale,
+            rope_theta,
+            0,
+            true,
+            sliding_window,
+            &o,
+            &gate,
+            &up,
+            &down,
+            12,
+            &post_attn_norm,
+            &ffn_norm,
+            &post_ffn_norm,
+            q_dim,
+            n_ff,
+            output_cols,
+            norm_eps,
+            post_norm_eps,
+        )
+    };
+    let err = run_chain(n_embd * 2).expect_err("mismatched output width must be rejected");
+    assert!(
+        err.contains("dimensions are invalid"),
+        "unexpected output width error: {err}"
+    );
+    let output = run_chain(n_embd)
+        .expect("CUDA Muse device-input fused QKV dense chain")
+        .expect("CUDA Muse device-input fused QKV path");
+    assert_eq!(
+        output.output_id, input_id,
+        "Muse device chain must reuse its input allocation"
+    );
+    assert_eq!(
+        output.output_desc,
+        DeviceTensorDesc::new(seq_len, n_embd, ScalarType::F32, DeviceTensorRole::Hidden),
+        "Muse device chain must retag MoeOutput input as Hidden output"
+    );
+    let actual =
+        download_device_tensor_f32(output.output_id).expect("download retagged Muse hidden output");
+    let actual_k_bits = output.k_bits;
+    let actual_v_bits = output.v_bits;
+    assert!(
+        release_device_tensor(output.output_id).expect("release Muse hidden output"),
+        "Muse hidden output allocation must still exist"
+    );
+    assert_eq!(
+        llama_mmq_j128_launch_counts_for_test(),
+        (5, 1),
+        "Muse product-shape full chain must launch five Q4_K and one Q6_K J128 kernels"
+    );
 
     assert_f16_bits_close(
         "Muse fused QKV K cache",
         &actual_k_bits,
         &expected_k_bits,
-        1e-3,
+        3e-3,
     );
     assert_f16_bits_close(
         "Muse fused QKV V cache",
         &actual_v_bits,
         &expected_v_bits,
-        1e-3,
+        3e-3,
     );
     assert_close_rows_abs_rel(
         "Muse fused QKV hd128 dense chain",
         &actual,
         &expected_hidden,
-        2e-4,
-        2e-5,
+        1.5e-2,
+        2e-3,
     );
 }
 
@@ -10516,12 +10807,12 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
     let post_norm_eps = 1.0e-6;
 
     let hidden_dev = acquire_decode_hidden_carrier(n_embd * std::mem::size_of::<f32>()).unwrap();
-    let run_layer = |layer_idx| {
+    let run_layer = |layer_idx, out_scale, q_weights: &[u8], v_weights: &[u8]| {
         decode_full_layer_device_resident(
             layer_idx,
-            &q,
+            q_weights,
             &k,
-            &v,
+            v_weights,
             &o,
             Some(&attention_gate),
             &gate,
@@ -10545,7 +10836,7 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
             false,
             Some(2),
             false,
-            1.0,
+            out_scale,
             rope_theta,
             0,
             0,
@@ -10555,11 +10846,18 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
         )
     };
 
+    let err = run_layer(8998, 1.0, &q[..q.len() - 1], &v)
+        .expect_err("short Q weight must be rejected before launch");
+    assert!(err.contains("weight/norm shape mismatch"), "{err}");
+    let err = run_layer(8999, 1.0, &q, &v[..v.len() - 1])
+        .expect_err("short V weight must be rejected before launch");
+    assert!(err.contains("V weight bytes mismatch"), "{err}");
+
     upload_to_decode_hidden_carrier(&initial_hidden, hidden_dev).unwrap();
     {
         let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "0");
         let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "0");
-        run_layer(9000).expect("separate QKV Muse layer");
+        run_layer(9000, 1.0, &q, &v).expect("separate QKV Muse layer");
     }
     let mut expected = vec![0.0f32; n_embd];
     download_from_decode_hidden_carrier(hidden_dev, &mut expected).unwrap();
@@ -10569,7 +10867,7 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
     {
         let _q4_row4 = EnvVarGuard::set("RNB_CUDA_Q4K_Q8DOT_ROW4", "1");
         let _q6_row4 = EnvVarGuard::set("RNB_CUDA_Q6K_Q8DOT_ROW4", "1");
-        run_layer(9001).expect("fused QKV Muse layer");
+        run_layer(9001, 1.0, &q, &v).expect("fused QKV Muse layer");
     }
     let mut actual = vec![0.0f32; n_embd];
     download_from_decode_hidden_carrier(hidden_dev, &mut actual).unwrap();
@@ -10580,6 +10878,17 @@ fn cuda_muse_full_device_decode_matches_fused_single_token_layer() {
         &expected,
         3e-4,
         3e-5,
+    );
+
+    upload_to_decode_hidden_carrier(&initial_hidden, hidden_dev).unwrap();
+    run_layer(9002, 0.0, &q, &v).expect("zero output scale Muse layer");
+    let mut zero_scaled = vec![f32::NAN; n_embd];
+    download_from_decode_hidden_carrier(hidden_dev, &mut zero_scaled).unwrap();
+    sync_decode_stream().unwrap();
+    assert_eq!(
+        zero_scaled,
+        vec![0.0; n_embd],
+        "explicit zero output scale must zero the full-device layer result"
     );
 }
 
@@ -12623,6 +12932,77 @@ fn cuda_rms_norm_add_then_rms_norm_matches_two_step_reference() {
         );
     }
 }
+#[test]
+fn cuda_cooperative_rms_norm_kernels_match_scalar_kernels_and_cpu() {
+    let _guard = runtime_test_lock();
+    let len = 6656usize;
+    let input = (0..len)
+        .map(|i| ((i as f32 * 0.013).sin() * 0.7) + ((i % 31) as f32 - 15.0) * 0.002)
+        .collect::<Vec<_>>();
+    let weight = (0..len)
+        .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
+        .collect::<Vec<_>>();
+    let residual = (0..len)
+        .map(|i| ((i as f32 * 0.017).cos() * 0.5) - 0.02)
+        .collect::<Vec<_>>();
+    let eps = 1.0e-5f32;
+    let inv_rms = (input.iter().map(|value| value * value).sum::<f32>() / len as f32 + eps)
+        .sqrt()
+        .recip();
+
+    for unit_offset in [false, true] {
+        let expected_norm = input
+            .iter()
+            .zip(&weight)
+            .map(|(&value, &weight)| {
+                value * inv_rms * if unit_offset { 1.0 + weight } else { weight }
+            })
+            .collect::<Vec<_>>();
+        let scalar_norm = rms_norm_for_test(&input, &weight, eps, unit_offset, false)
+            .expect("scalar CUDA RMS norm");
+        let cooperative_norm = rms_norm_for_test(&input, &weight, eps, unit_offset, true)
+            .expect("cooperative CUDA RMS norm");
+        assert_close_rows_abs_rel(
+            "cooperative RMS norm vs CPU",
+            &cooperative_norm,
+            &expected_norm,
+            2e-5,
+            2e-5,
+        );
+        assert_close_rows_abs_rel(
+            "cooperative RMS norm vs scalar CUDA",
+            &cooperative_norm,
+            &scalar_norm,
+            2e-5,
+            2e-5,
+        );
+
+        let expected_add = residual
+            .iter()
+            .zip(&expected_norm)
+            .map(|(&residual, &normalized)| residual + normalized)
+            .collect::<Vec<_>>();
+        let scalar_add = rms_norm_add_for_test(&input, &weight, &residual, eps, unit_offset, false)
+            .expect("scalar CUDA RMS norm-add");
+        let cooperative_add =
+            rms_norm_add_for_test(&input, &weight, &residual, eps, unit_offset, true)
+                .expect("cooperative CUDA RMS norm-add");
+        assert_close_rows_abs_rel(
+            "cooperative RMS norm-add vs CPU",
+            &cooperative_add,
+            &expected_add,
+            2e-5,
+            2e-5,
+        );
+        assert_close_rows_abs_rel(
+            "cooperative RMS norm-add vs scalar CUDA",
+            &cooperative_add,
+            &scalar_add,
+            2e-5,
+            2e-5,
+        );
+    }
+}
 
 #[test]
 fn cuda_mtp_build_eh_input_matches_cpu_norm_concat() {
@@ -13670,6 +14050,7 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
     let resident_limit = state.resident_q4k_limit;
     let mut run_pair = |parallel: &str, limit: usize| {
         state.resident_q4k_limit = limit;
+        let launches_before = q4k_parallel_gate_up_launch_count_for_test();
         let _parallel = EnvVarGuard::set("RNB_CUDA_Q4K_PARALLEL_GATE_UP", parallel);
         state
             .q4k_pair_batch_q8dot_to_dev(
@@ -13709,8 +14090,8 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
         state
             .stream_synchronize()
             .expect("synchronize gate-up pair");
-        let used_parallel_events = state.dense_parallel_events.is_some();
-        (gate, up, used_parallel_events)
+        let launches_after = q4k_parallel_gate_up_launch_count_for_test();
+        (gate, up, launches_after == launches_before + 1)
     };
 
     let cold_requested = run_pair("1", 0);
@@ -13743,6 +14124,7 @@ fn cuda_q4k_mmq_tile128_persistent_grid_matches_tile64() {
     let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
     let _tile64 = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_TILE64", "1");
+    let _llama_mmq = EnvVarGuard::set("RNB_CUDA_Q4K_MMQ_LLAMA_AMPERE_J128", "0");
     let rows = 8193usize;
     let cols = 256usize;
     let blocks_per_row = 1usize;
@@ -14783,6 +15165,7 @@ fn cuda_q6k_mmq_tile128_matches_tile64_with_tails() {
     let _min_seq = EnvVarGuard::set("RNB_CUDA_MMQ_TILE32_MIN_SEQ", "8");
     let _seq64 = EnvVarGuard::set("RNB_CUDA_MMQ_TILE_SEQ64", "1");
     let _tile64 = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_TILE64", "1");
+    let _llama_mmq = EnvVarGuard::set("RNB_CUDA_Q6K_MMQ_LLAMA_AMPERE_J128", "0");
     let rows = 1057usize;
     let cols = 1024usize;
     let blocks_per_row = cols / 256;

@@ -713,7 +713,7 @@ impl Engine {
                 muse_low_vram,
             )
         })?;
-        backend_runtime.set_decode_gpu_layer_prefixes(decode_gpu_layer_prefixes);
+        backend_runtime.set_initial_decode_gpu_layer_prefixes(decode_gpu_layer_prefixes);
         if !muse_low_vram && !muse_model {
             load_stage!("backend_prewarm_q6_down", {
                 super::backend_runtime::prewarm_dense_q6_packed_down_weights(&weights)

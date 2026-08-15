@@ -157,7 +157,31 @@ impl CudaState {
         );
     }
 
-    fn clear_low_priority_resident_caches(&mut self) -> Result<usize, String> {
+    pub(in crate::runtime) fn begin_muse_decode_tail_residency(&mut self) {
+        self.muse_decode_tail_base_residency
+            .get_or_insert((self.device_residency_plan, self.resident_q4k_limit));
+    }
+
+    pub(in crate::runtime) fn prepare_muse_decode_layer_streaming_admission(
+        &mut self,
+    ) -> Result<(), String> {
+        if !self.muse_decode_tail_streaming {
+            return Ok(());
+        }
+        let (free_bytes, _) = unsafe { self.api.mem_get_info() }?;
+        self.configure_decode_residency_reserve(0);
+        self.resident_q4k_limit = self.resident_q4k_bytes.saturating_add(free_bytes);
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn restore_configured_device_residency_plan(&mut self) {
+        self.device_residency_plan = self.configured_device_residency_plan;
+        self.resident_q4k_limit = self.configured_resident_q4k_limit;
+    }
+
+    pub(in crate::runtime) fn clear_low_priority_resident_caches(
+        &mut self,
+    ) -> Result<usize, String> {
         let before = self.resident_cache_bytes();
 
         for (_, entry) in self.resident_q8_f32.drain() {

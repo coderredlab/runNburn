@@ -25,6 +25,7 @@ pub(in crate::engine) struct EngineBackendRuntime {
     #[cfg(feature = "vulkan")]
     gpu_layer_runtime: Option<GpuRuntime>,
     decode_gpu_layer_prefixes: Option<(usize, usize)>,
+    base_decode_gpu_layer_prefixes: Option<(usize, usize)>,
 }
 
 impl EngineBackendRuntime {
@@ -37,6 +38,7 @@ impl EngineBackendRuntime {
         Self {
             gpu_layer_runtime,
             decode_gpu_layer_prefixes: None,
+            base_decode_gpu_layer_prefixes: None,
         }
     }
 
@@ -49,6 +51,18 @@ impl EngineBackendRuntime {
     pub(in crate::engine) fn restore_gpu_runtime(&mut self, gpu_layer_runtime: Option<GpuRuntime>) {
         self.gpu_layer_runtime = gpu_layer_runtime;
     }
+    pub(in crate::engine) fn set_initial_decode_gpu_layer_prefixes(
+        &mut self,
+        layers: Option<(usize, usize)>,
+    ) {
+        self.base_decode_gpu_layer_prefixes = layers;
+        self.decode_gpu_layer_prefixes = layers;
+    }
+
+    pub(in crate::engine) fn restore_initial_decode_gpu_layer_prefixes(&mut self) {
+        self.decode_gpu_layer_prefixes = self.base_decode_gpu_layer_prefixes;
+    }
+
     pub(in crate::engine) fn set_decode_gpu_layer_prefixes(
         &mut self,
         layers: Option<(usize, usize)>,
@@ -180,10 +194,12 @@ mod tests {
         let mut runtime = EngineBackendRuntime::new();
         assert!(runtime.decode_all_layers_use_gpu(52));
 
-        runtime.set_decode_gpu_layer_prefixes(Some((52, 30)));
+        runtime.set_initial_decode_gpu_layer_prefixes(Some((52, 30)));
         assert!(!runtime.decode_all_layers_use_gpu(52));
 
         runtime.set_decode_gpu_layer_prefixes(Some((52, 52)));
         assert!(runtime.decode_all_layers_use_gpu(52));
+        runtime.restore_initial_decode_gpu_layer_prefixes();
+        assert!(!runtime.decode_all_layers_use_gpu(52));
     }
 }

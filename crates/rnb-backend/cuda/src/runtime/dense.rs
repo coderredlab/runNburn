@@ -1111,6 +1111,8 @@ impl CudaState {
                 up_output_dev,
             );
         }
+        #[cfg(test)]
+        crate::runtime::test_support::record_q4k_parallel_gate_up_launch();
 
         let chunks_per_seq = blocks_per_row * 8;
         let chunks = seq_len * chunks_per_seq;

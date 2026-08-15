@@ -2,6 +2,40 @@ use super::*;
 use crate::runtime::state::{pack_q4k_for_q8dot, pack_q6k_for_q8dot};
 
 static CUDA_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+static Q4K_LLAMA_MMQ_J128_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static Q6K_LLAMA_MMQ_J128_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static Q4K_PARALLEL_GATE_UP_LAUNCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn record_q4k_llama_mmq_j128_launch() {
+    Q4K_LLAMA_MMQ_J128_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn record_q6k_llama_mmq_j128_launch() {
+    Q6K_LLAMA_MMQ_J128_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn record_q4k_parallel_gate_up_launch() {
+    Q4K_PARALLEL_GATE_UP_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reset_llama_mmq_j128_launch_counts_for_test() {
+    Q4K_LLAMA_MMQ_J128_LAUNCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+    Q6K_LLAMA_MMQ_J128_LAUNCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn llama_mmq_j128_launch_counts_for_test() -> (usize, usize) {
+    (
+        Q4K_LLAMA_MMQ_J128_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),
+        Q6K_LLAMA_MMQ_J128_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub fn q4k_parallel_gate_up_launch_count_for_test() -> usize {
+    Q4K_PARALLEL_GATE_UP_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub(crate) fn cuda_test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     CUDA_TEST_LOCK
@@ -2205,6 +2239,136 @@ pub fn q4k_packed_gate_up_batch_seq2_q8_for_test(
         state.api.mem_free(up_dev)?;
     }
     Ok((gate, up))
+}
+
+#[cfg(test)]
+pub fn rms_norm_for_test(
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    unit_offset: bool,
+    cooperative: bool,
+) -> Result<Vec<f32>, String> {
+    if input.len() != weight.len() {
+        return Err(format!(
+            "RMS norm test length mismatch: input={} weight={}",
+            input.len(),
+            weight.len()
+        ));
+    }
+    let mut state = CudaState::open()?;
+    let bytes = std::mem::size_of_val(input);
+    let input_dev = state.mem_alloc(bytes)?;
+    let weight_dev = state.mem_alloc(bytes)?;
+    let output_dev = state.mem_alloc(bytes)?;
+    unsafe {
+        state.api.memcpy_htod_async(
+            input_dev,
+            input.as_ptr().cast::<libc::c_void>(),
+            bytes,
+            state.stream,
+        )?;
+        state.api.memcpy_htod_async(
+            weight_dev,
+            weight.as_ptr().cast::<libc::c_void>(),
+            bytes,
+            state.stream,
+        )?;
+    }
+    state.launch_rms_norm_f32(
+        input_dev,
+        weight_dev,
+        output_dev,
+        eps,
+        input.len(),
+        unit_offset,
+        cooperative,
+    )?;
+    let mut output = vec![0.0f32; input.len()];
+    unsafe {
+        state.api.memcpy_dtoh_async(
+            output.as_mut_ptr().cast::<libc::c_void>(),
+            output_dev,
+            bytes,
+            state.stream,
+        )?;
+    }
+    state.stream_synchronize()?;
+    unsafe {
+        state.api.mem_free(input_dev)?;
+        state.api.mem_free(weight_dev)?;
+        state.api.mem_free(output_dev)?;
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+pub fn rms_norm_add_for_test(
+    input: &[f32],
+    weight: &[f32],
+    residual: &[f32],
+    eps: f32,
+    unit_offset: bool,
+    cooperative: bool,
+) -> Result<Vec<f32>, String> {
+    if input.len() != weight.len() || input.len() != residual.len() {
+        return Err(format!(
+            "RMS norm-add test length mismatch: input={} weight={} residual={}",
+            input.len(),
+            weight.len(),
+            residual.len()
+        ));
+    }
+    let mut state = CudaState::open()?;
+    let bytes = std::mem::size_of_val(input);
+    let input_dev = state.mem_alloc(bytes)?;
+    let weight_dev = state.mem_alloc(bytes)?;
+    let residual_dev = state.mem_alloc(bytes)?;
+    unsafe {
+        state.api.memcpy_htod_async(
+            input_dev,
+            input.as_ptr().cast::<libc::c_void>(),
+            bytes,
+            state.stream,
+        )?;
+        state.api.memcpy_htod_async(
+            weight_dev,
+            weight.as_ptr().cast::<libc::c_void>(),
+            bytes,
+            state.stream,
+        )?;
+        state.api.memcpy_htod_async(
+            residual_dev,
+            residual.as_ptr().cast::<libc::c_void>(),
+            bytes,
+            state.stream,
+        )?;
+    }
+    state.launch_rms_norm_add_f32_inplace(
+        input_dev,
+        weight_dev,
+        residual_dev,
+        eps,
+        input.len(),
+        unit_offset,
+        cooperative,
+    )?;
+    let mut output = vec![0.0f32; input.len()];
+    unsafe {
+        state.api.memcpy_dtoh_async(
+            output.as_mut_ptr().cast::<libc::c_void>(),
+            residual_dev,
+            bytes,
+            state.stream,
+        )?;
+    }
+    state.stream_synchronize()?;
+    unsafe {
+        state.api.mem_free(input_dev)?;
+        state.api.mem_free(weight_dev)?;
+        state.api.mem_free(residual_dev)?;
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

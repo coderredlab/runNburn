@@ -160,6 +160,7 @@ pub(super) use gpu_gdn::{nemotron_mamba2_decode_scan, nemotron_mamba2_prefill_sc
 pub(super) use init::init_prefill_layer_runtime;
 pub(super) use init::{
     clear_decode_attention_kv_cache_before_prefill, clear_host_registered_ranges_before_prefill,
+    muse_decode_tail_reserve_bytes, prepare_residency_before_prefill,
     release_prefill_residency_after_prefill, reset_backend_state_for_engine_init,
 };
 #[cfg(not(feature = "cuda"))]
