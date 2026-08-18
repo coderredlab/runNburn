@@ -26163,4 +26163,845 @@ kernel void q4k_ro_vec4(
             "splitk KVarN attention diverged from CPU reference: max_diff={max_diff}"
         );
     }
+    /// Qwen3.8 27B debug: prefill flash TG 커널을 scalar 참조와 대조.
+    /// Qwen3.8 shape (nh=24, nkv=4 → GQA 6:1, hd=256) 에서 gibberish 재현 확인용.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn flash_tg_prefill_matches_scalar_reference() {
+        let backend = MetalBackend::new();
+        let Some(_ctx) = backend.ctx.as_ref() else {
+            eprintln!("[flash-dbg] no Metal ctx; skip");
+            return;
+        };
+
+        fn run_case(backend: &MetalBackend, nh: usize, nkv: usize, seq: usize, kv: usize) {
+            let hd = 256usize;
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            // half roundtrip inputs so f16 rounding matches on both sides.
+            let q: Vec<f32> = (0..seq * nh * hd)
+                .map(|i| {
+                    let v = (((i * 37) % 97) as f32 - 48.0) * 0.01;
+                    half::f16::from_f32(v).to_f32()
+                })
+                .collect();
+            let k_f16: Vec<u16> = (0..kv * nkv * hd)
+                .map(|i| half::f16::from_f32((((i * 13) % 89) as f32 - 44.0) * 0.01).to_bits())
+                .collect();
+            let v_f16: Vec<u16> = (0..kv * nkv * hd)
+                .map(|i| half::f16::from_f32((((i * 29) % 83) as f32 - 41.0) * 0.01).to_bits())
+                .collect();
+            let k_f32: Vec<f32> = k_f16
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect();
+            let v_f32: Vec<f32> = v_f16
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect();
+
+            // scalar causal GQA reference
+            let mut expected = vec![0.0f32; seq * nh * hd];
+            let hpg = nh / nkv;
+            for head in 0..nh {
+                let kv_head = head / hpg;
+                for row in 0..seq {
+                    let global_pos = (kv - seq) + row;
+                    let mut scores = vec![f32::NEG_INFINITY; kv];
+                    for col in 0..kv {
+                        if col > global_pos {
+                            continue;
+                        }
+                        let mut dot = 0.0f32;
+                        for d in 0..hd {
+                            dot += q[(row * nh + head) * hd + d]
+                                * k_f32[(col * nkv + kv_head) * hd + d];
+                        }
+                        scores[col] = dot * scale;
+                    }
+                    let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    let mut p = vec![0.0f32; kv];
+                    for col in 0..kv {
+                        if scores[col] > f32::NEG_INFINITY {
+                            p[col] = (scores[col] - m).exp();
+                            sum += p[col];
+                        }
+                    }
+                    for d in 0..hd {
+                        let mut acc = 0.0f32;
+                        for col in 0..kv {
+                            if p[col] > 0.0 {
+                                acc += p[col] * v_f32[(col * nkv + kv_head) * hd + d];
+                            }
+                        }
+                        expected[(row * nh + head) * hd + d] = acc / sum;
+                    }
+                }
+            }
+
+            let actual = backend
+                .prefill_flash_attention(&q, &k_f16, &v_f16, seq, kv, nh, nkv, hd, scale)
+                .expect("flash tg should support this shape");
+            let mut max_diff = 0.0f32;
+            let mut arg: usize = 0;
+            for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let d = (a - e).abs();
+                if d > max_diff {
+                    max_diff = d;
+                    arg = i;
+                }
+            }
+            let row = arg / (nh * hd);
+            let head = (arg / hd) % nh;
+            eprintln!(
+                "[flash-dbg] nh={nh} nkv={nkv} seq={seq} kv={kv}: max_diff={max_diff:.6e} at row={row} head={head} dim={} actual={} expected={}",
+                arg % hd, actual[arg], expected[arg]
+            );
+            assert!(
+                max_diff < 2.0e-2,
+                "flash tg diverged (nh={nh} nkv={nkv}): max_diff={max_diff}"
+            );
+        }
+
+        run_case(&backend, 4, 2, 8, 8); // 2:1 sanity
+        run_case(&backend, 24, 4, 8, 8); // Qwen3.8 GQA 6:1
+        run_case(&backend, 24, 4, 8, 16); // with prefix offset
+        run_case(&backend, 24, 4, 16, 16); // seq > Q block
+    }
+
+    /// pm253: Q4_K TensorOps GEMM을 carrier와 동일 shape (n=2048, k=512, m=8)로 테스트.
+    /// 작은 shape(n=8)은 통과하지만 큰 n에서 깨지면 GEMM 커널 버그.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn gemm_q4k_tensorops_large_n_matches_cpu_reference() {
+        let Some(ctx) = crate::compute::build_metal_context() else {
+            panic!("no Metal device — run on macOS host")
+        };
+        let (n, k, m) = (2048usize, 512usize, 8usize);
+        let wb = quantize_rows_q4k(&det_vals(n * k, 0.007), n, k);
+
+        // Use the same input as the carrier: RMS-normed hidden
+        let hidden_dim = 512usize;
+        let norm_eps = 1e-5f32;
+        let hidden = det_vals(m * hidden_dim, 0.031);
+        let attn_norm_w = det_vals(hidden_dim, 0.017)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let mut normed = vec![0.0f32; m * hidden_dim];
+        for t in 0..m {
+            let base = t * hidden_dim;
+            let sum_sq: f32 = hidden[base..base + hidden_dim].iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + norm_eps).sqrt();
+            for i in 0..hidden_dim {
+                normed[base + i] = hidden[base + i] * inv_rms * attn_norm_w[i];
+            }
+        }
+        let input = normed;
+
+        let cpu = cpu_q4k_gemm_reference(&wb, n, k, &input, m);
+
+        // Register weight as host storage
+        let wb_len = wb.len();
+        let wb_tensor = rnb_core::tensor::Tensor::from_vec(wb, &[wb_len]);
+        wb_tensor.register_host_storage();
+        let wb = wb_tensor.as_bytes().expect("weight bytes");
+
+        // Use the same tile config as the carrier (nra=64, nrb=8)
+        let gpu = crate::compute::run_q4k_tensorops_v2_variant(
+            &ctx,
+            wb,
+            &input,
+            n,
+            k,
+            m,
+            "gemm_q4k_tensorops_v2_64x8_packed",
+            64,
+            8,
+        );
+        assert_eq!(gpu.len(), m * n);
+
+        let mut max_abs = 0.0f32;
+        let mut arg = 0usize;
+        for i in 0..m * n {
+            let d = (gpu[i] - cpu[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+                arg = i;
+            }
+        }
+        let row = arg % n;
+        let col = arg / n;
+        eprintln!(
+            "[pm253] gemm q4k tensorops n={n} k={k} m={m}: max_abs={max_abs:.6e} at row={row} col={col} gpu={} cpu={}",
+            gpu[arg], cpu[arg]
+        );
+        assert!(
+            max_abs < 0.1,
+            "gemm q4k tensorops large-n diverged: max_abs={max_abs}"
+        );
+    }
+
+    /// pm253: flash kernel에 큰 값(실제 carrier 수준) 입력 시 발산 여부.
+    /// 작은 값(기존 테스트)은 통과하지만 큰 값에서 깨지면 F16 정밀도 문제.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn flash_tg_prefill_large_values() {
+        let backend = MetalBackend::new();
+        let Some(_ctx) = backend.ctx.as_ref() else {
+            eprintln!("[flash-dbg] no Metal ctx; skip");
+            return;
+        };
+
+        let nh = 4usize;
+        let nkv = 2usize;
+        let seq = 8usize;
+        let kv = 8usize;
+        let hd = 256usize;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        // Use values similar to the carrier's actual Q/K/V magnitudes
+        let q: Vec<f32> = (0..seq * nh * hd)
+            .map(|i| {
+                let v = (((i * 37) % 97) as f32 - 48.0) * 0.05; // ±2.4
+                half::f16::from_f32(v).to_f32()
+            })
+            .collect();
+        let k_f16: Vec<u16> = (0..kv * nkv * hd)
+            .map(|i| half::f16::from_f32((((i * 13) % 89) as f32 - 44.0) * 0.05).to_bits())
+            .collect();
+        let v_f16: Vec<u16> = (0..kv * nkv * hd)
+            .map(|i| half::f16::from_f32((((i * 29) % 83) as f32 - 41.0) * 0.3).to_bits())
+            .collect();
+        let k_f32: Vec<f32> = k_f16
+            .iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect();
+        let v_f32: Vec<f32> = v_f16
+            .iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect();
+
+        // scalar causal GQA reference
+        let mut expected = vec![0.0f32; seq * nh * hd];
+        let hpg = nh / nkv;
+        for head in 0..nh {
+            let kv_head = head / hpg;
+            for row in 0..seq {
+                let global_pos = (kv - seq) + row;
+                let mut scores = vec![f32::NEG_INFINITY; kv];
+                for col in 0..kv {
+                    if col > global_pos {
+                        continue;
+                    }
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot +=
+                            q[(row * nh + head) * hd + d] * k_f32[(col * nkv + kv_head) * hd + d];
+                    }
+                    scores[col] = dot * scale;
+                }
+                let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                let mut p = vec![0.0f32; kv];
+                for col in 0..kv {
+                    if scores[col] > f32::NEG_INFINITY {
+                        p[col] = (scores[col] - m).exp();
+                        sum += p[col];
+                    }
+                }
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for col in 0..kv {
+                        if p[col] > 0.0 {
+                            acc += p[col] * v_f32[(col * nkv + kv_head) * hd + d];
+                        }
+                    }
+                    expected[(row * nh + head) * hd + d] = acc / sum;
+                }
+            }
+        }
+
+        let actual = backend
+            .prefill_flash_attention(&q, &k_f16, &v_f16, seq, kv, nh, nkv, hd, scale)
+            .expect("flash tg should support this shape");
+        let mut max_diff = 0.0f32;
+        let mut arg: usize = 0;
+        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let d = (a - e).abs();
+            if d > max_diff {
+                max_diff = d;
+                arg = i;
+            }
+        }
+        let row = arg / (nh * hd);
+        let head = (arg / hd) % nh;
+        eprintln!(
+            "[flash-dbg] large values nh={nh} nkv={nkv} seq={seq} kv={kv}: max_diff={max_diff:.6e} at row={row} head={head} dim={} actual={} expected={}",
+            arg % hd, actual[arg], expected[arg]
+        );
+        assert!(
+            max_diff < 2.0e-2,
+            "flash tg large values diverged: max_diff={max_diff}"
+        );
+    }
+
+    /// pm253: Qwen3.8 27B shape (nh=24, nkv=4, GQA 6:1, hd=256, hidden=5120)
+    /// attn_core carrier vs CPU reference. gibberish 재현 shape으로 정확도 검증.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn prefill_atn_core_qwen35_shape_matches_cpu_reference() {
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            eprintln!("[pm253] no Metal ctx; skipping");
+            return;
+        }
+
+        // Qwen3.8 27B shape
+        let seq_len = 8usize;
+        let hidden_dim = 5120usize;
+        let head_dim = 256usize;
+        let num_heads = 24usize;
+        let num_kv_heads = 4usize;
+        let q_dim = num_heads * head_dim; // 6144
+        let kv_dim = num_kv_heads * head_dim; // 1024
+        let n_rot = 64usize;
+        let norm_eps = 1e-5f32;
+        let rope_theta = 10_000_000.0f32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let pos_start = 0usize;
+
+        let hidden = det_vals(seq_len * hidden_dim, 0.031);
+        let attn_norm_w = det_vals(hidden_dim, 0.017)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let q_norm_w = det_vals(head_dim, 0.013)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let k_norm_w = det_vals(head_dim, 0.011)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let q_w = quantize_rows_q4k(
+            &det_vals(q_dim * 2 * hidden_dim, 0.007),
+            q_dim * 2,
+            hidden_dim,
+        );
+        let k_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.009), kv_dim, hidden_dim);
+        let v_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.005), kv_dim, hidden_dim);
+
+        // Register weights as host storage for Metal zero-copy access.
+        // Tensor takes ownership; weight views borrow the tensor's bytes so
+        // the raw pointer matches the registered allocation.
+        let q_w_len = q_w.len();
+        let k_w_len = k_w.len();
+        let v_w_len = v_w.len();
+        let q_w_tensor = rnb_core::tensor::Tensor::from_vec(q_w, &[q_w_len]);
+        let k_w_tensor = rnb_core::tensor::Tensor::from_vec(k_w, &[k_w_len]);
+        let v_w_tensor = rnb_core::tensor::Tensor::from_vec(v_w, &[v_w_len]);
+        q_w_tensor.register_host_storage();
+        k_w_tensor.register_host_storage();
+        v_w_tensor.register_host_storage();
+        let q_w = q_w_tensor.as_bytes().expect("q weight bytes");
+        let k_w = k_w_tensor.as_bytes().expect("k weight bytes");
+        let v_w = v_w_tensor.as_bytes().expect("v weight bytes");
+
+        let q_view = PrefillAtnCoreWeightView {
+            raw: q_w,
+            quant: TensoropsQuant::Q4K,
+            rows: q_dim * 2,
+            cols: hidden_dim,
+        };
+        let k_view = PrefillAtnCoreWeightView {
+            raw: k_w,
+            quant: TensoropsQuant::Q4K,
+            rows: kv_dim,
+            cols: hidden_dim,
+        };
+        let v_view = PrefillAtnCoreWeightView {
+            raw: v_w,
+            quant: TensoropsQuant::Q4K,
+            rows: kv_dim,
+            cols: hidden_dim,
+        };
+
+        let Some((attn_out_metal, k_bits_metal, v_bits_metal)) = backend
+            .prefill_atn_core_if_supported(PrefillAtnCoreBackendRequest {
+                hidden: &hidden,
+                attn_norm_w: &attn_norm_w,
+                q_norm_w: &q_norm_w,
+                k_norm_w: &k_norm_w,
+                q_weight: q_view,
+                k_weight: k_view,
+                v_weight: v_view,
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                kv_dim,
+                n_rot,
+                rope_theta,
+                scale,
+                norm_eps,
+                pos_start,
+            })
+            .expect("ATN core dispatch")
+        else {
+            eprintln!("[pm253] ATN core unsupported; skipping");
+            return;
+        };
+
+        // CPU reference: norm → QKV proj → gate split → QK norm → RoPE → flash → gate apply
+        // 1. RMS norm on hidden
+        let mut normed = vec![0.0f32; seq_len * hidden_dim];
+        for t in 0..seq_len {
+            let base = t * hidden_dim;
+            let sum_sq: f32 = hidden[base..base + hidden_dim].iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + norm_eps).sqrt();
+            for i in 0..hidden_dim {
+                normed[base + i] = hidden[base + i] * inv_rms * attn_norm_w[i];
+            }
+        }
+
+        // 2. QKV projection (Q4_K GEMM, F32 input)
+        let q_full = cpu_q4k_gemm_reference(&q_w, q_dim * 2, hidden_dim, &normed, seq_len);
+        let k_proj = cpu_q4k_gemm_reference(&k_w, kv_dim, hidden_dim, &normed, seq_len);
+        let v_proj = cpu_q4k_gemm_reference(&v_w, kv_dim, hidden_dim, &normed, seq_len);
+
+        // 3. Split Q into Q and gate (head-interleaved)
+        let mut q_vec = vec![0.0f32; seq_len * q_dim];
+        let mut gate_vec = vec![0.0f32; seq_len * q_dim];
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let src = t * q_dim * 2 + h * head_dim * 2;
+                let dst = t * q_dim + h * head_dim;
+                q_vec[dst..dst + head_dim].copy_from_slice(&q_full[src..src + head_dim]);
+                gate_vec[dst..dst + head_dim]
+                    .copy_from_slice(&q_full[src + head_dim..src + head_dim * 2]);
+            }
+        }
+
+        // 4. Q/K norm (per-head RMS norm) + RoPE (adjacent-pair)
+        let theta_scale = rope_theta.powf(-2.0 / n_rot as f32);
+        let mut q_normed = q_vec.clone();
+        let mut k_normed = k_proj.clone();
+        for t in 0..seq_len {
+            let pos = (pos_start + t) as f32;
+            // Q norm + RoPE
+            for h in 0..num_heads {
+                let base = t * q_dim + h * head_dim;
+                let sum_sq: f32 = q_vec[base..base + head_dim].iter().map(|v| v * v).sum();
+                let inv_rms = 1.0 / (sum_sq / head_dim as f32 + norm_eps).sqrt();
+                for i in 0..head_dim {
+                    q_normed[base + i] = q_vec[base + i] * inv_rms * q_norm_w[i];
+                }
+                // adjacent-pair RoPE on first n_rot dims
+                let mut angle = pos;
+                let mut i = 0;
+                while i < n_rot {
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let x0 = q_normed[base + i];
+                    let x1 = q_normed[base + i + 1];
+                    q_normed[base + i] = x0 * cos_a - x1 * sin_a;
+                    q_normed[base + i + 1] = x0 * sin_a + x1 * cos_a;
+                    angle *= theta_scale;
+                    i += 2;
+                }
+            }
+            // K norm + RoPE
+            for h in 0..num_kv_heads {
+                let base = t * kv_dim + h * head_dim;
+                let sum_sq: f32 = k_proj[base..base + head_dim].iter().map(|v| v * v).sum();
+                let inv_rms = 1.0 / (sum_sq / head_dim as f32 + norm_eps).sqrt();
+                for i in 0..head_dim {
+                    k_normed[base + i] = k_proj[base + i] * inv_rms * k_norm_w[i];
+                }
+                let mut angle = pos;
+                let mut i = 0;
+                while i < n_rot {
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let x0 = k_normed[base + i];
+                    let x1 = k_normed[base + i + 1];
+                    k_normed[base + i] = x0 * cos_a - x1 * sin_a;
+                    k_normed[base + i + 1] = x0 * sin_a + x1 * cos_a;
+                    angle *= theta_scale;
+                    i += 2;
+                }
+            }
+        }
+
+        // 5. Flash attention (causal, GQA)
+        let gqa_factor = num_heads / num_kv_heads;
+        let mut attn_out_cpu = vec![0.0f32; seq_len * q_dim];
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let kv_h = h / gqa_factor;
+                let q_base = t * q_dim + h * head_dim;
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; t + 1];
+                for s in 0..=t {
+                    let k_base = s * kv_dim + kv_h * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_normed[q_base + d] * k_normed[k_base + d];
+                    }
+                    scores[s] = dot * scale;
+                    max_score = max_score.max(scores[s]);
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t {
+                    scores[s] = (scores[s] - max_score).exp();
+                    sum_exp += scores[s];
+                }
+                let out_base = t * q_dim + h * head_dim;
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for s in 0..=t {
+                        let v_base = s * kv_dim + kv_h * head_dim;
+                        acc += scores[s] * v_proj[v_base + d];
+                    }
+                    attn_out_cpu[out_base + d] = acc / sum_exp;
+                }
+            }
+        }
+
+        // 6. Gate apply: silu(gate) * attn_out
+        for i in 0..seq_len * q_dim {
+            let g = gate_vec[i];
+            let sigmoid = 1.0 / (1.0 + (-g).exp());
+            attn_out_cpu[i] *= sigmoid;
+        }
+
+        // Compare
+        let max_abs = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mean_abs = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / attn_out_metal.len() as f32;
+        let max_rel = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[pm253] Qwen35 shape attn_core: max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} max_rel={max_rel:.6e}"
+        );
+        eprintln!(
+            "[pm253] metal head: {:?}",
+            &attn_out_metal[..8.min(attn_out_metal.len())]
+        );
+        eprintln!(
+            "[pm253] cpu   head: {:?}",
+            &attn_out_cpu[..8.min(attn_out_cpu.len())]
+        );
+
+        // Find worst divergence locations
+        let mut worst: Vec<(usize, f32, f32, f32)> = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .enumerate()
+            .map(|(i, (m, c))| (i, *m, *c, (m - c).abs()))
+            .collect();
+        worst.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        for (i, m, c, d) in worst.iter().take(10) {
+            let token = i / q_dim;
+            let head = (i % q_dim) / head_dim;
+            let dim = i % head_dim;
+            eprintln!(
+                "[pm253] worst[{i}] token={token} head={head} dim={dim}: metal={m:.6e} cpu={c:.6e} diff={d:.6e}"
+            );
+        }
+
+        // Per-token max divergence
+        for t in 0..seq_len {
+            let base = t * q_dim;
+            let token_max = attn_out_metal[base..base + q_dim]
+                .iter()
+                .zip(attn_out_cpu[base..base + q_dim].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("[pm253] token {t}: max_abs={token_max:.6e}");
+        }
+
+        assert!(
+            max_abs < 0.5,
+            "Qwen35 shape attn_core diverged: max_abs={max_abs} mean_abs={mean_abs}"
+        );
+    }
+
+    /// pm253 sanity: 작은 shape(nh=4, nkv=2, hidden=512)으로 CPU reference 검증.
+    /// 이 shape에서 Metal==CPU면 reference 구현이 맞고, Qwen35 shape 발산은 실버그.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn prefill_atn_core_small_shape_sanity() {
+        let backend = MetalBackend::new();
+        if backend.ctx.is_none() {
+            eprintln!("[pm253] no Metal ctx; skipping");
+            return;
+        }
+
+        let seq_len = 8usize;
+        let hidden_dim = 512usize;
+        let head_dim = 256usize;
+        let num_heads = 4usize;
+        let num_kv_heads = 2usize;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let n_rot = 64usize;
+        let norm_eps = 1e-5f32;
+        let rope_theta = 10_000_000.0f32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let pos_start = 0usize;
+
+        let hidden = det_vals(seq_len * hidden_dim, 0.031);
+        let attn_norm_w = det_vals(hidden_dim, 0.017)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let q_norm_w = det_vals(head_dim, 0.013)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let k_norm_w = det_vals(head_dim, 0.011)
+            .into_iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>();
+        let q_w = quantize_rows_q4k(
+            &det_vals(q_dim * 2 * hidden_dim, 0.007),
+            q_dim * 2,
+            hidden_dim,
+        );
+        let k_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.009), kv_dim, hidden_dim);
+        let v_w = quantize_rows_q4k(&det_vals(kv_dim * hidden_dim, 0.005), kv_dim, hidden_dim);
+
+        let q_w_len = q_w.len();
+        let k_w_len = k_w.len();
+        let v_w_len = v_w.len();
+        let q_w_tensor = rnb_core::tensor::Tensor::from_vec(q_w, &[q_w_len]);
+        let k_w_tensor = rnb_core::tensor::Tensor::from_vec(k_w, &[k_w_len]);
+        let v_w_tensor = rnb_core::tensor::Tensor::from_vec(v_w, &[v_w_len]);
+        q_w_tensor.register_host_storage();
+        k_w_tensor.register_host_storage();
+        v_w_tensor.register_host_storage();
+        let q_w = q_w_tensor.as_bytes().expect("q weight bytes");
+        let k_w = k_w_tensor.as_bytes().expect("k weight bytes");
+        let v_w = v_w_tensor.as_bytes().expect("v weight bytes");
+
+        let Some((attn_out_metal, _, _)) = backend
+            .prefill_atn_core_if_supported(PrefillAtnCoreBackendRequest {
+                hidden: &hidden,
+                attn_norm_w: &attn_norm_w,
+                q_norm_w: &q_norm_w,
+                k_norm_w: &k_norm_w,
+                q_weight: PrefillAtnCoreWeightView {
+                    raw: q_w,
+                    quant: TensoropsQuant::Q4K,
+                    rows: q_dim * 2,
+                    cols: hidden_dim,
+                },
+                k_weight: PrefillAtnCoreWeightView {
+                    raw: k_w,
+                    quant: TensoropsQuant::Q4K,
+                    rows: kv_dim,
+                    cols: hidden_dim,
+                },
+                v_weight: PrefillAtnCoreWeightView {
+                    raw: v_w,
+                    quant: TensoropsQuant::Q4K,
+                    rows: kv_dim,
+                    cols: hidden_dim,
+                },
+                seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                hidden_dim,
+                q_dim,
+                kv_dim,
+                n_rot,
+                rope_theta,
+                scale,
+                norm_eps,
+                pos_start,
+            })
+            .expect("ATN core dispatch")
+        else {
+            eprintln!("[pm253] ATN core unsupported; skipping");
+            return;
+        };
+
+        // CPU reference (same as Qwen35 test)
+        let mut normed = vec![0.0f32; seq_len * hidden_dim];
+        for t in 0..seq_len {
+            let base = t * hidden_dim;
+            let sum_sq: f32 = hidden[base..base + hidden_dim].iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + norm_eps).sqrt();
+            for i in 0..hidden_dim {
+                normed[base + i] = hidden[base + i] * inv_rms * attn_norm_w[i];
+            }
+        }
+
+        let q_full = cpu_q4k_gemm_reference(q_w, q_dim * 2, hidden_dim, &normed, seq_len);
+        let k_proj = cpu_q4k_gemm_reference(k_w, kv_dim, hidden_dim, &normed, seq_len);
+        let v_proj = cpu_q4k_gemm_reference(v_w, kv_dim, hidden_dim, &normed, seq_len);
+
+        let mut q_vec = vec![0.0f32; seq_len * q_dim];
+        let mut gate_vec = vec![0.0f32; seq_len * q_dim];
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let src = t * q_dim * 2 + h * head_dim * 2;
+                let dst = t * q_dim + h * head_dim;
+                q_vec[dst..dst + head_dim].copy_from_slice(&q_full[src..src + head_dim]);
+                gate_vec[dst..dst + head_dim]
+                    .copy_from_slice(&q_full[src + head_dim..src + head_dim * 2]);
+            }
+        }
+
+        let theta_scale = rope_theta.powf(-2.0 / n_rot as f32);
+        let mut q_normed = q_vec.clone();
+        let mut k_normed = k_proj.clone();
+        for t in 0..seq_len {
+            let pos = (pos_start + t) as f32;
+            for h in 0..num_heads {
+                let base = t * q_dim + h * head_dim;
+                let sum_sq: f32 = q_vec[base..base + head_dim].iter().map(|v| v * v).sum();
+                let inv_rms = 1.0 / (sum_sq / head_dim as f32 + norm_eps).sqrt();
+                for i in 0..head_dim {
+                    q_normed[base + i] = q_vec[base + i] * inv_rms * q_norm_w[i];
+                }
+                let mut angle = pos;
+                let mut i = 0;
+                while i < n_rot {
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let x0 = q_normed[base + i];
+                    let x1 = q_normed[base + i + 1];
+                    q_normed[base + i] = x0 * cos_a - x1 * sin_a;
+                    q_normed[base + i + 1] = x0 * sin_a + x1 * cos_a;
+                    angle *= theta_scale;
+                    i += 2;
+                }
+            }
+            for h in 0..num_kv_heads {
+                let base = t * kv_dim + h * head_dim;
+                let sum_sq: f32 = k_proj[base..base + head_dim].iter().map(|v| v * v).sum();
+                let inv_rms = 1.0 / (sum_sq / head_dim as f32 + norm_eps).sqrt();
+                for i in 0..head_dim {
+                    k_normed[base + i] = k_proj[base + i] * inv_rms * k_norm_w[i];
+                }
+                let mut angle = pos;
+                let mut i = 0;
+                while i < n_rot {
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let x0 = k_normed[base + i];
+                    let x1 = k_normed[base + i + 1];
+                    k_normed[base + i] = x0 * cos_a - x1 * sin_a;
+                    k_normed[base + i + 1] = x0 * sin_a + x1 * cos_a;
+                    angle *= theta_scale;
+                    i += 2;
+                }
+            }
+        }
+
+        let gqa_factor = num_heads / num_kv_heads;
+        let mut attn_out_cpu = vec![0.0f32; seq_len * q_dim];
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let kv_h = h / gqa_factor;
+                let q_base = t * q_dim + h * head_dim;
+                let mut max_score = f32::NEG_INFINITY;
+                let mut scores = vec![0.0f32; t + 1];
+                for s in 0..=t {
+                    let k_base = s * kv_dim + kv_h * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_normed[q_base + d] * k_normed[k_base + d];
+                    }
+                    scores[s] = dot * scale;
+                    max_score = max_score.max(scores[s]);
+                }
+                let mut sum_exp = 0.0f32;
+                for s in 0..=t {
+                    scores[s] = (scores[s] - max_score).exp();
+                    sum_exp += scores[s];
+                }
+                let out_base = t * q_dim + h * head_dim;
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for s in 0..=t {
+                        let v_base = s * kv_dim + kv_h * head_dim;
+                        acc += scores[s] * v_proj[v_base + d];
+                    }
+                    attn_out_cpu[out_base + d] = acc / sum_exp;
+                }
+            }
+        }
+
+        for i in 0..seq_len * q_dim {
+            let g = gate_vec[i];
+            let sigmoid = 1.0 / (1.0 + (-g).exp());
+            attn_out_cpu[i] *= sigmoid;
+        }
+
+        let max_abs = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let mean_abs = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>()
+            / attn_out_metal.len() as f32;
+        eprintln!("[pm253] small shape attn_core: max_abs={max_abs:.6e} mean_abs={mean_abs:.6e}");
+        eprintln!(
+            "[pm253] metal head: {:?}",
+            &attn_out_metal[..8.min(attn_out_metal.len())]
+        );
+        eprintln!(
+            "[pm253] cpu   head: {:?}",
+            &attn_out_cpu[..8.min(attn_out_cpu.len())]
+        );
+
+        // Find worst divergence locations
+        let mut worst: Vec<(usize, f32, f32, f32)> = attn_out_metal
+            .iter()
+            .zip(attn_out_cpu.iter())
+            .enumerate()
+            .map(|(i, (m, c))| (i, *m, *c, (m - c).abs()))
+            .collect();
+        worst.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        for (i, m, c, d) in worst.iter().take(10) {
+            let token = i / q_dim;
+            let head = (i % q_dim) / head_dim;
+            let dim = i % head_dim;
+            eprintln!(
+                "[pm253] worst[{i}] token={token} head={head} dim={dim}: metal={m:.6e} cpu={c:.6e} diff={d:.6e}"
+            );
+        }
+
+        assert!(
+            max_abs < 0.5,
+            "small shape attn_core diverged: max_abs={max_abs} mean_abs={mean_abs}"
+        );
+    }
 }
