@@ -561,20 +561,29 @@ impl Engine {
         }
     }
 
-    fn prepare_residency_before_prefill(&mut self) -> crate::error::Result<()> {
+    fn prepare_residency_before_prefill(
+        &mut self,
+        pending_tokens: usize,
+    ) -> crate::error::Result<()> {
         if matches!(self.architecture, rnb_loader::Architecture::MuseGlimmer) {
             self.backend_runtime
                 .restore_initial_decode_gpu_layer_prefixes();
         }
-        let prefill_scratch_bytes = if self.prefill_chunk_size() == usize::MAX {
-            0
-        } else {
-            #[cfg(feature = "cuda")]
-            {
-                crate::engine::tuning_runtime::prefill_chunk_scratch_budget_bytes()
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
+        // cu286: admission clamp은 실제로 프롬프트가 청킹되는 경우에만 arm한다.
+        // 단일 청크 prefill(표준 suite 1139/1115 토큰 등)은 체인 스크래치가 예산 안에
+        // 들어가므로 streaming 모델의 prefill 어드미션 여유를 깎으면 안 된다.
+        let prefill_scratch_bytes = {
+            let chunk = self.prefill_chunk_size();
+            if chunk != usize::MAX && pending_tokens > chunk {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::engine::tuning_runtime::prefill_chunk_scratch_budget_bytes()
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    0
+                }
+            } else {
                 0
             }
         };
@@ -624,7 +633,7 @@ impl Engine {
         }
 
         if release_tail {
-            self.prepare_residency_before_prefill()?;
+            self.prepare_residency_before_prefill(tokens.len())?;
         }
         let result = (|| {
             let weights = self.weights.as_ref().expect("loaded weights checked");
@@ -2124,7 +2133,7 @@ impl Engine {
         {
             self.materialize_sequence_state()?;
         }
-        self.prepare_residency_before_prefill()?;
+        self.prepare_residency_before_prefill(tokens.len())?;
         super::backend_runtime::clear_host_registered_ranges_before_prefill()?;
         super::backend_runtime::clear_decode_attention_kv_cache_before_prefill()?;
         let result = (|| {
