@@ -807,18 +807,6 @@ fn mtp_auto_policy_for_model(
             resource,
             reason: "insufficient-free-vram-for-mtp-device-verify",
         },
-        // mt103: 모델 weight가 device에 통째로 상주하지 못하면 dense device verify는
-        // 크게 진다. 12GiB 3060 + 15.9GiB 27B에서 auto MTP가 target-only 0.5 tok/s의
-        // 1/5 아래였다. `!device_verify_possible`은 workspace만 보므로 이 조건이 따로
-        // 필요하다.
-        ModelArchitecture::Qwen35 if !dense_model_fits_resident => MtpAutoPolicy {
-            enabled: false,
-            spec_k: dense_spec_k,
-            device_verify: false,
-            min_free_vram_mib: dense_min_free_vram_mib,
-            resource,
-            reason: "dense-qwen35-model-exceeds-resident-vram",
-        },
         // mt103: 한때 이 분기를 auto-off로 내렸다가 되돌렸다. device verify가 1.0 tok/s로
         // target-only 7.2의 1/7이던 원인은 `spec_k`였다. 같은 코드에서 `k=4`만 주면
         // 8.9 tok/s로 target-only를 1.24배 앞서고, 이는 resident cache 상한 수정 이전
@@ -827,14 +815,24 @@ fn mtp_auto_policy_for_model(
         // cu209: cu203~208 이 target-only decode 만 −30%+ 빨라지며 이 분기가
         // 한때 +6.7% 회귀로 뒤집혔었다. verify batch GEMV 를 q8dot 세대로
         // 올린 뒤(27B, 15/100 ABABAB) MTP on 이 target-only 대비 −5.52%
-        // (same-index 3/3, 100-token hash 동일)로 복귀해 auto-on 을 유지한다.
-        ModelArchitecture::Qwen35 => MtpAutoPolicy {
+        ModelArchitecture::Qwen35 if dense_model_fits_resident => MtpAutoPolicy {
             enabled: true,
             spec_k: dense_spec_k,
             device_verify: true,
             min_free_vram_mib: dense_min_free_vram_mib,
             resource,
             reason: "dense-qwen35-device-verify-auto",
+        },
+        // heterogeneous FFN(cu266): 모델이 VRAM에 다 못 들어가면 device verify
+        // workspace가 부족하고 host verify는 target forward 재실행(480ms/round)이라
+        // draft 이득을 초과한다 — small VRAM에서는 MTP를 끈다.
+        ModelArchitecture::Qwen35 => MtpAutoPolicy {
+            enabled: false,
+            spec_k: dense_spec_k,
+            device_verify: false,
+            min_free_vram_mib: dense_min_free_vram_mib,
+            resource,
+            reason: "dense-qwen35-heterogeneous-no-mtp",
         },
         _ => MtpAutoPolicy {
             enabled: false,
@@ -2364,7 +2362,7 @@ mod tests {
 
         assert!(!policy.enabled);
         assert!(!policy.device_verify);
-        assert_eq!(policy.reason, "dense-qwen35-model-exceeds-resident-vram");
+        assert_eq!(policy.reason, "dense-qwen35-heterogeneous-no-mtp");
     }
 
     /// 같은 조건에서 MoE는 expert read를 공유해 4.2배 빨라지므로 auto-on을 유지한다.

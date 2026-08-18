@@ -11,6 +11,6 @@ rnb-backend-api = { path = "../api" }
 rnb-core = { path = "../../rnb-core" }
 rnb-memory = { path = "../../rnb-memory" }
 rnb-platform = { path = "../../rnb-platform" }
+rnb_cpu = { package = "rnb-cpu", path = "../../rnb-cpu" }
 
 [dev-dependencies]
-rnb-cpu = { path = "../../rnb-cpu" }

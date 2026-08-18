@@ -88,10 +88,17 @@ pub(crate) fn quant_resident_budget_plan(
 }
 
 pub(in crate::runtime) fn quant_resident_reserve_mib(total_mib: usize) -> usize {
+    // Small VRAM (≤16GiB) + heterogeneous FFN(cu266): FFN weight가 GPU에 없으면
+    // CPU fallback이 PCIe 전송보다 빠르므로 reserve를 최소화해 raw quant weight를
+    // 최대한 prewarm한다. 큰 VRAM은 기존 비례식을 유지한다.
+    if total_mib <= 16 * 1024 {
+        return 512;
+    }
     let ratio = total_mib.saturating_mul(35) / 100;
     let floor = (total_mib / 4).clamp(1024, 4096);
     ratio.max(floor)
 }
+
 pub(in crate::runtime) fn pinned_prefix_reserve_mib(total_mib: usize) -> usize {
     total_mib
         .div_ceil(8)

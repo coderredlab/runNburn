@@ -6446,6 +6446,26 @@ impl CudaState {
             unit_offset_norm,
             false,
         )?;
+        let all_resident = self.q4k_weight_slice_is_resident(gate_weights)
+            && self.q4k_weight_slice_is_resident(up_weights)
+            && self.q4k_weight_slice_is_resident(down_weights);
+        if !all_resident {
+            return self.cpu_dense_q4k_gelu_ffn_norm_residual(
+                gate_weights,
+                up_weights,
+                down_weights,
+                down_quant,
+                norm_weight,
+                post_norm_weight,
+                n_ff,
+                n_embd,
+                hidden,
+                norm_eps,
+                post_norm_eps,
+                unit_offset_norm,
+                gelu,
+            );
+        }
         self.qwen35_expert_dev_input_to_dev(
             gate_weights,
             up_weights,
@@ -8153,5 +8173,116 @@ impl CudaState {
         }
         self.stream_synchronize()?;
         Ok(())
+    }
+
+    /// CPU fallback: weight가 GPU에 없을 때 PCIe 전송 대신 CPU에서 직접 FFN 계산.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_dense_q4k_gelu_ffn_norm_residual(
+        &self,
+        gate_weights: &[u8],
+        up_weights: &[u8],
+        down_weights: &[u8],
+        down_quant: u32,
+        norm_weight: &[f32],
+        post_norm_weight: Option<&[f32]>,
+        n_ff: usize,
+        n_embd: usize,
+        hidden: &[f32],
+        norm_eps: f32,
+        post_norm_eps: f32,
+        unit_offset_norm: bool,
+        gelu: bool,
+    ) -> Result<Vec<f32>, String> {
+        use rnb_cpu::gemm::quant_gemv::{gemv_quantized, QuantGemvType};
+        use rnb_cpu::kernels::norm::{rms_norm_into, rms_norm_unit_offset_into};
+
+        let _ = self;
+        let gate_quant = QuantGemvType::Q4K;
+        let down_qtype = match down_quant {
+            12 => QuantGemvType::Q4K,
+            13 => QuantGemvType::Q5K,
+            14 => QuantGemvType::Q6K,
+            _ => return Err(format!("unsupported down quant for CPU FFN: {down_quant}")),
+        };
+        let gate_bpr = (n_embd / 256) * 144;
+        let down_bpr = (n_ff / 256)
+            * match down_qtype {
+                QuantGemvType::Q4K => 144,
+                QuantGemvType::Q5K => 176,
+                QuantGemvType::Q6K => 210,
+                _ => 144,
+            };
+
+        let mut normed = vec![0.0f32; n_embd];
+        if unit_offset_norm {
+            rms_norm_unit_offset_into(hidden, norm_weight, norm_eps, &mut normed);
+        } else {
+            rms_norm_into(hidden, norm_weight, norm_eps, &mut normed);
+        }
+
+        let mut gate_out = vec![0.0f32; n_ff];
+        gemv_quantized(
+            gate_weights,
+            &normed,
+            &mut gate_out,
+            n_ff,
+            n_embd,
+            1,
+            gate_bpr,
+            gate_quant,
+        );
+        let mut up_out = vec![0.0f32; n_ff];
+        gemv_quantized(
+            up_weights,
+            &normed,
+            &mut up_out,
+            n_ff,
+            n_embd,
+            1,
+            gate_bpr,
+            gate_quant,
+        );
+
+        if gelu {
+            for (g, u) in gate_out.iter_mut().zip(up_out.iter()) {
+                *g = 0.5
+                    * *g
+                    * (1.0 + (*g * 0.797_884_560_8 * (1.0 + 0.044_715 * *g * *g)).tanh())
+                    * u;
+            }
+        } else {
+            for (g, u) in gate_out.iter_mut().zip(up_out.iter()) {
+                *g = (*g / (1.0 + (-*g).exp())) * u;
+            }
+        }
+
+        let mut down_out = vec![0.0f32; n_embd];
+        gemv_quantized(
+            down_weights,
+            &gate_out,
+            &mut down_out,
+            n_embd,
+            n_ff,
+            1,
+            down_bpr,
+            down_qtype,
+        );
+
+        let mut output = hidden.to_vec();
+        for (o, d) in output.iter_mut().zip(down_out.iter()) {
+            *o += d;
+        }
+
+        if let Some(post_norm) = post_norm_weight {
+            let mut post_normed = vec![0.0f32; n_embd];
+            if unit_offset_norm {
+                rms_norm_unit_offset_into(&output, post_norm, post_norm_eps, &mut post_normed);
+            } else {
+                rms_norm_into(&output, post_norm, post_norm_eps, &mut post_normed);
+            }
+            Ok(post_normed)
+        } else {
+            Ok(output)
+        }
     }
 }

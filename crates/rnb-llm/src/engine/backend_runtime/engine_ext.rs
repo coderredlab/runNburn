@@ -156,7 +156,10 @@ impl Engine {
             if !needs_prewarm {
                 return Ok(());
             }
-            self.prewarm_mtp_device_verify_static_weights()?;
+            if let Err(e) = self.prewarm_mtp_device_verify_static_weights() {
+                eprintln!("[WARN] MTP static weight prewarm failed (non-fatal): {e}");
+                return Ok(());
+            }
             if let Some(scratch) = self.scratch.as_mut() {
                 scratch.device_verify_static_weights_warmed = true;
             }
