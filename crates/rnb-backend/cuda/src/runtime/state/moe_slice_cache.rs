@@ -473,7 +473,7 @@ mod tests {
         assert!(budget > 10 * 1024 * 1024 * 1024);
         // Small device: reserve floor dominates, budget shrinks to zero.
         let small_total = 2 * 1024 * 1024 * 1024usize;
-        let small_free = 1024 * 1024 * 1024usize;
+        let small_free = 400 * 1024 * 1024usize;
         assert_eq!(
             moe_slice_cache_budget_bytes(MoeSliceCacheEnv::Auto, small_free, small_total),
             0

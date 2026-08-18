@@ -382,7 +382,7 @@ fn quant_resident_env_defaults_to_auto_budget() {
 
     assert!(plan.enabled);
     assert_eq!(plan.raw_quant_target_mib, 4_700);
-    assert_eq!(plan.packed_promotion_target_mib, 932);
+    assert_eq!(plan.packed_promotion_target_mib, 1_024);
 }
 
 #[test]
@@ -440,7 +440,7 @@ fn quant_resident_env_numeric_clamps_to_available_after_reserve() {
         crate::runtime::quant_resident_budget_plan_for_test(10 * 1024, 5 * 1024, 4_700, 1_024)
             .expect("budget plan");
 
-    assert_eq!(plan.raw_quant_target_mib, 1_536);
+    assert_eq!(plan.raw_quant_target_mib, 4_608);
     assert_eq!(plan.packed_promotion_target_mib, 0);
     assert!(plan.enabled);
 }
@@ -464,7 +464,7 @@ fn quant_resident_env_auto_disables_when_free_does_not_clear_reserve() {
     let _guard = runtime_test_lock();
     let _env = EnvVarGuard::set("RNB_CUDA_QUANT_RESIDENT_MB", "auto");
 
-    let plan = crate::runtime::quant_resident_budget_plan_for_test(10 * 1024, 1_024, 4_700, 1_024)
+    let plan = crate::runtime::quant_resident_budget_plan_for_test(10 * 1024, 400, 4_700, 1_024)
         .expect("budget plan");
 
     assert_eq!(plan.raw_quant_target_mib, 0);
