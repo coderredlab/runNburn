@@ -13924,7 +13924,8 @@ impl MetalBackend {
                     ChainLayerSpecRef::AttnMoeQwen(a) => a.kvarn.is_none(),
                     _ => true,
                 });
-            let enabled = std::env::var("RNB_METAL_BATCH_FUSED").as_deref() == Ok("1");
+            // Default-on (matches Engine::batched_decode_chain_ready); `=0` opts out.
+            let enabled = std::env::var("RNB_METAL_BATCH_FUSED").as_deref() != Ok("0");
             if all_qwen_chain
                 && attn_fusable
                 && (fused_lo..=fused_hi).contains(&batch)
