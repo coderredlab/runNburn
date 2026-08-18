@@ -1124,11 +1124,12 @@ impl Engine {
                     "Muse DFlash verify does not use recurrent prefix snapshots".to_string(),
                 ));
             }
-            let target_layers = if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
-                (0..self.metadata.num_layers).collect()
-            } else {
-                self.mtp_dflash_target_layers()
-            };
+            let target_layers =
+                if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
+                    (0..self.metadata.num_layers).collect()
+                } else {
+                    self.mtp_dflash_target_layers()
+                };
             let (hidden, features, output_tail) =
                 run_prefill_layers_cpu_range_collect_dflash_features(
                     &mut self.kv_cache,
@@ -1258,7 +1259,9 @@ impl Engine {
                 self.mtp_observe_target_batch(tokens, hidden_rows)?;
             }
         }
-        if !dflash_features.is_empty() && crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_none() {
+        if !dflash_features.is_empty()
+            && crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_none()
+        {
             self.mtp_dflash_observe_target_batch(&dflash_features, seq_len, pos_start)?;
         }
         let mut prefix_states = prefix_collector

@@ -2187,18 +2187,20 @@ fn generate_with_muse_dflash(
         let verify_start = Instant::now();
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         let (mut verify, dflash_features, batched_commit) = {
-            let target_layers = if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
-                (0..engine.metadata.num_layers).collect()
-            } else {
-                engine.mtp_dflash_target_layers()
-            };
+            let target_layers =
+                if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
+                    (0..engine.metadata.num_layers).collect()
+                } else {
+                    engine.mtp_dflash_target_layers()
+                };
             match engine.forward_batched_decode_verify_window(
                 &verify_tokens,
                 sampled_verify,
                 &target_layers,
             )? {
                 Some((verify, commit, features)) => {
-                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some()
+                    {
                         eprintln!("[batch-fused] Muse DFlash verify selected");
                     }
                     if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
@@ -2246,7 +2248,8 @@ fn generate_with_muse_dflash(
                     }
                 }
                 None => {
-                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some()
+                    {
                         eprintln!("[batch-fused] Muse DFlash verify fell back to prefill");
                     }
                     let (verify, features) =
