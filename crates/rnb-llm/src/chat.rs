@@ -16,6 +16,33 @@ fn normalize_hf_jinja(source: &str) -> Cow<'_, str> {
         Cow::Borrowed(source)
     }
 }
+/// GGUF chat templates written for HF `apply_chat_template` (and vLLM, which
+/// parses arguments server-side) expect assistant
+/// `tool_calls[].function.arguments` as a mapping, while the OpenAI wire
+/// format carries them as a JSON string. Parse strings into values before
+/// rendering so both representations reach the template as a mapping;
+/// unparseable strings are left untouched for the template to reject.
+fn parse_tool_call_arguments(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut messages = messages.to_vec();
+    for message in &mut messages {
+        let Some(Value::Array(calls)) = &mut message.tool_calls else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(json) = function.get("arguments").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Ok(parsed) = serde_json::from_str::<Value>(json) {
+                function.insert("arguments".to_string(), parsed);
+            }
+        }
+    }
+    messages
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum ChatContent {
@@ -127,6 +154,7 @@ impl Tokenizer {
                 "chat completion requires at least one message".to_string(),
             ));
         }
+        let messages = parse_tool_call_arguments(messages);
         let source = self.chat_template().ok_or_else(|| {
             LlmError::Tokenizer("GGUF does not contain tokenizer.chat_template".to_string())
         })?;
@@ -164,7 +192,7 @@ impl Tokenizer {
             .get_template("chat")
             .expect("template was added above")
             .render(context! {
-                messages => messages,
+                messages => &messages,
                 tools => tools,
                 add_generation_prompt => options.add_generation_prompt,
                 enable_thinking => options.enable_thinking,
@@ -328,6 +356,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(rendered, "weather|weather|call_1");
+    }
+    #[test]
+    fn parses_string_tool_call_arguments_into_template_mappings() {
+        let tokenizer = tokenizer(
+            true,
+            Some(
+                "{% for message in messages %}{% for call in message.tool_calls %}{% for name, value in call.function.arguments|items %}{{ name }}={{ value }};{% endfor %}{% endfor %}{% endfor %}",
+            ),
+        );
+        let messages = [
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"Seoul\"}"}
+                }])),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                recipient: None,
+                end_turn: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "time", "arguments": {"hour": 9}}
+                }])),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                recipient: None,
+                end_turn: None,
+            },
+        ];
+
+        let rendered = tokenizer
+            .render_chat_prompt(&messages, ChatTemplateOptions::default())
+            .unwrap();
+
+        assert_eq!(rendered, "city=Seoul;hour=9;");
     }
     #[test]
     fn renders_muse_reasoning_and_final_assistant_turns() {
