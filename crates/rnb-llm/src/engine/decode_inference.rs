@@ -454,6 +454,9 @@ impl Engine {
     /// 공유해 미지원 quant/KV layout을 auto-enable하거나 생성 중간에 발견하지 않게 한다.
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     pub(crate) fn batched_decode_chain_ready(&self) -> bool {
+        if std::env::var("RNB_METAL_BATCH_FUSED").as_deref() != Ok("1") {
+            return false;
+        }
         if !batched_decode_chain_position_supported(self.sequence_cursor) {
             return false;
         }
