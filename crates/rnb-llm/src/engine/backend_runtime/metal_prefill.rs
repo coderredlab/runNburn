@@ -48,6 +48,7 @@ pub(in crate::engine) struct MusePrefillLayerRangeTarget {
     pub kv_len: usize,
 }
 
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
 pub(in crate::engine) struct MusePrefillLayerRangeSpec<'a> {
     pub layer_idx: usize,
     pub target: Option<MusePrefillLayerRangeTarget>,

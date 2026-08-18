@@ -68,7 +68,6 @@ fn full_device_decode_weight_bytes<'a>(
     })
 }
 
-
 #[cfg(feature = "cuda")]
 fn muse_full_device_decode_supported(
     metadata: &ModelMetadata,
@@ -149,6 +148,7 @@ fn muse_full_device_decode_supported(
             && w.shared_expert_moe.is_none()
             && w.ffn_gate_up_fused.is_none()
     })
+}
 #[cfg(any(all(feature = "metal", not(feature = "cuda")), test))]
 fn batched_decode_chain_max_batch(architecture: ModelArchitecture) -> usize {
     if architecture == ModelArchitecture::MuseGlimmer {

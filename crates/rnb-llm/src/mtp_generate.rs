@@ -2147,9 +2147,9 @@ fn generate_with_muse_dflash(
     };
     let mut phase = MtpPhaseTimings::default();
     let decode_loop_start = Instant::now();
-    let adaptive_target = crate::runtime::policy::mtp_dflash_adaptive_target_enabled();
+    let adaptive_target = crate::engine::policy::mtp_dflash_adaptive_target_enabled();
     let confidence_cutoff = (!sampled_verify && adaptive_target)
-        .then(crate::runtime::policy::mtp_dflash_confidence_cutoff)
+        .then(crate::engine::policy::mtp_dflash_confidence_cutoff)
         .flatten();
     let mut finish_with_target = false;
 
@@ -2187,7 +2187,7 @@ fn generate_with_muse_dflash(
         let verify_start = Instant::now();
         #[cfg(all(feature = "metal", not(feature = "cuda")))]
         let (mut verify, dflash_features, batched_commit) = {
-            let target_layers = if std::env::var_os("RNB_METAL_BATCH_COMPARE").is_some() {
+            let target_layers = if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
                 (0..engine.metadata.num_layers).collect()
             } else {
                 engine.mtp_dflash_target_layers()
@@ -2198,10 +2198,10 @@ fn generate_with_muse_dflash(
                 &target_layers,
             )? {
                 Some((verify, commit, features)) => {
-                    if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
                         eprintln!("[batch-fused] Muse DFlash verify selected");
                     }
-                    if std::env::var_os("RNB_METAL_BATCH_COMPARE").is_some() {
+                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_COMPARE").is_some() {
                         let (reference, reference_features) =
                             engine.forward_prefill_dflash_verify(&verify_tokens, sampled_verify)?;
                         let hidden_dim = engine.metadata.hidden_dim;
@@ -2246,7 +2246,7 @@ fn generate_with_muse_dflash(
                     }
                 }
                 None => {
-                    if std::env::var_os("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
+                    if crate::engine::policy::env_os_string("RNB_METAL_BATCH_FUSED_TRACE").is_some() {
                         eprintln!("[batch-fused] Muse DFlash verify fell back to prefill");
                     }
                     let (verify, features) =
