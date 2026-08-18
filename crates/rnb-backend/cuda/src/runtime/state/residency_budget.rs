@@ -1,6 +1,36 @@
 use super::super::*;
 
 impl CudaState {
+    /// Mid-prefill resident-admission clamp for chunked CUDA prefill.
+    ///
+    /// Chunked prefill keeps its chain temps and per-chunk KV growth in device
+    /// memory outside the resident caches. Without this clamp, hot-slab
+    /// admissions during a long multi-chunk prompt fill every byte the plan
+    /// allows and the later chunks die on cuMemAlloc with nothing evictable
+    /// (in-use weights are protected). `clamp` lowers the admission limit for
+    /// the duration of the prefill; `release` restores the saved limit.
+    pub(in crate::runtime) fn clamp_resident_limit_for_prefill_scratch(
+        &mut self,
+        scratch_bytes: usize,
+    ) {
+        if scratch_bytes == 0 {
+            return;
+        }
+        if self.prefill_scratch_saved_limit.is_none() {
+            self.prefill_scratch_saved_limit = Some(self.resident_q4k_limit);
+        }
+        let base = self
+            .prefill_scratch_saved_limit
+            .unwrap_or(self.resident_q4k_limit);
+        self.resident_q4k_limit = base.saturating_sub(scratch_bytes);
+    }
+
+    pub(in crate::runtime) fn release_prefill_scratch_clamp(&mut self) {
+        if let Some(saved) = self.prefill_scratch_saved_limit.take() {
+            self.resident_q4k_limit = saved;
+        }
+    }
+
     pub(in crate::runtime) fn resident_cache_bytes(&self) -> usize {
         let q4k_physical_bytes = self
             .resident_q4k_non_arena_bytes()

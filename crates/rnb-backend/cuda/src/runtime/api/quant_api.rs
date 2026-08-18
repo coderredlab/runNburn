@@ -1052,6 +1052,36 @@ pub fn prewarm_q4k_weights_pinned(weights: &[&[u8]]) -> Result<usize, String> {
     Ok(warmed)
 }
 
+pub fn clamp_resident_limit_for_prefill_scratch(scratch_bytes: usize) -> Result<(), String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .clamp_resident_limit_for_prefill_scratch(scratch_bytes);
+    Ok(())
+}
+
+pub fn release_prefill_scratch_clamp() -> Result<(), String> {
+    let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
+    let mut guard = compute
+        .lock()
+        .map_err(|_| "cuda compute state lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(CudaState::open()?);
+    }
+    guard
+        .as_mut()
+        .expect("cuda compute state initialized")
+        .release_prefill_scratch_clamp();
+    Ok(())
+}
+
 pub fn prewarm_q4k_weights_pinned_prefix(weights: &[&[u8]]) -> Result<usize, String> {
     if weights.is_empty() {
         return Ok(0);

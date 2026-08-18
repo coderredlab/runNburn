@@ -335,7 +335,11 @@ impl Engine {
                 self.metadata.hidden_dim,
             );
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(all(feature = "cuda", not(feature = "vulkan")))]
+        {
+            return crate::engine::tuning_runtime::prefill_chunk_tokens(self.metadata.hidden_dim);
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
         usize::MAX
     }
 

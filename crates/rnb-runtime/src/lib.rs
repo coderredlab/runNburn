@@ -6,10 +6,10 @@ pub mod device_prefill;
 pub mod compute {
     pub use rnb_backend_cuda::glm_register_stream_region_sequence;
     pub use rnb_backend_cuda::runtime::{
-        download_device_tensor_f32, download_device_tensor_f32_row,
-        nemotron_q8_shared_q5_sparse_prefill_moe_device,
+        clamp_resident_limit_for_prefill_scratch, download_device_tensor_f32,
+        download_device_tensor_f32_row, nemotron_q8_shared_q5_sparse_prefill_moe_device,
         nemotron_q8_shared_q5_sparse_prefill_moe_device_with_residual_desc, release_device_tensor,
-        upload_device_tensor_f32,
+        release_prefill_scratch_clamp, upload_device_tensor_f32,
     };
     pub use rnb_backend_cuda::{cuda_cache_snapshot, CudaCacheSnapshot};
     // cu74: persistent decode (Gemma4 E2B) cooperative kernel dispatch entry.
@@ -173,8 +173,9 @@ pub mod compute {
             gdn_prefill_gemv_mode, gdn_prefill_gemv_mode_for_seq, layer_gemv_enabled,
             moe_layer_cache_enabled, moe_route_hist_enabled, nemotron_q5_full_layer_enabled,
             nemotron_q5_layer_cache_enabled, nemotron_q8_shared_q5_sparse_decode_enabled,
-            output_argmax_enabled, output_logits_enabled, prefill_conv_enabled,
-            prefill_delta_enabled, prefill_f32_gemm_allowed, prefill_f32_gemm_trace_enabled,
+            output_argmax_enabled, output_logits_enabled, prefill_chunk_scratch_budget_bytes,
+            prefill_chunk_tokens, prefill_conv_enabled, prefill_delta_enabled,
+            prefill_f32_gemm_allowed, prefill_f32_gemm_trace_enabled,
             prefill_flash_attention_enabled, prefill_flash_attention_min_seq, prefill_gemv_enabled,
             prefill_moe_enabled, prefill_moe_enabled_for_seq, prefill_moe_full_layer_enabled,
             prefill_moe_full_layer_min_expert_permille, prefill_moe_range_slab_enabled,

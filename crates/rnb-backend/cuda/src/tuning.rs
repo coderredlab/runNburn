@@ -1029,6 +1029,46 @@ pub fn gdn_prefill_chain_skip_host_projection_enabled() -> bool {
     env_bool("RNB_CUDA_GDN_PREFILL_CHAIN_SKIP_HOST_PROJECTION", true)
 }
 
+/// CUDA prefill chunk in tokens.
+///
+/// `forward_prefill` splits long prompts into chunks of this size. That
+/// bounds the GDN prefill chain's device scratch (measured on Qwen3.8 27B
+/// hidden=5120: 1911 MiB for a ~2k-token call, i.e. ~hidden_dim*200 bytes
+/// per token) so a long agent prompt no longer OOMs a card whose weights are
+/// resident, and it makes the per-chunk cancellation check a real cancel
+/// point instead of a whole-prompt one. The default spends at most ~1 GiB of
+/// chain scratch per chunk, rounded down to a multiple of the 128-row kvarn
+/// KV block, clamped to [128, 2048] tokens. Models below the 2048
+/// hidden-dim large-model threshold are not chunked. `RNB_CUDA_PREFILL_CHUNK`
+/// (tokens) overrides for measurement and low-VRAM devices.
+pub fn prefill_chunk_tokens(hidden_dim: usize) -> usize {
+    const PER_TOKEN_BYTES_PER_HIDDEN: usize = 200;
+    const KV_BLOCK_TOKENS: usize = 128;
+    const LARGE_MODEL_HIDDEN: usize = 2048;
+    if let Some(raw) = std::env::var("RNB_CUDA_PREFILL_CHUNK").ok() {
+        if let Ok(tokens) = raw.trim().parse::<usize>() {
+            if tokens > 0 {
+                return tokens;
+            }
+        }
+    }
+    if hidden_dim < LARGE_MODEL_HIDDEN {
+        return usize::MAX;
+    }
+    let per_token_bytes = hidden_dim.saturating_mul(PER_TOKEN_BYTES_PER_HIDDEN).max(1);
+    (prefill_chunk_scratch_budget_bytes() / per_token_bytes / KV_BLOCK_TOKENS * KV_BLOCK_TOKENS)
+        .clamp(KV_BLOCK_TOKENS, 2048)
+}
+
+/// Device headroom a chunked CUDA prefill keeps free for its own working set:
+/// GDN chain temps (~96 MiB transient calls) plus the per-chunk KV growth the
+/// chunks leave behind. Mid-prefill resident admissions are clamped by this
+/// budget (see `clamp_resident_limit_for_prefill_scratch`) so they cannot eat
+/// the chunk's working room before the prompt finishes.
+pub fn prefill_chunk_scratch_budget_bytes() -> usize {
+    1024 * 1024 * 1024
+}
+
 pub fn qwen35_device_moe_phase_profile_enabled() -> bool {
     env_bool("RNB_CUDA_QWEN35_DEVICE_MOE_PHASE_PROFILE", false)
 }
@@ -1696,6 +1736,35 @@ mod tests {
 
         unsafe {
             std::env::remove_var("RNB_CUDA_GDN_PREFILL_GEMV");
+        }
+    }
+
+    #[test]
+    fn prefill_chunk_tokens_bounds_large_hidden_models() {
+        let _guard = crate::runtime::cuda_test_env_lock();
+        unsafe {
+            std::env::remove_var("RNB_CUDA_PREFILL_CHUNK");
+        }
+
+        // Qwen3.8 27B (hidden 5120): ~1 KiB scratch per token keeps the GDN
+        // chain under ~1 GiB per chunk in 128-token KV blocks.
+        assert_eq!(prefill_chunk_tokens(5120), 1024);
+        // Gemma 26B (hidden 2816) gets a proportionally larger chunk.
+        assert_eq!(prefill_chunk_tokens(2816), 1792);
+        // Small-hidden models stay on the unchunked path.
+        assert_eq!(prefill_chunk_tokens(1536), usize::MAX);
+        assert_eq!(prefill_chunk_tokens(0), usize::MAX);
+
+        unsafe {
+            std::env::set_var("RNB_CUDA_PREFILL_CHUNK", "256");
+        }
+        assert_eq!(prefill_chunk_tokens(5120), 256);
+        unsafe {
+            std::env::set_var("RNB_CUDA_PREFILL_CHUNK", "0");
+        }
+        assert_eq!(prefill_chunk_tokens(5120), 1024);
+        unsafe {
+            std::env::remove_var("RNB_CUDA_PREFILL_CHUNK");
         }
     }
 

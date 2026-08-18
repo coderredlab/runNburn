@@ -566,7 +566,22 @@ impl Engine {
             self.backend_runtime
                 .restore_initial_decode_gpu_layer_prefixes();
         }
-        super::backend_runtime::prepare_residency_before_prefill(self.architecture)
+        let prefill_scratch_bytes = if self.prefill_chunk_size() == usize::MAX {
+            0
+        } else {
+            #[cfg(feature = "cuda")]
+            {
+                crate::engine::tuning_runtime::prefill_chunk_scratch_budget_bytes()
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                0
+            }
+        };
+        super::backend_runtime::prepare_residency_before_prefill(
+            self.architecture,
+            prefill_scratch_bytes,
+        )
     }
 
     pub fn forward_prefill_all_logits(

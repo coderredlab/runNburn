@@ -135,6 +135,9 @@ pub use backend::{cuda_cache_snapshot, CudaCacheSnapshot};
 // cu59 axis A — chain function sub-phase timing bridge re-export.
 pub use backend::chain_diag_bridge;
 
+// Chunked CUDA prefill: keep resident admissions out of the chunk's scratch.
+pub use backend::{clamp_resident_limit_for_prefill_scratch, release_prefill_scratch_clamp};
+
 // cu41 Phase 1: decode device-resident hidden carrier API wrappers.
 pub fn acquire_decode_attn_out_carrier(bytes: usize) -> Result<u64> {
     backend::acquire_decode_attn_out_carrier(bytes)

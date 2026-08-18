@@ -907,6 +907,35 @@ fn cuda_q4_qkv_raw_projection_runs_with_zero_resident_cache_and_no_expanded_admi
 
 #[test]
 #[ignore = "requires CUDA"]
+fn prefill_scratch_clamp_saves_and_restores_resident_limit() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let base = state.resident_q4k_limit;
+
+    state.clamp_resident_limit_for_prefill_scratch(512 * 1024 * 1024);
+    assert_eq!(
+        state.resident_q4k_limit,
+        base.saturating_sub(512 * 1024 * 1024)
+    );
+
+    // Re-clamping re-derives from the saved base instead of stacking.
+    state.clamp_resident_limit_for_prefill_scratch(256 * 1024 * 1024);
+    assert_eq!(
+        state.resident_q4k_limit,
+        base.saturating_sub(256 * 1024 * 1024)
+    );
+
+    state.release_prefill_scratch_clamp();
+    assert_eq!(state.resident_q4k_limit, base);
+
+    // Release without an active clamp is a no-op; a zero-byte clamp never arms.
+    state.release_prefill_scratch_clamp();
+    state.clamp_resident_limit_for_prefill_scratch(0);
+    assert_eq!(state.resident_q4k_limit, base);
+}
+
+#[test]
+#[ignore = "requires CUDA"]
 fn cuda_q4_output_projection_force_diag_admits_expanded_f16() {
     let _guard = runtime_test_lock();
     let _allow = EnvVarGuard::set("RNB_CUDA_ALLOW_EXPANDED_WEIGHT_CACHE", "1");

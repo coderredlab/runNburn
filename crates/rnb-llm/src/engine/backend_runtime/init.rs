@@ -28,6 +28,7 @@ pub(in crate::engine) fn release_prefill_residency_after_prefill(
     architecture: rnb_loader::Architecture,
     release_compute_buffers: bool,
 ) -> crate::error::Result<()> {
+    cuda_runtime::release_prefill_scratch_clamp().map_err(crate::error::LlmError::Forward)?;
     let env_bool_or = |name: &str, default: bool| {
         crate::engine::policy::env_string(name)
             .map(|value| {
@@ -88,11 +89,14 @@ pub(in crate::engine) fn release_prefill_residency_after_prefill(
 #[cfg(feature = "cuda")]
 pub(in crate::engine) fn prepare_residency_before_prefill(
     architecture: rnb_loader::Architecture,
+    prefill_scratch_bytes: usize,
 ) -> crate::error::Result<()> {
     if matches!(architecture, rnb_loader::Architecture::MuseGlimmer) {
         cuda_runtime::release_muse_decode_tail_residency()
             .map_err(crate::error::LlmError::Forward)?;
     }
+    cuda_runtime::clamp_resident_limit_for_prefill_scratch(prefill_scratch_bytes)
+        .map_err(crate::error::LlmError::Forward)?;
     Ok(())
 }
 
@@ -120,6 +124,7 @@ pub(in crate::engine) fn muse_decode_tail_reserve_bytes() -> crate::error::Resul
 #[cfg(not(feature = "cuda"))]
 pub(in crate::engine) fn prepare_residency_before_prefill(
     _architecture: rnb_loader::Architecture,
+    _prefill_scratch_bytes: usize,
 ) -> crate::error::Result<()> {
     Ok(())
 }

@@ -377,6 +377,7 @@ pub(super) struct CudaState {
     pub(super) resident_q4k_epoch: u64,
     pub(super) resident_q4k_bytes: usize,
     pub(super) resident_q4k_limit: usize,
+    pub(super) prefill_scratch_saved_limit: Option<usize>,
     pub(super) qwen35_target_decode_q4k_limit_checked: bool,
     pub(super) nemotron_decode_q4k_limit_checked: bool,
     pub(super) resident_q4k_touch_hits_auto: bool,
