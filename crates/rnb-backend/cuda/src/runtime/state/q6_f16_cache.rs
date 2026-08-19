@@ -53,7 +53,7 @@ impl CudaState {
         let ptr = match unsafe { self.api.mem_alloc(bytes) } {
             Ok(p) => p,
             Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                let _ = self.offload_non_pinned_resident_q4k();
+                let _ = self.offload_non_pinned_resident_q4k_releasing(bytes);
                 match unsafe { self.api.mem_alloc(bytes) } {
                     Ok(p) => p,
                     Err(err2) if cuda_mem_alloc_oom(&err2) => {

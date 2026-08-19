@@ -478,7 +478,7 @@ impl CudaState {
         let slab = match unsafe { self.api.mem_alloc(total_bytes) } {
             Ok(ptr) => ptr,
             Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                let _ = self.offload_non_pinned_resident_q4k()?;
+                let _ = self.offload_non_pinned_resident_q4k_releasing(total_bytes)?;
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -1248,7 +1248,7 @@ impl CudaState {
                                 && cuda_offload_on_oom_enabled()
                                 && cuda_mem_alloc_oom(&retry_err) =>
                         {
-                            let _ = self.offload_non_pinned_resident_q4k()?;
+                            let _ = self.offload_non_pinned_resident_q4k_releasing(slab_bytes)?;
                             return Ok(ResidentQ4kAdmissionResult::default());
                         }
                         Err(retry_err) if cuda_mem_alloc_oom(&retry_err) => {

@@ -294,6 +294,38 @@ impl CudaState {
         Ok(released)
     }
 
+    /// cu288: OOM fallback drain that releases only what the failed
+    /// allocation needs. The previous behavior drained the entire non-pinned
+    /// residency, which evicted model-lifetime slabs (embedding gather 682MB,
+    /// Q6 down 995MB on Qwen3.8-27B) that then re-uploaded on every call once
+    /// free memory stayed low (32k prefill: 84x682MB + 43x995MB measured).
+    /// Falls back to a full drain when the needed amount is not releasable.
+    pub(in crate::runtime) fn offload_non_pinned_resident_q4k_releasing(
+        &mut self,
+        need_release: usize,
+    ) -> Result<usize, String> {
+        self.set_current()?;
+        if self.resident_q4k.is_empty() && self.resident_q4k_arena.is_none() {
+            return Ok(0);
+        }
+        let before = self.resident_q4k_bytes;
+        let plan = self
+            .plan_resident_q4k_evictions(Some(need_release), &HashSet::new(), None, false, false)
+            .or_else(|| self.plan_resident_q4k_evictions(None, &HashSet::new(), None, false, false))
+            .expect("resident Q4K eviction plan");
+        let _ = self.execute_resident_q4k_eviction_plan(plan)?;
+        let released = before.saturating_sub(self.resident_q4k_bytes);
+        if released > 0 && std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[cuda] q4k resident offloaded (targeted) needed={}MiB released={}MiB remaining={}MiB",
+                need_release / (1024 * 1024),
+                released / (1024 * 1024),
+                self.resident_q4k_bytes / (1024 * 1024),
+            );
+        }
+        Ok(released)
+    }
+
     fn upload_temp_q4k_weights_current(&mut self, weights: &[u8]) -> Result<u64, String> {
         cache_stats()
             .temp_upload_bytes
@@ -703,7 +735,7 @@ impl CudaState {
                     Err(retry_err)
                         if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&retry_err) =>
                     {
-                        let _ = self.offload_non_pinned_resident_q4k()?;
+                        let _ = self.offload_non_pinned_resident_q4k_releasing(weights.len())?;
                         if !self.prepare_quant_resident_admission(weights.len())?
                             || self.resident_q4k_bytes.saturating_add(weights.len())
                                 > self.resident_q4k_effective_limit()
@@ -780,7 +812,7 @@ impl CudaState {
             let ptr = match unsafe { self.api.mem_alloc(arena_limit) } {
                 Ok(ptr) => ptr,
                 Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                    let _ = self.offload_non_pinned_resident_q4k()?;
+                    let _ = self.offload_non_pinned_resident_q4k_releasing(arena_limit)?;
                     self.resident_q4k_limit = self.resident_q4k_non_arena_bytes();
                     return self.upload_temp_q4k_weights_current(weights);
                 }
@@ -871,7 +903,7 @@ impl CudaState {
         let ptr = match unsafe { self.api.mem_alloc(weights.len()) } {
             Ok(ptr) => ptr,
             Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                let _ = self.offload_non_pinned_resident_q4k()?;
+                let _ = self.offload_non_pinned_resident_q4k_releasing(weights.len())?;
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -1075,7 +1107,8 @@ impl CudaState {
                                 && cuda_offload_on_oom_enabled()
                                 && cuda_mem_alloc_oom(&retry_err) =>
                         {
-                            let _ = self.offload_non_pinned_resident_q4k()?;
+                            let _ =
+                                self.offload_non_pinned_resident_q4k_releasing(weights.len())?;
                             self.evict_resident_q4k_until(weights.len())?;
                             if !self.prepare_quant_resident_admission(weights.len())?
                                 || self.resident_q4k_bytes.saturating_add(weights.len())

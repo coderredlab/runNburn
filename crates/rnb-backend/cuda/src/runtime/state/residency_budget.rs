@@ -202,7 +202,7 @@ impl CudaState {
         }
         let (free_after_slice, _) = unsafe { self.api.mem_get_info() }?;
         if reclaim_bytes(free_after_slice) > 0 {
-            let _ = self.offload_non_pinned_resident_q4k()?;
+            let _ = self.offload_non_pinned_resident_q4k_releasing(requested_bytes)?;
         }
 
         // cu287: 마지막 계단 — non-pinned까지 풀어도 부족하면 prewarm이 올린

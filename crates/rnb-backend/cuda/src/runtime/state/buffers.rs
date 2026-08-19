@@ -13,7 +13,7 @@ macro_rules! ensure_with_oom_retry {
         match first {
             Ok(p) => Ok(p),
             Err(err) if cuda_offload_on_oom_enabled() && cuda_mem_alloc_oom(&err) => {
-                let _ = $self.offload_non_pinned_resident_q4k();
+                let _ = $self.offload_non_pinned_resident_q4k_releasing(bytes);
                 $self.set_current()?;
                 let second =
                     ensure_device_buffer(&$self.api, &mut $self.$ptr, &mut $self.$cap, bytes);
