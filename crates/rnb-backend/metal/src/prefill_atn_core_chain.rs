@@ -12,9 +12,9 @@ use objc2_metal::{
 };
 
 use crate::compute::{
-    self, encode_cast_f32_to_f16, encode_flash_attn_prefill, encode_prefill_gate_apply,
-    encode_prefill_rope_qk_norm, encode_prefill_split_q_gate, encode_rms_norm_batch,
-    encode_silu_mul_to_f16, MetalContext,
+    self, encode_cast_f32_to_f16, encode_cast_f32_to_f16_offset, encode_flash_attn_prefill,
+    encode_prefill_gate_apply, encode_prefill_rope_qk_norm, encode_prefill_split_q_gate,
+    encode_rms_norm_batch, encode_silu_mul_to_f16, MetalContext,
 };
 use crate::ffn_chain::{
     empty_f16_buf, empty_f16_buf_with_zeroed_tail, empty_f32_buf, f32_buf, private_f16_buf,
@@ -25,6 +25,7 @@ use crate::{PrefillAtnOTailBackendSpecRef, TensoropsQuant};
 
 pub(crate) struct PrefillAtnCoreCarrier {
     pub seq_len: usize,
+    pub pos_start: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
@@ -376,10 +377,12 @@ impl PrefillAtnCoreCarrier {
         norm_eps: f32,
         pos_start: usize,
     ) -> Self {
-        let kv_elems = seq_len * kv_dim;
-        let padded_kv_elems = seq_len.next_multiple_of(64) * kv_dim;
+        let kv_total = pos_start + seq_len;
+        let kv_elems = kv_total * kv_dim;
+        let padded_kv_elems = kv_total.next_multiple_of(64) * kv_dim;
         Self {
             seq_len,
+            pos_start,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -405,7 +408,7 @@ impl PrefillAtnCoreCarrier {
             attn_out_dev: empty_f32_buf(ctx, seq_len * q_dim),
             attn_gated_dev: empty_f32_buf(ctx, seq_len * q_dim),
             seq_buf: u32_buf(ctx, seq_len as u32),
-            kv_len_buf: u32_buf(ctx, seq_len as u32),
+            kv_len_buf: u32_buf(ctx, kv_total as u32),
             nh_buf: u32_buf(ctx, num_heads as u32),
             nkv_buf: u32_buf(ctx, num_kv_heads as u32),
             hd_buf: u32_buf(ctx, head_dim as u32),
@@ -437,6 +440,26 @@ impl PrefillAtnCoreCarrier {
         copy_f32(attn_norm_w, &self.attn_norm_w_dev);
         copy_f32(q_norm_w, &self.q_norm_w_dev);
         copy_f32(k_norm_w, &self.k_norm_w_dev);
+    }
+
+    /// Continuation-chunk 지원: 앞선 청크의 K/V(f16 bits)를 attention 캐시
+    /// 버퍼의 [0, pos_start) 구간에 업로드한다. 이 청크의 K/V는 cast 단계가
+    /// [pos_start, pos_start+seq_len)에 쓴다.
+    fn upload_prior_kv(&self, prior_k: &[u16], prior_v: &[u16]) -> Result<(), String> {
+        let expected = self.pos_start * self.kv_dim;
+        if prior_k.len() != expected || prior_v.len() != expected {
+            return Err(format!(
+                "Metal prefill ATN core: prior KV len mismatch: k={} v={} expected {}",
+                prior_k.len(),
+                prior_v.len(),
+                expected
+            ));
+        }
+        if expected > 0 {
+            copy_u16(prior_k, &self.k_f16_dev);
+            copy_u16(prior_v, &self.v_f16_dev);
+        }
+        Ok(())
     }
 
     fn update_rope_cos_sin(
@@ -895,6 +918,12 @@ fn copy_f32(src: &[f32], dst: &ProtocolObject<dyn MTLBuffer>) {
     }
 }
 
+fn copy_u16(src: &[u16], dst: &ProtocolObject<dyn MTLBuffer>) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.contents().as_ptr() as *mut u16, src.len());
+    }
+}
+
 pub(crate) fn ensure_command_completed(
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
 ) -> Result<(), String> {
@@ -972,6 +1001,9 @@ pub(crate) struct PrefillAtnCoreDispatchRequest<'a> {
     pub v_w_buf: &'a ProtocolObject<dyn MTLBuffer>,
     pub v_w_off: u32,
     pub v_quant: TensoropsQuant,
+    /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits.
+    /// pos_start > 0이면 필수이며 길이는 pos_start * kv_dim.
+    pub prior_kv: Option<(&'a [u16], &'a [u16])>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1112,6 +1144,8 @@ pub(crate) struct MusePrefillFullLayerDispatchRequest<'a> {
 pub(crate) struct PrefillAtnOTailDispatchRequest<'a> {
     pub hidden: &'a [f32],
     pub spec: PrefillAtnOTailBackendSpecRef<'a>,
+    /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits (pos_start*kv_dim).
+    pub prior_kv: Option<(&'a [u16], &'a [u16])>,
 }
 
 #[derive(Clone, Copy)]
@@ -1388,22 +1422,24 @@ fn encode_atn_core_ops(
         sampler.end(enc);
         sampler.begin(enc, QwenMoeLlamaIdStage::Activation);
     }
-    encode_cast_f32_to_f16(
+    encode_cast_f32_to_f16_offset(
         ctx,
         enc,
         &carrier.k_normed_dev,
         kv_out.0,
-        &carrier.kv_elems_buf,
+        carrier.pos_start * carrier.kv_dim * 2,
         carrier.seq_len * carrier.kv_dim,
-    );
-    encode_cast_f32_to_f16(
+    )
+    .map_err(|error| format!("Metal prefill ATN k cast failed: {error}"))?;
+    encode_cast_f32_to_f16_offset(
         ctx,
         enc,
         &carrier.v_dev,
         kv_out.1,
-        &carrier.kv_elems_buf,
+        carrier.pos_start * carrier.kv_dim * 2,
         carrier.seq_len * carrier.kv_dim,
-    );
+    )
+    .map_err(|error| format!("Metal prefill ATN v cast failed: {error}"))?;
     compute::chain_barrier(ctx, enc);
     if let Some(sampler) = stage_sampler.as_deref_mut() {
         sampler.end(enc);
@@ -1668,6 +1704,9 @@ pub(crate) fn prefill_atn_core_dispatch(
     req: PrefillAtnCoreDispatchRequest<'_>,
 ) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
     carrier.upload(req.hidden, req.attn_norm_w, req.q_norm_w, req.k_norm_w);
+    if let Some((prior_k, prior_v)) = req.prior_kv {
+        carrier.upload_prior_kv(prior_k, prior_v)?;
+    }
 
     let cmd = ctx
         .queue
@@ -1706,14 +1745,20 @@ pub(crate) fn prefill_atn_core_dispatch(
     let k_bits = {
         let c = carrier.k_f16_dev.contents();
         unsafe {
-            std::slice::from_raw_parts(c.as_ptr() as *const u16, carrier.seq_len * carrier.kv_dim)
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(carrier.pos_start * carrier.kv_dim),
+                carrier.seq_len * carrier.kv_dim,
+            )
         }
         .to_vec()
     };
     let v_bits = {
         let c = carrier.v_f16_dev.contents();
         unsafe {
-            std::slice::from_raw_parts(c.as_ptr() as *const u16, carrier.seq_len * carrier.kv_dim)
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(carrier.pos_start * carrier.kv_dim),
+                carrier.seq_len * carrier.kv_dim,
+            )
         }
         .to_vec()
     };
@@ -1727,6 +1772,9 @@ pub(crate) fn prefill_atn_o_tail_dispatch(
 ) -> Result<(Vec<f32>, Vec<u16>, Vec<u16>), String> {
     let core = &carrier.core;
     carrier.upload_hidden(req.hidden);
+    if let Some((prior_k, prior_v)) = req.prior_kv {
+        core.upload_prior_kv(prior_k, prior_v)?;
+    }
 
     let cmd = ctx
         .queue
@@ -1754,13 +1802,23 @@ pub(crate) fn prefill_atn_o_tail_dispatch(
     let hidden = readback(&carrier.o_proj_dev, core.seq_len * core.hidden_dim);
     let k_bits = {
         let c = core.k_f16_dev.contents();
-        unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u16, core.seq_len * core.kv_dim) }
-            .to_vec()
+        unsafe {
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(core.pos_start * core.kv_dim),
+                core.seq_len * core.kv_dim,
+            )
+        }
+        .to_vec()
     };
     let v_bits = {
         let c = core.v_f16_dev.contents();
-        unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u16, core.seq_len * core.kv_dim) }
-            .to_vec()
+        unsafe {
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(core.pos_start * core.kv_dim),
+                core.seq_len * core.kv_dim,
+            )
+        }
+        .to_vec()
     };
     Ok((hidden, k_bits, v_bits))
 }
@@ -2965,6 +3023,9 @@ pub(crate) fn prefill_atn_full_layer_dispatch(
         req.core.k_norm_w,
         req.ffn_norm_w,
     );
+    if let Some((prior_k, prior_v)) = req.core.prior_kv {
+        core.upload_prior_kv(prior_k, prior_v)?;
+    }
 
     let cmd = ctx.queue.commandBuffer().ok_or_else(|| {
         "Metal prefill ATN full layer: command buffer creation failed".to_string()
@@ -3104,13 +3165,23 @@ pub(crate) fn prefill_atn_full_layer_dispatch(
     let hidden = readback(&core.hidden_dev, core.seq_len * core.hidden_dim);
     let k_bits = {
         let c = core.k_f16_dev.contents();
-        unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u16, core.seq_len * core.kv_dim) }
-            .to_vec()
+        unsafe {
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(core.pos_start * core.kv_dim),
+                core.seq_len * core.kv_dim,
+            )
+        }
+        .to_vec()
     };
     let v_bits = {
         let c = core.v_f16_dev.contents();
-        unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u16, core.seq_len * core.kv_dim) }
-            .to_vec()
+        unsafe {
+            std::slice::from_raw_parts(
+                (c.as_ptr() as *const u16).add(core.pos_start * core.kv_dim),
+                core.seq_len * core.kv_dim,
+            )
+        }
+        .to_vec()
     };
     Ok((hidden, k_bits, v_bits))
 }

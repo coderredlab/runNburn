@@ -602,6 +602,7 @@ pub(super) fn try_prefill_atn_full_layer_metal(
     layer_idx: usize,
     seq_len: usize,
     pos_start: usize,
+    prior_kv: Option<(&[u16], &[u16])>,
     norm_eps: f32,
 ) -> crate::error::Result<Option<PrefillFullAttentionLayer>> {
     if crate::engine::policy::env_string("RNB_METAL_PREFILL_ATN_FULL_LAYER_TAIL").as_deref()
@@ -614,7 +615,7 @@ pub(super) fn try_prefill_atn_full_layer_metal(
         || w.v_proj_missing
         || !layout.has_gated_attn
         || layout.head_dim != 256
-        || pos_start != 0
+        || (pos_start != 0 && prior_kv.is_none())
         || w.q_bias.is_some()
         || w.k_bias.is_some()
         || w.v_bias.is_some()
@@ -692,6 +693,7 @@ pub(super) fn try_prefill_atn_full_layer_metal(
             norm_eps,
             pos_start,
         },
+        prior_kv,
     )?
     else {
         return Ok(None);
@@ -719,6 +721,7 @@ pub(super) fn try_prefill_atn_full_layer_metal(
     _layer_idx: usize,
     _seq_len: usize,
     _pos_start: usize,
+    _prior_kv: Option<(&[u16], &[u16])>,
     _norm_eps: f32,
 ) -> crate::error::Result<Option<PrefillFullAttentionLayer>> {
     Ok(None)
@@ -830,6 +833,7 @@ pub(super) fn try_prefill_atn_o_tail_metal(
             norm_eps,
             pos_start,
         },
+        None,
     )?
     else {
         return Ok(None);
@@ -954,6 +958,7 @@ pub(super) fn try_prefill_atn_core_metal(
             norm_eps,
             pos_start,
         },
+        None,
     )?
     else {
         return Ok(None);

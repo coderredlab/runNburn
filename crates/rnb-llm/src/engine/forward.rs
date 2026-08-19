@@ -548,6 +548,16 @@ fn forward_attention_layer_impl(
     }
 
     let attn_step = if !non_causal && positions_aligned {
+        // Continuation-chunk(prefill chunking) 지원: pos_start > 0이면 앞선
+        // 청크의 K/V를 host cache에서 읽어 ATN full-layer chain에 넘긴다.
+        // Gemma resident_kv 경로와 같은 패턴.
+        let atn_prior_storage;
+        let atn_prior_kv = if pos_start != 0 {
+            atn_prior_storage = kv_cache.read_up_to(kv_cache_layer, pos_start);
+            Some(atn_prior_storage.as_slices())
+        } else {
+            None
+        };
         if let Some(fused) = try_prefill_atn_full_layer_metal(
             metadata,
             architecture,
@@ -559,6 +569,7 @@ fn forward_attention_layer_impl(
             layer_idx,
             seq_len,
             pos_start,
+            atn_prior_kv,
             norm_eps,
         )? {
             if owns_kv {

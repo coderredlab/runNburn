@@ -926,6 +926,7 @@ pub(in crate::engine) fn metal_prefill_atn_core_if_supported(
     k_weight: &QuantizedWeight,
     v_weight: &QuantizedWeight,
     shape: MetalPrefillAtnCoreShape,
+    prior_kv: Option<(&[u16], &[u16])>,
 ) -> crate::error::Result<Option<MetalPrefillAtnCoreAdapterOut>> {
     let (Some(q_view), Some(k_view), Some(v_view)) = (
         q_weight.backend_view(),
@@ -967,6 +968,7 @@ pub(in crate::engine) fn metal_prefill_atn_core_if_supported(
                 scale: shape.scale,
                 norm_eps: shape.norm_eps,
                 pos_start: shape.pos_start,
+                prior_kv,
             },
         )
         .map_err(crate::error::LlmError::Forward)?;
@@ -1005,6 +1007,7 @@ pub(in crate::engine) fn metal_prefill_atn_o_tail_if_supported(
     v_weight: &QuantizedWeight,
     o_weight: &QuantizedWeight,
     shape: MetalPrefillAtnCoreShape,
+    prior_kv: Option<(&[u16], &[u16])>,
 ) -> crate::error::Result<Option<MetalPrefillAtnOTailAdapterOut>> {
     let (Some(q_view), Some(k_view), Some(v_view), Some(o_view)) = (
         q_weight.backend_view(),
@@ -1048,6 +1051,7 @@ pub(in crate::engine) fn metal_prefill_atn_o_tail_if_supported(
                     scale: shape.scale,
                     norm_eps: shape.norm_eps,
                     pos_start: shape.pos_start,
+                    prior_kv,
                 },
                 o_weight_ggml: backend_ggml_type(o_view.quant()),
                 o_weight_raw: o_view.raw(),
@@ -1096,6 +1100,7 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
     ffn_up_weight: &QuantizedWeight,
     ffn_down_weight: &QuantizedWeight,
     shape: MetalPrefillAtnCoreShape,
+    prior_kv: Option<(&[u16], &[u16])>,
 ) -> crate::error::Result<Option<MetalPrefillAtnFullLayerAdapterOut>> {
     let (
         Some(q_view),
@@ -1151,6 +1156,7 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
                     scale: shape.scale,
                     norm_eps: shape.norm_eps,
                     pos_start: shape.pos_start,
+                    prior_kv,
                 },
                 o_weight_ggml: backend_ggml_type(o_view.quant()),
                 o_weight_raw: o_view.raw(),

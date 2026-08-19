@@ -68,6 +68,9 @@ pub struct MetalPrefillAtnCoreRequest<'a> {
     pub scale: f32,
     pub norm_eps: f32,
     pub pos_start: usize,
+    /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits.
+    /// pos_start > 0이면 필수이며 각 길이는 pos_start * kv_dim.
+    pub prior_kv: Option<(&'a [u16], &'a [u16])>,
 }
 
 pub struct MetalPrefillAtnCoreOut {
@@ -7095,6 +7098,7 @@ pub fn metal_prefill_atn_core_if_supported(
         scale: req.scale,
         norm_eps: req.norm_eps,
         pos_start: req.pos_start,
+        prior_kv: req.prior_kv,
     };
     let result = METAL.with(|b| b.prefill_atn_core_if_supported(backend_req));
     match result {
@@ -7176,6 +7180,7 @@ pub fn metal_prefill_atn_o_tail_if_supported(
         scale: req.core.scale,
         norm_eps: req.core.norm_eps,
         pos_start: req.core.pos_start,
+        prior_kv: req.core.prior_kv,
     };
     let backend_req = rnb_backend_metal::PrefillAtnOTailBackendRequest {
         core,
@@ -7278,6 +7283,7 @@ pub fn metal_prefill_atn_full_layer_if_supported(
         scale: req.core.scale,
         norm_eps: req.core.norm_eps,
         pos_start: req.core.pos_start,
+        prior_kv: req.core.prior_kv,
     };
     let backend_req = rnb_backend_metal::PrefillAtnFullLayerBackendRequest {
         core,

@@ -1896,6 +1896,9 @@ pub struct PrefillAtnCoreBackendRequest<'a> {
     pub scale: f32,
     pub norm_eps: f32,
     pub pos_start: usize,
+    /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits.
+    /// pos_start > 0이면 필수이며 각 길이는 pos_start * kv_dim.
+    pub prior_kv: Option<(&'a [u16], &'a [u16])>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3524,6 +3527,26 @@ impl MetalBackend {
                 "Metal prefill ATN core: invalid {what}: got {actual}, expected {expected}"
             ));
         }
+        Ok(())
+    }
+
+    /// Continuation-chunk admission: pos_start > 0 requires the caller to
+    /// supply the preceding chunks' K/V (f16 bits, pos_start * kv_dim each) so
+    /// the flash-attention stage can attend over the full prefix.
+    #[cfg(target_os = "macos")]
+    fn atn_core_require_prior_kv(
+        who: &str,
+        core: &PrefillAtnCoreBackendRequest<'_>,
+    ) -> std::result::Result<(), String> {
+        if core.pos_start == 0 {
+            return Ok(());
+        }
+        let Some((prior_k, prior_v)) = core.prior_kv else {
+            return Err(format!("{who}: pos_start > 0 requires prior chunk KV"));
+        };
+        let expected = Self::atn_core_checked_mul(core.pos_start, core.kv_dim, "prior kv")?;
+        Self::atn_core_require_eq("prior k len", prior_k.len(), expected)?;
+        Self::atn_core_require_eq("prior v len", prior_v.len(), expected)?;
         Ok(())
     }
 
@@ -5726,6 +5749,9 @@ impl MetalBackend {
                         v_w_buf: &v_w_buf,
                         v_w_off,
                         v_quant: req.v_weight.quant,
+                        // DFlash full layer은 자체 drafter attention carrier가
+                        // prior KV를 다룬다. ATN core 버퍼는 chunk-local.
+                        prior_kv: None,
                     },
                     o_w_buf: &o_w_buf,
                     o_w_off,
@@ -6930,7 +6956,7 @@ impl MetalBackend {
             ));
         }
         Self::atn_core_require_eq("head_dim", req.head_dim, 256)?;
-        Self::atn_core_require_eq("pos_start", req.pos_start, 0)?;
+        Self::atn_core_require_prior_kv("Metal prefill ATN core", &req)?;
         if req.n_rot > req.head_dim {
             return Err(format!(
                 "Metal prefill ATN core: n_rot {} exceeds head_dim {}",
@@ -7024,6 +7050,7 @@ impl MetalBackend {
                 v_w_buf: &v_w_buf,
                 v_w_off,
                 v_quant: req.v_weight.quant,
+                prior_kv: req.prior_kv,
             },
         )?;
         Ok(Some(out))
@@ -7069,7 +7096,7 @@ impl MetalBackend {
             ));
         }
         Self::atn_core_require_eq("head_dim", core.head_dim, 256)?;
-        Self::atn_core_require_eq("pos_start", core.pos_start, 0)?;
+        Self::atn_core_require_prior_kv("Metal prefill ATN o-tail", &core)?;
         if core.n_rot > core.head_dim {
             return Err(format!(
                 "Metal prefill ATN o-tail: n_rot {} exceeds head_dim {}",
@@ -7170,6 +7197,7 @@ impl MetalBackend {
                     },
                     o_weight: req.o_weight,
                 },
+                prior_kv: core.prior_kv,
             },
         )?;
         Ok(Some(out))
@@ -7218,7 +7246,7 @@ impl MetalBackend {
             ));
         }
         Self::atn_core_require_eq("head_dim", core.head_dim, 256)?;
-        Self::atn_core_require_eq("pos_start", core.pos_start, 0)?;
+        Self::atn_core_require_prior_kv("Metal prefill ATN full layer", &core)?;
         if core.n_rot > core.head_dim {
             return Err(format!(
                 "Metal prefill ATN full layer: n_rot {} exceeds head_dim {}",
@@ -7370,6 +7398,7 @@ impl MetalBackend {
                     v_w_buf: &v_w_buf,
                     v_w_off,
                     v_quant: core.v_weight.quant,
+                    prior_kv: core.prior_kv,
                 },
                 o_w_buf: &o_w_buf,
                 o_w_off,
@@ -17276,6 +17305,7 @@ mod tests {
             scale,
             norm_eps,
             pos_start,
+            prior_kv: None,
         };
 
         let Some((attn_out, core_k, core_v)) = backend
@@ -26744,6 +26774,7 @@ kernel void q4k_ro_vec4(
                 scale,
                 norm_eps,
                 pos_start,
+                prior_kv: None,
             })
             .expect("ATN core dispatch")
         else {
@@ -27032,6 +27063,7 @@ kernel void q4k_ro_vec4(
                 scale,
                 norm_eps,
                 pos_start,
+                prior_kv: None,
             })
             .expect("ATN core dispatch")
         else {
