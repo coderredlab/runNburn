@@ -2335,6 +2335,159 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_split_partia
 
 // Four causal queries share each F32 K/V load while preserving the per-query
 // online-softmax and ordered split reduction arithmetic.
+// cu287: prefill window split partials v2. The qtile4 kernel spends its issue
+// slots on a block-wide two-stage dot reduction (16-slot shuffle chains per
+// key batch plus shared memory round-trips and two barriers per four keys)
+// and recomputes the online-softmax expf in every thread even though scores
+// are thread-uniform — NCU shows SM busy at 86% while useful FMA stays a
+// small share of issued instructions. This variant assigns one query per
+// warp and eight head dims per lane (32 lanes x 8 = 256), so the dot needs a
+// single warp shuffle chain, shared memory and block barriers disappear, and
+// only lane 0 evaluates expf before broadcasting probability and rescale.
+// The partial_acc/partial_meta layout and the ordered reduce contract stay
+// identical to the qtile4 kernel. Floating-point summation order differs
+// from qtile4 (drift-level), gated by semantic-equivalence checks.
+extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_split_partials_qtile8_jbatch4(
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_meta,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    unsigned seq_len,
+    unsigned kv_len,
+    unsigned num_heads,
+    unsigned num_kv_heads,
+    float scale,
+    unsigned window,
+    unsigned chunk_size,
+    unsigned num_chunks) {
+    constexpr unsigned query_tile = 8u;   // one warp per query
+    constexpr unsigned key_batch = 4u;
+    constexpr unsigned dims_per_lane = 8u; // 32 lanes * 8 dims = head_dim 256
+    const unsigned tid = threadIdx.x;
+    const unsigned query_base = blockIdx.x * query_tile;
+    const unsigned h = blockIdx.y;
+    const unsigned chunk = blockIdx.z;
+    if (tid >= 256u || query_base >= seq_len || h >= num_heads || chunk >= num_chunks
+        || num_kv_heads == 0u || window < kv_len || chunk_size == 0u || kv_len < seq_len) {
+        return;
+    }
+    const unsigned lane = tid & 31u;
+    const unsigned warp = tid >> 5;
+    const unsigned query_idx = query_base + warp;
+    // Warps are query-uniform, and this kernel carries no block-wide
+    // synchronization, so out-of-range warps can leave immediately.
+    if (query_idx >= seq_len) {
+        return;
+    }
+    const unsigned heads_per_group = num_heads / num_kv_heads;
+    const unsigned kv_h = h / heads_per_group;
+    const unsigned global_pos = kv_len - seq_len + query_idx;
+    const unsigned start = chunk * chunk_size;
+    unsigned end = start + chunk_size;
+    if (end > global_pos + 1u) {
+        end = global_pos + 1u;
+    }
+
+    const unsigned q_off = query_idx * num_heads * 256u + h * 256u;
+    float qv[dims_per_lane];
+#pragma unroll
+    for (unsigned d = 0u; d < dims_per_lane; ++d) {
+        qv[d] = q[q_off + d * 32u + lane];
+    }
+    float accv[dims_per_lane];
+#pragma unroll
+    for (unsigned d = 0u; d < dims_per_lane; ++d) {
+        accv[d] = 0.0f;
+    }
+    float row_max = -3.4028234663852886e38f;
+    float row_sum = 0.0f;
+    const unsigned k_base = kv_h * 256u;
+
+    unsigned j = start;
+    for (; j + key_batch <= end; j += key_batch) {
+#pragma unroll
+        for (unsigned key = 0u; key < key_batch; ++key) {
+            const unsigned k_off = (j + key) * num_kv_heads * 256u + k_base;
+            float dot = 0.0f;
+#pragma unroll
+            for (unsigned d = 0u; d < dims_per_lane; ++d) {
+                dot += qv[d] * k[k_off + d * 32u + lane];
+            }
+#pragma unroll
+            for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+            const bool live = j + key <= global_pos;
+            float probability = 0.0f;
+            float old_scale = 0.0f;
+            if (lane == 0u && live) {
+                const float score = dot * scale;
+                const float new_max = fmaxf(row_max, score);
+                old_scale = row_max == -3.4028234663852886e38f
+                    ? 0.0f
+                    : expf(row_max - new_max);
+                probability = expf(score - new_max);
+                row_max = new_max;
+                row_sum = row_sum * old_scale + probability;
+            }
+            probability = __shfl_sync(0xffffffffu, probability, 0u);
+            old_scale = __shfl_sync(0xffffffffu, old_scale, 0u);
+            if (live) {
+                const unsigned v_off = (j + key) * num_kv_heads * 256u + k_base;
+#pragma unroll
+                for (unsigned d = 0u; d < dims_per_lane; ++d) {
+                    accv[d] = accv[d] * old_scale + probability * v[v_off + d * 32u + lane];
+                }
+            }
+        }
+    }
+    for (; j < end; ++j) {
+        const unsigned k_off = j * num_kv_heads * 256u + k_base;
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned d = 0u; d < dims_per_lane; ++d) {
+            dot += qv[d] * k[k_off + d * 32u + lane];
+        }
+#pragma unroll
+        for (unsigned offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        const bool live = j <= global_pos;
+        float probability = 0.0f;
+        float old_scale = 0.0f;
+        if (lane == 0u && live) {
+            const float score = dot * scale;
+            const float new_max = fmaxf(row_max, score);
+            old_scale = row_max == -3.4028234663852886e38f
+                ? 0.0f
+                : expf(row_max - new_max);
+            probability = expf(score - new_max);
+            row_max = new_max;
+            row_sum = row_sum * old_scale + probability;
+        }
+        probability = __shfl_sync(0xffffffffu, probability, 0u);
+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0u);
+        if (live) {
+            const unsigned v_off = j * num_kv_heads * 256u + k_base;
+#pragma unroll
+            for (unsigned d = 0u; d < dims_per_lane; ++d) {
+                accv[d] = accv[d] * old_scale + probability * v[v_off + d * 32u + lane];
+            }
+        }
+    }
+
+    const unsigned partial_row = (query_idx * num_heads + h) * num_chunks + chunk;
+#pragma unroll
+    for (unsigned d = 0u; d < dims_per_lane; ++d) {
+        partial_acc[partial_row * 256u + d * 32u + lane] = accv[d];
+    }
+    if (lane == 0u) {
+        partial_meta[partial_row * 2u] = row_max;
+        partial_meta[partial_row * 2u + 1u] = row_sum;
+    }
+}
+
 extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_split_partials_qtile4_jbatch4(
     float* __restrict__ partial_acc,
     float* __restrict__ partial_meta,

@@ -2682,14 +2682,14 @@ impl super::CudaState {
         let partial_kernel = if use_mma_stream_k {
             "rnb_attention_prefill_flash_hd256_window_mma_stream_k_partials"
         } else if query_tile {
-            "rnb_attention_prefill_flash_hd256_window_split_partials_qtile4_jbatch4"
+            "rnb_attention_prefill_flash_hd256_window_split_partials_qtile8_jbatch4"
         } else {
             "rnb_attention_prefill_flash_hd256_window_split_partials_jbatch8"
         };
         let partial_grid_x = if use_mma_stream_k {
             seq_arg.div_ceil(64)
         } else if query_tile {
-            seq_arg.div_ceil(4)
+            seq_arg.div_ceil(8)
         } else {
             seq_arg
         };
