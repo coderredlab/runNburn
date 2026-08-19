@@ -3733,6 +3733,160 @@ pub(in crate::engine) fn qwen35_prefill_attention_dense_device_layers_supported(
     saw_attention
 }
 
+/// cu291: dense Qwen35 MTP block(nextn layer)의 prompt observe를 device에서
+/// 실행하기 위한 단일 attention layer view를 만든다. trunk builder
+/// (`build_mtp_device_verify_attention_moe_layers_inner`)의 dense 분기와 같은
+/// 필드 계약을 MTP drafter 자체 weights(`runtime.weights.block`)와 MTP 전용
+/// KV cache에 적용한다. dense 전용 — MoE block(Qwen35MoE)은 별도 게이트에서
+/// 걸러진다.
+#[cfg(feature = "cuda")]
+pub(in crate::engine) fn build_mtp_device_observe_dense_attention_layer<'a>(
+    attn: &'a super::layer_weights::AttentionLayerWeights,
+    metadata: &ModelMetadata,
+    architecture: super::ModelArchitecture,
+    kv_cache: &crate::kv_cache::KVCache,
+    device_layer_idx: usize,
+) -> crate::error::Result<super::cuda_runtime::MtpDeviceVerifyAttentionMoeLayer<'a>> {
+    if attn.shared_expert_moe.is_some() || attn.moe.is_some() {
+        return Err(crate::error::LlmError::Forward(
+            "MTP device observe requires a dense attention block".to_string(),
+        ));
+    }
+    let (q_q4k, q_quant) =
+        k_quant_weight_bytes_for_mtp_device(&attn.q_weight, device_layer_idx, "attn_q")?;
+    let (k_q4k, k_quant) =
+        k_quant_weight_bytes_for_mtp_device(&attn.k_weight, device_layer_idx, "attn_k")?;
+    let (v_q4k, v_quant) =
+        k_quant_weight_bytes_for_mtp_device(&attn.v_weight, device_layer_idx, "attn_v")?;
+    let (o_q4k, o_quant) =
+        k_quant_weight_bytes_for_mtp_device(&attn.o_weight, device_layer_idx, "attn_o")?;
+    let q_norm = attn.q_norm.as_ref().ok_or_else(|| {
+        crate::error::LlmError::Forward("MTP device observe attention q_norm missing".to_string())
+    })?;
+    let k_norm = attn.k_norm.as_ref().ok_or_else(|| {
+        crate::error::LlmError::Forward("MTP device observe attention k_norm missing".to_string())
+    })?;
+    // dense Qwen block은 post_attention_norm이 pre-FFN norm이다(draft builder와
+    // 동일하게 ffn_norm 필드에 태운다).
+    let ffn_norm = attn.post_attn_norm.as_ref().ok_or_else(|| {
+        crate::error::LlmError::Forward(
+            "MTP device observe attention post_attention_norm missing".to_string(),
+        )
+    })?;
+    let ffn_gate_q4k =
+        q4k_weight_bytes_for_mtp_device(&attn.ffn_gate_weight, device_layer_idx, "ffn_gate")?;
+    let ffn_up_q4k =
+        q4k_weight_bytes_for_mtp_device(&attn.ffn_up_weight, device_layer_idx, "ffn_up")?;
+    let (ffn_down, ffn_down_quant) =
+        k_quant_weight_bytes_for_mtp_device(&attn.ffn_down_weight, device_layer_idx, "ffn_down")?;
+    let prior_tokens = kv_cache.current_len();
+    let prior_sequence_epoch = kv_cache.sequence_epoch();
+    let cache_layer = kv_cache.layers().first().ok_or_else(|| {
+        crate::error::LlmError::Forward("MTP device observe KV cache layer 0 missing".to_string())
+    })?;
+    let (prior_k_bits, prior_v_bits) = mtp_device_prior_kv_bits(cache_layer, prior_tokens);
+    let expected_prior_values =
+        prior_tokens
+            .checked_mul(attn.k_weight.rows)
+            .ok_or_else(|| {
+                crate::error::LlmError::Forward(format!(
+                    "MTP device observe prior KV size overflow: tokens={prior_tokens} rows={}",
+                    attn.k_weight.rows
+                ))
+            })?;
+    let prior_is_device_resident =
+        prior_tokens > 0 && prior_k_bits.is_empty() && prior_v_bits.is_empty();
+    if !prior_is_device_resident
+        && (prior_k_bits.len() != expected_prior_values
+            || prior_v_bits.len() != expected_prior_values)
+    {
+        return Err(crate::error::LlmError::Forward(format!(
+            "MTP device observe prior KV len mismatch: k={} v={} expected={expected_prior_values}",
+            prior_k_bits.len(),
+            prior_v_bits.len()
+        )));
+    }
+    Ok(super::cuda_runtime::MtpDeviceVerifyAttentionMoeLayer {
+        layer_index: device_layer_idx,
+        kv_source_layer: None,
+        attn_norm: super::cpu_runtime::kernels::tensor_as_f32_slice(&attn.attn_norm),
+        q_q4k,
+        q_quant,
+        q_rows: attn.q_weight.rows,
+        q_cols: attn.q_weight.cols,
+        k_q4k,
+        k_quant,
+        k_rows: attn.k_weight.rows,
+        k_cols: attn.k_weight.cols,
+        v_q4k,
+        v_quant,
+        v_rows: attn.v_weight.rows,
+        v_cols: attn.v_weight.cols,
+        prior_k_bits,
+        prior_v_bits,
+        prior_tokens,
+        prior_sequence_epoch,
+        attention_scale: resolve_attention_scale(metadata, architecture),
+        o_q4k,
+        o_quant,
+        o_rows: attn.o_weight.rows,
+        o_cols: attn.o_weight.cols,
+        q_norm: super::cpu_runtime::kernels::tensor_as_f32_slice(q_norm),
+        k_norm: super::cpu_runtime::kernels::tensor_as_f32_slice(k_norm),
+        qk_norm_unit_offset: false,
+        v_no_scale_norm: false,
+        rope_freq_factors: &[],
+        post_attn_norm: &[],
+        post_attn_norm_unit_offset: false,
+        ffn_norm_unit_offset: false,
+        post_ffw_norm_unit_offset: false,
+        ffn_norm: super::cpu_runtime::kernels::tensor_as_f32_slice(ffn_norm),
+        post_ffw_norm: &[],
+        out_scale: &[],
+        ple_gate: &[],
+        ple_gate_quant: rnb_loader::GGMLType::F32,
+        ple_gate_rows: 0,
+        ple_gate_cols: 0,
+        ple_proj: &[],
+        ple_proj_quant: rnb_loader::GGMLType::F32,
+        ple_proj_rows: 0,
+        ple_proj_cols: 0,
+        ple_post_norm: &[],
+        ple_post_norm_unit_offset: false,
+        ple_input: Vec::new(),
+        ffn_uses_gelu: false,
+        ffn_gate_q4k,
+        ffn_gate_rows: attn.ffn_gate_weight.rows,
+        ffn_gate_cols: attn.ffn_gate_weight.cols,
+        ffn_up_q4k,
+        ffn_up_rows: attn.ffn_up_weight.rows,
+        ffn_up_cols: attn.ffn_up_weight.cols,
+        ffn_down,
+        ffn_down_quant,
+        ffn_down_rows: attn.ffn_down_weight.rows,
+        ffn_down_cols: attn.ffn_down_weight.cols,
+        router_w: &[],
+        n_expert: 0,
+        n_expert_used: 0,
+        expert_gating_func: 0,
+        shared_expert_gated: true,
+        gate_all: &[],
+        up_all: &[],
+        down_all: &[],
+        down_quant: rnb_loader::GGMLType::Q4_K,
+        shared_input_scale: &[],
+        shared_gate: &[],
+        shared_gate_quant: rnb_loader::GGMLType::Q4_K,
+        shared_up: &[],
+        shared_up_quant: rnb_loader::GGMLType::Q4_K,
+        shared_down: &[],
+        shared_down_quant: rnb_loader::GGMLType::Q4_K,
+        n_ff: attn.ffn_gate_weight.rows,
+        n_embd: metadata.hidden_dim,
+        gemma_mtp2_moe: None,
+    })
+}
+
 #[cfg(all(feature = "cuda", test))]
 pub(super) fn build_mtp_device_verify_gdn_moe_layers<'a>(
     weights: &'a super::layer_weights::ModelWeights,

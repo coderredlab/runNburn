@@ -2406,6 +2406,7 @@ fn cuda_qwen35_mtp_verify_attention_moe_layer_chains_resident_stages() {
             true,
             rope_theta,
             pos_start,
+            pos_start,
             1.0e-5,
             true,
         )

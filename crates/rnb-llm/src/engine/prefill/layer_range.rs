@@ -2577,6 +2577,7 @@ fn run_prefill_layers_cpu_range_impl(
                             *rope_neox,
                             *device_rope_theta,
                             pos_start,
+                            pos_start,
                             norm_eps,
                             mirror_attention_kv,
                         ) {

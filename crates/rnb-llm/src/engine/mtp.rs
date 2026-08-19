@@ -1985,6 +1985,32 @@ fn run_mtp_block(
         }
         return Ok(hidden);
     }
+    // cu291: 긴 prefill의 청크마다 불리는 MTP prompt observe가 host 경로
+    // (f32 full attention + 매 청크 전체 KV 재재료화 H2D)로 떨어져 32k 기준
+    // ~25%를 먹었다. dense Qwen35 block이면 device 경로(qtile8 window
+    // attention + dense FFN carrier)를 먼저 시도하고, 실패 시 host로 되돌린다.
+    #[cfg(feature = "cuda")]
+    {
+        // pair 위치는 target 토큰 좌표(rope)이고 cache 좌표는 별도로 관리된다
+        // (host 경로와 동일하게 cache_pos=current_len, rope_pos=pair_positions[0]).
+        let cache_pos_start = runtime.kv_cache.current_len();
+        match try_run_mtp_block_device_observe(
+            runtime,
+            architecture,
+            &projected,
+            seq_len,
+            cache_pos_start,
+            rope_pos_start,
+        ) {
+            Ok(Some(last)) => return Ok(last),
+            Ok(None) => {}
+            Err(err) => {
+                if crate::engine::policy::env_os_string("RNB_MTP_DRAFT_TRACE").is_some() {
+                    eprintln!("[mtp-device-observe] host fallback: {err}");
+                }
+            }
+        }
+    }
     let hidden = Tensor::from_vec(projected, &[seq_len, hidden_dim]);
     let cache_pos_start = runtime.kv_cache.current_len();
     let hidden = forward_attention_layer_with_rope_pos(
@@ -2013,6 +2039,212 @@ fn run_mtp_block(
     let data = kernels::tensor_as_f32_slice(&hidden);
     let last = data[(seq_len - 1) * hidden_dim..seq_len * hidden_dim].to_vec();
     Ok(last)
+}
+
+/// cu291: MTP prompt observe의 device 실행. projected(eh_proj 출력) 한 chunk를
+/// 업로드해 trunk prefill과 같은 device attention + dense FFN carrier로
+/// 실행하고, host KV 미러(f16 range append)와 마지막 hidden row만 회수한다.
+/// 반환: Ok(Some(last_hidden)) 실행 성공, Ok(None) 구조적 미지원(host 진행),
+/// Err는 실행/정리 실패 — 호출자가 host 경로로 되돌린다(host KV는 append 전까진
+/// 불변이라 안전).
+#[cfg(feature = "cuda")]
+fn try_run_mtp_block_device_observe(
+    runtime: &mut InModelMtpRuntime,
+    architecture: ModelArchitecture,
+    projected: &[f32],
+    seq_len: usize,
+    cache_pos_start: usize,
+    rope_pos_start: usize,
+) -> Result<Option<Vec<f32>>> {
+    use super::prefill::hidden_carrier::{
+        materialize_device_hidden_row, DevicePrefillHidden,
+    };
+
+    let trace_gate = |reason: &str| {
+        if crate::engine::policy::env_os_string("RNB_MTP_DRAFT_TRACE").is_some() {
+            eprintln!("[mtp-device-observe] gate: {reason}");
+        }
+    };
+    if architecture != ModelArchitecture::Qwen35 {
+        trace_gate("arch-not-qwen35");
+        return Ok(None);
+    }
+    if !super::policy::mtp_device_observe_enabled() {
+        trace_gate("policy-disabled");
+        return Ok(None);
+    }
+    if runtime.weights.block.shared_expert_moe.is_some()
+        || runtime.weights.block.moe.is_some()
+    {
+        trace_gate("moe-block");
+        return Ok(None);
+    }
+    let hidden_dim = runtime.metadata.hidden_dim;
+    if projected.len() != seq_len * hidden_dim {
+        return Err(LlmError::Forward(format!(
+            "MTP device observe projected length {} != seq_len*hidden_dim {}",
+            projected.len(),
+            seq_len * hidden_dim
+        )));
+    }
+    if !super::backend_runtime::gdn_dense_prefill_ffn_device_supported(
+        &runtime.weights.block.ffn_gate_weight,
+        &runtime.weights.block.ffn_up_weight,
+        &runtime.weights.block.ffn_down_weight,
+        hidden_dim,
+    ) {
+        trace_gate("ffn-device-unsupported");
+        return Ok(None);
+    }
+    let (rope_dim, rope_theta, proportional_rope) = resolve_rope_params(
+        &runtime.metadata,
+        architecture,
+        0,
+        runtime.metadata.head_dim,
+    );
+    if proportional_rope {
+        return Ok(None);
+    }
+    let qwen_mrope_dim = qwen_text_mrope_dim(
+        &runtime.metadata,
+        architecture,
+        rope_dim,
+        runtime.metadata.head_dim,
+    );
+    let device_rope_dim = qwen_mrope_dim.unwrap_or(rope_dim);
+    let device_layer_idx = runtime.weights.layer_index;
+    let kv_dim = runtime.weights.block.k_weight.rows;
+
+    let layer = super::inference::build_mtp_device_observe_dense_attention_layer(
+        &runtime.weights.block,
+        &runtime.metadata,
+        architecture,
+        &runtime.kv_cache,
+        device_layer_idx,
+    )?;
+    if layer.prior_tokens != cache_pos_start {
+        // prior bits 길이와 cache 위치가 어긋나면 window 배치가 틀어진다.
+        trace_gate("prior-cache-mismatch");
+        return Ok(None);
+    }
+    if cache_pos_start.checked_add(seq_len).map_or(true, |end| {
+        end > runtime.kv_cache.max_seq_len
+    }) {
+        trace_gate("cache-capacity");
+        return Ok(None);
+    }
+
+    let device_input = super::backend_runtime::upload_hidden_device_output_f32(
+        projected,
+        seq_len,
+        hidden_dim,
+    )?;
+    let attention_output = match super::backend_runtime::qwen35_prefill_attention_device_input(
+        &device_input,
+        &layer,
+        seq_len,
+        hidden_dim,
+        device_rope_dim,
+        qwen_mrope_dim.is_some(),
+        rope_theta,
+        cache_pos_start,
+        rope_pos_start,
+        runtime.metadata.norm_eps,
+        true,
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = device_input.release();
+            return Err(err);
+        }
+    };
+    let normalized = attention_output.normalized;
+    let residual = attention_output.residual;
+    let attention_kv = attention_output.attention_kv;
+    let ffn_result = super::backend_runtime::gdn_dense_prefill_ffn_device_carrier(
+        &runtime.weights.block.ffn_gate_weight,
+        &runtime.weights.block.ffn_up_weight,
+        &runtime.weights.block.ffn_down_weight,
+        seq_len,
+        hidden_dim,
+        normalized.output_id,
+        normalized.output_desc,
+        residual.output_id,
+        residual.output_desc,
+    );
+    let ffn_output = match ffn_result {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = normalized.release();
+            let _ = residual.release();
+            let _ = device_input.release();
+            return Err(err);
+        }
+    };
+    // FFN carrier는 residual 버퍼를 재사용할 수 있다 — 같은 id 이중 해제 금지.
+    for output in [normalized, residual] {
+        if output.output_id == ffn_output.output_id {
+            continue;
+        }
+        let _ = output.release();
+    }
+    let _ = device_input.release();
+
+    let expected_kv_values = seq_len.checked_mul(kv_dim).ok_or_else(|| {
+        LlmError::Forward("MTP device observe KV size overflow".to_string())
+    })?;
+    if attention_kv.layer_idx != device_layer_idx
+        || attention_kv.window_tokens != seq_len
+        || attention_kv.kv_rows != kv_dim
+        || attention_kv.k_bits.len() != expected_kv_values
+        || attention_kv.v_bits.len() != expected_kv_values
+    {
+        let _ = ffn_output.release();
+        return Err(LlmError::Forward(format!(
+            "MTP device observe K/V result mismatch: layer={} window={} rows={} k={} v={} expected={expected_kv_values}",
+            attention_kv.layer_idx,
+            attention_kv.window_tokens,
+            attention_kv.kv_rows,
+            attention_kv.k_bits.len(),
+            attention_kv.v_bits.len()
+        )));
+    }
+    runtime.kv_cache.replace_layer_f16_range_compacted(
+        0,
+        cache_pos_start,
+        seq_len,
+        &attention_kv.k_bits,
+        &attention_kv.v_bits,
+    )
+    .map_err(LlmError::Forward)?;
+    runtime.kv_cache.set_len(mtp_block_cache_len_after(
+        cache_pos_start,
+        seq_len,
+        runtime.kv_cache.max_seq_len,
+    ));
+    if crate::engine::policy::env_string("RNB_CUDA_DEVICE_PREFILL_TRACE").as_deref() == Some("1") {
+        eprintln!(
+            "[cuda:mtp-device-observe] layer={} tokens={} prior={} kv_d2h_bytes={}",
+            device_layer_idx,
+            seq_len,
+            cache_pos_start,
+            attention_kv
+                .k_bits
+                .len()
+                .saturating_add(attention_kv.v_bits.len())
+                .saturating_mul(std::mem::size_of::<u16>())
+        );
+    }
+    let last_row = materialize_device_hidden_row(
+        DevicePrefillHidden {
+            output: ffn_output,
+            producer_layer_idx: device_layer_idx,
+        },
+        seq_len - 1,
+        None,
+        "mtp_observe_last_row",
+    )?;
+    Ok(Some(kernels::tensor_as_f32_slice(&last_row).to_vec()))
 }
 
 fn run_glm_mtp_block(

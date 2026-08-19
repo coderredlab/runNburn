@@ -462,6 +462,7 @@ pub fn qwen35_prefill_attention_device_input(
     rope_neox: bool,
     rope_theta: f32,
     pos_start: usize,
+    rope_pos_start: usize,
     norm_eps: f32,
     mirror_attention_kv_to_host: bool,
 ) -> Result<QwenAttentionDeviceInputOutput> {
@@ -476,6 +477,7 @@ pub fn qwen35_prefill_attention_device_input(
         rope_neox,
         rope_theta,
         pos_start,
+        rope_pos_start,
         norm_eps,
         mirror_attention_kv_to_host,
     )?;

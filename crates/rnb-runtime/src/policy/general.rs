@@ -321,6 +321,13 @@ pub fn mtp_decode_block_enabled() -> bool {
     env_truthy_override("RNB_MTP_DECODE_BLOCK").unwrap_or(true)
 }
 
+/// cu291: MTP prompt observe(긴 prefill 중 청크마다 drafter KV/hidden을 채우는
+/// 경로)의 attention+FFN을 CUDA device에서 실행한다. 기본 on, 문제 시
+/// `RNB_CUDA_MTP_DEVICE_OBSERVE=0`으로 host 경로에 되돌린다.
+pub fn mtp_device_observe_enabled() -> bool {
+    env_truthy_override("RNB_CUDA_MTP_DEVICE_OBSERVE").unwrap_or(true)
+}
+
 pub fn mtp_device_draft_enabled() -> bool {
     env_truthy_override("RNB_CUDA_MTP_DEVICE_DRAFT").unwrap_or_else(mtp_device_verify_enabled)
 }

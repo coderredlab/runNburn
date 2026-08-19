@@ -58,6 +58,7 @@ pub fn qwen35_prefill_attention_device_input(
     rope_neox: bool,
     rope_theta: f32,
     pos_start: usize,
+    rope_pos_start: usize,
     norm_eps: f32,
     collect_host_kv_when_resident: bool,
 ) -> Result<Qwen35PrefillAttentionDeviceOutput, String> {
@@ -82,6 +83,7 @@ pub fn qwen35_prefill_attention_device_input(
             rope_neox,
             rope_theta,
             pos_start,
+            rope_pos_start,
             norm_eps,
             collect_host_kv_when_resident,
         )
@@ -100,6 +102,7 @@ impl CudaState {
         rope_neox: bool,
         rope_theta: f32,
         pos_start: usize,
+        rope_pos_start: usize,
         norm_eps: f32,
         collect_host_kv_when_resident: bool,
     ) -> Result<Qwen35PrefillAttentionDeviceOutput, String> {
@@ -168,6 +171,7 @@ impl CudaState {
                 rope_neox,
                 rope_theta,
                 pos_start,
+                rope_pos_start,
                 norm_eps,
                 collect_host_kv_when_resident,
             )?;
