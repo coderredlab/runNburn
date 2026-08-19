@@ -502,6 +502,74 @@ fn qwen_moe_prefill_mulmmid_v3_scratch_budget_bytes() -> usize {
 #[cfg(target_os = "macos")]
 const QWEN_MOE_LLAMA_ID_SCRATCH_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
+/// Largest token window whose llama_id scratch plan fits `scratch_budget_bytes`.
+/// Halves from `seq_len` until the preflight passes. Returns None when even a
+/// single token exceeds the budget (caller falls back to the CPU path).
+#[cfg(target_os = "macos")]
+fn qwen_moe_llama_id_chunk_tokens(
+    seq_len: usize,
+    n_expert: usize,
+    n_expert_used: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    scratch_budget_bytes: usize,
+) -> Option<usize> {
+    let mut chunk = seq_len / 2;
+    while chunk > 0 {
+        match ffn_chain::qwen_moe_llama_id_preflight(
+            true,
+            true,
+            chunk,
+            n_expert,
+            n_expert_used,
+            hidden_dim,
+            ffn_dim,
+            scratch_budget_bytes,
+        ) {
+            Ok(ffn_chain::QwenMoeLlamaIdPreflight::Run(_)) => return Some(chunk),
+            Ok(ffn_chain::QwenMoeLlamaIdPreflight::Fallback(
+                ffn_chain::QwenMoeLlamaIdFallbackReason::ScratchOverBudget,
+            )) => {
+                chunk /= 2;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_moe_llama_id_merge_trace(acc: &mut QwenMoeLlamaIdTrace, chunk: &QwenMoeLlamaIdTrace) {
+    acc.map_dispatches += chunk.map_dispatches;
+    acc.gate_dispatches += chunk.gate_dispatches;
+    acc.up_dispatches += chunk.up_dispatches;
+    acc.activation_dispatches += chunk.activation_dispatches;
+    acc.down_dispatches += chunk.down_dispatches;
+    acc.reduce_dispatches += chunk.reduce_dispatches;
+    fn sum_ms(lhs: Option<f64>, rhs: Option<f64>) -> Option<f64> {
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+    acc.map_ms = sum_ms(acc.map_ms, chunk.map_ms);
+    acc.gate_ms = sum_ms(acc.gate_ms, chunk.gate_ms);
+    acc.up_ms = sum_ms(acc.up_ms, chunk.up_ms);
+    acc.activation_ms = sum_ms(acc.activation_ms, chunk.activation_ms);
+    acc.down_ms = sum_ms(acc.down_ms, chunk.down_ms);
+    acc.reduce_ms = sum_ms(acc.reduce_ms, chunk.reduce_ms);
+    acc.stage_timing_source = chunk.stage_timing_source.or(acc.stage_timing_source);
+    acc.stage_timing_unsupported_reason = chunk
+        .stage_timing_unsupported_reason
+        .or(acc.stage_timing_unsupported_reason);
+    acc.stage_timing_fallback_reason = chunk
+        .stage_timing_fallback_reason
+        .or(acc.stage_timing_fallback_reason);
+    acc.scratch_bytes = acc.scratch_bytes.max(chunk.scratch_bytes);
+}
+
 #[cfg(target_os = "macos")]
 fn qwen_moe_llama_id_quant_supported(
     sparse: QwenMoeLlamaIdQuantSet,
@@ -8577,6 +8645,12 @@ impl MetalBackend {
             {
                 Ok(ffn_chain::QwenMoeLlamaIdPreflight::Run(plan)) => plan,
                 Ok(ffn_chain::QwenMoeLlamaIdPreflight::Fallback(reason)) => {
+                    if matches!(
+                        reason,
+                        ffn_chain::QwenMoeLlamaIdFallbackReason::ScratchOverBudget
+                    ) {
+                        return self.qwen_moe_llama_id_prefill_chunked(&request, requested);
+                    }
                     trace_fallback(qwen_moe_llama_id_fallback_reason(reason));
                     return Ok(None);
                 }
@@ -8797,6 +8871,85 @@ impl MetalBackend {
             );
         }
         Ok(Some(QwenMoeLlamaIdPrefillOutput { values, trace }))
+    }
+
+    /// Scratch-budget fallback that keeps the Metal path: split the token axis
+    /// into budget-sized windows and run the unchanged single-shot path per
+    /// window. MoE is token-local, so windowing is numerics-preserving.
+    fn qwen_moe_llama_id_prefill_chunked(
+        &self,
+        request: &QwenMoeLlamaIdPrefillRequest<'_>,
+        requested: bool,
+    ) -> Result<Option<QwenMoeLlamaIdPrefillOutput>, String> {
+        let trace_enabled = qwen_moe_llama_id_trace_enabled();
+        let n_expert = request.gate_all.len() / request.gate_expert_bytes;
+        let n_expert_used = request.selected_experts.len() / request.seq_len;
+        let Some(chunk_tokens) = qwen_moe_llama_id_chunk_tokens(
+            request.seq_len,
+            n_expert,
+            n_expert_used,
+            request.hidden_dim,
+            request.ffn_dim,
+            QWEN_MOE_LLAMA_ID_SCRATCH_BUDGET_BYTES,
+        ) else {
+            if trace_enabled {
+                eprintln!(
+                    "[metal-qwen-moe-prefill-accum] mode=llama_id_chunked fallback_reason=chunk_unavailable seq_len={}",
+                    request.seq_len
+                );
+            }
+            return Ok(None);
+        };
+        let chunk_count = request.seq_len.div_ceil(chunk_tokens);
+        if trace_enabled {
+            eprintln!(
+                "[metal-qwen-moe-prefill-accum] mode=llama_id_chunked seq_len={} chunk_tokens={chunk_tokens} chunks={chunk_count} layer_idx={}",
+                request.seq_len, request.layer_idx
+            );
+        }
+        let mut values = vec![0.0f32; request.seq_len * request.hidden_dim];
+        let mut merged_trace = QwenMoeLlamaIdTrace::default();
+        let mut chunk_start = 0usize;
+        while chunk_start < request.seq_len {
+            let chunk_len = chunk_tokens.min(request.seq_len - chunk_start);
+            let route_lo = chunk_start * n_expert_used;
+            let route_hi = route_lo + chunk_len * n_expert_used;
+            let row_lo = chunk_start * request.hidden_dim;
+            let row_hi = row_lo + chunk_len * request.hidden_dim;
+            let sub_request = QwenMoeLlamaIdPrefillRequest {
+                gate_all: request.gate_all,
+                up_all: request.up_all,
+                down_all: request.down_all,
+                gate_expert_bytes: request.gate_expert_bytes,
+                up_expert_bytes: request.up_expert_bytes,
+                down_expert_bytes: request.down_expert_bytes,
+                selected_experts: &request.selected_experts[route_lo..route_hi],
+                route_weights: &request.route_weights[route_lo..route_hi],
+                shared_gate: request.shared_gate,
+                shared_up: request.shared_up,
+                shared_down: request.shared_down,
+                shared_route_weights: &request.shared_route_weights
+                    [chunk_start..chunk_start + chunk_len],
+                sparse_quant: request.sparse_quant,
+                shared_quant: request.shared_quant,
+                norm_all: &request.norm_all[row_lo..row_hi],
+                seq_len: chunk_len,
+                hidden_dim: request.hidden_dim,
+                ffn_dim: request.ffn_dim,
+                layer_idx: request.layer_idx,
+            };
+            let Some(output) = self.qwen_moe_llama_id_prefill_requested(sub_request, requested)?
+            else {
+                return Ok(None);
+            };
+            values[row_lo..row_hi].copy_from_slice(&output.values);
+            qwen_moe_llama_id_merge_trace(&mut merged_trace, &output.trace);
+            chunk_start += chunk_len;
+        }
+        Ok(Some(QwenMoeLlamaIdPrefillOutput {
+            values,
+            trace: merged_trace,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16542,6 +16695,44 @@ mod tests {
             ffn_chain::QwenMoeLlamaIdPreflight::Fallback(
                 ffn_chain::QwenMoeLlamaIdFallbackReason::UnsupportedQuant,
             )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qwen_moe_llama_id_chunk_tokens_halves_until_budget_fits() {
+        // Qwen3.6-35B-A3B dims: 128 experts, top-8, hidden 2048, ffn 768.
+        let (n_expert, n_expert_used, hidden, ffn) = (128, 8, 2048, 768);
+        let budget = super::QWEN_MOE_LLAMA_ID_SCRATCH_BUDGET_BYTES;
+        // 8192 tokens exceed the budget; the largest halved window that fits is
+        // 4096.
+        assert_eq!(
+            super::qwen_moe_llama_id_chunk_tokens(
+                8192,
+                n_expert,
+                n_expert_used,
+                hidden,
+                ffn,
+                budget
+            ),
+            Some(4096)
+        );
+        // 50000 tokens halve down to 3125 (~145KB/token scratch).
+        assert_eq!(
+            super::qwen_moe_llama_id_chunk_tokens(
+                50000,
+                n_expert,
+                n_expert_used,
+                hidden,
+                ffn,
+                budget
+            ),
+            Some(3125)
+        );
+        // A budget below the single-token scratch has no valid window.
+        assert_eq!(
+            super::qwen_moe_llama_id_chunk_tokens(8192, n_expert, n_expert_used, hidden, ffn, 1024),
+            None
         );
     }
 
