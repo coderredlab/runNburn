@@ -28,6 +28,23 @@ impl CudaState {
         // clamp 시점에 초과분을 즉시 LRU(모델 수명 pinned 포함)로 내려
         // prefill 전 구간의 자리를 시작부터 확보한다.
         let resident_before_clamp_evict = self.resident_q4k_bytes;
+        // cu287: MoE layer cache(q4k와 별도 한도)가 prefill 중 KV 성장분을
+        // 희생하지 않으면 q4k eviction → evicted weight의 매 청크 temporary
+        // upload(H2D 수백 GB)로 이어진다. clamp 때 MoE cache 한도도 같이
+        // 조이고 초과분을 즉시 내린다.
+        if self.prefill_scratch_saved_moe_limit.is_none() {
+            self.prefill_scratch_saved_moe_limit = Some(self.resident_moe_layer_limit);
+        }
+        let moe_base = self
+            .prefill_scratch_saved_moe_limit
+            .unwrap_or(self.resident_moe_layer_limit);
+        let moe_target = moe_base.saturating_sub(scratch_bytes);
+        self.resident_moe_layer_limit = moe_target;
+        if self.resident_moe_layer_bytes > moe_target {
+            let moe_excess = self.resident_moe_layer_bytes - moe_target;
+            let moe_before = self.resident_moe_layer_bytes;
+            let _ = self.evict_resident_moe_layers_until(moe_excess, moe_before);
+        }
         if self.resident_q4k_bytes > self.resident_q4k_limit {
             let excess = self.resident_q4k_bytes - self.resident_q4k_limit;
             let _ = self.clear_weight_referencing_graphs();
@@ -51,6 +68,9 @@ impl CudaState {
     pub(in crate::runtime) fn release_prefill_scratch_clamp(&mut self) {
         if let Some(saved) = self.prefill_scratch_saved_limit.take() {
             self.resident_q4k_limit = saved;
+        }
+        if let Some(saved_moe) = self.prefill_scratch_saved_moe_limit.take() {
+            self.resident_moe_layer_limit = saved_moe;
         }
     }
 

@@ -169,6 +169,7 @@ impl CudaState {
             resident_q4k_bytes: 0,
             resident_q4k_limit,
             prefill_scratch_saved_limit: None,
+            prefill_scratch_saved_moe_limit: None,
             qwen35_target_decode_q4k_limit_checked: false,
             nemotron_decode_q4k_limit_checked: false,
             resident_q4k_touch_hits_auto: false,
