@@ -339,7 +339,20 @@ impl Engine {
         {
             return crate::engine::tuning_runtime::prefill_chunk_tokens(self.metadata.hidden_dim);
         }
-        #[cfg(not(any(feature = "vulkan", feature = "cuda")))]
+        #[cfg(all(feature = "metal", not(any(feature = "vulkan", feature = "cuda"))))]
+        {
+            // Experiment seam: RNB_METAL_PREFILL_CHUNK=<tokens> enables
+            // token-window prefill chunking on Metal (default: off).
+            if let Some(raw) = crate::engine::policy::env_string("RNB_METAL_PREFILL_CHUNK") {
+                if let Ok(tokens) = raw.parse::<usize>() {
+                    if tokens > 0 {
+                        return tokens;
+                    }
+                }
+            }
+            usize::MAX
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "cuda", feature = "metal")))]
         usize::MAX
     }
 
