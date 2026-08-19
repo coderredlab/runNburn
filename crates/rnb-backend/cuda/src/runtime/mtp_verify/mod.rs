@@ -2663,8 +2663,12 @@ impl super::CudaState {
         let mut num_chunks_arg = u32::try_from(num_chunks).map_err(|_| {
             format!("MTP verify attention split chunk count exceeds u32: {num_chunks}")
         })?;
+        // cu292: mma stream-K 커널은 pos = kv_len - seq_len + qrow 오프셋으로
+        // kv_len > seq_len(trunk prefill의 prior+current 윈도)을 구조적으로 지원한다.
+        // trunk 경로는 prior+current f16을 통합 스테이징해 넘기므로 kv_tokens >= window_tokens면
+        // 된다. window < kv_tokens(SWA)는 여전히 배제한다.
         let use_mma_stream_k = f16_kv.is_some()
-            && kv_tokens == post_buffers.window_tokens
+            && kv_tokens >= post_buffers.window_tokens
             && post_buffers.window_tokens >= 64
             && window >= kv_tokens
             && crate::tuning::mtp_verify_attention_hd256_mma_stream_k_enabled();
@@ -2892,44 +2896,96 @@ impl super::CudaState {
                     post_buffers.window_tokens, post_buffers.kv_rows
                 )
             })?;
-        if prior_values > 0 {
-            self.launch_f16_to_f32(
+        // cu292: mma stream-K 경로는 f16 K/V를 직접 읽는다. 조건이 맞으면 f32 변환 대신
+        // prior+current f16을 K/V f32 스크래치 할당 안에 연속 복사해 넘긴다
+        // (f16은 절반 footprint라 기존 capacity 안에 들어가고 추가 VRAM 할당이 없다).
+        // 런처가 mma를 거부하면 스크래치를 f32로 다시 채운 뒤 기존 커널로 떨어진다.
+        // 사전 조건은 launch_mtp_verify_attention_hd256_split의 use_mma_stream_k 게이트와
+        // 항상 동기화되어야 한다.
+        let mma_f16_eligible = post_buffers.head_dim == 256
+            && crate::tuning::mtp_verify_attention_hd256_split_enabled()
+            && request.window.min(kv_tokens)
+                > crate::tuning::mtp_verify_attention_hd256_split_chunk_size()
+            && crate::tuning::mtp_verify_attention_hd256_mma_stream_k_enabled()
+            && post_buffers.window_tokens >= 64
+            && request.window >= kv_tokens;
+        let mut f16_kv_arg = None;
+        if mma_f16_eligible {
+            let prior_f16_bytes = prior_values
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or_else(|| {
+                    format!(
+                        "MTP verify attention output prior f16 byte overflow: values={prior_values}"
+                    )
+                })?;
+            let current_f16_bytes = current_values
+                .checked_mul(std::mem::size_of::<u16>())
+                .ok_or_else(|| {
+                    format!(
+                        "MTP verify attention output current f16 byte overflow: values={current_values}"
+                    )
+                })?;
+            let current_k_f16_dev = attention_buffers
+                .k_f32_dev
+                .checked_add(u64::try_from(prior_f16_bytes).map_err(|_| {
+                    format!(
+                        "MTP verify attention output prior f16 byte offset exceeds u64: {prior_f16_bytes}"
+                    )
+                })?)
+                .ok_or_else(|| {
+                    "MTP verify attention output prior K f16 device pointer overflow".to_string()
+                })?;
+            let current_v_f16_dev = attention_buffers
+                .v_f32_dev
+                .checked_add(u64::try_from(prior_f16_bytes).map_err(|_| {
+                    format!(
+                        "MTP verify attention output prior f16 byte offset exceeds u64: {prior_f16_bytes}"
+                    )
+                })?)
+                .ok_or_else(|| {
+                    "MTP verify attention output prior V f16 device pointer overflow".to_string()
+                })?;
+            unsafe {
+                if prior_values > 0 {
+                    self.api.memcpy_dtod_async(
+                        attention_buffers.k_f32_dev,
+                        request.prior_k_bits_dev,
+                        prior_f16_bytes,
+                        self.stream,
+                    )?;
+                    self.api.memcpy_dtod_async(
+                        attention_buffers.v_f32_dev,
+                        request.prior_v_bits_dev,
+                        prior_f16_bytes,
+                        self.stream,
+                    )?;
+                }
+                self.api.memcpy_dtod_async(
+                    current_k_f16_dev,
+                    post_buffers.k_bits_dev,
+                    current_f16_bytes,
+                    self.stream,
+                )?;
+                self.api.memcpy_dtod_async(
+                    current_v_f16_dev,
+                    post_buffers.v_bits_dev,
+                    current_f16_bytes,
+                    self.stream,
+                )?;
+            }
+            f16_kv_arg = Some((attention_buffers.k_f32_dev, attention_buffers.v_f32_dev));
+        }
+        if f16_kv_arg.is_none() {
+            self.stage_prior_window_kv_f32(
+                &attention_buffers,
+                post_buffers.k_bits_dev,
+                post_buffers.v_bits_dev,
                 request.prior_k_bits_dev,
-                attention_buffers.k_f32_dev,
-                prior_values,
-            )?;
-            self.launch_f16_to_f32(
                 request.prior_v_bits_dev,
-                attention_buffers.v_f32_dev,
                 prior_values,
+                current_values,
             )?;
         }
-        let prior_f32_bytes = prior_values
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| {
-                format!(
-                    "MTP verify attention output prior f32 byte overflow: values={prior_values}"
-                )
-            })?;
-        let prior_f32_bytes = u64::try_from(prior_f32_bytes).map_err(|_| {
-            format!(
-                "MTP verify attention output prior f32 byte offset exceeds u64: {prior_f32_bytes}"
-            )
-        })?;
-        let current_k_f32_dev = attention_buffers
-            .k_f32_dev
-            .checked_add(prior_f32_bytes)
-            .ok_or_else(|| {
-                "MTP verify attention output prior K device pointer overflow".to_string()
-            })?;
-        let current_v_f32_dev = attention_buffers
-            .v_f32_dev
-            .checked_add(prior_f32_bytes)
-            .ok_or_else(|| {
-                "MTP verify attention output prior V device pointer overflow".to_string()
-            })?;
-        self.launch_f16_to_f32(post_buffers.k_bits_dev, current_k_f32_dev, current_values)?;
-        self.launch_f16_to_f32(post_buffers.v_bits_dev, current_v_f32_dev, current_values)?;
 
         let mut output_arg = attention_buffers.attn_out_dev;
         let mut q_arg = post_buffers.q_dev;
@@ -2966,13 +3022,25 @@ impl super::CudaState {
         if !self.launch_mtp_verify_attention_hd256_split(
             &attention_buffers,
             post_buffers,
-            None,
+            f16_kv_arg,
             kv_tokens,
             request.num_heads,
             request.num_kv_heads,
             request.scale,
             request.window,
         )? {
+            // 런처 거부: 스크래치가 f16 통합본이면 레거시 커널용 f32로 다시 채운다.
+            if f16_kv_arg.is_some() {
+                self.stage_prior_window_kv_f32(
+                    &attention_buffers,
+                    post_buffers.k_bits_dev,
+                    post_buffers.v_bits_dev,
+                    request.prior_k_bits_dev,
+                    request.prior_v_bits_dev,
+                    prior_values,
+                    current_values,
+                )?;
+            }
             self.launch_cached_gemv(
                 attention_kernel,
                 &[
@@ -2993,6 +3061,59 @@ impl super::CudaState {
         }
 
         Ok(attention_buffers)
+    }
+
+    // prior+current f16 K/V를 하나의 연속 f32 버퍼로 변환한다 (레거시 f32 커널 경로).
+    #[allow(clippy::too_many_arguments)]
+    fn stage_prior_window_kv_f32(
+        &mut self,
+        attention_buffers: &MtpVerifyAttentionOutputBuffers,
+        current_k_bits_dev: u64,
+        current_v_bits_dev: u64,
+        prior_k_bits_dev: u64,
+        prior_v_bits_dev: u64,
+        prior_values: usize,
+        current_values: usize,
+    ) -> Result<(), String> {
+        if prior_values > 0 {
+            self.launch_f16_to_f32(
+                prior_k_bits_dev,
+                attention_buffers.k_f32_dev,
+                prior_values,
+            )?;
+            self.launch_f16_to_f32(
+                prior_v_bits_dev,
+                attention_buffers.v_f32_dev,
+                prior_values,
+            )?;
+        }
+        let prior_f32_bytes = prior_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                format!(
+                    "MTP verify attention output prior f32 byte overflow: values={prior_values}"
+                )
+            })?;
+        let prior_f32_bytes = u64::try_from(prior_f32_bytes).map_err(|_| {
+            format!(
+                "MTP verify attention output prior f32 byte offset exceeds u64: {prior_f32_bytes}"
+            )
+        })?;
+        let current_k_f32_dev = attention_buffers
+            .k_f32_dev
+            .checked_add(prior_f32_bytes)
+            .ok_or_else(|| {
+                "MTP verify attention output prior K device pointer overflow".to_string()
+            })?;
+        let current_v_f32_dev = attention_buffers
+            .v_f32_dev
+            .checked_add(prior_f32_bytes)
+            .ok_or_else(|| {
+                "MTP verify attention output prior V device pointer overflow".to_string()
+            })?;
+        self.launch_f16_to_f32(current_k_bits_dev, current_k_f32_dev, current_values)?;
+        self.launch_f16_to_f32(current_v_bits_dev, current_v_f32_dev, current_values)?;
+        Ok(())
     }
 
     fn stage_mtp_verify_attention_output_kvarn_window(

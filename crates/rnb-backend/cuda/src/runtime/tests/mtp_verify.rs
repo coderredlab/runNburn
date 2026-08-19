@@ -1729,6 +1729,213 @@ fn cuda_qwen35_mtp_verify_attention_output_hd256_mma_stream_k_matches_f32_split(
     );
 }
 
+// cu292: trunk prefill prior-window 경로(kv_len > seq_len)의 mma stream-K 채택 검증.
+// mma on/off 출력이 f32 split과 일치하는지에 더해, f32 스크래치에 통합 f16 비트가
+// 남아 있는지로 mma 스테이징이 실제 발화했는지 판별한다 (무발화 공집합 통과 방지).
+#[test]
+fn cuda_qwen35_mtp_verify_attention_hd256_prior_window_mma_stream_k_matches_f32() {
+    let _guard = runtime_test_lock();
+    if !crate::tuning::compiled_ampere_mma_supported() {
+        eprintln!("skipping prior-window MMA stream-K test: compiled arch lacks sm_80+");
+        return;
+    }
+    let mut state = CudaState::open().expect("open CUDA state");
+    let window_tokens = 128usize;
+    let prior_tokens = 257usize;
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let head_dim = 256usize;
+    let q_rows = num_heads * head_dim;
+    let kv_rows = num_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let q = (0..window_tokens * q_rows)
+        .map(|i| ((i as f32 % 43.0) - 21.0) * 0.012345679)
+        .collect::<Vec<_>>();
+    assert!(
+        q.iter()
+            .any(|&value| half::f16::from_f32(value).to_f32() != value),
+        "prior-window MMA Q fixture must exercise the F16 residual path"
+    );
+    let prior_k_bits = (0..prior_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i as f32 % 37.0) - 18.0) * 0.0107421875).to_bits())
+        .collect::<Vec<_>>();
+    let prior_v_bits = (0..prior_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i as f32 % 41.0) - 20.0) * 0.0087890625).to_bits())
+        .collect::<Vec<_>>();
+    let current_k_bits = (0..window_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i as f32 % 31.0) - 15.0) * 0.0126953125).to_bits())
+        .collect::<Vec<_>>();
+    let current_v_bits = (0..window_tokens * kv_rows)
+        .map(|i| half::f16::from_f32(((i as f32 % 29.0) - 14.0) * 0.01171875).to_bits())
+        .collect::<Vec<_>>();
+
+    let q_dev = state
+        .mem_alloc(std::mem::size_of_val(q.as_slice()))
+        .expect("allocate q");
+    let k_dev = state
+        .mem_alloc(std::mem::size_of_val(current_k_bits.as_slice()))
+        .expect("allocate current k");
+    let v_dev = state
+        .mem_alloc(std::mem::size_of_val(current_v_bits.as_slice()))
+        .expect("allocate current v");
+    let prior_k_dev = state
+        .mem_alloc(std::mem::size_of_val(prior_k_bits.as_slice()))
+        .expect("allocate prior k");
+    let prior_v_dev = state
+        .mem_alloc(std::mem::size_of_val(prior_v_bits.as_slice()))
+        .expect("allocate prior v");
+    unsafe {
+        state
+            .api
+            .memcpy_htod_async(
+                q_dev,
+                q.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(q.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+        state
+            .api
+            .memcpy_htod_async(
+                k_dev,
+                current_k_bits.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(current_k_bits.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+        state
+            .api
+            .memcpy_htod_async(
+                v_dev,
+                current_v_bits.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(current_v_bits.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+        state
+            .api
+            .memcpy_htod_async(
+                prior_k_dev,
+                prior_k_bits.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(prior_k_bits.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+        state
+            .api
+            .memcpy_htod_async(
+                prior_v_dev,
+                prior_v_bits.as_ptr().cast::<libc::c_void>(),
+                std::mem::size_of_val(prior_v_bits.as_slice()),
+                state.stream,
+            )
+            .unwrap();
+    }
+
+    let post_buffers = mtp_verify::MtpVerifyAttentionQkNormRopeBuffers {
+        q_dev,
+        gate_dev: None,
+        k_bits_dev: k_dev,
+        v_bits_dev: v_dev,
+        window_tokens,
+        q_rows,
+        kv_rows,
+        head_dim,
+    };
+    let run_attention = |state: &mut CudaState| -> (Vec<f32>, u64) {
+        let buffers = state
+            .stage_mtp_verify_attention_output_prior_window(
+                &post_buffers,
+                mtp_verify::Qwen35MtpAttentionOutputWithPriorRequest {
+                    prior_k_bits_dev: prior_k_dev,
+                    prior_v_bits_dev: prior_v_dev,
+                    prior_tokens,
+                    num_heads,
+                    num_kv_heads,
+                    scale,
+                    window: prior_tokens + window_tokens,
+                },
+            )
+            .expect("stage prior-window attention output");
+        let mut out = vec![0.0f32; window_tokens * q_rows];
+        unsafe {
+            state
+                .api
+                .memcpy_dtoh_async(
+                    out.as_mut_ptr().cast::<libc::c_void>(),
+                    buffers.attn_out_dev,
+                    std::mem::size_of_val(out.as_slice()),
+                    state.stream,
+                )
+                .unwrap();
+        }
+        state.stream_synchronize().unwrap();
+        (out, buffers.k_f32_dev)
+    };
+
+    unsafe {
+        std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", "0");
+    }
+    let (baseline, _) = run_attention(&mut state);
+    unsafe {
+        std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", "1");
+    }
+    let (candidate, candidate_k_f32_dev) = run_attention(&mut state);
+    unsafe {
+        std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K");
+    }
+
+    // 판별자: mma 경로는 f32 스크래치를 통합 f16 저장소로 쓰므로, 첫 2바이트에
+    // prior K의 f16 비트가 그대로 남아야 한다. f32 경로면 f32 float가 들어간다.
+    let mut scratch_prefix = [0u8; 2];
+    unsafe {
+        state
+            .api
+            .memcpy_dtoh_async(
+                scratch_prefix.as_mut_ptr().cast::<libc::c_void>(),
+                candidate_k_f32_dev,
+                2,
+                state.stream,
+            )
+            .unwrap();
+    }
+    state.stream_synchronize().unwrap();
+    assert_eq!(
+        scratch_prefix,
+        prior_k_bits[0].to_le_bytes(),
+        "MMA stream-K prior-window staging did not leave unified f16 K/V in the scratch"
+    );
+
+    unsafe {
+        state.api.mem_free(q_dev).unwrap();
+        state.api.mem_free(k_dev).unwrap();
+        state.api.mem_free(v_dev).unwrap();
+        state.api.mem_free(prior_k_dev).unwrap();
+        state.api.mem_free(prior_v_dev).unwrap();
+    }
+
+    let mut dot = 0.0f64;
+    let mut baseline_norm = 0.0f64;
+    let mut candidate_norm = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&expected, &actual) in baseline.iter().zip(&candidate) {
+        assert!(
+            actual.is_finite(),
+            "prior-window MMA stream-K produced non-finite output"
+        );
+        dot += expected as f64 * actual as f64;
+        baseline_norm += expected as f64 * expected as f64;
+        candidate_norm += actual as f64 * actual as f64;
+        max_abs = max_abs.max((expected - actual).abs());
+    }
+    let cosine = dot / (baseline_norm.sqrt() * candidate_norm.sqrt());
+    eprintln!("prior-window MMA stream-K vs F32 split: cosine={cosine:.9} max_abs={max_abs:.9}");
+    assert!(
+        cosine > 0.999999 && max_abs < 1.0e-4,
+        "prior-window MMA stream-K mismatch: cosine={cosine} max_abs={max_abs}"
+    );
+}
+
 #[test]
 fn cuda_qwen35_mtp_verify_attention_prior_kv_cache_reuses_layer_device_buffers() {
     let _guard = runtime_test_lock();
