@@ -23,6 +23,29 @@ impl CudaState {
             .prefill_scratch_saved_limit
             .unwrap_or(self.resident_q4k_limit);
         self.resident_q4k_limit = base.saturating_sub(scratch_bytes);
+        // cu287: 한도만 조이면 이미 상주한 weight이 그대로라 KV가 자라는
+        // 중반에 eviction thrash(내린 weight 재업로드 반복)가 시작된다.
+        // clamp 시점에 초과분을 즉시 LRU(모델 수명 pinned 포함)로 내려
+        // prefill 전 구간의 자리를 시작부터 확보한다.
+        let resident_before_clamp_evict = self.resident_q4k_bytes;
+        if self.resident_q4k_bytes > self.resident_q4k_limit {
+            let excess = self.resident_q4k_bytes - self.resident_q4k_limit;
+            let _ = self.clear_weight_referencing_graphs();
+            if let Some(plan) = self.resident_q4k_transient_reclaim_eviction_plan(excess) {
+                let _ = self.execute_resident_q4k_eviction_plan(plan);
+            }
+        }
+        if std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {
+            let released = resident_before_clamp_evict.saturating_sub(self.resident_q4k_bytes);
+            eprintln!(
+                "[cuda] prefill scratch clamp armed: scratch={}MiB limit={}MiB resident_before={}MiB evicted={}MiB resident_now={}MiB",
+                scratch_bytes / (1024 * 1024),
+                self.resident_q4k_limit / (1024 * 1024),
+                resident_before_clamp_evict / (1024 * 1024),
+                released / (1024 * 1024),
+                self.resident_q4k_bytes / (1024 * 1024),
+            );
+        }
     }
 
     pub(in crate::runtime) fn release_prefill_scratch_clamp(&mut self) {
@@ -160,6 +183,43 @@ impl CudaState {
         let (free_after_slice, _) = unsafe { self.api.mem_get_info() }?;
         if reclaim_bytes(free_after_slice) > 0 {
             let _ = self.offload_non_pinned_resident_q4k()?;
+        }
+
+        // cu287: 마지막 계단 — non-pinned까지 풀어도 부족하면 prewarm이 올린
+        // model-lifetime pinned q4k까지 LRU로 내려 transient(KV device 상주·
+        // 청크 스크래치)에 예산을 이전한다. 긴 prefill에서 KV가 자랄 때 이
+        // 경로가 없으면 free가 단조 감소하다 cuMemAlloc error 2로 사망한다.
+        // weight ptr을 쥔 CUDA graph를 먼저 drain해 stale launch를 막고,
+        // stream 캡처 진행 중에는 graph drain이 부적절하므로 건너뛴다.
+        let (free_after_offload, _) = unsafe { self.api.mem_get_info() }?;
+        let still_needed = reclaim_bytes(free_after_offload);
+        if still_needed > 0 && !self.mtp_verify_segment_capture_active {
+            self.clear_weight_referencing_graphs()?;
+            let resident_before = self.resident_q4k_bytes;
+            // hysteresis: 필요분만 내리면 free가 매번 reserve 근처에
+            // 붙어 다음 할당에서 즉시 재발동한다(release 41~95MiB가
+            // 반복되다 96MiB 요청 하나에 바닥나는 패턴). 여유 1GiB까지
+            // 함께 내리고, 내릴 수 있는 q4k가 그만 못하면 필요분으로
+            // 폴백한다.
+            const RECLAIM_HYSTERESIS_BYTES: usize = 1024 * 1024 * 1024;
+            let plan = self
+                .resident_q4k_transient_reclaim_eviction_plan(
+                    still_needed.saturating_add(RECLAIM_HYSTERESIS_BYTES),
+                )
+                .or_else(|| self.resident_q4k_transient_reclaim_eviction_plan(still_needed));
+            if let Some(plan) = plan {
+                let _ = self.execute_resident_q4k_eviction_plan(plan)?;
+            }
+            if std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {
+                let released = resident_before.saturating_sub(self.resident_q4k_bytes);
+                let (free_after_evict, _) = unsafe { self.api.mem_get_info() }?;
+                eprintln!(
+                    "[cuda] transient reclaim evicted resident q4k (pinned incl.): needed={}MiB released={}MiB free={}MiB",
+                    still_needed / (1024 * 1024),
+                    released / (1024 * 1024),
+                    free_after_evict / (1024 * 1024),
+                );
+            }
         }
 
         if std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {

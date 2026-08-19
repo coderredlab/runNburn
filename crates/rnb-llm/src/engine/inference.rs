@@ -577,7 +577,16 @@ impl Engine {
             if chunk != usize::MAX && pending_tokens > chunk {
                 #[cfg(feature = "cuda")]
                 {
+                    // cu287: 청킹되는 긴 prefill에서 KV device 상주(f16
+                    // bits)가 토큰당 kv_bits_bytes씩 자란다. 청크 스크래치
+                    // 예산에 prompt + decode 여유(4096 토큰)의 KV 예상치를
+                    // 더해 clamp를 깊게 조여 시작부터 자리를 확보한다.
+                    // 중반 eviction thrash(내린 weight 재업로드 반복)를
+                    // 피하는 것이 목적이다.
+                    let kv_bits_bytes = self.kv_cache.f16_kv_bits_bytes_per_token();
+                    let kv_budget = kv_bits_bytes.saturating_mul(pending_tokens + 4096);
                     crate::engine::tuning_runtime::prefill_chunk_scratch_budget_bytes()
+                        .saturating_add(kv_budget)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {

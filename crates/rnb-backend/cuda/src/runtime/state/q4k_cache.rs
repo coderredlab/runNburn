@@ -280,7 +280,7 @@ impl CudaState {
         }
         let before = self.resident_q4k_bytes;
         let plan = self
-            .plan_resident_q4k_evictions(None, &HashSet::new(), None, false)
+            .plan_resident_q4k_evictions(None, &HashSet::new(), None, false, false)
             .expect("unbounded resident Q4K eviction plan");
         let _ = self.execute_resident_q4k_eviction_plan(plan)?;
         let released = before.saturating_sub(self.resident_q4k_bytes);
@@ -453,6 +453,87 @@ impl CudaState {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    /// cu287: transient reclaim 가 pinned weight residency까지 내려야 하는
+    /// 비상 계단에서 쓴다. weight ptr을 박아둔 CUDA graph가 stale pointer로
+    /// kernel을 launch하는 사고를 막으려면 eviction 전에 전부 drain해야
+    /// 한다. 재생성 비용(다음 호출의 재캡처 1회)만 남는다.
+    pub(in crate::runtime) fn clear_weight_referencing_graphs(&mut self) -> Result<(), String> {
+        let empty = self.mtp_verify_selected_graphs.is_empty()
+            && self.mtp_verify_gdn_graphs.is_empty()
+            && self.mtp_verify_attention_graphs.is_empty()
+            && self.mtp_verify_segment_graphs.is_empty()
+            && self.cu65_qkv_graphs.is_empty()
+            && self.cu68_attention_graphs.is_empty()
+            && self.dense_expert_graphs.is_empty()
+            && self.cu71_layer_segment_graphs.is_empty();
+        self.mtp_verify_gdn_graph_warmed.clear();
+        self.mtp_verify_attention_graph_warmed.clear();
+        self.mtp_verify_segment_graph_warmed.clear();
+        self.cu65_qkv_graph_warmed.clear();
+        self.cu68_attention_graph_warmed.clear();
+        self.dense_expert_graph_warmed.clear();
+        self.cu71_layer_segment_graph_warmed.clear();
+        if empty {
+            return Ok(());
+        }
+        self.stream_synchronize()?;
+        let mut first_error = None;
+        for graph in self
+            .mtp_verify_selected_graphs
+            .drain()
+            .map(|(_, graph)| graph)
+            .chain(self.mtp_verify_gdn_graphs.drain().map(|(_, graph)| graph))
+            .chain(
+                self.mtp_verify_attention_graphs
+                    .drain()
+                    .map(|(_, graph)| graph),
+            )
+            .chain(
+                self.mtp_verify_segment_graphs
+                    .drain()
+                    .map(|(_, graph)| graph),
+            )
+            .chain(self.cu65_qkv_graphs.drain().map(|(_, graph)| graph))
+            .chain(self.cu68_attention_graphs.drain().map(|(_, graph)| graph))
+            .chain(self.dense_expert_graphs.drain().map(|(_, graph)| graph))
+            .chain(
+                self.cu71_layer_segment_graphs
+                    .drain()
+                    .map(|(_, graph)| graph),
+            )
+        {
+            for result in unsafe {
+                [
+                    self.api.graph_exec_destroy(graph.exec as *mut libc::c_void),
+                    self.api.graph_destroy(graph.graph as *mut libc::c_void),
+                ]
+            } {
+                if let Err(err) = result {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// cu287: transient(KV device 상주·청크 스크래치)가 늘어날 때
+    /// prewarm이 올린 model-lifetime pinned q4k까지 LRU로 내려 예산을
+    /// 이전받는 eviction plan. 기존 eviction 진입점은 pinned를 후보에서
+    /// 제외하므로, 이 경로가 아니면 prefill 중 free가 단조 감소하다
+    /// cuMemAlloc error 2로 사망한다.
+    pub(in crate::runtime) fn resident_q4k_transient_reclaim_eviction_plan(
+        &self,
+        need_release: usize,
+    ) -> Option<ResidentQ4kEvictionPlan> {
+        if need_release == 0 {
+            return Some(ResidentQ4kEvictionPlan::default());
+        }
+        self.plan_resident_q4k_evictions(Some(need_release), &HashSet::new(), None, false, true)
     }
 
     pub(in crate::runtime) fn release_muse_decode_tail_residency(
@@ -1086,6 +1167,7 @@ impl CudaState {
     fn resident_q4k_eviction_candidates(
         &self,
         protected_keys: &HashSet<(usize, usize)>,
+        include_pinned: bool,
     ) -> Vec<ResidentQ4kEvictionUnit> {
         let mut ordered = Vec::new();
         for &(bundle, epoch) in &self.qwen35_q2q3_bundle_ownership.bundle_lru {
@@ -1145,7 +1227,8 @@ impl CudaState {
             considered_bundles.extend(unit.bundles().iter().copied());
             if unit.roles().iter().any(|role| {
                 protected_keys.contains(role)
-                    || self.resident_q4k.get(role).is_none_or(|entry| entry.pinned)
+                    || (!include_pinned
+                        && self.resident_q4k.get(role).is_none_or(|entry| entry.pinned))
             }) {
                 continue;
             }
@@ -1160,6 +1243,7 @@ impl CudaState {
         protected_keys: &HashSet<(usize, usize)>,
         max_reload_payload_bytes: Option<u64>,
         bundles_only: bool,
+        include_pinned: bool,
     ) -> Option<ResidentQ4kEvictionPlan> {
         if need_release == Some(0) {
             return Some(ResidentQ4kEvictionPlan::default());
@@ -1177,7 +1261,7 @@ impl CudaState {
             .count();
         let mut arena_released = false;
 
-        for unit in self.resident_q4k_eviction_candidates(protected_keys) {
+        for unit in self.resident_q4k_eviction_candidates(protected_keys, include_pinned) {
             if bundles_only && unit.bundles().is_empty() {
                 continue;
             }
@@ -1247,7 +1331,7 @@ impl CudaState {
             .resident_q4k_bytes
             .saturating_add(incoming)
             .saturating_sub(effective_limit);
-        self.plan_resident_q4k_evictions(Some(need_release), protected_keys, None, false)
+        self.plan_resident_q4k_evictions(Some(need_release), protected_keys, None, false, false)
     }
 
     pub(in crate::runtime) fn resident_q4k_eviction_cost_bytes_for_incoming(
@@ -1272,6 +1356,7 @@ impl CudaState {
             protected_keys,
             Some(max_reload_payload_bytes),
             true,
+            false,
         )
     }
 

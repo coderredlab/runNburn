@@ -4851,6 +4851,83 @@ fn cuda_q4k_offload_preserves_pinned_resident_entries() {
 }
 
 #[test]
+fn transient_reclaim_eviction_releases_pinned_residents() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let pinned_a = vec![1_u8; 4096];
+    let pinned_b = vec![2_u8; 8192];
+    state.resident_q4k_limit = pinned_a.len() + pinned_b.len();
+
+    state
+        .resident_q4k_weights_ptr_pinned(&pinned_a)
+        .expect("pin resident q4k weight a");
+    state
+        .resident_q4k_weights_ptr_pinned(&pinned_b)
+        .expect("pin resident q4k weight b");
+
+    // 기존 incoming eviction 진입점은 pinned만 남으면 후보가 없어
+    // need_release를 충족할 plan 자체를 내놓지 못한다.
+    assert!(
+        state
+            .resident_q4k_eviction_plan_for_incoming(
+                pinned_a.len(),
+                &std::collections::HashSet::new()
+            )
+            .is_none(),
+        "incoming eviction plan must not consider pinned entries"
+    );
+    // cu287 transient reclaim plan은 pinned 포함 LRU로 need를 충족한다.
+    let plan = state
+        .resident_q4k_transient_reclaim_eviction_plan(pinned_a.len())
+        .expect("transient reclaim plan releases pinned residents");
+    assert!(
+        plan.releasable_bytes >= pinned_a.len(),
+        "plan must release at least the requested bytes, got {}",
+        plan.releasable_bytes
+    );
+    let _evicted = state
+        .execute_resident_q4k_eviction_plan(plan)
+        .expect("execute transient reclaim eviction");
+    assert!(
+        state.resident_q4k_bytes < pinned_a.len() + pinned_b.len(),
+        "resident bytes must shrink after pinned eviction"
+    );
+}
+
+#[test]
+fn transient_reclaim_eviction_prefers_oldest_pinned_resident() {
+    let _guard = runtime_test_lock();
+    let mut state = CudaState::open().expect("open CUDA state");
+    let oldest = vec![1_u8; 4096];
+    let newest = vec![2_u8; 8192];
+    state.resident_q4k_limit = oldest.len() + newest.len();
+
+    state
+        .resident_q4k_weights_ptr_pinned(&oldest)
+        .expect("pin oldest resident q4k weight");
+    state
+        .resident_q4k_weights_ptr_pinned(&newest)
+        .expect("pin newest resident q4k weight");
+
+    // oldest 크기만큼만 요구하면 LRU 순서로 oldest만 내려가야 한다.
+    let plan = state
+        .resident_q4k_transient_reclaim_eviction_plan(oldest.len())
+        .expect("transient reclaim plan for oldest pinned resident");
+    state
+        .execute_resident_q4k_eviction_plan(plan)
+        .expect("execute oldest-pinned eviction");
+
+    assert!(
+        !state.resident_q4k.contains_key(&q4k_resident_key(&oldest)),
+        "oldest pinned entry must be evicted first"
+    );
+    assert!(
+        state.resident_q4k.contains_key(&q4k_resident_key(&newest)),
+        "newest pinned entry must survive a bounded eviction"
+    );
+}
+
+#[test]
 fn cuda_f16_gemv_matches_cpu_reference() {
     let _guard = runtime_test_lock();
     let mut state = CudaState::open().expect("open CUDA state");

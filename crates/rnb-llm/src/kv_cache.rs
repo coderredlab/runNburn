@@ -661,6 +661,23 @@ impl KVCache {
             .sum::<usize>() as u64
     }
 
+    /// cu287: CUDA/Metal device attention이 f16 K/V bits로 레이어별 상주
+    /// 유지하는 크기 기준 — 토큰당 k+v bits 바이트 합. 긴 prefill의
+    /// residency clamp가 KV 성장분을 미리 확보할 때 쓴다. num_kv_heads가
+    /// 0인 비-attention 층은 자연히 0으로 기여한다.
+    pub fn f16_kv_bits_bytes_per_token(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .num_kv_heads
+                    .saturating_mul(layer.head_dim)
+                    .saturating_mul(2) // k + v
+                    .saturating_mul(std::mem::size_of::<u16>())
+            })
+            .sum()
+    }
+
     pub fn metrics(&self) -> KvCacheMetrics {
         let mut compressed_layers = 0;
         let mut quantized_token_rows = 0;
