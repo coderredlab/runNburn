@@ -160,6 +160,8 @@ impl CudaState {
             next_nemotron_prefill_workspace_id: 1,
             compute_weights: None,
             compute_weights_capacity: 0,
+            compute_prefetch_weights: None,
+            compute_prefetch_weights_capacity: 0,
             transient_q4_f16_pool: Vec::new(),
             transient_q4_f16_pool_cursor: 0,
             resident_q4k: HashMap::new(),
@@ -447,6 +449,9 @@ impl Drop for CudaState {
             drop(cublas);
         }
         if let Some(ptr) = self.compute_weights.take() {
+            let _ = unsafe { self.api.mem_free(ptr) };
+        }
+        if let Some(ptr) = self.compute_prefetch_weights.take() {
             let _ = unsafe { self.api.mem_free(ptr) };
         }
         for slot in self.transient_q4_f16_pool.drain(..) {

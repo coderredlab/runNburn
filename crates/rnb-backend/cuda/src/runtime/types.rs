@@ -369,6 +369,8 @@ pub(super) struct CudaState {
     pub(super) next_nemotron_prefill_workspace_id: u64,
     pub(super) compute_weights: Option<u64>,
     pub(super) compute_weights_capacity: usize,
+    pub(super) compute_prefetch_weights: Option<u64>,
+    pub(super) compute_prefetch_weights_capacity: usize,
     pub(super) transient_q4_f16_pool: Vec<TransientQ4F16Slot>,
     pub(super) transient_q4_f16_pool_cursor: usize,
     pub(super) resident_q4k: HashMap<(usize, usize), ResidentQ4k>,

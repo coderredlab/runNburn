@@ -327,6 +327,15 @@ impl CudaState {
     }
 
     fn upload_temp_q4k_weights_current(&mut self, weights: &[u8]) -> Result<u64, String> {
+        let stream = self.stream;
+        self.upload_temp_q4k_weights_on_stream(weights, stream)
+    }
+
+    pub(in crate::runtime) fn upload_temp_q4k_weights_on_stream(
+        &mut self,
+        weights: &[u8],
+        stream: usize,
+    ) -> Result<u64, String> {
         cache_stats()
             .temp_upload_bytes
             .fetch_add(weights.len() as u64, Ordering::Relaxed);
@@ -336,7 +345,27 @@ impl CudaState {
                 ptr,
                 weights.as_ptr().cast::<libc::c_void>(),
                 weights.len(),
-                self.stream,
+                stream,
+            )
+        }?;
+        self.record_transient_quant_upload("Q4_K", weights.len());
+        Ok(ptr)
+    }
+    pub(in crate::runtime) fn upload_prefetch_temp_q4k_weights_on_stream(
+        &mut self,
+        weights: &[u8],
+        stream: usize,
+    ) -> Result<u64, String> {
+        cache_stats()
+            .temp_upload_bytes
+            .fetch_add(weights.len() as u64, Ordering::Relaxed);
+        let ptr = self.compute_prefetch_weights_ptr(weights.len())?;
+        unsafe {
+            self.api.memcpy_htod_async(
+                ptr,
+                weights.as_ptr().cast::<libc::c_void>(),
+                weights.len(),
+                stream,
             )
         }?;
         self.record_transient_quant_upload("Q4_K", weights.len());

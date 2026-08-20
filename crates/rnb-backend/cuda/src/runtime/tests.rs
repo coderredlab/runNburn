@@ -14077,8 +14077,18 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
         .expect("quantize parallel gate-up input");
 
     let resident_limit = state.resident_q4k_limit;
-    let mut run_pair = |parallel: &str, limit: usize| {
+    let mut run_pair = |parallel: &str, limit: usize, preload_gate: bool| {
         state.resident_q4k_limit = limit;
+        if preload_gate {
+            state
+                .preload_resident_q4k_weight_slice(&weights[0])
+                .expect("preload one gate weight");
+            state
+                .stream_synchronize()
+                .expect("synchronize one-resident preload");
+            assert!(state.q4k_weight_slice_is_resident(&weights[0]));
+            assert!(!state.q4k_weight_slice_is_resident(&weights[1]));
+        }
         let launches_before = q4k_parallel_gate_up_launch_count_for_test();
         let _parallel = EnvVarGuard::set("RNB_CUDA_Q4K_PARALLEL_GATE_UP", parallel);
         state
@@ -14123,18 +14133,21 @@ fn cuda_q4k_parallel_gate_up_matches_serial_and_persists_events() {
         (gate, up, launches_after == launches_before + 1)
     };
 
-    let cold_requested = run_pair("1", 0);
-    let cold_serial = run_pair("0", 0);
-    let resident_serial = run_pair("0", resident_limit);
-    let parallel_first = run_pair("1", resident_limit);
-    let parallel_second = run_pair("1", resident_limit);
+    let cold_requested = run_pair("1", 0, false);
+    let cold_serial = run_pair("0", 0, false);
+    let mixed_parallel = run_pair("1", weights[0].len(), true);
+    let mixed_serial = run_pair("0", weights[0].len(), false);
+    let resident_serial = run_pair("0", resident_limit, false);
+    let parallel_first = run_pair("1", resident_limit, false);
+    let parallel_second = run_pair("1", resident_limit, false);
     drop(run_pair);
-    assert!(
-        !cold_requested.2,
-        "nonresident gate/up pair must use the serial staging path"
-    );
+    assert!(cold_requested.2);
+    assert!(state.compute_prefetch_weights.is_some());
     assert_eq!(cold_requested.0, cold_serial.0);
     assert_eq!(cold_requested.1, cold_serial.1);
+    assert!(mixed_parallel.2);
+    assert_eq!(mixed_parallel.0, mixed_serial.0);
+    assert_eq!(mixed_parallel.1, mixed_serial.1);
     assert_eq!(resident_serial.0, cold_serial.0);
     assert_eq!(resident_serial.1, cold_serial.1);
     assert!(parallel_first.2);

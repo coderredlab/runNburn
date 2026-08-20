@@ -1084,13 +1084,13 @@ impl CudaState {
         gate_output_dev: u64,
         up_output_dev: u64,
     ) -> Result<(), String> {
+        let gate_resident = self.q4k_weight_slice_is_resident(gate_weights);
+        let up_resident = self.q4k_weight_slice_is_resident(up_weights);
         let parallel = tuning::q4k_parallel_gate_up_enabled()
             && tuning::q4k_mmq_transposed_enabled()
             && tuning::q4k_mmq_tile32_enabled(seq_len, rows, blocks_per_row)
             && tuning::mmq_tile_seq64_enabled(seq_len)
-            && tuning::q4k_mmq_tile128_enabled(seq_len, rows)
-            && self.q4k_weight_slice_is_resident(gate_weights)
-            && self.q4k_weight_slice_is_resident(up_weights);
+            && tuning::q4k_mmq_tile128_enabled(seq_len, rows);
         if !parallel {
             self.q4k_batch_q8dot_to_dev(
                 gate_weights,
@@ -1119,8 +1119,19 @@ impl CudaState {
         let transposed_qs_dev = self.compute_q8_transposed_ptr(chunks * 32)?;
         let transposed_meta_dev =
             self.compute_q8_transposed_meta_ptr(chunks * std::mem::size_of::<(f32, f32)>())?;
-        let _ = self.resident_q4k_weights_ptr(gate_weights)?;
-        let _ = self.resident_q4k_weights_ptr(up_weights)?;
+        let gate_weights_dev = if gate_resident {
+            Some(self.resident_q4k_weights_ptr(gate_weights)?)
+        } else if !up_resident {
+            let stream = self.stream;
+            Some(self.upload_temp_q4k_weights_on_stream(gate_weights, stream)?)
+        } else {
+            None
+        };
+        let up_weights_dev = if up_resident {
+            Some(self.resident_q4k_weights_ptr(up_weights)?)
+        } else {
+            None
+        };
         self.launch_q8_1_transpose_chunks_by_seq(
             input_qs_dev,
             input_ds_dev,
@@ -1138,28 +1149,93 @@ impl CudaState {
                 self.api.event_record(ready, main_stream)?;
                 self.api.stream_wait_event(parallel_stream, ready)?;
             }
-            self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
-                gate_weights,
-                rows,
-                blocks_per_row,
-                seq_len,
-                transposed_qs_dev,
-                transposed_meta_dev,
-                gate_output_dev,
-            )?;
-
-            self.stream = parallel_stream;
-            let up_result = self.launch_q4k_q8_1_matmul_mmq_transposed_seq128(
-                up_weights,
-                rows,
-                blocks_per_row,
-                seq_len,
-                transposed_qs_dev,
-                transposed_meta_dev,
-                up_output_dev,
-            );
-            self.stream = main_stream;
-            up_result?;
+            match (gate_weights_dev, up_weights_dev) {
+                (Some(gate_weights_dev), Some(up_weights_dev)) => {
+                    self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                        gate_weights_dev,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        transposed_qs_dev,
+                        transposed_meta_dev,
+                        gate_output_dev,
+                    )?;
+                    self.stream = parallel_stream;
+                    let up_result = self
+                        .launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                            up_weights_dev,
+                            rows,
+                            blocks_per_row,
+                            seq_len,
+                            transposed_qs_dev,
+                            transposed_meta_dev,
+                            up_output_dev,
+                        );
+                    self.stream = main_stream;
+                    up_result?;
+                }
+                (Some(gate_weights_dev), None) => {
+                    self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                        gate_weights_dev,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        transposed_qs_dev,
+                        transposed_meta_dev,
+                        gate_output_dev,
+                    )?;
+                    self.stream = parallel_stream;
+                    let up_result = (|| {
+                        let up_weights_dev = if gate_resident {
+                            self.upload_temp_q4k_weights_on_stream(up_weights, parallel_stream)?
+                        } else {
+                            self.upload_prefetch_temp_q4k_weights_on_stream(
+                                up_weights,
+                                parallel_stream,
+                            )?
+                        };
+                        self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                            up_weights_dev,
+                            rows,
+                            blocks_per_row,
+                            seq_len,
+                            transposed_qs_dev,
+                            transposed_meta_dev,
+                            up_output_dev,
+                        )
+                    })();
+                    self.stream = main_stream;
+                    up_result?;
+                }
+                (None, Some(up_weights_dev)) => {
+                    self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                        up_weights_dev,
+                        rows,
+                        blocks_per_row,
+                        seq_len,
+                        transposed_qs_dev,
+                        transposed_meta_dev,
+                        up_output_dev,
+                    )?;
+                    self.stream = parallel_stream;
+                    let gate_result = (|| {
+                        let gate_weights_dev =
+                            self.upload_temp_q4k_weights_on_stream(gate_weights, parallel_stream)?;
+                        self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+                            gate_weights_dev,
+                            rows,
+                            blocks_per_row,
+                            seq_len,
+                            transposed_qs_dev,
+                            transposed_meta_dev,
+                            gate_output_dev,
+                        )
+                    })();
+                    self.stream = main_stream;
+                    gate_result?;
+                }
+                (None, None) => unreachable!("parallel gate/up requires at least one resident"),
+            }
             unsafe {
                 self.api.event_record(done, parallel_stream)?;
                 self.api.stream_wait_event(main_stream, done)?;

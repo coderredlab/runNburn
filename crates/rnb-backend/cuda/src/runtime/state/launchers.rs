@@ -6339,6 +6339,28 @@ impl CudaState {
         output_dev: u64,
     ) -> Result<(), String> {
         let weights_dev = self.resident_q4k_weights_ptr(weights)?;
+        self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+            weights_dev,
+            rows,
+            blocks_per_row,
+            seq_len,
+            input_qs_dev,
+            input_meta_dev,
+            output_dev,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::runtime) fn launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
+        &mut self,
+        weights_dev: u64,
+        rows: usize,
+        blocks_per_row: usize,
+        seq_len: usize,
+        input_qs_dev: u64,
+        input_meta_dev: u64,
+        output_dev: u64,
+    ) -> Result<(), String> {
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
         let mut input_qs_arg = input_qs_dev;

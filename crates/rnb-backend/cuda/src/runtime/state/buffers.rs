@@ -53,6 +53,17 @@ impl CudaState {
     pub(in crate::runtime) fn compute_weights_ptr(&mut self, bytes: usize) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_weights, compute_weights_capacity, bytes)
     }
+    pub(in crate::runtime) fn compute_prefetch_weights_ptr(
+        &mut self,
+        bytes: usize,
+    ) -> Result<u64, String> {
+        ensure_with_oom_retry!(
+            self,
+            compute_prefetch_weights,
+            compute_prefetch_weights_capacity,
+            bytes
+        )
+    }
 
     pub(in crate::runtime) fn compute_input_ptr(&mut self, bytes: usize) -> Result<u64, String> {
         ensure_with_oom_retry!(self, compute_input, compute_input_capacity, bytes)
@@ -199,6 +210,11 @@ impl CudaState {
 
         let mut released = 0usize;
         release!(compute_weights, compute_weights_capacity, released);
+        release!(
+            compute_prefetch_weights,
+            compute_prefetch_weights_capacity,
+            released
+        );
         release!(compute_input, compute_input_capacity, released);
         release!(compute_output, compute_output_capacity, released);
         release!(compute_aux_output, compute_aux_output_capacity, released);
