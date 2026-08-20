@@ -1390,6 +1390,9 @@ pub(crate) fn persistent_decode_cooperative_smoke(
     let q_buf = unsafe { state.api.mem_alloc(q_dim as usize * 4)? };
     let k_buf = unsafe { state.api.mem_alloc(kv_dim as usize * 4)? };
     let v_buf = unsafe { state.api.mem_alloc(kv_dim as usize * 4)? };
+    let attn_normed = unsafe { state.api.mem_alloc(hidden_dim as usize * 4)? };
+    let ffn_normed = unsafe { state.api.mem_alloc(hidden_dim as usize * 4)? };
+    let ffn_down = unsafe { state.api.mem_alloc(hidden_dim as usize * 4)? };
 
     let layer = PersistentLayerParamsHost {
         q_weight: zero_layer_weight,
@@ -1477,12 +1480,12 @@ pub(crate) fn persistent_decode_cooperative_smoke(
         nan_trace: 0,
         gemma_v_norm: 0,
         seq_len: 1,
-        q_dim_max: 1,
-        ffn_normed_dev: 0,
-        ffn_down_dev: 0,
+        q_dim_max: q_dim,
+        ffn_normed_dev: ffn_normed,
+        ffn_down_dev: ffn_down,
         n_ff_max: 1,
-        kv_dim_max: 1,
-        attn_normed_dev: 0,
+        kv_dim_max: kv_dim,
+        attn_normed_dev: attn_normed,
     };
 
     // Clamp grid to a single SM-wave so grid.sync() can make progress.
@@ -1514,6 +1517,9 @@ pub(crate) fn persistent_decode_cooperative_smoke(
         state.api.mem_free(zero_norm)?;
         state.api.mem_free(hidden)?;
         state.api.mem_free(normed)?;
+        state.api.mem_free(attn_normed)?;
+        state.api.mem_free(ffn_normed)?;
+        state.api.mem_free(ffn_down)?;
         state.api.mem_free(q_buf)?;
         state.api.mem_free(k_buf)?;
         state.api.mem_free(v_buf)?;
