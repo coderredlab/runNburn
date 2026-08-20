@@ -83,6 +83,10 @@ pub(crate) struct ScratchBuffers {
     pub(super) logits: Vec<f32>,
     pub(super) backend_argmax_token: Option<u32>,
     pub(super) backend_argmax_excluded_token: Option<u32>,
+    // cu293: generate 진입의 요청 스케일 device-verify 게이트 결과.
+    // decode-step 경로(decode_inference::forward_decode_backend_argmax_only_inner)가
+    // 정책 수준의 requested() 대신 이 값을 따라야 게이트가 우회되지 않는다.
+    pub(super) mtp_device_verify_request_allowed: Option<bool>,
     pub(super) backend_argmax_only: bool,
     #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(super) fullpath_resident_kv_active: bool,
@@ -171,6 +175,7 @@ impl ScratchBuffers {
             backend_argmax_token: None,
             backend_argmax_excluded_token: None,
             backend_argmax_only: false,
+            mtp_device_verify_request_allowed: None,
             fullpath_resident_kv_active: false,
             #[cfg(feature = "cuda")]
             cuda_decode_kv_authoritative: false,

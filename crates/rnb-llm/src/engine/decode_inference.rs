@@ -316,14 +316,25 @@ impl Engine {
         token: u32,
     ) -> crate::error::Result<Option<u32>> {
         #[cfg(feature = "cuda")]
-        if qwen35_device_verify_decode_enabled()
-            && self.mtp_device_verify_requested()
-            && self
+        {
+            // cu293: generate 진입의 요청 스케일 게이트 결과가 scratch에 있으면
+            // 그것을 따른다. 정책 수준 requested()만 보면 긴 컨텍스트에서 게이트가
+            // 거절한 뒤에도 이 경로가 device verify graph로 들어가 error 900으로 죽는다.
+            // scratch가 없는 직접 API 호출은 기존 정책 동작을 유지한다.
+            let request_allowed = self
                 .scratch
                 .as_ref()
-                .is_none_or(|scratch| scratch.backend_argmax_excluded_token.is_none())
-        {
-            return self.forward_decode_backend_argmax_only_device_verify(token);
+                .and_then(|scratch| scratch.mtp_device_verify_request_allowed)
+                .unwrap_or_else(|| self.mtp_device_verify_requested());
+            if qwen35_device_verify_decode_enabled()
+                && request_allowed
+                && self
+                    .scratch
+                    .as_ref()
+                    .is_none_or(|scratch| scratch.backend_argmax_excluded_token.is_none())
+            {
+                return self.forward_decode_backend_argmax_only_device_verify(token);
+            }
         }
         let (_, backend_argmax_token, _) = self.forward_decode_impl(token, true, true)?;
         Ok(backend_argmax_token)

@@ -1113,6 +1113,15 @@ impl Engine {
         }
     }
 
+    /// cu293: generate 진입에서 계산한 요청 스케일 device-verify 허용 여부를
+    /// scratch에 기록한다. decode-step 경로(`forward_decode_backend_argmax_only_inner`)가
+    /// 정책 수준의 `mtp_device_verify_requested()`를 직접 보면 이 게이트가 우회된다.
+    pub(crate) fn set_mtp_device_verify_request_allowed(&mut self, allowed: bool) {
+        if let Some(scratch) = self.scratch.as_mut() {
+            scratch.mtp_device_verify_request_allowed = Some(allowed);
+        }
+    }
+
     fn mtp_device_verify_supported_by_weights(&self) -> bool {
         let Some(weights) = self.weights.as_ref() else {
             return false;
@@ -2284,6 +2293,20 @@ fn try_run_mtp_block_device_observe(
             attention_kv.v_bits.len()
         )));
     }
+    // review(cu293): 마지막 row 회수(D2H, 실패 가능)를 host KV mutation보다
+    // 먼저 둔다. set_len 이후에 실패하면 호출자의 host fallback이 이미 전진한
+    // current_len으로 같은 청크를 재실행해 KV를 이중 append하고 위치가 어긋난다.
+    // replace 자체가 실패(compact)하면 set_len 전이라 current_len이 불변이고
+    // host fallback이 같은 범위를 덮어써 안전하다.
+    let last_row = materialize_device_hidden_row(
+        DevicePrefillHidden {
+            output: ffn_output,
+            producer_layer_idx: device_layer_idx,
+        },
+        seq_len - 1,
+        None,
+        "mtp_observe_last_row",
+    )?;
     runtime
         .kv_cache
         .replace_layer_f16_range_compacted(
@@ -2312,15 +2335,6 @@ fn try_run_mtp_block_device_observe(
                 .saturating_mul(std::mem::size_of::<u16>())
         );
     }
-    let last_row = materialize_device_hidden_row(
-        DevicePrefillHidden {
-            output: ffn_output,
-            producer_layer_idx: device_layer_idx,
-        },
-        seq_len - 1,
-        None,
-        "mtp_observe_last_row",
-    )?;
     Ok(Some(kernels::tensor_as_f32_slice(&last_row).to_vec()))
 }
 

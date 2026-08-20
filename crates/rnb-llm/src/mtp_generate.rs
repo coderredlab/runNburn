@@ -879,6 +879,7 @@ fn generate_stream_mtp_with_tokens(
 
     let request_prepare_start = Instant::now();
     let mtp_device_verify = engine.mtp_device_verify_request_allowed(prompt_len, params.max_tokens);
+    engine.set_mtp_device_verify_request_allowed(mtp_device_verify);
 
     let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
         (prefilled.logits, elapsed_ms(start))
@@ -2946,7 +2947,9 @@ fn generate_with_external_drafter(
         draft_n,
         engine.mtp_explicitly_forced(),
     );
-    let external_device_verify = engine.mtp_device_verify_requested();
+    let external_device_verify =
+        engine.mtp_device_verify_request_allowed(prompt_len, params.max_tokens);
+    engine.set_mtp_device_verify_request_allowed(external_device_verify);
     let sampled_verify = mtp_sampled_verify_allowed(params);
     if external_device_verify {
         engine.ensure_mtp_device_verify_static_weights_prewarmed()?;
