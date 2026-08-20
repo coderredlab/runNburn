@@ -425,7 +425,7 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma(
 }
 
 // hd256 stream-K partial: query64 tensor-core tile over one KV chunk.
-// Emits the same unnormalized (max, sum, accumulator) ABI as the F32 split kernel.
+// Uses one FP16 QK/PV term and emits the F32 split kernel's unnormalized ABI.
 extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k_partials(
     float* __restrict__ partial_acc,
     float* __restrict__ partial_meta,
@@ -519,7 +519,6 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k
         float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (int ks = 0; ks < 256; ks += 16) {
             unsigned qa[4];
-            unsigned qla[4];
             unsigned kb[2];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -530,17 +529,6 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k
                 const __half q1 = qsm[q_local][col + 1];
                 qa[i] = (unsigned)__half_as_ushort(q1) << 16
                     | __half_as_ushort(q0);
-                const unsigned qpos = query_tile_base + q_local;
-                const float q0_original = qpos < seq_len
-                    ? q[qpos * num_heads * 256u + h * 256u + col + 0]
-                    : 0.0f;
-                const float q1_original = qpos < seq_len
-                    ? q[qpos * num_heads * 256u + h * 256u + col + 1]
-                    : 0.0f;
-                const __half q0_low = __float2half(q0_original - __half2float(q0));
-                const __half q1_low = __float2half(q1_original - __half2float(q1));
-                qla[i] = (unsigned)__half_as_ushort(q1_low) << 16
-                    | __half_as_ushort(q0_low);
             }
 #pragma unroll
             for (int i = 0; i < 2; ++i) {
@@ -553,11 +541,6 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                 : "r"(qa[0]), "r"(qa[1]), "r"(qa[2]), "r"(qa[3]), "r"(kb[0]), "r"(kb[1]));
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                : "r"(qla[0]), "r"(qla[1]), "r"(qla[2]), "r"(qla[3]), "r"(kb[0]), "r"(kb[1]));
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -598,16 +581,8 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k
         const __half p01 = __float2half(probability[1]);
         const __half p10 = __float2half(probability[2]);
         const __half p11 = __float2half(probability[3]);
-        const __half p00_low = __float2half(probability[0] - __half2float(p00));
-        const __half p01_low = __float2half(probability[1] - __half2float(p01));
-        const __half p10_low = __float2half(probability[2] - __half2float(p10));
-        const __half p11_low = __float2half(probability[3] - __half2float(p11));
         const unsigned pa0 = (unsigned)__half_as_ushort(p01) << 16 | __half_as_ushort(p00);
         const unsigned pa1 = (unsigned)__half_as_ushort(p11) << 16 | __half_as_ushort(p10);
-        const unsigned pa0_low = (unsigned)__half_as_ushort(p01_low) << 16
-            | __half_as_ushort(p00_low);
-        const unsigned pa1_low = (unsigned)__half_as_ushort(p11_low) << 16
-            | __half_as_ushort(p10_low);
 
 #pragma unroll
         for (int nt = 0; nt < 32; ++nt) {
@@ -625,11 +600,6 @@ extern "C" __global__ void rnb_attention_prefill_flash_hd256_window_mma_stream_k
                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                 : "+f"(o[nt][0]), "+f"(o[nt][1]), "+f"(o[nt][2]), "+f"(o[nt][3])
                 : "r"(pa0), "r"(pa1), "r"(bv));
-            asm volatile(
-                "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-                "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-                : "+f"(o[nt][0]), "+f"(o[nt][1]), "+f"(o[nt][2]), "+f"(o[nt][3])
-                : "r"(pa0_low), "r"(pa1_low), "r"(bv));
         }
         row_max0 = new_max0;
         row_max1 = new_max1;

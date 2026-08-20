@@ -1587,7 +1587,7 @@ fn cuda_qwen35_mtp_verify_attention_output_hd256_mma_stream_k_matches_f32_split(
     assert!(
         q.iter()
             .any(|&value| half::f16::from_f32(value).to_f32() != value),
-        "MMA stream-K Q fixture must exercise the F16 residual path"
+        "MMA stream-K Q fixture must exercise F16 query rounding"
     );
     let k_bits = (0..window_tokens * kv_rows)
         .map(|i| half::f16::from_f32(((i as f32 % 37.0) - 18.0) * 0.0107421875).to_bits())
@@ -1724,8 +1724,8 @@ fn cuda_qwen35_mtp_verify_attention_output_hd256_mma_stream_k_matches_f32_split(
     let cosine = dot / (baseline_norm.sqrt() * candidate_norm.sqrt());
     eprintln!("MMA stream-K vs F32 split: cosine={cosine:.9} max_abs={max_abs:.9}");
     assert!(
-        cosine > 0.999999 && max_abs < 1.0e-4,
-        "MMA stream-K mismatch: cosine={cosine} max_abs={max_abs}"
+        cosine > 0.999998 && max_abs < 2.0e-5,
+        "single-term MMA stream-K mismatch: cosine={cosine} max_abs={max_abs}"
     );
 }
 
@@ -1754,7 +1754,7 @@ fn cuda_qwen35_mtp_verify_attention_hd256_prior_window_mma_stream_k_matches_f32(
     assert!(
         q.iter()
             .any(|&value| half::f16::from_f32(value).to_f32() != value),
-        "prior-window MMA Q fixture must exercise the F16 residual path"
+        "prior-window MMA Q fixture must exercise F16 query rounding"
     );
     let prior_k_bits = (0..prior_tokens * kv_rows)
         .map(|i| half::f16::from_f32(((i as f32 % 37.0) - 18.0) * 0.0107421875).to_bits())
@@ -1931,8 +1931,8 @@ fn cuda_qwen35_mtp_verify_attention_hd256_prior_window_mma_stream_k_matches_f32(
     let cosine = dot / (baseline_norm.sqrt() * candidate_norm.sqrt());
     eprintln!("prior-window MMA stream-K vs F32 split: cosine={cosine:.9} max_abs={max_abs:.9}");
     assert!(
-        cosine > 0.999999 && max_abs < 1.0e-4,
-        "prior-window MMA stream-K mismatch: cosine={cosine} max_abs={max_abs}"
+        cosine > 0.999998 && max_abs < 2.0e-5,
+        "single-term prior-window MMA mismatch: cosine={cosine} max_abs={max_abs}"
     );
 }
 
