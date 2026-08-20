@@ -575,16 +575,15 @@ pub(super) fn mtp_verify_row_workspace_bytes(
         .max(256 * 1024 * 1024)
 }
 
-fn mtp_device_verify_min_free_vram_mib(metadata: &ModelMetadata, spec_k: usize) -> usize {
+/// verify workspace의 request-무관 공통 항(row workspace, layer workspace).
+/// `mtp_device_verify_min_free_vram_mib`(init 게이트, weight 포함)과
+/// `mtp_device_verify_marginal_workspace_mib`(request 게이트, weight 제외)가
+/// 같은 산정식을 공유하도록 둘을 분리한다.
+fn mtp_device_verify_workspace_terms_mib(
+    metadata: &ModelMetadata,
+    spec_k: usize,
+) -> (usize, usize) {
     let window_tokens = spec_k.saturating_add(1).max(2);
-    let token_embd_mib = q4k_like_matrix_mib(metadata.vocab_size, metadata.hidden_dim);
-    let output_mib = q4k_like_matrix_mib(metadata.vocab_size, metadata.hidden_dim);
-    let eh_proj_mib = bytes_to_mib_ceil(
-        metadata
-            .hidden_dim
-            .saturating_mul(metadata.hidden_dim)
-            .saturating_mul(4),
-    );
     let row_workspace_mib =
         bytes_to_mib_ceil(mtp_verify_row_workspace_bytes(metadata, window_tokens));
     let layer_workspace_mib = align_mib(
@@ -597,11 +596,40 @@ fn mtp_device_verify_min_free_vram_mib(metadata: &ModelMetadata, spec_k: usize) 
         128,
     )
     .clamp(512, 2048);
+    (row_workspace_mib, layer_workspace_mib)
+}
+
+fn mtp_device_verify_min_free_vram_mib(metadata: &ModelMetadata, spec_k: usize) -> usize {
+    let token_embd_mib = q4k_like_matrix_mib(metadata.vocab_size, metadata.hidden_dim);
+    let output_mib = q4k_like_matrix_mib(metadata.vocab_size, metadata.hidden_dim);
+    let eh_proj_mib = bytes_to_mib_ceil(
+        metadata
+            .hidden_dim
+            .saturating_mul(metadata.hidden_dim)
+            .saturating_mul(4),
+    );
+    let (row_workspace_mib, layer_workspace_mib) =
+        mtp_device_verify_workspace_terms_mib(metadata, spec_k);
     align_mib(
         token_embd_mib
             .saturating_add(output_mib)
             .saturating_add(eh_proj_mib)
             .saturating_add(row_workspace_mib)
+            .saturating_add(layer_workspace_mib)
+            .saturating_add(512),
+        256,
+    )
+}
+
+/// cu293: decode 시점에 request마다 새로 필요한 verify workspace만 산정한다.
+/// token_embd/output/eh_proj는 init의 pinned prewarm으로 요청과 무관하게 이미
+/// 상주해 있으므로 request 스케일 게이트에서는 제외한다. row/layer 산정식은
+/// `mtp_device_verify_min_free_vram_mib`와 같은 항목을 유지해야 한다.
+fn mtp_device_verify_marginal_workspace_mib(metadata: &ModelMetadata, spec_k: usize) -> usize {
+    let (row_workspace_mib, layer_workspace_mib) =
+        mtp_device_verify_workspace_terms_mib(metadata, spec_k);
+    align_mib(
+        row_workspace_mib
             .saturating_add(layer_workspace_mib)
             .saturating_add(512),
         256,
@@ -1030,6 +1058,59 @@ impl Engine {
     pub(crate) fn mtp_device_verify_requested(&self) -> bool {
         crate::engine::runtime::policy::mtp_device_verify_override()
             .unwrap_or_else(|| self.mtp_auto_policy().device_verify)
+    }
+
+    /// cu293: auto device verify가 이 요청의 컨텍스트 스케일과 함께 VRAM에
+    /// 들어가는지 검사한다. device verify는 모델 전체를 pinned 상주시키므로,
+    /// 긴 컨텍스트에서는 KV 미러 성장분+verify workspace가 pinned를 건드리지
+    /// 않고는 들어가지 못하고, graph capture 중에는 pinned eviction이
+    /// 건너뛰어져 decode verify graph가 CUDA error 900으로 죽는다
+    /// (RTX 3090 24GiB, Qwen3.8-27B, 47k 토큰 관측). chunk scratch 항은
+    /// prefill 종료 시 해제되고 prefill 자체는 clamp가 담당하므로 여기서는
+    /// KV+workspace만 본다. auto 정책으로 켜진 경우에만 예산이 부족하면
+    /// false를 반환해 호출부가 batch prefill verify로 후퇴하게 하고,
+    /// 명시적 RNB_MTP_DEVICE_VERIFY=1은 사용자의 명시 요청이라 계약대로
+    /// 게이트를 건너뛴다.
+    pub fn mtp_device_verify_request_allowed(
+        &self,
+        pending_tokens: usize,
+        max_new_tokens: usize,
+    ) -> bool {
+        if !self.mtp_device_verify_requested() {
+            return false;
+        }
+        if crate::engine::runtime::policy::mtp_device_verify_override().is_some() {
+            return true;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let Ok(info) = super::backend_runtime::cuda_memory_info() else {
+                return true;
+            };
+            let spec_k = self.mtp_auto_policy().spec_k;
+            let workspace_bytes = mtp_device_verify_marginal_workspace_mib(&self.metadata, spec_k)
+                .saturating_mul(1024 * 1024);
+            let kv_bytes = self.kv_cache.f16_kv_bits_bytes_per_token().saturating_mul(
+                pending_tokens
+                    .saturating_add(max_new_tokens)
+                    .saturating_add(4096),
+            );
+            let required_bytes = workspace_bytes.saturating_add(kv_bytes);
+            let fits = info.free_bytes as usize >= required_bytes;
+            if !fits {
+                eprintln!(
+                    "[INFO] MTP device verify auto-disabled for this request: need={}MiB free={}MiB (long-context budget)",
+                    required_bytes / (1024 * 1024),
+                    info.free_bytes / (1024 * 1024),
+                );
+            }
+            fits
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (pending_tokens, max_new_tokens);
+            true
+        }
     }
 
     fn mtp_device_verify_supported_by_weights(&self) -> bool {
@@ -2056,9 +2137,7 @@ fn try_run_mtp_block_device_observe(
     cache_pos_start: usize,
     rope_pos_start: usize,
 ) -> Result<Option<Vec<f32>>> {
-    use super::prefill::hidden_carrier::{
-        materialize_device_hidden_row, DevicePrefillHidden,
-    };
+    use super::prefill::hidden_carrier::{materialize_device_hidden_row, DevicePrefillHidden};
 
     let trace_gate = |reason: &str| {
         if crate::engine::policy::env_os_string("RNB_MTP_DRAFT_TRACE").is_some() {
@@ -2073,9 +2152,7 @@ fn try_run_mtp_block_device_observe(
         trace_gate("policy-disabled");
         return Ok(None);
     }
-    if runtime.weights.block.shared_expert_moe.is_some()
-        || runtime.weights.block.moe.is_some()
-    {
+    if runtime.weights.block.shared_expert_moe.is_some() || runtime.weights.block.moe.is_some() {
         trace_gate("moe-block");
         return Ok(None);
     }
@@ -2127,18 +2204,16 @@ fn try_run_mtp_block_device_observe(
         trace_gate("prior-cache-mismatch");
         return Ok(None);
     }
-    if cache_pos_start.checked_add(seq_len).map_or(true, |end| {
-        end > runtime.kv_cache.max_seq_len
-    }) {
+    if cache_pos_start
+        .checked_add(seq_len)
+        .map_or(true, |end| end > runtime.kv_cache.max_seq_len)
+    {
         trace_gate("cache-capacity");
         return Ok(None);
     }
 
-    let device_input = super::backend_runtime::upload_hidden_device_output_f32(
-        projected,
-        seq_len,
-        hidden_dim,
-    )?;
+    let device_input =
+        super::backend_runtime::upload_hidden_device_output_f32(projected, seq_len, hidden_dim)?;
     let attention_output = match super::backend_runtime::qwen35_prefill_attention_device_input(
         &device_input,
         &layer,
@@ -2190,9 +2265,9 @@ fn try_run_mtp_block_device_observe(
     }
     let _ = device_input.release();
 
-    let expected_kv_values = seq_len.checked_mul(kv_dim).ok_or_else(|| {
-        LlmError::Forward("MTP device observe KV size overflow".to_string())
-    })?;
+    let expected_kv_values = seq_len
+        .checked_mul(kv_dim)
+        .ok_or_else(|| LlmError::Forward("MTP device observe KV size overflow".to_string()))?;
     if attention_kv.layer_idx != device_layer_idx
         || attention_kv.window_tokens != seq_len
         || attention_kv.kv_rows != kv_dim
@@ -2209,14 +2284,16 @@ fn try_run_mtp_block_device_observe(
             attention_kv.v_bits.len()
         )));
     }
-    runtime.kv_cache.replace_layer_f16_range_compacted(
-        0,
-        cache_pos_start,
-        seq_len,
-        &attention_kv.k_bits,
-        &attention_kv.v_bits,
-    )
-    .map_err(LlmError::Forward)?;
+    runtime
+        .kv_cache
+        .replace_layer_f16_range_compacted(
+            0,
+            cache_pos_start,
+            seq_len,
+            &attention_kv.k_bits,
+            &attention_kv.v_bits,
+        )
+        .map_err(LlmError::Forward)?;
     runtime.kv_cache.set_len(mtp_block_cache_len_after(
         cache_pos_start,
         seq_len,
@@ -2762,6 +2839,26 @@ mod tests {
             256 * 1024 * 1024
         );
         assert!(mtp_verify_row_workspace_bytes(&metadata, 2048) > 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mtp_device_verify_marginal_workspace_excludes_weight_terms() {
+        // cu293: request 게이트의 marginal workspace는 init에서 이미 상주한
+        // weight 항(token_embd/output/eh_proj)을 제외하므로 min_free보다
+        // 작아야 하고, 두 산정식의 row/layer 항은 같은 헬퍼를 공유한다.
+        let metadata = policy_metadata(5120, 64);
+        for spec_k in [1, 4] {
+            let min_free = mtp_device_verify_min_free_vram_mib(&metadata, spec_k);
+            let marginal = mtp_device_verify_marginal_workspace_mib(&metadata, spec_k);
+            assert!(
+                marginal < min_free,
+                "spec_k={spec_k}: {marginal} !< {min_free}"
+            );
+            assert_eq!(min_free % 256, 0);
+            assert_eq!(marginal % 256, 0);
+            let (row, layer) = mtp_device_verify_workspace_terms_mib(&metadata, spec_k);
+            assert_eq!(marginal, align_mib(row + layer + 512, 256));
+        }
     }
 
     #[cfg(feature = "cuda")]

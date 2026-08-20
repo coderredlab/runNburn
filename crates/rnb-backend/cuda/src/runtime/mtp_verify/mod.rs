@@ -3076,16 +3076,8 @@ impl super::CudaState {
         current_values: usize,
     ) -> Result<(), String> {
         if prior_values > 0 {
-            self.launch_f16_to_f32(
-                prior_k_bits_dev,
-                attention_buffers.k_f32_dev,
-                prior_values,
-            )?;
-            self.launch_f16_to_f32(
-                prior_v_bits_dev,
-                attention_buffers.v_f32_dev,
-                prior_values,
-            )?;
+            self.launch_f16_to_f32(prior_k_bits_dev, attention_buffers.k_f32_dev, prior_values)?;
+            self.launch_f16_to_f32(prior_v_bits_dev, attention_buffers.v_f32_dev, prior_values)?;
         }
         let prior_f32_bytes = prior_values
             .checked_mul(std::mem::size_of::<f32>())

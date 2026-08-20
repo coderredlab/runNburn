@@ -878,7 +878,7 @@ fn generate_stream_mtp_with_tokens(
     let mut sampler = SamplerChain::from_params(params);
 
     let request_prepare_start = Instant::now();
-    let mtp_device_verify = engine.mtp_device_verify_requested();
+    let mtp_device_verify = engine.mtp_device_verify_request_allowed(prompt_len, params.max_tokens);
 
     let (mut logits, prompt_prefill_ms) = if let Some(prefilled) = prefilled {
         (prefilled.logits, elapsed_ms(start))

@@ -3785,15 +3785,14 @@ pub(in crate::engine) fn build_mtp_device_observe_dense_attention_layer<'a>(
         crate::error::LlmError::Forward("MTP device observe KV cache layer 0 missing".to_string())
     })?;
     let (prior_k_bits, prior_v_bits) = mtp_device_prior_kv_bits(cache_layer, prior_tokens);
-    let expected_prior_values =
-        prior_tokens
-            .checked_mul(attn.k_weight.rows)
-            .ok_or_else(|| {
-                crate::error::LlmError::Forward(format!(
-                    "MTP device observe prior KV size overflow: tokens={prior_tokens} rows={}",
-                    attn.k_weight.rows
-                ))
-            })?;
+    let expected_prior_values = prior_tokens
+        .checked_mul(attn.k_weight.rows)
+        .ok_or_else(|| {
+            crate::error::LlmError::Forward(format!(
+                "MTP device observe prior KV size overflow: tokens={prior_tokens} rows={}",
+                attn.k_weight.rows
+            ))
+        })?;
     let prior_is_device_resident =
         prior_tokens > 0 && prior_k_bits.is_empty() && prior_v_bits.is_empty();
     if !prior_is_device_resident

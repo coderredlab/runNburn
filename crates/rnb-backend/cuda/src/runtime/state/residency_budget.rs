@@ -52,15 +52,69 @@ impl CudaState {
                 let _ = self.execute_resident_q4k_eviction_plan(plan);
             }
         }
+        // cu293: 원장 한도 정합만으로는 부족하다. packed cache·staging·graph
+        // 처럼 q4k/MoE 원장 밖의 할당이 VRAM을 점유하면 resident < limit인데도
+        // 실측 free가 scratch+reserve보다 부족해져 prefill 중반이 cuMemAlloc
+        // error 2로 죽는다(47k verify-on: resident 16,293 < limit 18,080이라
+        // eviction 0이었지만 실측 free 3,884MiB < 필요 5,763MiB). 실측 free
+        // 기준으로 부족분을 시작 전에 확보한다.
+        //
+        // 단 packed 등 파생 캐시는 MMQ가 prefill 내내 다시 올리므로(cu289)
+        // 선제 해제하면 곧 돌아올 바이트만큼 유령 여유가 생겨 아래 cap이
+        // over-commit된다. shortfall은 q4k(pinned 포함 LRU) 선해제로 먼저
+        // 충당하고, 그래도 부족할 때만 generic reclaim으로 내려간다.
+        let target_free = scratch_bytes.saturating_add(self.transient_residency_reserve_bytes());
+        let mut deep_reclaim_used = false;
+        if let Ok((free_bytes, _)) = unsafe { self.api.mem_get_info() } {
+            if (free_bytes as usize) < target_free {
+                let shortfall = target_free - (free_bytes as usize);
+                const RECLAIM_HYSTERESIS_BYTES: usize = 1024 * 1024 * 1024;
+                let _ = self.clear_weight_referencing_graphs();
+                let plan = self
+                    .resident_q4k_transient_reclaim_eviction_plan(
+                        shortfall.saturating_add(RECLAIM_HYSTERESIS_BYTES),
+                    )
+                    .or_else(|| self.resident_q4k_transient_reclaim_eviction_plan(shortfall));
+                if let Some(plan) = plan {
+                    let _ = self.execute_resident_q4k_eviction_plan(plan);
+                }
+                if let Ok((free_after_q4k, _)) = unsafe { self.api.mem_get_info() } {
+                    if (free_after_q4k as usize) < target_free {
+                        let _ = self.reclaim_residency_for_transient(scratch_bytes);
+                        deep_reclaim_used = true;
+                    }
+                }
+            }
+        }
+        // re-admission이 확보된 scratch 여유를 다시 먹지 못하게 한도를 실측
+        // slack으로 조인다. admission 자체의 free 게이트는 plan reserve만 보기
+        // 때문에 이 cap이 없으면 prefill 중 admission이 free를 reserve까지
+        // 채워 scratch 예산을 잠식한다. generic reclaim이 파생 캐시를 해제한
+        // 경우 그 바이트는 prefill 중 돌아오므로 slack에서 제외한다.
+        if let Ok((free_bytes, _)) = unsafe { self.api.mem_get_info() } {
+            let slack = if deep_reclaim_used {
+                0
+            } else {
+                (free_bytes as usize).saturating_sub(target_free)
+            };
+            let headroom_cap = self.resident_q4k_bytes.saturating_add(slack);
+            if self.resident_q4k_limit > headroom_cap {
+                self.resident_q4k_limit = headroom_cap;
+            }
+        }
         if std::env::var("RNB_CUDA_CACHE_LOG").ok().as_deref() == Some("1") {
             let released = resident_before_clamp_evict.saturating_sub(self.resident_q4k_bytes);
+            let free_mib = unsafe { self.api.mem_get_info() }
+                .map(|(free, _)| free / (1024 * 1024))
+                .unwrap_or(0);
             eprintln!(
-                "[cuda] prefill scratch clamp armed: scratch={}MiB limit={}MiB resident_before={}MiB evicted={}MiB resident_now={}MiB",
+                "[cuda] prefill scratch clamp armed: scratch={}MiB limit={}MiB resident_before={}MiB evicted={}MiB resident_now={}MiB free={}MiB",
                 scratch_bytes / (1024 * 1024),
                 self.resident_q4k_limit / (1024 * 1024),
                 resident_before_clamp_evict / (1024 * 1024),
                 released / (1024 * 1024),
                 self.resident_q4k_bytes / (1024 * 1024),
+                free_mib,
             );
         }
     }

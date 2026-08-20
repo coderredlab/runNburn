@@ -2381,12 +2381,17 @@ fn main() {
         )
         .unwrap_or_else(|err| panic!("{err}"));
     }
+    // cu293: auto 정책의 device verify를 env로 승격하기 전에 요청 스케일
+    // 예산을 검사한다. 긴 컨텍스트에서 device verify는 VRAM에 들어가지
+    // 않아 decode verify graph가 죽는다. 승격을 건너뛰면 엔진의
+    // auto 경로 게이트가 같은 검사를 다시 해 batch prefill verify로 후퇴한다.
     let mtp_set_device_verify = mtp_env_requested
         && mtp_should_enable_device_verify(
             mtp_env_request,
             mtp_policy,
             std::env::var("RNB_MTP_DEVICE_VERIFY").is_ok(),
-        );
+        )
+        && engine.mtp_device_verify_request_allowed(tokens.len(), decode_count);
     if matches!(mtp_env_request, MtpEnvRequest::Auto) {
         let resource = mtp_policy
             .resource
