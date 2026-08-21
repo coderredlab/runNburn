@@ -824,6 +824,24 @@ impl CudaApi {
         Ok(count)
     }
 
+    // cu309: hd256 split chunk 산정식 입력. CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 38.
+    pub(super) unsafe fn device_l2_cache_bytes(&self) -> Result<usize, String> {
+        let get_dev = self
+            .cu_ctx_get_device
+            .ok_or_else(|| "cuCtxGetDevice symbol not loaded".to_string())?;
+        let get_attr = self
+            .cu_device_get_attribute
+            .ok_or_else(|| "cuDeviceGetAttribute symbol not loaded".to_string())?;
+        let mut device: i32 = 0;
+        check_cuda(get_dev(&mut device), "cuCtxGetDevice")?;
+        let mut bytes: i32 = 0;
+        check_cuda(
+            get_attr(&mut bytes, 38, device),
+            "cuDeviceGetAttribute(L2_CACHE_SIZE)",
+        )?;
+        usize::try_from(bytes).map_err(|_| format!("negative L2 cache size: {bytes}"))
+    }
+
     pub(super) unsafe fn device_supports_cooperative_launch(&self) -> Result<bool, String> {
         let get_dev = self
             .cu_ctx_get_device

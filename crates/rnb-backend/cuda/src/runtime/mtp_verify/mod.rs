@@ -2576,6 +2576,27 @@ impl super::CudaState {
         Ok((k_bits, v_bits))
     }
 
+    // cu309: split chunk 기본값은 L2 working set 산출식(env 미지정 시).
+    // device_l2_cache_bytes 조회 실패 시 측정된 고정 기본값으로 후퇴한다.
+    fn hd256_split_chunk_default(&mut self, kv_heads: usize, head_dim: usize) -> usize {
+        let l2_bytes = match self.device_l2_cache_bytes {
+            Some(l2) => l2,
+            None => match unsafe { self.api.device_l2_cache_bytes() } {
+                Ok(l2) => {
+                    self.device_l2_cache_bytes = Some(l2);
+                    l2
+                }
+                Err(_) => 0,
+            },
+        };
+        if l2_bytes == 0 {
+            crate::tuning::decode_attention_hd256_split_chunk_size()
+        } else {
+            crate::tuning::hd256_split_chunk_from_l2(l2_bytes, kv_heads, head_dim)
+        }
+    }
+
+
     #[allow(clippy::too_many_arguments)]
     fn launch_mtp_verify_attention_hd256_split(
         &mut self,
@@ -2594,7 +2615,10 @@ impl super::CudaState {
             return Ok(false);
         }
         let active_window = window.min(kv_tokens);
-        let chunk_size = crate::tuning::mtp_verify_attention_hd256_split_chunk_size();
+        let chunk_size =
+            crate::tuning::mtp_verify_attention_hd256_split_chunk_env_override().unwrap_or_else(
+                || self.hd256_split_chunk_default(num_kv_heads, post_buffers.head_dim),
+            );
         if active_window <= chunk_size {
             return Ok(false);
         }
@@ -2902,10 +2926,13 @@ impl super::CudaState {
         // 런처가 mma를 거부하면 스크래치를 f32로 다시 채운 뒤 기존 커널로 떨어진다.
         // 사전 조건은 launch_mtp_verify_attention_hd256_split의 use_mma_stream_k 게이트와
         // 항상 동기화되어야 한다.
+        let mma_split_chunk_size =
+            crate::tuning::mtp_verify_attention_hd256_split_chunk_env_override().unwrap_or_else(
+                || self.hd256_split_chunk_default(request.num_kv_heads, post_buffers.head_dim),
+            );
         let mma_f16_eligible = post_buffers.head_dim == 256
             && crate::tuning::mtp_verify_attention_hd256_split_enabled()
-            && request.window.min(kv_tokens)
-                > crate::tuning::mtp_verify_attention_hd256_split_chunk_size()
+            && request.window.min(kv_tokens) > mma_split_chunk_size
             && crate::tuning::mtp_verify_attention_hd256_mma_stream_k_enabled()
             && post_buffers.window_tokens >= 64
             && request.window >= kv_tokens;

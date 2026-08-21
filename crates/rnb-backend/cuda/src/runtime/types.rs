@@ -657,6 +657,7 @@ pub(super) struct CudaState {
     pub(super) q4k_tile128_grid_cap: Option<u32>,
     pub(super) cooperative_norm_grid_cap: Option<u32>,
     pub(super) device_sm_count: Option<usize>,
+    pub(super) device_l2_cache_bytes: Option<usize>,
     pub(super) nemotron_selected_module: Option<usize>,
     pub(super) cooperative_launch_supported: Option<bool>,
     pub(super) persistent_decode_module: Option<usize>,

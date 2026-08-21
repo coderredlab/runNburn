@@ -378,6 +378,7 @@ impl CudaState {
             q4k_tile128_grid_cap: None,
             cooperative_norm_grid_cap: None,
             device_sm_count: None,
+            device_l2_cache_bytes: None,
             nemotron_selected_module: None,
             persistent_decode_module: None,
             cooperative_launch_supported: None,

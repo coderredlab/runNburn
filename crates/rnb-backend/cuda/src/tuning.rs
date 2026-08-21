@@ -956,7 +956,11 @@ pub fn decode_attention_hd256_split_chunk_size() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|&chunk| matches!(chunk, 128 | 256 | 512 | 1024))
-        .unwrap_or(256)
+        // cu309: 1024 quarters the split-partial write/read traffic (the
+        // partial buffer scales with num_chunks) while grid.x*heads still
+        // supplies far more CTAs than the device can host. 47k-token ABABAB
+        // median 118.519s -> 110.146s (-7.07%, 3/3, hash exact).
+        .unwrap_or(1024)
 }
 
 pub fn mtp_verify_attention_hd256_split_enabled() -> bool {
@@ -981,11 +985,31 @@ pub fn mtp_verify_attention_hd256_mma_stream_k_enabled() -> bool {
     compiled_ampere_mma_supported() && env_bool("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", true)
 }
 
-pub fn mtp_verify_attention_hd256_split_chunk_size() -> usize {
+pub fn mtp_verify_attention_hd256_split_chunk_env_override() -> Option<usize> {
     std::env::var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&chunk| matches!(chunk, 128 | 256 | 512 | 1024))
+        .filter(|&chunk| matches!(chunk, 128 | 256 | 512 | 1024 | 2048))
+}
+
+// cu309: split chunk 기본값은 고정 관측값이 아니라 L2 working set 산출식이다.
+// x-major rasterization에서 같은 chunk의 head CTA들이 KV를 L2에서 재사용하므로,
+// chunk KV working set(C × kv_heads × 2(K,V) × head_dim × 2B)이 L2에 들어가는
+// 최대 제곱수를 고른다(내림 — WS ≤ L2 보장). 6MB GA102 + Qwen3.8(4×512B/token)
+// → 1536 → 1024로, ABAB median 118.519→110.146s(-7.07%) 실측과 일치.
+pub fn hd256_split_chunk_from_l2(l2_bytes: usize, kv_heads: usize, head_dim: usize) -> usize {
+    let per_token_kv_bytes = kv_heads.max(1) * 2 * head_dim * std::mem::size_of::<u16>();
+    let raw = l2_bytes / per_token_kv_bytes.max(1);
+    let floored_pow2 = if raw == 0 {
+        0
+    } else {
+        1 << (usize::BITS - 1 - raw.leading_zeros())
+    };
+    floored_pow2.clamp(256, 16384)
+}
+
+pub fn mtp_verify_attention_hd256_split_chunk_size() -> usize {
+    mtp_verify_attention_hd256_split_chunk_env_override()
         .unwrap_or_else(decode_attention_hd256_split_chunk_size)
 }
 
@@ -2337,12 +2361,13 @@ mod tests {
 
     #[test]
     fn decode_attention_hd256_split_defaults_on_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT");
             std::env::remove_var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT_CHUNK");
         }
         assert!(decode_attention_hd256_split_enabled());
-        assert_eq!(decode_attention_hd256_split_chunk_size(), 256);
+        assert_eq!(decode_attention_hd256_split_chunk_size(), 1024);
 
         unsafe {
             std::env::set_var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT", "0");
@@ -2354,7 +2379,7 @@ mod tests {
         unsafe {
             std::env::set_var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT_CHUNK", "7");
         }
-        assert_eq!(decode_attention_hd256_split_chunk_size(), 256);
+        assert_eq!(decode_attention_hd256_split_chunk_size(), 1024);
 
         unsafe {
             std::env::remove_var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT");
@@ -2364,6 +2389,7 @@ mod tests {
 
     #[test]
     fn mtp_verify_attention_hd256_split_defaults_on_and_allows_opt_out() {
+        let _guard = crate::runtime::cuda_test_env_lock();
         unsafe {
             std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT");
             std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK");
@@ -2372,7 +2398,7 @@ mod tests {
             std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K");
         }
         assert!(mtp_verify_attention_hd256_split_enabled());
-        assert_eq!(mtp_verify_attention_hd256_split_chunk_size(), 256);
+        assert_eq!(mtp_verify_attention_hd256_split_chunk_size(), 1024);
         assert!(mtp_verify_attention_hd256_query_tile_enabled());
         assert_eq!(
             mtp_verify_attention_hd256_mma_stream_k_enabled(),
@@ -2408,6 +2434,22 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn hd256_split_chunk_from_l2_matches_l2_working_set_model() {
+        // GA102 6MB + Qwen3.8 (4 kv heads, hd256): 6291456/4096 = 1536 -> 1024.
+        assert_eq!(hd256_split_chunk_from_l2(6_291_456, 4, 256), 1024);
+        // 4090-class 72MB: 18432 -> 16384 (clamped ceiling).
+        assert_eq!(hd256_split_chunk_from_l2(75_497_472, 4, 256), 16384);
+        // Tiny L2 floors at 256 so partial traffic cannot explode.
+        assert_eq!(hd256_split_chunk_from_l2(262_144, 4, 256), 256);
+        // Degenerate kv_heads must not divide by zero; falls back to the
+        // single-kv-head token size (1024B) -> 6144 -> 4096.
+        assert_eq!(hd256_split_chunk_from_l2(6_291_456, 0, 256), 4096);
+        // Larger head_dim shrinks the chunk proportionally (hd512 path uses a
+        // different producer, this only guards the formula).
+        assert_eq!(hd256_split_chunk_from_l2(6_291_456, 4, 512), 512);
+    }
     #[test]
     fn decode_attention_hd512_split_defaults_on_and_allows_opt_out() {
         unsafe {

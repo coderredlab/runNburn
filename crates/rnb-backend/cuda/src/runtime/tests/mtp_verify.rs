@@ -1875,6 +1875,10 @@ fn cuda_qwen35_mtp_verify_attention_hd256_prior_window_mma_stream_k_matches_f32(
 
     unsafe {
         std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", "0");
+        // cu309: the default split chunk grew to 1024, which skips splitting
+        // entirely for this small fixture. Pin 256 so the test keeps exercising
+        // the mma stream-K prior-window producer it targets.
+        std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK", "256");
     }
     let (baseline, _) = run_attention(&mut state);
     unsafe {
@@ -1883,6 +1887,7 @@ fn cuda_qwen35_mtp_verify_attention_hd256_prior_window_mma_stream_k_matches_f32(
     let (candidate, candidate_k_f32_dev) = run_attention(&mut state);
     unsafe {
         std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K");
+        std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK");
     }
 
     // 판별자: mma 경로는 f32 스크래치를 통합 f16 저장소로 쓰므로, 첫 2바이트에
