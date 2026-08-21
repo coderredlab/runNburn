@@ -1461,8 +1461,9 @@ fn cuda_q4_raw_pinned_parent_serves_contained_weight_without_duplicate_upload() 
     let resident_bytes = state.resident_q4k_bytes;
     let before = state.weight_residency_counters();
     let child_ptr = state
-        .resident_q4k_weights_ptr(child)
-        .expect("resolve contained child");
+        .resident_q4k_weights_ptr_if_present(child)
+        .expect("lookup contained child")
+        .expect("contained child should be resident");
     let delta = state.weight_residency_counters().delta(before);
 
     assert_eq!(child_ptr, parent_ptr + 512);
@@ -12549,13 +12550,13 @@ fn cuda_q4k_row_dot_matches_cpu_reference() {
 #[test]
 fn cuda_q4k_embedding_gather_dequants_token_rows() {
     let _guard = runtime_test_lock();
-    let rows = 4usize;
+    let rows = 6usize;
     let cols = 512usize;
     let blocks_per_row = cols / 256;
     let weights = make_test_q4k_weights(1, rows, blocks_per_row, 127)
         .pop()
         .unwrap();
-    let token_ids = [2u32, 0u32, 3u32];
+    let token_ids = [4u32, 0u32, 4u32, 5u32];
 
     let mut expected = Vec::with_capacity(token_ids.len() * cols);
     for &token_id in &token_ids {
@@ -12564,8 +12565,21 @@ fn cuda_q4k_embedding_gather_dequants_token_rows() {
         expected.extend(cpu_q4k_dequant_row(row, blocks_per_row));
     }
 
-    let actual = q4k_embedding_gather_for_test(&weights, rows, cols, &token_ids)
-        .expect("CUDA Q4_K embedding gather");
+    let before = cache_snapshot();
+    let actual = quant_embedding_gather(
+        rnb_backend_api::QuantFormat::Q4K,
+        &weights,
+        rows,
+        cols,
+        &token_ids,
+    )
+    .expect("CUDA compact Q4_K embedding gather");
+    let upload_delta = cache_snapshot().delta(before);
+    assert_eq!(upload_delta.resident_upload_bytes, 0);
+    assert_eq!(
+        upload_delta.temp_upload_bytes,
+        (token_ids.len() * blocks_per_row * 144) as u64
+    );
 
     assert_eq!(actual.len(), expected.len());
     for (idx, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {

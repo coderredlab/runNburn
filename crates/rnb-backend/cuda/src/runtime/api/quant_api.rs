@@ -1519,6 +1519,17 @@ mod tests {
         assert_eq!(candidates[0].gate.as_ptr(), first_gate.as_ptr());
         assert_eq!(candidates[1].gate.as_ptr(), second_gate.as_ptr());
     }
+
+    #[test]
+    fn compact_embedding_rows_preserves_order_and_duplicates() {
+        let row_bytes = 3usize;
+        let weights = [0u8, 1, 2, 10, 11, 12, 20, 21, 22, 30, 31, 32];
+        let (compact, remapped) =
+            compact_embedding_rows(&weights, &[2, 0, 2, 3], row_bytes).expect("compact rows");
+
+        assert_eq!(compact, [20u8, 21, 22, 0, 1, 2, 20, 21, 22, 30, 31, 32]);
+        assert_eq!(remapped, [0u32, 1, 2, 3]);
+    }
 }
 
 pub fn prewarm_q4k_packed_weights(weights: &[(&[u8], usize, usize)]) -> Result<usize, String> {
@@ -1757,6 +1768,62 @@ fn quant_block_gemv_batch(
         .q5_basic_gemv_batch(weights, rows, blocks_per_row, seq_len, input, kernel)
 }
 
+fn compact_embedding_rows(
+    weights: &[u8],
+    token_ids: &[u32],
+    row_bytes: usize,
+) -> Result<(Vec<u8>, Vec<u32>), String> {
+    let compact_bytes = token_ids
+        .len()
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "embedding compact row byte size overflow".to_string())?;
+    let mut compact = Vec::with_capacity(compact_bytes);
+    let mut remapped_ids = Vec::with_capacity(token_ids.len());
+    for (compact_row, &token_id) in token_ids.iter().enumerate() {
+        let source_start = (token_id as usize)
+            .checked_mul(row_bytes)
+            .ok_or_else(|| format!("embedding source row {token_id} offset overflow"))?;
+        let source_end = source_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| format!("embedding source row {token_id} end overflow"))?;
+        let source = weights.get(source_start..source_end).ok_or_else(|| {
+            format!(
+                "embedding source row {token_id} exceeds weight bytes: end={source_end}, len={}",
+                weights.len()
+            )
+        })?;
+        compact.extend_from_slice(source);
+        remapped_ids.push(
+            u32::try_from(compact_row)
+                .map_err(|_| format!("embedding compact row index exceeds u32: {compact_row}"))?,
+        );
+    }
+    Ok((compact, remapped_ids))
+}
+
+fn quant_format_label(quant: QuantFormat) -> &'static str {
+    match quant {
+        QuantFormat::F32 => "F32",
+        QuantFormat::F16 => "F16",
+        QuantFormat::BF16 => "BF16",
+        QuantFormat::Q40 => "Q4_0",
+        QuantFormat::Q41 => "Q4_1",
+        QuantFormat::Q50 => "Q5_0",
+        QuantFormat::Q51 => "Q5_1",
+        QuantFormat::Q80 => "Q8_0",
+        QuantFormat::Q81 => "Q8_1",
+        QuantFormat::Q2K => "Q2_K",
+        QuantFormat::Q3K => "Q3_K",
+        QuantFormat::Q4K => "Q4_K",
+        QuantFormat::Q5K => "Q5_K",
+        QuantFormat::Q6K => "Q6_K",
+        QuantFormat::IQ2XXS => "IQ2_XXS",
+        QuantFormat::IQ2S => "IQ2_S",
+        QuantFormat::IQ3XXS => "IQ3_XXS",
+        QuantFormat::IQ4XS => "IQ4_XS",
+    }
+}
+
 pub fn quant_embedding_gather(
     quant: QuantFormat,
     weights: &[u8],
@@ -1819,6 +1886,9 @@ pub fn quant_embedding_gather(
     let output_bytes = output_len
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| format!("{quant:?} embedding output byte size overflow"))?;
+    let row_bytes = blocks_per_row
+        .checked_mul(block_bytes)
+        .ok_or_else(|| format!("{quant:?} embedding row byte size overflow"))?;
     let token_bytes = std::mem::size_of_val(token_ids);
 
     let compute = DEFAULT_CUDA_COMPUTE.get_or_init(|| Mutex::new(None));
@@ -1830,6 +1900,16 @@ pub fn quant_embedding_gather(
     }
     let state = guard.as_mut().expect("cuda compute state initialized");
     state.set_current()?;
+    let resident_weights_dev = state.resident_q4k_weights_ptr_if_present(weights)?;
+    let compact = if resident_weights_dev.is_some() {
+        None
+    } else {
+        Some(compact_embedding_rows(weights, token_ids, row_bytes)?)
+    };
+    let device_token_ids = compact
+        .as_ref()
+        .map(|(_, remapped_ids)| remapped_ids.as_slice())
+        .unwrap_or(token_ids);
     let token_ids_dev = unsafe { state.api.mem_alloc(token_bytes)? };
     let output_dev = match unsafe { state.api.mem_alloc(output_bytes) } {
         Ok(output) => output,
@@ -1845,21 +1925,40 @@ pub fn quant_embedding_gather(
         unsafe {
             state.api.memcpy_htod_async(
                 token_ids_dev,
-                token_ids.as_ptr().cast::<libc::c_void>(),
+                device_token_ids.as_ptr().cast::<libc::c_void>(),
                 token_bytes,
                 state.stream,
             )?;
         }
-        state.launch_quant_embedding_gather_to_dev(
-            kernel,
-            weights,
-            rows,
-            blocks_per_row,
-            block_elems,
-            token_ids_dev,
-            token_ids.len(),
-            output_dev,
-        )?;
+        if let Some((compact_weights, _)) = compact.as_ref() {
+            let stream = state.stream;
+            let weights_dev = state.upload_temp_quant_weights_on_stream(
+                compact_weights,
+                stream,
+                quant_format_label(quant),
+            )?;
+            state.launch_quant_embedding_gather_with_weights_dev(
+                kernel,
+                weights_dev,
+                token_ids.len(),
+                blocks_per_row,
+                block_elems,
+                token_ids_dev,
+                token_ids.len(),
+                output_dev,
+            )?;
+        } else {
+            state.launch_quant_embedding_gather_with_weights_dev(
+                kernel,
+                resident_weights_dev.expect("resident embedding pointer"),
+                rows,
+                blocks_per_row,
+                block_elems,
+                token_ids_dev,
+                token_ids.len(),
+                output_dev,
+            )?;
+        }
         unsafe {
             state.api.memcpy_dtoh_async(
                 output.as_mut_ptr().cast::<libc::c_void>(),

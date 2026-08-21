@@ -4059,10 +4059,10 @@ impl CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) fn launch_quant_embedding_gather_to_dev(
+    pub(in crate::runtime) fn launch_quant_embedding_gather_with_weights_dev(
         &mut self,
         kernel_name: &str,
-        weights: &[u8],
+        weights_dev: u64,
         rows: usize,
         blocks_per_row: usize,
         block_elems: usize,
@@ -4079,7 +4079,6 @@ impl CudaState {
             .map_err(|_| format!("embedding token_count exceeds CUDA u32 limit: {token_count}"))?;
         let threads_u32 = u32::try_from(block_elems)
             .map_err(|_| format!("embedding block width exceeds CUDA u32 limit: {block_elems}"))?;
-        let weights_dev = self.resident_q4k_weights_ptr(weights)?;
         let mut output_arg = output_dev;
         let mut weights_arg = weights_dev;
         let mut token_ids_arg = token_ids_dev;

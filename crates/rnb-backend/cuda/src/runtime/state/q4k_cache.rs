@@ -331,10 +331,11 @@ impl CudaState {
         self.upload_temp_q4k_weights_on_stream(weights, stream)
     }
 
-    pub(in crate::runtime) fn upload_temp_q4k_weights_on_stream(
+    pub(in crate::runtime) fn upload_temp_quant_weights_on_stream(
         &mut self,
         weights: &[u8],
         stream: usize,
+        source_quant: &'static str,
     ) -> Result<u64, String> {
         cache_stats()
             .temp_upload_bytes
@@ -348,8 +349,16 @@ impl CudaState {
                 stream,
             )
         }?;
-        self.record_transient_quant_upload("Q4_K", weights.len());
+        self.record_transient_quant_upload(source_quant, weights.len());
         Ok(ptr)
+    }
+
+    pub(in crate::runtime) fn upload_temp_q4k_weights_on_stream(
+        &mut self,
+        weights: &[u8],
+        stream: usize,
+    ) -> Result<u64, String> {
+        self.upload_temp_quant_weights_on_stream(weights, stream, "Q4_K")
     }
     pub(in crate::runtime) fn upload_prefetch_temp_q4k_weights_on_stream(
         &mut self,
@@ -684,15 +693,12 @@ impl CudaState {
         self.resident_q4k_weights_ptr_current_with_arena(weights, true, false, true)
     }
 
-    fn resident_q4k_weights_ptr_current_with_arena(
+    fn resident_q4k_weights_ptr_cached(
         &mut self,
         weights: &[u8],
-        use_arena: bool,
+        key: (usize, usize),
         pinned: bool,
-        allow_temp: bool,
-    ) -> Result<u64, String> {
-        cache_stats().lookups.fetch_add(1, Ordering::Relaxed);
-        let key = q4k_resident_key(weights);
+    ) -> Option<u64> {
         if let Some(ptr) = self.resident_q4k.get(&key).map(|entry| entry.ptr) {
             cache_stats().hits.fetch_add(1, Ordering::Relaxed);
             if pinned {
@@ -710,31 +716,59 @@ impl CudaState {
                     self.resident_q4k_lru.push_back((key, epoch));
                 }
             }
-            return Ok(ptr);
+            return Some(ptr);
         }
 
-        let source_identity = rnb_core::tensor::host_storage_identity(weights);
-        if let Some(ptr) = source_identity.and_then(|source| {
-            let source_end = source.byte_offset.checked_add(source.len)?;
-            self.resident_q4k.values().find_map(|entry| {
-                let resident = entry.source_identity?;
-                let resident_end = resident.byte_offset.checked_add(resident.len)?;
-                if entry.pinned
-                    && source.allocation_id == resident.allocation_id
-                    && source.byte_offset >= resident.byte_offset
-                    && source_end <= resident_end
-                {
-                    Some(entry.ptr + (source.byte_offset - resident.byte_offset) as u64)
-                } else {
-                    None
-                }
-            })
-        }) {
-            cache_stats().hits.fetch_add(1, Ordering::Relaxed);
+        let source_identity = rnb_core::tensor::host_storage_identity(weights)?;
+        let source_end = source_identity
+            .byte_offset
+            .checked_add(source_identity.len)?;
+        let ptr = self.resident_q4k.values().find_map(|entry| {
+            let resident = entry.source_identity?;
+            let resident_end = resident.byte_offset.checked_add(resident.len)?;
+            if entry.pinned
+                && source_identity.allocation_id == resident.allocation_id
+                && source_identity.byte_offset >= resident.byte_offset
+                && source_end <= resident_end
+            {
+                Some(entry.ptr + (source_identity.byte_offset - resident.byte_offset) as u64)
+            } else {
+                None
+            }
+        })?;
+        cache_stats().hits.fetch_add(1, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    pub(in crate::runtime) fn resident_q4k_weights_ptr_if_present(
+        &mut self,
+        weights: &[u8],
+    ) -> Result<Option<u64>, String> {
+        self.set_current()?;
+        cache_stats().lookups.fetch_add(1, Ordering::Relaxed);
+        let key = q4k_resident_key(weights);
+        let ptr = self.resident_q4k_weights_ptr_cached(weights, key, false);
+        if ptr.is_none() {
+            cache_stats().misses.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(ptr)
+    }
+
+    fn resident_q4k_weights_ptr_current_with_arena(
+        &mut self,
+        weights: &[u8],
+        use_arena: bool,
+        pinned: bool,
+        allow_temp: bool,
+    ) -> Result<u64, String> {
+        cache_stats().lookups.fetch_add(1, Ordering::Relaxed);
+        let key = q4k_resident_key(weights);
+        if let Some(ptr) = self.resident_q4k_weights_ptr_cached(weights, key, pinned) {
             return Ok(ptr);
         }
 
         cache_stats().misses.fetch_add(1, Ordering::Relaxed);
+        let source_identity = rnb_core::tensor::host_storage_identity(weights);
         let epoch = self.next_resident_q4k_epoch();
         if use_arena {
             return self.resident_q4k_weights_ptr_arena(weights, key, epoch);
