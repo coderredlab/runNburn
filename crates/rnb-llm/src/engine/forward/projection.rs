@@ -692,8 +692,10 @@ pub(super) fn try_prefill_atn_full_layer_metal(
             scale,
             norm_eps,
             pos_start,
+            rope_pos_start: pos_start,
         },
         prior_kv,
+        true,
     )?
     else {
         return Ok(None);
@@ -832,6 +834,7 @@ pub(super) fn try_prefill_atn_o_tail_metal(
             scale,
             norm_eps,
             pos_start,
+            rope_pos_start: pos_start,
         },
         None,
     )?
@@ -957,6 +960,7 @@ pub(super) fn try_prefill_atn_core_metal(
             scale,
             norm_eps,
             pos_start,
+            rope_pos_start: pos_start,
         },
         None,
     )?

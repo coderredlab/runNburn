@@ -33,6 +33,8 @@ pub(crate) struct PrefillAtnCoreCarrier {
     pub q_dim: usize,
     pub kv_dim: usize,
     pub n_rot: usize,
+    /// pm260: 디스패치별 rope_pos_start로 테이블을 갱신할 때 재사용.
+    rope_theta: f32,
     hidden_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     attn_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
     q_norm_w_dev: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -390,6 +392,7 @@ impl PrefillAtnCoreCarrier {
             q_dim,
             kv_dim,
             n_rot,
+            rope_theta,
             hidden_dev: empty_f32_buf(ctx, seq_len * hidden_dim),
             attn_norm_w_dev: empty_f32_buf(ctx, hidden_dim),
             q_norm_w_dev: empty_f32_buf(ctx, head_dim),
@@ -461,19 +464,31 @@ impl PrefillAtnCoreCarrier {
         }
         Ok(())
     }
-
     fn update_rope_cos_sin(
         &self,
         positions: Option<&[[u32; 4]]>,
         sections: [usize; 4],
         theta: f32,
-        pos_start: usize,
+        rope_pos_start: usize,
     ) {
         let table = positions.map_or_else(
-            || prefill_rope_cos_sin(self.seq_len, self.head_dim, self.n_rot, theta, pos_start),
+            || {
+                prefill_rope_cos_sin(
+                    self.seq_len,
+                    self.head_dim,
+                    self.n_rot,
+                    theta,
+                    rope_pos_start,
+                )
+            },
             |positions| prefill_imrope_cos_sin(positions, self.n_rot, sections, theta),
         );
         copy_f32(&table, &self.rope_cos_sin_dev);
+        // LegacyTree 경로는 precomputed table 대신 pos_buf를 직접 소비하므로
+        // rope/cache 좌표가 분리된 MTP observe에서 둘을 함께 갱신해야 한다.
+        unsafe {
+            (self.pos_buf.contents().as_ptr() as *mut u32).write(rope_pos_start as u32);
+        }
     }
 }
 
@@ -1004,6 +1019,8 @@ pub(crate) struct PrefillAtnCoreDispatchRequest<'a> {
     /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits.
     /// pos_start > 0이면 필수이며 길이는 pos_start * kv_dim.
     pub prior_kv: Option<(&'a [u16], &'a [u16])>,
+    /// pm260: 이 디스패치의 RoPE 테이블 기준 위치. pos_start와 독립.
+    pub rope_pos_start: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1707,6 +1724,7 @@ pub(crate) fn prefill_atn_core_dispatch(
     if let Some((prior_k, prior_v)) = req.prior_kv {
         carrier.upload_prior_kv(prior_k, prior_v)?;
     }
+    carrier.update_rope_cos_sin(None, [0; 4], carrier.rope_theta, req.rope_pos_start);
 
     let cmd = ctx
         .queue
@@ -3026,6 +3044,7 @@ pub(crate) fn prefill_atn_full_layer_dispatch(
     if let Some((prior_k, prior_v)) = req.core.prior_kv {
         core.upload_prior_kv(prior_k, prior_v)?;
     }
+    core.update_rope_cos_sin(None, [0; 4], core.rope_theta, req.core.rope_pos_start);
 
     let cmd = ctx.queue.commandBuffer().ok_or_else(|| {
         "Metal prefill ATN full layer: command buffer creation failed".to_string()

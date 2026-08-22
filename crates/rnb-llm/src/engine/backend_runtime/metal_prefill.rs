@@ -891,6 +891,8 @@ pub(in crate::engine) struct MetalPrefillAtnCoreShape {
     pub(in crate::engine) scale: f32,
     pub(in crate::engine) norm_eps: f32,
     pub(in crate::engine) pos_start: usize,
+    /// pm260: 캐시 쓰기 위치(pos_start)와 독립적인 RoPE 논리 위치.
+    pub(in crate::engine) rope_pos_start: usize,
 }
 
 #[cfg(all(feature = "metal", not(feature = "cuda")))]
@@ -968,6 +970,7 @@ pub(in crate::engine) fn metal_prefill_atn_core_if_supported(
                 scale: shape.scale,
                 norm_eps: shape.norm_eps,
                 pos_start: shape.pos_start,
+                rope_pos_start: shape.rope_pos_start,
                 prior_kv,
             },
         )
@@ -1051,6 +1054,7 @@ pub(in crate::engine) fn metal_prefill_atn_o_tail_if_supported(
                     scale: shape.scale,
                     norm_eps: shape.norm_eps,
                     pos_start: shape.pos_start,
+                    rope_pos_start: shape.rope_pos_start,
                     prior_kv,
                 },
                 o_weight_ggml: backend_ggml_type(o_view.quant()),
@@ -1101,6 +1105,7 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
     ffn_down_weight: &QuantizedWeight,
     shape: MetalPrefillAtnCoreShape,
     prior_kv: Option<(&[u16], &[u16])>,
+    cache_carrier: bool,
 ) -> crate::error::Result<Option<MetalPrefillAtnFullLayerAdapterOut>> {
     let (
         Some(q_view),
@@ -1156,6 +1161,7 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
                     scale: shape.scale,
                     norm_eps: shape.norm_eps,
                     pos_start: shape.pos_start,
+                    rope_pos_start: shape.rope_pos_start,
                     prior_kv,
                 },
                 o_weight_ggml: backend_ggml_type(o_view.quant()),
@@ -1176,6 +1182,7 @@ pub(in crate::engine) fn metal_prefill_atn_full_layer_if_supported(
                 ffn_down_weight_rows: ffn_down_view.rows(),
                 ffn_down_weight_cols: ffn_down_view.cols(),
                 ffn_dim: ffn_gate_view.rows(),
+                cache_carrier,
             },
         )
         .map_err(crate::error::LlmError::Forward)?;

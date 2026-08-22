@@ -1896,6 +1896,8 @@ pub struct PrefillAtnCoreBackendRequest<'a> {
     pub scale: f32,
     pub norm_eps: f32,
     pub pos_start: usize,
+    /// pm260: 캐시 쓰기 위치(pos_start)와 독립적인 RoPE 논리 위치.
+    pub rope_pos_start: usize,
     /// Continuation-chunk attention: 앞선 청크의 K/V f16 bits.
     /// pos_start > 0이면 필수이며 각 길이는 pos_start * kv_dim.
     pub prior_kv: Option<(&'a [u16], &'a [u16])>,
@@ -1911,6 +1913,9 @@ pub struct PrefillAtnFullLayerBackendRequest<'a> {
     pub ffn_up_weight: PrefillAtnCoreWeightView<'a>,
     pub ffn_down_weight: PrefillAtnCoreWeightView<'a>,
     pub ffn_dim: usize,
+    /// true면 shape/position별 캐리어를 재사용한다. MTP observe는 순차 위치를
+    /// 한 번씩만 쓰므로 false로 요청해 디스패치 직후 즉시 evict한다.
+    pub cache_carrier: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -5752,6 +5757,7 @@ impl MetalBackend {
                         // DFlash full layer은 자체 drafter attention carrier가
                         // prior KV를 다룬다. ATN core 버퍼는 chunk-local.
                         prior_kv: None,
+                        rope_pos_start: 0,
                     },
                     o_w_buf: &o_w_buf,
                     o_w_off,
@@ -7050,6 +7056,7 @@ impl MetalBackend {
                 v_w_buf: &v_w_buf,
                 v_w_off,
                 v_quant: req.v_weight.quant,
+                rope_pos_start: req.rope_pos_start,
                 prior_kv: req.prior_kv,
             },
         )?;
@@ -7362,7 +7369,7 @@ impl MetalBackend {
             ffn_down_quant: req.ffn_down_weight.quant,
         };
         let mut carriers = self.prefill_atn_full_layer_carriers.borrow_mut();
-        let carrier = carriers.entry(key).or_insert_with(|| {
+        let carrier = carriers.entry(key.clone()).or_insert_with(|| {
             prefill_atn_core_chain::PrefillAtnFullLayerCarrier::new(
                 ctx,
                 core.seq_len,
@@ -7380,7 +7387,7 @@ impl MetalBackend {
                 core.pos_start,
             )
         });
-        let out = prefill_atn_core_chain::prefill_atn_full_layer_dispatch(
+        let result = prefill_atn_core_chain::prefill_atn_full_layer_dispatch(
             ctx,
             carrier,
             prefill_atn_core_chain::PrefillAtnFullLayerDispatchRequest {
@@ -7399,6 +7406,7 @@ impl MetalBackend {
                     v_w_off,
                     v_quant: core.v_weight.quant,
                     prior_kv: core.prior_kv,
+                    rope_pos_start: core.rope_pos_start,
                 },
                 o_w_buf: &o_w_buf,
                 o_w_off,
@@ -7414,7 +7422,11 @@ impl MetalBackend {
                 ffn_down_w_off,
                 ffn_down_quant: req.ffn_down_weight.quant,
             },
-        )?;
+        );
+        if !req.cache_carrier {
+            carriers.remove(&key);
+        }
+        let out = result?;
         Ok(Some(out))
     }
 
@@ -17305,6 +17317,7 @@ mod tests {
             scale,
             norm_eps,
             pos_start,
+            rope_pos_start: pos_start,
             prior_kv: None,
         };
 
@@ -26774,6 +26787,7 @@ kernel void q4k_ro_vec4(
                 scale,
                 norm_eps,
                 pos_start,
+                rope_pos_start: pos_start,
                 prior_kv: None,
             })
             .expect("ATN core dispatch")
@@ -27063,6 +27077,7 @@ kernel void q4k_ro_vec4(
                 scale,
                 norm_eps,
                 pos_start,
+                rope_pos_start: pos_start,
                 prior_kv: None,
             })
             .expect("ATN core dispatch")

@@ -2052,7 +2052,27 @@ fn run_mtp_block(
 
     let projection_start = std::time::Instant::now();
     let prep_ms = prep_start.elapsed().as_secs_f64() * 1000.0;
-    let projected = runtime.weights.eh_proj.gemv_vec(&combined)?;
+    // pm260: eh_proj(Q8_0) batched GEMV를 Metal tensorops v2로 우선 시도한다.
+    // 미입 시 CPU i8mm 경로로 폴백한다.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let projected_metal = if seq_len > 1 && mtp_block_metal_enabled() {
+        backend_runtime::metal_prefill_gdn_proj_into_if_supported(
+            &runtime.weights.eh_proj,
+            &combined,
+            seq_len,
+            hidden_dim * 2,
+        )
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+    let projected_metal: Option<Vec<f32>> = None;
+    let projected = match projected_metal {
+        Some(projected) => projected,
+        None => runtime.weights.eh_proj.gemv_vec(&combined)?,
+    };
     let projection_ms = projection_start.elapsed().as_secs_f64() * 1000.0;
     emit_mtp_finite_trace(
         "mtp",
@@ -2101,6 +2121,30 @@ fn run_mtp_block(
             }
         }
     }
+    // pm260: Metal에서도 동일한 병목(청크마다 불리는 drafter observe의 host
+    // 실행, 청크마다 293→4522ms로 KV 길이에 증가, 24k 기준 ~27.4s)이 있다.
+    // dense Qwen35 블록을 ATN full-layer 캐리어로 먼저 시도하고, 미입 시
+    // 아래 host 경로로 폴백한다(RNB_MTP_BLOCK_METAL=0 opt-out).
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    if seq_len > 1 && mtp_block_metal_enabled() {
+        let cache_pos_start = runtime.kv_cache.current_len();
+        match run_mtp_block_metal(
+            runtime,
+            architecture,
+            &projected,
+            seq_len,
+            cache_pos_start,
+            rope_pos_start,
+        ) {
+            Ok(Some(last)) => return Ok(last),
+            Ok(None) => {}
+            Err(error) => {
+                if crate::engine::policy::env_os_string("RNB_MTP_DRAFT_TRACE").is_some() {
+                    eprintln!("[mtp-block-metal] host fallback: {error}");
+                }
+            }
+        }
+    }
     let hidden = Tensor::from_vec(projected, &[seq_len, hidden_dim]);
     let cache_pos_start = runtime.kv_cache.current_len();
     let hidden = forward_attention_layer_with_rope_pos(
@@ -2129,6 +2173,124 @@ fn run_mtp_block(
     let data = kernels::tensor_as_f32_slice(&hidden);
     let last = data[(seq_len - 1) * hidden_dim..seq_len * hidden_dim].to_vec();
     Ok(last)
+}
+
+/// pm260: 드래프터 블록 Metal 라우팅 활성 여부. 기본 ON,
+/// `RNB_MTP_BLOCK_METAL=0`으로 host 경로로 되돌린다.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn mtp_block_metal_enabled() -> bool {
+    std::env::var("RNB_MTP_BLOCK_METAL")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// pm260: nextn 드래프터 블록(attn+FFN)을 ATN full-layer 캐리어로 실행해
+/// 마지막 행 hidden을 돌려준다. K/V는 드래프터 KV 슬롯 0의
+/// [pos_start, pos_start+seq_len)에 기록된다. blk.64는 trunk ATN과 동일한
+/// packed q+gate 레이아웃이 아니면 Ok(None)으로 host 폴백을 유도한다.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn run_mtp_block_metal(
+    runtime: &mut InModelMtpRuntime,
+    architecture: ModelArchitecture,
+    projected: &[f32],
+    seq_len: usize,
+    pos_start: usize,
+    rope_pos_start: usize,
+) -> Result<Option<Vec<f32>>> {
+    let block = &runtime.weights.block;
+    if block.attn_gate_weight.is_some()
+        || block.q_bias.is_some()
+        || block.k_bias.is_some()
+        || block.v_bias.is_some()
+        || block.moe.is_some()
+        || block.shared_expert_moe.is_some()
+        || block.ffn_gate_up_fused.is_some()
+        || block.v_proj_missing
+        || block.out_scale.is_some()
+    {
+        return Ok(None);
+    }
+    let (Some(q_norm), Some(k_norm)) = (&block.q_norm, &block.k_norm) else {
+        return Ok(None);
+    };
+    let layout = layout::resolve_attention_layout(&runtime.metadata, block, None)
+        .map_err(|error| LlmError::Forward(format!("mtp block layout: {error}")))?;
+    if !layout.packed_q_gate {
+        return Ok(None);
+    }
+    let (rope_dim, rope_theta, proportional_rope) =
+        models::gemma::resolve_rope_params(&runtime.metadata, architecture, 0, layout.head_dim);
+    if proportional_rope || rope_dim == 0 || rope_dim >= layout.head_dim {
+        return Ok(None);
+    }
+    if models::gemma::qwen_text_mrope_dim(
+        &runtime.metadata,
+        architecture,
+        rope_dim,
+        layout.head_dim,
+    )
+    .is_some()
+    {
+        return Ok(None);
+    }
+    let prior_storage;
+    let prior_kv = if pos_start != 0 {
+        prior_storage = runtime.kv_cache.read_up_to(0, pos_start);
+        Some(prior_storage.as_slices())
+    } else {
+        None
+    };
+    let shape = backend_runtime::MetalPrefillAtnCoreShape {
+        seq_len,
+        num_heads: runtime.metadata.num_heads,
+        num_kv_heads: runtime.metadata.num_kv_heads,
+        head_dim: layout.head_dim,
+        hidden_dim: runtime.metadata.hidden_dim,
+        q_dim: layout.q_dim,
+        kv_dim: layout.kv_dim,
+        n_rot: rope_dim.min(layout.head_dim),
+        rope_theta,
+        scale: models::gemma::resolve_attention_scale(&runtime.metadata, architecture),
+        norm_eps: runtime.metadata.norm_eps,
+        pos_start,
+        rope_pos_start,
+    };
+    let Some(out) = backend_runtime::metal_prefill_atn_full_layer_if_supported(
+        projected,
+        kernels::tensor_as_f32_slice(&block.attn_norm),
+        kernels::tensor_as_f32_slice(q_norm),
+        kernels::tensor_as_f32_slice(k_norm),
+        &block.q_weight,
+        &block.k_weight,
+        &block.v_weight,
+        &block.o_weight,
+        kernels::tensor_as_f32_slice(&block.ffn_norm),
+        &block.ffn_gate_weight,
+        &block.ffn_up_weight,
+        &block.ffn_down_weight,
+        shape,
+        prior_kv,
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+    runtime
+        .kv_cache
+        .replace_layer_f16_range(0, pos_start, seq_len, &out.k_bits, &out.v_bits);
+    runtime.kv_cache.set_len(mtp_block_cache_len_after(
+        pos_start,
+        seq_len,
+        runtime.kv_cache.max_seq_len,
+    ));
+    let hidden_dim = runtime.metadata.hidden_dim;
+    let last = out.hidden[(seq_len - 1) * hidden_dim..seq_len * hidden_dim].to_vec();
+    Ok(Some(last))
 }
 
 /// cu291: MTP prompt observe의 device 실행. projected(eh_proj 출력) 한 chunk를
