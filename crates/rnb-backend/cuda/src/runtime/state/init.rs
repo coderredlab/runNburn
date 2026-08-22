@@ -742,6 +742,9 @@ impl Drop for CudaState {
             if let Some(ptr) = cache.f16_dev {
                 let _ = unsafe { self.api.mem_free(ptr) };
             }
+            if let Some(ptr) = cache.split_scratch_dev {
+                let _ = unsafe { self.api.mem_free(ptr) };
+            }
         }
         if let Some(ptr) = self.mtp_verify_attention_out.take() {
             let _ = unsafe { self.api.mem_free(ptr) };

@@ -1175,6 +1175,19 @@ impl CudaState {
                     up_result?;
                 }
                 (Some(gate_weights_dev), None) => {
+                    // cu312 review: reserve the missing-side temp slot while
+                    // still on the main stream — slot growth can reclaim
+                    // resident weights, and reclamation synchronizes
+                    // self.stream. Reserving after the switch would let it
+                    // free buffers with the in-flight main-stream gate MMQ.
+                    let up_weights_dev = if gate_resident {
+                        self.compute_weights_ptr(up_weights.len())?
+                    } else {
+                        self.compute_prefetch_weights_ptr(up_weights.len())?
+                    };
+                    cache_stats()
+                        .temp_upload_bytes
+                        .fetch_add(up_weights.len() as u64, Ordering::Relaxed);
                     self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
                         gate_weights_dev,
                         rows,
@@ -1186,14 +1199,15 @@ impl CudaState {
                     )?;
                     self.stream = parallel_stream;
                     let up_result = (|| {
-                        let up_weights_dev = if gate_resident {
-                            self.upload_temp_q4k_weights_on_stream(up_weights, parallel_stream)?
-                        } else {
-                            self.upload_prefetch_temp_q4k_weights_on_stream(
-                                up_weights,
+                        unsafe {
+                            self.api.memcpy_htod_async(
+                                up_weights_dev,
+                                up_weights.as_ptr().cast::<libc::c_void>(),
+                                up_weights.len(),
                                 parallel_stream,
-                            )?
-                        };
+                            )?;
+                        }
+                        self.record_transient_quant_upload("Q4_K", up_weights.len());
                         self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
                             up_weights_dev,
                             rows,
@@ -1208,6 +1222,13 @@ impl CudaState {
                     up_result?;
                 }
                 (None, Some(up_weights_dev)) => {
+                    // cu312 review: same reservation-before-switch contract as
+                    // the gate-resident branch — reclaim must not free
+                    // buffers with in-flight main-stream work.
+                    let gate_weights_dev = self.compute_weights_ptr(gate_weights.len())?;
+                    cache_stats()
+                        .temp_upload_bytes
+                        .fetch_add(gate_weights.len() as u64, Ordering::Relaxed);
                     self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
                         up_weights_dev,
                         rows,
@@ -1219,8 +1240,15 @@ impl CudaState {
                     )?;
                     self.stream = parallel_stream;
                     let gate_result = (|| {
-                        let gate_weights_dev =
-                            self.upload_temp_q4k_weights_on_stream(gate_weights, parallel_stream)?;
+                        unsafe {
+                            self.api.memcpy_htod_async(
+                                gate_weights_dev,
+                                gate_weights.as_ptr().cast::<libc::c_void>(),
+                                gate_weights.len(),
+                                parallel_stream,
+                            )?;
+                        }
+                        self.record_transient_quant_upload("Q4_K", gate_weights.len());
                         self.launch_q4k_q8_1_matmul_mmq_transposed_seq128_with_weights_dev(
                             gate_weights_dev,
                             rows,

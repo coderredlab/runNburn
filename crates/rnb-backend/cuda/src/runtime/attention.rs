@@ -23,6 +23,9 @@ impl CudaState {
             if let Some(ptr) = cache.f16_dev {
                 unsafe { self.api.mem_free(ptr)? };
             }
+            if let Some(ptr) = cache.split_scratch_dev {
+                unsafe { self.api.mem_free(ptr)? };
+            }
         }
         Ok(())
     }
@@ -3572,6 +3575,9 @@ impl CudaState {
                 if let Some(ptr) = cache.f16_dev.take() {
                     unsafe { self.api.mem_free(ptr)? };
                 }
+                if let Some(ptr) = cache.split_scratch_dev.take() {
+                    unsafe { self.api.mem_free(ptr)? };
+                }
                 cache = KvarnDecodeAttentionCache {
                     kv_rows: row_width,
                     key_bits: request.key_bits(),
@@ -3828,6 +3834,7 @@ impl CudaState {
                     512 => "rnb_kvarn_attention_decode_merge_hd512",
                     _ => unreachable!(),
                 };
+                let mut query_rows_arg = query_rows_u32;
                 self.launch_cached_gemv(
                     merge_kernel,
                     &[
@@ -3835,6 +3842,7 @@ impl CudaState {
                         (&mut split_scratch_ptr as *mut u64).cast(),
                         (&mut split_z_arg as *mut u32).cast(),
                         (&mut num_heads_arg as *mut u32).cast(),
+                        (&mut query_rows_arg as *mut u32).cast(),
                     ],
                     (num_heads, query_rows_u32, 1),
                     (head_dim as u32, 1, 1),

@@ -985,6 +985,15 @@ pub fn mtp_verify_attention_hd256_mma_stream_k_enabled() -> bool {
     compiled_ampere_mma_supported() && env_bool("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", true)
 }
 
+// cu312 review: raw decode-chunk override without the 1024 default so the
+// MTP launcher can honor the legacy override before the L2-derived default.
+pub fn decode_attention_hd256_split_chunk_env_override_option() -> Option<usize> {
+    std::env::var("RNB_CUDA_DECODE_ATTN_HD256_SPLIT_CHUNK")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&chunk| matches!(chunk, 128 | 256 | 512 | 1024))
+}
+
 pub fn mtp_verify_attention_hd256_split_chunk_env_override() -> Option<usize> {
     std::env::var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK")
         .ok()
@@ -2433,7 +2442,6 @@ mod tests {
             std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K");
         }
     }
-
 
     #[test]
     fn hd256_split_chunk_from_l2_matches_l2_working_set_model() {

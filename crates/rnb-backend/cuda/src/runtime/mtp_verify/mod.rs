@@ -2596,7 +2596,6 @@ impl super::CudaState {
         }
     }
 
-
     #[allow(clippy::too_many_arguments)]
     fn launch_mtp_verify_attention_hd256_split(
         &mut self,
@@ -2615,10 +2614,12 @@ impl super::CudaState {
             return Ok(false);
         }
         let active_window = window.min(kv_tokens);
-        let chunk_size =
-            crate::tuning::mtp_verify_attention_hd256_split_chunk_env_override().unwrap_or_else(
-                || self.hd256_split_chunk_default(num_kv_heads, post_buffers.head_dim),
-            );
+        // cu312 review: keep the legacy override precedence — MTP env first,
+        // then the pre-existing decode-chunk env, and only then the
+        // cu309 L2-derived default.
+        let chunk_size = crate::tuning::mtp_verify_attention_hd256_split_chunk_env_override()
+            .or_else(crate::tuning::decode_attention_hd256_split_chunk_env_override_option)
+            .unwrap_or_else(|| self.hd256_split_chunk_default(num_kv_heads, post_buffers.head_dim));
         if active_window <= chunk_size {
             return Ok(false);
         }

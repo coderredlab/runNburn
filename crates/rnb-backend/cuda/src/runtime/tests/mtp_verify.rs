@@ -1647,6 +1647,11 @@ fn cuda_qwen35_mtp_verify_attention_output_hd256_mma_stream_k_matches_f32_split(
     };
     unsafe {
         std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K", "0");
+        // cu309 grew the default split chunk to 1024, which skips splitting
+        // for this 257-token fixture and would silently compare the F32
+        // kernel against itself. Pin 256 so the split launcher fires on both
+        // sides of the MMA comparison.
+        std::env::set_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK", "256");
     }
     let baseline_buffers = state
         .stage_mtp_verify_attention_output_window(
@@ -1702,6 +1707,7 @@ fn cuda_qwen35_mtp_verify_attention_output_hd256_mma_stream_k_matches_f32_split(
     state.stream_synchronize().unwrap();
     unsafe {
         std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_MMA_STREAM_K");
+        std::env::remove_var("RNB_CUDA_MTP_ATTN_HD256_SPLIT_CHUNK");
         state.api.mem_free(q_dev).unwrap();
         state.api.mem_free(k_dev).unwrap();
         state.api.mem_free(v_dev).unwrap();

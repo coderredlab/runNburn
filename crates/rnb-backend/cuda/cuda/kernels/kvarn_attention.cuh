@@ -273,11 +273,16 @@ __device__ void rnb_kvarn_attention_decode_impl(
         transform[lane] = quantized_acc;
         __syncthreads();
         rnb_kvarn_hadamard<D>(transform);
+        // Accumulators start after EVERY query row's statistics; using a
+        // single-row stride here would collide slice accumulators of query
+        // row N with the stats of row N+1 on MTP verify requests.
+        const size_t stats_floats =
+            static_cast<size_t>(query_rows) * regions * num_heads * 2u;
         const size_t slice_slot =
             (static_cast<size_t>(query_token) * regions + z_index) * num_heads + head;
         split_scratch[slice_slot * 2u] = quantized_max;
         split_scratch[slice_slot * 2u + 1u] = quantized_sum;
-        split_scratch[regions * num_heads * 2u + slice_slot * D + lane] = transform[lane];
+        split_scratch[stats_floats + slice_slot * D + lane] = transform[lane];
         if (z_index == 0u) {
             const size_t sink_slot =
                 (static_cast<size_t>(query_token) * regions + region_sink) * num_heads + head;
@@ -287,13 +292,13 @@ __device__ void rnb_kvarn_attention_decode_impl(
                 (static_cast<size_t>(query_token) * regions + region_current) * num_heads + head;
             split_scratch[sink_slot * 2u] = sink_max;
             split_scratch[sink_slot * 2u + 1u] = sink_sum;
-            split_scratch[regions * num_heads * 2u + sink_slot * D + lane] = sink_acc;
+            split_scratch[stats_floats + sink_slot * D + lane] = sink_acc;
             split_scratch[tail_slot * 2u] = tail_max;
             split_scratch[tail_slot * 2u + 1u] = tail_sum;
-            split_scratch[regions * num_heads * 2u + tail_slot * D + lane] = tail_acc;
+            split_scratch[stats_floats + tail_slot * D + lane] = tail_acc;
             split_scratch[current_slot * 2u] = current_max;
             split_scratch[current_slot * 2u + 1u] = current_sum;
-            split_scratch[regions * num_heads * 2u + current_slot * D + lane] = current_acc;
+            split_scratch[stats_floats + current_slot * D + lane] = current_acc;
         }
         return;
     }
@@ -365,7 +370,8 @@ __device__ void rnb_kvarn_attention_decode_merge_impl(
     float* __restrict__ out,
     const float* __restrict__ split_scratch,
     unsigned split_z,
-    unsigned num_heads) {
+    unsigned num_heads,
+    unsigned query_rows) {
     const unsigned lane = threadIdx.x;
     const unsigned head = blockIdx.x;
     const unsigned query_token = blockIdx.y;
@@ -373,6 +379,8 @@ __device__ void rnb_kvarn_attention_decode_merge_impl(
         return;
     }
     const unsigned regions = split_z + 3u;
+    const size_t stats_floats =
+        static_cast<size_t>(query_rows) * regions * num_heads * 2u;
     const size_t region_base = static_cast<size_t>(query_token) * regions * num_heads;
     float merged_max = -FLT_MAX;
     float merged_sum = 0.0f;
@@ -385,7 +393,7 @@ __device__ void rnb_kvarn_attention_decode_merge_impl(
             return;
         }
         const float region_acc =
-            split_scratch[regions * num_heads * 2u + slot * D + lane];
+            split_scratch[stats_floats + slot * D + lane];
         if (merged_sum <= 0.0f) {
             merged_max = region_max;
             merged_sum = region_sum;
@@ -411,10 +419,11 @@ __device__ void rnb_kvarn_attention_decode_merge_impl(
 }
 
 #define RNB_KVARN_MERGE_ARGUMENTS \
-    float* out, const float* split_scratch, unsigned split_z, unsigned num_heads
+    float* out, const float* split_scratch, unsigned split_z, unsigned num_heads, \
+    unsigned query_rows
 
 #define RNB_KVARN_MERGE_PASS \
-    out, split_scratch, split_z, num_heads
+    out, split_scratch, split_z, num_heads, query_rows
 
 extern "C" __global__ void rnb_kvarn_attention_decode_merge_hd128(RNB_KVARN_MERGE_ARGUMENTS) {
     rnb_kvarn_attention_decode_merge_impl<128>(RNB_KVARN_MERGE_PASS);
