@@ -20,18 +20,48 @@ __device__ __forceinline__ void rnb_kvarn_hadamard(float* values) {
     __syncthreads();
 }
 
+__host__ __device__ constexpr unsigned rnb_log2u(unsigned value) {
+    return value <= 1u ? 0u : 1u + rnb_log2u(value >> 1u);
+}
+
+// Tree reduction preserving the original pairwise addition order (stride D/2
+// down to 1, lower lane absorbs upper) with half of the original barriers:
+// three staged shared-memory rounds, an in-warp shuffle tail, one broadcast
+// round-trip so every lane receives the same dot result, and caller-side
+// buffer alternation replacing the old trailing __syncthreads.
 template <unsigned D>
-__device__ __forceinline__ float rnb_kvarn_dot_reduce(float value, float* partial) {
+__device__ __forceinline__ float rnb_kvarn_dot_reduce(
+    float value, float (*partial)[D], unsigned buf) {
+    constexpr unsigned LOG2_D = rnb_log2u(D);
+    constexpr unsigned SHARED_STEPS = LOG2_D - 5u;
+    static_assert(LOG2_D >= 6u, "D too small for staged reduce");
     const unsigned lane = threadIdx.x;
-    partial[lane] = value;
+    partial[buf][lane] = value;
     __syncthreads();
-    for (unsigned stride = D / 2u; stride > 0u; stride >>= 1u) {
+    unsigned stride = D >> 1u;
+    #pragma unroll
+    for (unsigned step = 0u; step < SHARED_STEPS; ++step) {
         if (lane < stride) {
-            partial[lane] += partial[lane + stride];
+            partial[buf][lane] += partial[buf][lane + stride];
         }
         __syncthreads();
+        stride >>= 1u;
     }
-    return partial[0];
+    // Surviving sums live in lanes < 32; the leftover strides stay inside
+    // warp 0, so register shuffles finish them with identical pairings.
+    // Lanes >= 32 hold stale scratch; masking to +0.0 keeps the shuffle tail
+    // free of contamination.
+    float value_in_warp = lane < 32u ? partial[buf][lane] : 0.0f;
+    value_in_warp += __shfl_down_sync(0xffffffffu, value_in_warp, 16u);
+    value_in_warp += __shfl_down_sync(0xffffffffu, value_in_warp, 8u);
+    value_in_warp += __shfl_down_sync(0xffffffffu, value_in_warp, 4u);
+    value_in_warp += __shfl_down_sync(0xffffffffu, value_in_warp, 2u);
+    value_in_warp += __shfl_down_sync(0xffffffffu, value_in_warp, 1u);
+    if (lane == 0u) {
+        partial[buf][0] = value_in_warp;
+    }
+    __syncthreads();
+    return partial[buf][0];
 }
 
 template <unsigned D>
@@ -66,7 +96,9 @@ __device__ void rnb_kvarn_attention_decode_impl(
     float scale,
     float softcap,
     unsigned current_tokens,
-    unsigned sliding_window) {
+    unsigned sliding_window,
+    float* __restrict__ split_scratch,
+    unsigned split_z) {
     const unsigned lane = threadIdx.x;
     const unsigned head = blockIdx.x;
     const unsigned query_token = blockIdx.y;
@@ -76,7 +108,11 @@ __device__ void rnb_kvarn_attention_decode_impl(
     }
 
     __shared__ float transform[D];
-    __shared__ float partial[D];
+    // Double-buffered reduction scratch: consecutive dot reductions alternate
+    // buffers, so no trailing barrier is needed before token N+1 overwrites
+    // the other plane.
+    __shared__ float partial[2][D];
+    unsigned reduce_buf = 0u;
 
     const unsigned heads_per_group = num_heads / num_kv_heads;
     const unsigned kv_head = head / heads_per_group;
@@ -86,6 +122,15 @@ __device__ void rnb_kvarn_attention_decode_impl(
     const unsigned visible_len = kv_len + visible_current;
     const unsigned window_start =
         sliding_window > 0u && visible_len > sliding_window ? visible_len - sliding_window : 0u;
+    const unsigned z_index = blockIdx.z;
+    const unsigned blocks_per_slice =
+        split_z > 0u ? (num_blocks + split_z - 1u) / split_z : num_blocks;
+    const unsigned slice_begin = blocks_per_slice * z_index;
+    const unsigned slice_end = min(slice_begin + blocks_per_slice, num_blocks);
+    const unsigned regions = split_z + 3u;
+    const unsigned region_sink = split_z;
+    const unsigned region_tail = split_z + 1u;
+    const unsigned region_current = split_z + 2u;
     const size_t query_base =
         (static_cast<size_t>(query_token) * num_heads + head) * D;
     const float q_original = q[query_base + lane];
@@ -97,13 +142,14 @@ __device__ void rnb_kvarn_attention_decode_impl(
     float sink_max = -FLT_MAX;
     float sink_sum = 0.0f;
     float sink_acc = 0.0f;
-    for (unsigned token = 0u; token < sink_len; ++token) {
+    for (unsigned token = 0u; z_index == 0u && token < sink_len; ++token) {
         if (token < window_start || token >= kv_len) {
             continue;
         }
         const unsigned base = token * row_width + kv_head * D;
         const float key = __half2float(__ushort_as_half(sink_key[base + lane]));
-        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial) * scale;
+        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial, reduce_buf) * scale;
+        reduce_buf ^= 1u;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -114,7 +160,6 @@ __device__ void rnb_kvarn_attention_decode_impl(
         sink_acc = sink_acc * old_scale + probability * value;
         sink_sum = sink_sum * old_scale + probability;
         sink_max = next_max;
-        __syncthreads();
     }
 
     float quantized_max = -FLT_MAX;
@@ -124,7 +169,7 @@ __device__ void rnb_kvarn_attention_decode_impl(
     const unsigned value_pack = 8u / value_bits;
     const unsigned value_packed_row = D / value_pack;
     const unsigned value_packed_head = group * value_packed_row;
-    for (unsigned block = 0u; block < num_blocks; ++block) {
+    for (unsigned block = slice_begin; block < slice_end; ++block) {
         const unsigned char* record = packed_blocks + static_cast<size_t>(block) * block_bytes;
         const unsigned short* key_scale = reinterpret_cast<const unsigned short*>(record + key_scale_offset);
         const unsigned short* key_zero = reinterpret_cast<const unsigned short*>(record + key_zero_offset);
@@ -145,7 +190,8 @@ __device__ void rnb_kvarn_attention_decode_impl(
             const float key_zero_value = __half2float(__ushort_as_half(key_zero[key_channel]));
             const float key_token_value = __half2float(__ushort_as_half(key_token_scale[kv_head * group + token]));
             const float key = (static_cast<float>(key_quant) * key_scale_value + key_zero_value) * key_token_value;
-            float score = rnb_kvarn_dot_reduce<D>(q_rotated * key, partial) * scale;
+            float score = rnb_kvarn_dot_reduce<D>(q_rotated * key, partial, reduce_buf) * scale;
+            reduce_buf ^= 1u;
             if (softcap > 0.0f) {
                 score = softcap * tanhf(score / softcap);
             }
@@ -164,7 +210,6 @@ __device__ void rnb_kvarn_attention_decode_impl(
             quantized_acc = quantized_acc * old_scale + probability * value;
             quantized_sum = quantized_sum * old_scale + probability;
             quantized_max = next_max;
-            __syncthreads();
         }
     }
 
@@ -176,14 +221,15 @@ __device__ void rnb_kvarn_attention_decode_impl(
     float tail_max = -FLT_MAX;
     float tail_sum = 0.0f;
     float tail_acc = 0.0f;
-    for (unsigned token = 0u; token < tail_len; ++token) {
+    for (unsigned token = 0u; z_index == 0u && token < tail_len; ++token) {
         const unsigned global_token = tail_start + token;
         if (global_token < window_start || global_token >= kv_len) {
             continue;
         }
         const unsigned base = token * row_width + kv_head * D;
         const float key = __half2float(__ushort_as_half(tail_key[base + lane]));
-        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial) * scale;
+        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial, reduce_buf) * scale;
+        reduce_buf ^= 1u;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -194,20 +240,20 @@ __device__ void rnb_kvarn_attention_decode_impl(
         tail_acc = tail_acc * old_scale + probability * value;
         tail_sum = tail_sum * old_scale + probability;
         tail_max = next_max;
-        __syncthreads();
     }
 
     float current_max = -FLT_MAX;
     float current_sum = 0.0f;
     float current_acc = 0.0f;
-    for (unsigned token = 0u; token < visible_current; ++token) {
+    for (unsigned token = 0u; z_index == 0u && token < visible_current; ++token) {
         const unsigned global_token = kv_len + token;
         if (global_token < window_start) {
             continue;
         }
         const unsigned base = token * row_width + kv_head * D;
         const float key = __half2float(__ushort_as_half(current_key[base + lane]));
-        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial) * scale;
+        float score = rnb_kvarn_dot_reduce<D>(q_original * key, partial, reduce_buf) * scale;
+        reduce_buf ^= 1u;
         if (softcap > 0.0f) {
             score = softcap * tanhf(score / softcap);
         }
@@ -218,9 +264,39 @@ __device__ void rnb_kvarn_attention_decode_impl(
         current_acc = current_acc * old_scale + probability * value;
         current_sum = current_sum * old_scale + probability;
         current_max = next_max;
-        __syncthreads();
     }
 
+    if (split_z > 1u) {
+        // Multi-slice path: stash this slice's partial softmax (acc rotated
+        // back to the original domain so the merge kernel stays linear) into
+        // the scratch regions; z==0 also records sink/tail/current.
+        transform[lane] = quantized_acc;
+        __syncthreads();
+        rnb_kvarn_hadamard<D>(transform);
+        const size_t slice_slot =
+            (static_cast<size_t>(query_token) * regions + z_index) * num_heads + head;
+        split_scratch[slice_slot * 2u] = quantized_max;
+        split_scratch[slice_slot * 2u + 1u] = quantized_sum;
+        split_scratch[regions * num_heads * 2u + slice_slot * D + lane] = transform[lane];
+        if (z_index == 0u) {
+            const size_t sink_slot =
+                (static_cast<size_t>(query_token) * regions + region_sink) * num_heads + head;
+            const size_t tail_slot =
+                (static_cast<size_t>(query_token) * regions + region_tail) * num_heads + head;
+            const size_t current_slot =
+                (static_cast<size_t>(query_token) * regions + region_current) * num_heads + head;
+            split_scratch[sink_slot * 2u] = sink_max;
+            split_scratch[sink_slot * 2u + 1u] = sink_sum;
+            split_scratch[regions * num_heads * 2u + sink_slot * D + lane] = sink_acc;
+            split_scratch[tail_slot * 2u] = tail_max;
+            split_scratch[tail_slot * 2u + 1u] = tail_sum;
+            split_scratch[regions * num_heads * 2u + tail_slot * D + lane] = tail_acc;
+            split_scratch[current_slot * 2u] = current_max;
+            split_scratch[current_slot * 2u + 1u] = current_sum;
+            split_scratch[regions * num_heads * 2u + current_slot * D + lane] = current_acc;
+        }
+        return;
+    }
     const float first_max = fmaxf(sink_max, quantized_max);
     const float sink_weight = sink_sum > 0.0f ? expf(sink_max - first_max) : 0.0f;
     const float quantized_weight = quantized_sum > 0.0f ? expf(quantized_max - first_max) : 0.0f;
@@ -257,7 +333,8 @@ __device__ void rnb_kvarn_attention_decode_impl(
     unsigned key_scale_offset, unsigned key_zero_offset, unsigned key_token_scale_offset, \
     unsigned value_packed_offset, unsigned value_channel_scale_offset, \
     unsigned value_token_scale_offset, unsigned value_zero_offset, float scale, \
-    float softcap, unsigned current_tokens, unsigned sliding_window
+    float softcap, unsigned current_tokens, unsigned sliding_window, \
+    float* split_scratch, unsigned split_z
 
 #define RNB_KVARN_PASS \
     out, q, packed_blocks, sink_key, sink_value, tail_key, tail_value, current_key, \
@@ -265,7 +342,7 @@ __device__ void rnb_kvarn_attention_decode_impl(
     num_kv_heads, group, value_bits, block_bytes, key_packed_offset, key_scale_offset, \
     key_zero_offset, key_token_scale_offset, value_packed_offset, \
     value_channel_scale_offset, value_token_scale_offset, value_zero_offset, scale, \
-    softcap, current_tokens, sliding_window
+    softcap, current_tokens, sliding_window, split_scratch, split_z
 
 extern "C" __global__ void rnb_kvarn_attention_decode_hd128(RNB_KVARN_ARGUMENTS) {
     rnb_kvarn_attention_decode_impl<128>(RNB_KVARN_PASS);
@@ -279,5 +356,79 @@ extern "C" __global__ void rnb_kvarn_attention_decode_hd512(RNB_KVARN_ARGUMENTS)
     rnb_kvarn_attention_decode_impl<512>(RNB_KVARN_PASS);
 }
 
+// Combines per-slice partial softmaxes from the split decode kernel. Regions
+// are consumed in ascending token order (quantized slices, then sink, tail,
+// current) with the same online-merge formulas as the single-pass version;
+// results match up to floating-point association inside the online softmax.
+template <unsigned D>
+__device__ void rnb_kvarn_attention_decode_merge_impl(
+    float* __restrict__ out,
+    const float* __restrict__ split_scratch,
+    unsigned split_z,
+    unsigned num_heads) {
+    const unsigned lane = threadIdx.x;
+    const unsigned head = blockIdx.x;
+    const unsigned query_token = blockIdx.y;
+    if (lane >= D || head >= num_heads) {
+        return;
+    }
+    const unsigned regions = split_z + 3u;
+    const size_t region_base = static_cast<size_t>(query_token) * regions * num_heads;
+    float merged_max = -FLT_MAX;
+    float merged_sum = 0.0f;
+    float merged_acc = 0.0f;
+    auto merge_region = [&](unsigned region) {
+        const size_t slot = region_base + region * num_heads + head;
+        const float region_max = split_scratch[slot * 2u];
+        const float region_sum = split_scratch[slot * 2u + 1u];
+        if (region_sum <= 0.0f) {
+            return;
+        }
+        const float region_acc =
+            split_scratch[regions * num_heads * 2u + slot * D + lane];
+        if (merged_sum <= 0.0f) {
+            merged_max = region_max;
+            merged_sum = region_sum;
+            merged_acc = region_acc;
+            return;
+        }
+        const float next_max = fmaxf(merged_max, region_max);
+        const float old_weight = expf(merged_max - next_max);
+        const float region_weight = expf(region_max - next_max);
+        merged_acc = merged_acc * old_weight + region_acc * region_weight;
+        merged_sum = merged_sum * old_weight + region_sum * region_weight;
+        merged_max = next_max;
+    };
+    for (unsigned slice = 0u; slice < split_z; ++slice) {
+        merge_region(slice);
+    }
+    merge_region(split_z);       // sink
+    merge_region(split_z + 1u);  // tail
+    merge_region(split_z + 2u);  // current
+    const size_t query_base =
+        (static_cast<size_t>(query_token) * num_heads + head) * D;
+    out[query_base + lane] = merged_sum > 0.0f ? merged_acc / merged_sum : 0.0f;
+}
+
+#define RNB_KVARN_MERGE_ARGUMENTS \
+    float* out, const float* split_scratch, unsigned split_z, unsigned num_heads
+
+#define RNB_KVARN_MERGE_PASS \
+    out, split_scratch, split_z, num_heads
+
+extern "C" __global__ void rnb_kvarn_attention_decode_merge_hd128(RNB_KVARN_MERGE_ARGUMENTS) {
+    rnb_kvarn_attention_decode_merge_impl<128>(RNB_KVARN_MERGE_PASS);
+}
+
+extern "C" __global__ void rnb_kvarn_attention_decode_merge_hd256(RNB_KVARN_MERGE_ARGUMENTS) {
+    rnb_kvarn_attention_decode_merge_impl<256>(RNB_KVARN_MERGE_PASS);
+}
+
+extern "C" __global__ void rnb_kvarn_attention_decode_merge_hd512(RNB_KVARN_MERGE_ARGUMENTS) {
+    rnb_kvarn_attention_decode_merge_impl<512>(RNB_KVARN_MERGE_PASS);
+}
+
 #undef RNB_KVARN_PASS
 #undef RNB_KVARN_ARGUMENTS
+#undef RNB_KVARN_MERGE_PASS
+#undef RNB_KVARN_MERGE_ARGUMENTS

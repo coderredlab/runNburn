@@ -30569,6 +30569,136 @@ fn mma_flash_hd512_matches_scalar() {
 }
 
 #[test]
+fn kvarn_attention_decode_split_matches_cpu_reference() {
+    let _guard = runtime_test_lock();
+    let head_dim = 128usize;
+    let num_heads = 2usize;
+    let num_kv_heads = 1usize;
+    let config = rnb_cpu::quantize::kvarn::KvarnConfig::K4_V4_G64;
+    let sink_len = config.sink_tokens;
+    let block_count = 100usize; // >= 64 so the launcher takes the split-Z path
+    let tail_len = 5usize;
+    let kv_len = sink_len + block_count * config.group + tail_len;
+    let row_width = num_kv_heads * head_dim;
+    let mut key = vec![0u16; kv_len * row_width];
+    let mut value = vec![0u16; kv_len * row_width];
+    for (index, bits) in key.iter_mut().enumerate() {
+        let sample = ((index * 17 % 101) as f32 - 50.0) * 0.00625;
+        *bits = half::f16::from_f32(sample).to_bits();
+    }
+    for (index, bits) in value.iter_mut().enumerate() {
+        let sample = ((index * 29 % 113) as f32 - 56.0) * 0.0078125;
+        *bits = half::f16::from_f32(sample).to_bits();
+    }
+    let layout =
+        rnb_cpu::quantize::kvarn::KvarnDeviceRecordLayout::new(config, num_kv_heads, head_dim)
+            .expect("KVarN device layout");
+    let mut packed = Vec::new();
+    let mut blocks = Vec::new();
+    for block_index in 0..block_count {
+        let start = (sink_len + block_index * config.group) * row_width;
+        let end = start + config.group * row_width;
+        let block = rnb_cpu::quantize::kvarn::KvarnBlock::quantize(
+            config,
+            num_kv_heads,
+            head_dim,
+            &key[start..end],
+            &value[start..end],
+        )
+        .expect("quantize KVarN block");
+        block.append_device_record(&mut packed);
+        blocks.push(block);
+    }
+    let quantized_end = (sink_len + block_count * config.group) * row_width;
+    let tail_start = sink_len + block_count * config.group;
+    let view = rnb_cpu::quantize::kvarn::KvarnKvView {
+        config,
+        num_kv_heads,
+        head_dim,
+        sink_key: &key[..sink_len * row_width],
+        sink_value: &value[..sink_len * row_width],
+        blocks: &blocks,
+        device_layout: layout,
+        device_blocks: &packed,
+        tail_start,
+        tail_key: &key[quantized_end..],
+        tail_value: &value[quantized_end..],
+        len: kv_len,
+    };
+    let query = (0..num_heads * head_dim)
+        .map(|index| ((index * 13 % 79) as f32 - 39.0) * 0.009)
+        .collect::<Vec<_>>();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut expected = vec![0.0f32; query.len()];
+    rnb_cpu::quantize::kvarn::attention_decode(
+        &query,
+        view,
+        &mut expected,
+        num_heads,
+        scale,
+        None,
+        None,
+    );
+
+    let output_bytes = expected.len() * std::mem::size_of::<f32>();
+    let output_dev = match acquire_decode_attn_out_carrier(output_bytes) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            eprintln!("skipping CUDA KVarN split attention test: {err}");
+            return;
+        }
+    };
+    let request = rnb_backend_api::KvarnDecodeRequest::new(
+        10_902,
+        &query,
+        &packed,
+        view.sink_key,
+        view.sink_value,
+        view.tail_key,
+        view.tail_value,
+        kv_len,
+        tail_start,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        config.key_bits,
+        config.value_bits,
+        config.group,
+        config.sink_tokens,
+        layout.block_bytes,
+        scale,
+        None,
+        None,
+    );
+    if let Err(err) = attention_decode_kvarn_to_device(request, output_dev) {
+        eprintln!("skipping CUDA KVarN split attention test: {err}");
+        return;
+    }
+    let mut actual = vec![0.0f32; expected.len()];
+    if let Err(err) = download_from_decode_hidden_carrier(output_dev, &mut actual) {
+        eprintln!("skipping CUDA KVarN split attention download: {err}");
+        return;
+    }
+    if let Err(err) = sync_decode_stream() {
+        eprintln!("skipping CUDA KVarN split attention sync: {err}");
+        return;
+    }
+    let mut dot = 0f64;
+    let mut ng = 0f64;
+    let mut ne = 0f64;
+    let mut max_abs = 0f32;
+    for i in 0..actual.len() {
+        dot += actual[i] as f64 * expected[i] as f64;
+        ng += actual[i] as f64 * actual[i] as f64;
+        ne += expected[i] as f64 * expected[i] as f64;
+        max_abs = max_abs.max((actual[i] - expected[i]).abs());
+    }
+    let cos = dot / (ng.sqrt() * ne.sqrt());
+    eprintln!("kvarn split decode vs cpu: cosine={cos:.7} max_abs={max_abs:.6}");
+    assert!(cos > 0.9999, "cosine {cos} too low (max_abs {max_abs})");
+}
+
+#[test]
 fn kvarn_attention_decode_matches_cpu_reference() {
     let _guard = runtime_test_lock();
     let head_dim = 128usize;

@@ -3714,6 +3714,32 @@ impl CudaState {
 
             let query_rows_u32 = u32::try_from(query_rows)
                 .map_err(|_| "CUDA KVarN query row count exceeds u32".to_string())?;
+            let split_z: u32 = match std::env::var("RNB_KVARN_SPLIT_Z")
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                Some(z) if (1..=32).contains(&z) => z,
+                _ => {
+                    if query_rows == 1 && num_blocks >= 64 {
+                        8
+                    } else {
+                        1
+                    }
+                }
+            };
+            let regions = split_z as usize + 3;
+            let scratch_floats = query_rows * regions * num_heads as usize * (2 + head_dim);
+            let scratch_bytes = scratch_floats.saturating_mul(std::mem::size_of::<f32>());
+            let split_scratch_arg = if split_z > 1 {
+                Some(ensure_device_buffer(
+                    &self.api,
+                    &mut cache.split_scratch_dev,
+                    &mut cache.split_scratch_capacity,
+                    scratch_bytes,
+                )?)
+            } else {
+                cache.split_scratch_dev
+            };
             let mut output_arg = output_dev;
             let mut query_arg = q_dev;
             let mut records_arg = records_dev;
@@ -3745,6 +3771,8 @@ impl CudaState {
                 .map_err(|_| "CUDA KVarN current token count exceeds u32".to_string())?;
             let mut sliding_window_arg = u32::try_from(request.sliding_window().unwrap_or(0))
                 .map_err(|_| "CUDA KVarN sliding window exceeds u32".to_string())?;
+            let mut split_scratch_ptr: u64 = split_scratch_arg.unwrap_or(0);
+            let mut split_z_arg = split_z;
             let mut scale_arg = request.scale();
             let mut softcap_arg = request.softcap().unwrap_or(0.0);
             let kernel = match head_dim {
@@ -3787,10 +3815,32 @@ impl CudaState {
                     (&mut softcap_arg as *mut f32).cast(),
                     (&mut current_tokens_arg as *mut u32).cast(),
                     (&mut sliding_window_arg as *mut u32).cast(),
+                    (&mut split_scratch_ptr as *mut u64).cast(),
+                    (&mut split_z_arg as *mut u32).cast(),
                 ],
-                (num_heads, query_rows_u32, 1),
+                (num_heads, query_rows_u32, split_z),
                 (head_dim as u32, 1, 1),
-            )
+            )?;
+            if split_z > 1 {
+                let merge_kernel = match head_dim {
+                    128 => "rnb_kvarn_attention_decode_merge_hd128",
+                    256 => "rnb_kvarn_attention_decode_merge_hd256",
+                    512 => "rnb_kvarn_attention_decode_merge_hd512",
+                    _ => unreachable!(),
+                };
+                self.launch_cached_gemv(
+                    merge_kernel,
+                    &[
+                        (&mut output_arg as *mut u64).cast(),
+                        (&mut split_scratch_ptr as *mut u64).cast(),
+                        (&mut split_z_arg as *mut u32).cast(),
+                        (&mut num_heads_arg as *mut u32).cast(),
+                    ],
+                    (num_heads, query_rows_u32, 1),
+                    (head_dim as u32, 1, 1),
+                )?;
+            }
+            Ok(())
         })();
         self.decode_attention_kvarn.insert(layer_idx, cache);
         result

@@ -792,6 +792,8 @@ pub(super) struct KvarnDecodeAttentionCache {
     pub(super) uploaded_sink_values: usize,
     pub(super) host_sink_k_base: usize,
     pub(super) host_sink_v_base: usize,
+    pub(super) split_scratch_dev: Option<u64>,
+    pub(super) split_scratch_capacity: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
